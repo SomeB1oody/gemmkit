@@ -122,15 +122,27 @@ belongs to the family (so a future integer family can interleave for VNNI); the
 mechanical copy is shared and never changes when a family is added.
 
 **Adaptive.** Packing is skipped when it doesn't pay. RHS is packed once per
-panel (always, in v1) and reused across all row blocks. LHS packing is
-**reuse-aware**: a non-unit row stride or a partial row panel forces packing
-(the microkernel reads full `MR`-row vectors), but a column-major full block is
-packed only when each worker reuses it across enough columns to amortize the copy.
-Because every worker packs into its own buffer, redundant packing across workers
-makes mid-size parallel runs cheaper *unpacked* — so column-major inputs flow
-straight into the kernel there, and pack only when reuse is genuinely high (serial
-or very wide). This single change roughly doubled mid-size multi-threaded
-throughput.
+panel (always, in v1) and reused across all row blocks. LHS packing has **two
+independent triggers**:
+
+1. *Reuse* — a non-unit row stride or a partial row panel forces packing (the
+   microkernel reads full `MR`-row vectors); otherwise a column-major full block is
+   packed only when each worker reuses it across enough columns to amortize the
+   copy. Historically every worker packed into its own buffer, so redundant packing
+   made mid-size parallel runs cheaper *unpacked* — column-major inputs flowed
+   straight into the kernel and packed only when reuse was genuinely high. (The L5
+   dynamic scheduler now hands each row-block to one worker on the packed path, so
+   that redundancy is largely gone.)
+2. *Stride* — even with low reuse, an in-place column-major A is read by walking K
+   with stride `csa`, so once `csa · sizeof` reaches ~a memory page every depth
+   step lands on a fresh page and the strided read collapses (TLB thrash). Above
+   that gate A is packed regardless of reuse, which recovers large-`m` parallel
+   throughput dramatically — measured ~2.4× at m = 4096 on Apple Silicon's 16 KiB
+   pages (50% → 111% of the `gemm` crate). The gate scales with the page, so —
+   keeping with the "detect geometry, don't hardcode" rule — it is **derived from
+   the runtime page size** (`cache::page_size()` via `getpagesize`, half a page),
+   not a fixed constant: 8 KiB on 16 KiB-page Apple Silicon, 2 KiB on 4 KiB-page
+   x86/Linux, automatically. `GEMMKIT_LHS_PACK_STRIDE` overrides it (`0` = auto).
 
 ## L3 — cache topology and analytical blocking
 
@@ -183,9 +195,22 @@ concretely-typed dispatch layer, not the fully generic driver.)
 `Parallelism::{Serial, Rayon(n)}` (`Rayon(0)` = auto). A single work-gate: below an
 `m·n·k` threshold the run is forced serial; above it the worker count *scales with
 the workload* (half-gate granularity) and is capped by the available parallelism
-and the job count. Work is a flat 1-D list of column strips; each worker takes a
-balanced contiguous slice. RHS packing is parallelized the same way with a barrier
-before compute.
+and the job count. Work is a flat 1-D list of column strips; workers pull
+contiguous chunks from a shared lock-free cursor (`JobCursor`) **on demand**, so
+faster cores absorb proportionally more — the makespan approaches `work / Σ core
+rates` instead of `n · slowest`, which matters on heterogeneous big.LITTLE layouts
+(Apple P/E, ARM DynamIQ, Intel hybrid) where an equal indivisible split is bounded
+by the slowest core. This forfeits *nothing*: blocking stays thread-count
+independent, the depth loop stays serial, and each output tile is still computed
+wholly by one worker over the full K, so *which* worker computes a tile is
+numerically irrelevant and the output is bit-identical. On the common in-place-LHS path, chunk size targets
+`GEMMKIT_PARALLEL_OVERSAMPLE` chunks per worker (default 8: ~8 chunks/worker bounds
+the heterogeneous tail imbalance to ~⅛ of a worker's share). When the LHS is packed
+*and* there are at least as many row-blocks as workers, the chunk is a whole
+row-block instead — each block's A is then packed by exactly one worker, trading
+some balance granularity for pack-once reuse; with fewer row-blocks it falls back to
+the fine grain. RHS packing is parallelized the same way (its own cursor) with a
+barrier before compute.
 
 ## L6 — gemv
 

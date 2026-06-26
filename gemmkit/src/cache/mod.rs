@@ -107,6 +107,33 @@ pub fn topology() -> &'static CacheTopology {
     &ZEN5_FALLBACK
 }
 
+/// The OS memory page size in bytes (memoized). Drives the LHS-packing stride
+/// gate.
+///
+/// `getpagesize` is POSIX/BSD and present on both Linux and macOS
+#[cfg(all(unix, feature = "std"))]
+pub(crate) fn page_size() -> usize {
+    static PAGE_SIZE: OnceLock<usize> = OnceLock::new();
+    *PAGE_SIZE.get_or_init(|| {
+        unsafe extern "C" {
+            fn getpagesize() -> core::ffi::c_int;
+        }
+        let p = unsafe { getpagesize() } as usize;
+        // A real base page is a power of two in a sane range; else fall back.
+        if p.is_power_of_two() && (4096..=2 * 1024 * 1024).contains(&p) {
+            p
+        } else {
+            4096
+        }
+    })
+}
+
+/// Page-size fallback for non-unix / no-std builds (assume the common 4 KiB).
+#[cfg(not(all(unix, feature = "std")))]
+pub(crate) fn page_size() -> usize {
+    4096
+}
+
 /// Run the fallback chain once. Never panics: any backend that fails or returns
 /// implausible values is skipped.
 #[cfg(feature = "std")]
@@ -226,5 +253,22 @@ impl CacheTopology {
         };
 
         Blocking { mc, kc, nc }
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod tests {
+    use super::*;
+
+    /// The detected page size must be a power of two in a sane range (the
+    /// LHS-packing stride gate is derived from it), on whatever host runs the test.
+    #[test]
+    fn page_size_is_plausible() {
+        let p = page_size();
+        assert!(p.is_power_of_two(), "page size {p} is not a power of two");
+        assert!(
+            (4096..=2 * 1024 * 1024).contains(&p),
+            "page size {p} out of range"
+        );
     }
 }

@@ -4,11 +4,12 @@
 //! untouched — the open/closed property the architecture promises.
 //!
 //! Loop structure (BLIS order): `jc` (N / L3) → `pc` (K, *not* parallel) → a
-//! flat 1-D job list over `(ic row-block × jt column-tile)` parallelized with a
-//! single work-gate. `beta` applies only on the first depth slice; later slices
+//! flat 1-D job list over `(ic row-block × jt column-tile)` that workers drain by
+//! pulling chunks from a shared cursor on demand (a single work-gate; faster cores
+//! take more). `beta` applies only on the first depth slice; later slices
 //! accumulate. Each output tile is computed start-to-finish by one worker over
 //! the full K, and the blocking is thread-count independent, so the result is
-//! bit-identical for any [`Parallelism`].
+//! bit-identical for any [`Parallelism`] regardless of how the chunks land.
 
 use core::mem::MaybeUninit;
 
@@ -120,23 +121,31 @@ pub unsafe fn run<Fam, S, const MR_REG: usize, const NR: usize>(
         let n_threads = par.resolve(mnk, n_jobs_max);
 
         // Reuse-aware LHS pack decision: each worker handles roughly
-        // `jobs_per_worker` column strips, all within one row block, so it reuses
-        // a packed A block across `reuse_cols` columns. Packing only amortizes
-        // when that reuse is high (always so in serial; rarely so for mid-size
-        // parallel, where many workers would redundantly pack the same block).
+        // `jobs_per_worker` column strips, all within one row block
         let jobs_per_worker = n_jobs_max.div_ceil(n_threads.max(1));
         let reuse_cols = jobs_per_worker.min(n_nt_max) * nr;
-        let want_pack_lhs = reuse_cols > tuning::lhs_pack_threshold();
+        // A column-major A (`rsa == 1`) is read in place by walking K with stride `csa`,
+        // so once `csa * sizeof(Lhs)` reaches ~a memory page the strided read thrashes
+        // the TLB and packing A into a contiguous panel wins regardless of reuse
+        // and it is redundancy-free here
+        let pack_stride = match tuning::lhs_pack_stride() {
+            0 => cache::page_size() / 2,
+            v => v,
+        };
+        let strided_lhs = rsa == 1
+            && csa
+                .unsigned_abs()
+                .saturating_mul(core::mem::size_of::<Fam::Lhs>())
+                >= pack_stride;
+        let want_pack_lhs = reuse_cols > tuning::lhs_pack_threshold() || strided_lhs;
 
         // Adaptive RHS packing: B (read only via broadcast, so any layout works
         // unpacked) is packed once and reused across all `n_mc` row blocks. The
         // copy amortizes only when that reuse is high (large `m`); otherwise B is
-        // read in place. The shared pack buffer has no per-worker redundancy, so
-        // the gate is simply on `m`.
+        // read in place
         let pack_b = m > tuning::rhs_pack_threshold();
 
-        // One packing allocation: `n_threads` LHS macro-block buffers + (if
-        // packing) one shared RHS macro-panel buffer.
+        // One packing allocation
         let a_per_thread = mc.next_multiple_of(mr) * kc;
         let b_elems = if pack_b {
             nc.next_multiple_of(nr) * kc
@@ -169,120 +178,122 @@ pub unsafe fn run<Fam, S, const MR_REG: usize, const NR: usize>(
                     BetaStatus::One
                 };
 
-                // Pack the RHS macro-panel in parallel (when packing): each worker
-                // packs a contiguous slice of the NR-wide column panels. A barrier
-                // (the `for_each_worker` join) precedes the compute region, since
-                // all workers read all of the packed B.
+                // Pack the RHS macro-panel in parallel (when packing)
                 if pack_b {
-                    parallel::for_each_worker(n_threads, |tid| {
+                    let bcur = parallel::JobCursor::new(n_nt, parallel::job_grain(n_nt, n_threads));
+                    parallel::for_each_worker(n_threads, |_tid| {
                         let (b, b_base) = (b, b_base);
-                        let (s, e) = parallel::job_range(n_nt, tid, n_threads);
-                        for jt in s..e {
-                            let col = jc + jt * nr;
-                            let nr_eff = core::cmp::min(nr, nc_eff - jt * nr);
-                            let dst = b_base.0.add(jt * kc_eff * nr);
-                            let src = b.0.offset(pc as isize * rsb + col as isize * csb)
-                                as *const Fam::Rhs;
-                            Fam::pack_rhs(dst, src, rsb, csb, kc_eff, nr_eff, nr);
+                        while let Some((s, e)) = bcur.next_chunk() {
+                            for jt in s..e {
+                                let col = jc + jt * nr;
+                                let nr_eff = core::cmp::min(nr, nc_eff - jt * nr);
+                                let dst = b_base.0.add(jt * kc_eff * nr);
+                                let src = b.0.offset(pc as isize * rsb + col as isize * csb)
+                                    as *const Fam::Rhs;
+                                Fam::pack_rhs(dst, src, rsb, csb, kc_eff, nr_eff, nr);
+                            }
                         }
                     });
                 }
 
                 let n_jobs = n_mc * n_nt;
 
+                // Dynamic self-scheduling for big.LITTLE heterogeneous layouts
+                let grain = if (rsa != 1 || want_pack_lhs) && n_mc >= n_threads {
+                    n_nt
+                } else {
+                    parallel::job_grain(n_jobs, n_threads)
+                };
+                let cur = parallel::JobCursor::new(n_jobs, grain);
+
                 parallel::for_each_worker(n_threads, |tid| {
-                    // Force whole-struct capture of the `Send + Sync` pointer
-                    // shims; edition-2024 closures otherwise capture the inner
-                    // `*mut` fields disjointly, which are not `Sync`.
+                    // Force whole-struct capture of the `Send + Sync` pointer shims
                     let (a, b, c, a_base, b_base) = (a, b, c, a_base, b_base);
-                    let (start, end) = parallel::job_range(n_jobs, tid, n_threads);
-                    if start >= end {
-                        return;
-                    }
                     let a_buf = a_base.0.add(tid * a_stride);
                     let mut scratch = [const { MaybeUninit::<Fam::Acc>::uninit() }; SCRATCH_LEN];
                     let scratch_ptr = scratch.as_mut_ptr() as *mut Fam::Acc;
 
-                    // Cached LHS pack state for the current row block.
+                    // Cached LHS pack state for the current row block
                     let mut cur_ic = usize::MAX;
                     let mut a_panel_base: *const Fam::Lhs = core::ptr::null();
                     let mut a_cs: isize = 0;
 
-                    for q in start..end {
-                        let ic_idx = q / n_nt;
-                        let jt = q % n_nt;
-                        let ic = ic_idx * mc;
-                        let mc_eff = core::cmp::min(mc, m - ic);
+                    while let Some((start, end)) = cur.next_chunk() {
+                        for q in start..end {
+                            let ic_idx = q / n_nt;
+                            let jt = q % n_nt;
+                            let ic = ic_idx * mc;
+                            let mc_eff = core::cmp::min(mc, m - ic);
 
-                        if ic_idx != cur_ic {
-                            cur_ic = ic_idx;
-                            let src = a.0.offset(ic as isize * rsa + pc as isize * csa)
-                                as *const Fam::Lhs;
-                            if do_pack_lhs(rsa, mc_eff, mr, want_pack_lhs) {
-                                Fam::pack_lhs(a_buf, src, rsa, csa, mc_eff, kc_eff, mr);
-                                a_panel_base = a_buf as *const Fam::Lhs;
-                                a_cs = mr as isize;
-                            } else {
-                                a_panel_base = src;
-                                a_cs = csa;
-                            }
-                        }
-
-                        let col = jc + jt * nr;
-                        let nr_eff = core::cmp::min(nr, nc_eff - jt * nr);
-                        // Packed B → contiguous panel with (NR, 1) strides;
-                        // unpacked B → read in place with the original strides.
-                        let (bpan, b_rs_k, b_cs_k) = if pack_b {
-                            (
-                                b_base.0.add(jt * kc_eff * nr) as *const Fam::Rhs,
-                                nr as isize,
-                                1,
-                            )
-                        } else {
-                            (
-                                b.0.offset(pc as isize * rsb + col as isize * csb)
-                                    as *const Fam::Rhs,
-                                rsb,
-                                csb,
-                            )
-                        };
-                        let packed_a = a_cs == mr as isize;
-
-                        // Process the whole column strip in the ISA's
-                        // target-feature context.
-                        simd.vectorize(|| {
-                            let mut ir = 0;
-                            while ir < mc_eff {
-                                let mr_eff = core::cmp::min(mr, mc_eff - ir);
-                                let apan = if packed_a {
-                                    a_panel_base.add((ir / mr) * mr * kc_eff)
+                            if ic_idx != cur_ic {
+                                cur_ic = ic_idx;
+                                let src = a.0.offset(ic as isize * rsa + pc as isize * csa)
+                                    as *const Fam::Lhs;
+                                if do_pack_lhs(rsa, mc_eff, mr, want_pack_lhs) {
+                                    Fam::pack_lhs(a_buf, src, rsa, csa, mc_eff, kc_eff, mr);
+                                    a_panel_base = a_buf as *const Fam::Lhs;
+                                    a_cs = mr as isize;
                                 } else {
-                                    a_panel_base.offset(ir as isize * rsa)
-                                };
-                                let cptr =
-                                    c.0.offset((ic + ir) as isize * rsc + col as isize * csc);
-                                Fam::microkernel::<S, MR_REG, NR>(
-                                    simd,
-                                    kc_eff,
-                                    alpha,
-                                    beta_eff,
-                                    ash,
-                                    bst,
-                                    apan,
-                                    a_cs,
-                                    bpan,
-                                    b_rs_k,
-                                    b_cs_k,
-                                    cptr,
-                                    rsc,
-                                    csc,
-                                    mr_eff,
-                                    nr_eff,
-                                    scratch_ptr,
-                                );
-                                ir += mr;
+                                    a_panel_base = src;
+                                    a_cs = csa;
+                                }
                             }
-                        });
+
+                            let col = jc + jt * nr;
+                            let nr_eff = core::cmp::min(nr, nc_eff - jt * nr);
+                            // Packed B -> contiguous panel with (NR, 1) strides
+                            // unpacked B -> read in place with the original strides
+                            let (bpan, b_rs_k, b_cs_k) = if pack_b {
+                                (
+                                    b_base.0.add(jt * kc_eff * nr) as *const Fam::Rhs,
+                                    nr as isize,
+                                    1,
+                                )
+                            } else {
+                                (
+                                    b.0.offset(pc as isize * rsb + col as isize * csb)
+                                        as *const Fam::Rhs,
+                                    rsb,
+                                    csb,
+                                )
+                            };
+                            let packed_a = a_cs == mr as isize;
+
+                            // Process the whole column strip in the ISA's target-feature context
+                            simd.vectorize(|| {
+                                let mut ir = 0;
+                                while ir < mc_eff {
+                                    let mr_eff = core::cmp::min(mr, mc_eff - ir);
+                                    let apan = if packed_a {
+                                        a_panel_base.add((ir / mr) * mr * kc_eff)
+                                    } else {
+                                        a_panel_base.offset(ir as isize * rsa)
+                                    };
+                                    let cptr =
+                                        c.0.offset((ic + ir) as isize * rsc + col as isize * csc);
+                                    Fam::microkernel::<S, MR_REG, NR>(
+                                        simd,
+                                        kc_eff,
+                                        alpha,
+                                        beta_eff,
+                                        ash,
+                                        bst,
+                                        apan,
+                                        a_cs,
+                                        bpan,
+                                        b_rs_k,
+                                        b_cs_k,
+                                        cptr,
+                                        rsc,
+                                        csc,
+                                        mr_eff,
+                                        nr_eff,
+                                        scratch_ptr,
+                                    );
+                                    ir += mr;
+                                }
+                            });
+                        }
                     }
                 });
 

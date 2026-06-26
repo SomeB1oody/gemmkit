@@ -73,9 +73,22 @@ static RHS_PACK_THRESHOLD: Threshold = Threshold::new("GEMMKIT_RHS_PACK_THRESHOL
 // is genuinely high.
 static LHS_PACK_THRESHOLD: Threshold = Threshold::new("GEMMKIT_LHS_PACK_THRESHOLD", 1024);
 
+// Avoid a TLB/cache-hostile strided read, not amortize a copy.
+// A column-major A is walked down K in the microkernel with stride `csa`,
+// so when `csa * sizeof(Lhs)` reaches ~a memory page every depth
+// step lands on a fresh page and the in-place read collapses
+static LHS_PACK_STRIDE: Threshold = Threshold::new("GEMMKIT_LHS_PACK_STRIDE", 0);
+
 // Maximum `min(m, n)` for which the dedicated gemv (matrix·vector) path is taken
 // when the other dimension is 1. (Shape, not size, decides; this only caps it.)
 static GEMV_THRESHOLD: Threshold = Threshold::new("GEMMKIT_GEMV_THRESHOLD", usize::MAX - 1);
+
+// Dynamic-scheduling granularity: the parallel driver aims for this many work
+// chunks *per worker*, handed out from a shared cursor on demand, so faster cores
+// (heterogeneous big.LITTLE P/E layouts) pull proportionally more. Higher = finer
+// load balance and a smaller tail, at the cost of more atomic claims (and, on the
+// rare packed-LHS path, more re-packing at chunk edges); lower = coarser
+static PARALLEL_OVERSAMPLE: Threshold = Threshold::new("GEMMKIT_PARALLEL_OVERSAMPLE", 8);
 
 /// Get the serial/parallel work gate (`m*n*k` threshold).
 pub fn parallel_threshold() -> usize {
@@ -104,6 +117,18 @@ pub fn set_lhs_pack_threshold(v: usize) {
     LHS_PACK_THRESHOLD.set(v);
 }
 
+/// Get the LHS-packing depth-stride gate, in bytes: a column-major A whose
+/// `csa * sizeof(Lhs)` reaches this is packed to avoid a TLB/cache-hostile strided
+/// read, independent of the reuse gate above. `0` (the default) means *auto* — the
+/// driver derives the gate from the OS page size.
+pub fn lhs_pack_stride() -> usize {
+    LHS_PACK_STRIDE.get()
+}
+/// Override the LHS-packing depth-stride gate (bytes); `0` restores auto.
+pub fn set_lhs_pack_stride(v: usize) {
+    LHS_PACK_STRIDE.set(v);
+}
+
 /// Get the gemv special-path cap on `min(m, n)`.
 pub fn gemv_threshold() -> usize {
     GEMV_THRESHOLD.get()
@@ -111,4 +136,14 @@ pub fn gemv_threshold() -> usize {
 /// Override the gemv special-path cap.
 pub fn set_gemv_threshold(v: usize) {
     GEMV_THRESHOLD.set(v);
+}
+
+/// Get the parallel dynamic-scheduling oversample factor (chunks per worker).
+/// Always `>= 1` so the scheduler can never receive a zero grain.
+pub fn parallel_oversample() -> usize {
+    PARALLEL_OVERSAMPLE.get().max(1)
+}
+/// Override the parallel dynamic-scheduling oversample factor.
+pub fn set_parallel_oversample(v: usize) {
+    PARALLEL_OVERSAMPLE.set(v);
 }
