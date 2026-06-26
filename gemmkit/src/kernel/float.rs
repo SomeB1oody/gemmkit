@@ -103,12 +103,31 @@ where
             // --- accumulate: acc[j][i] = column j, rows i*lanes..(i+1)*lanes ---
             let mut acc: [[<S as SimdOps<T>>::Reg; MR_REG]; NR] = [[simd.zero(); MR_REG]; NR];
 
-            if nr_eff == NR {
-                // Hot path: full NR-wide tile. The const-bounded `j` loop
-                // monomorphizes and fully unrolls (no `seq!` macro), so the
-                // optimizer keeps every `acc[j][i]` in a register. Reads exactly
-                // NR real RHS columns — correct whether B is packed or read in
-                // place (adaptive skip).
+            if nr_eff == NR && <S as SimdOps<T>>::LANE_FMA && b_cs == 1 && NR.is_multiple_of(lanes)
+            {
+                // Lane-indexed hot path (NEON). B is packed (`b_cs == 1`), so each
+                // group of `lanes` RHS columns is contiguous: load it as one
+                // vector and broadcast the lanes with a fused lane-indexed FMA
+                // (`fma_bvec`), replacing `NR` per-column `splat` loads with
+                // `NR/lanes` vector loads. Bit-identical to the splat path (same
+                // fused `a*b + c`). Every guard is a compile-time const except
+                // `b_cs == 1`, so non-lane ISAs drop this branch entirely.
+                for p in 0..kc {
+                    let pa = a.offset(p as isize * a_cs);
+                    let a_regs: [<S as SimdOps<T>>::Reg; MR_REG] =
+                        core::array::from_fn(|i| simd.loadu(pa.add(i * lanes)));
+                    let pb = b.offset(p as isize * b_rs);
+                    for jb in (0..NR).step_by(lanes) {
+                        let bvec = simd.loadu(pb.add(jb));
+                        simd.fma_bvec(&a_regs, bvec, &mut acc[jb..jb + lanes]);
+                    }
+                }
+            } else if nr_eff == NR {
+                // Splat hot path: one broadcast per RHS column. Correct whether B
+                // is packed or read in place (adaptive skip, arbitrary `b_cs`),
+                // and the only full-tile path for ISAs without a lane FMA. The
+                // const-bounded `j` loop fully unrolls, keeping every `acc[j][i]`
+                // in a register.
                 for p in 0..kc {
                     let pa = a.offset(p as isize * a_cs);
                     let a_regs: [<S as SimdOps<T>>::Reg; MR_REG] =

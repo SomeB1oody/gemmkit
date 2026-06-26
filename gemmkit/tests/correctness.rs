@@ -6,6 +6,8 @@
 
 use gemmkit::driver;
 use gemmkit::kernel::FloatGemm;
+#[cfg(target_arch = "aarch64")]
+use gemmkit::simd::Neon;
 use gemmkit::simd::ScalarTok;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use gemmkit::simd::{Avx512, Fma};
@@ -641,6 +643,17 @@ fn isa_avx512() {
     for (m, k, n) in isa_shapes() {
         driver_case::<f32, Avx512, 2, 12>(Avx512, m, k, n);
         driver_case::<f64, Avx512, 2, 12>(Avx512, m, k, n);
+    }
+}
+
+/// NEON is baseline on aarch64, so no feature-detection guard is needed: the
+/// kernel always runs here. Tile matches the production dispatch choice (3×8).
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn isa_neon() {
+    for (m, k, n) in isa_shapes() {
+        driver_case::<f32, Neon, 3, 8>(Neon, m, k, n);
+        driver_case::<f64, Neon, 3, 8>(Neon, m, k, n);
     }
 }
 

@@ -10,13 +10,15 @@
 //! ## Pinning the kernel: `GEMMKIT_REQUIRE_ISA`
 //!
 //! By default the best available ISA is selected at runtime. Setting the
-//! environment variable `GEMMKIT_REQUIRE_ISA` to `scalar`, `fma`, or `avx512`
-//! **forces** exactly that kernel; if the CPU (or an emulator such as Intel SDE)
-//! does not report the required feature, dispatch **panics** rather than falling
-//! back — so a CI job that means to exercise a given kernel fails loudly instead
-//! of silently testing a different one. `auto`/unset is the normal
-//! auto-selecting behavior. The value is read once (the choice is memoized), so
-//! set it in the process environment before the first GEMM call.
+//! environment variable `GEMMKIT_REQUIRE_ISA` to `scalar`, `fma`, `avx512`, or
+//! `neon` **forces** exactly that kernel; if the CPU (or an emulator such as
+//! Intel SDE) does not report the required feature — or the requested ISA does
+//! not exist on this target architecture — dispatch **panics** rather than
+//! falling back, so a CI job that means to exercise a given kernel fails loudly
+//! instead of silently testing a different one. (`neon` is only valid on
+//! aarch64, where it is baseline; `fma`/`avx512` only on x86.) `auto`/unset is
+//! the normal auto-selecting behavior. The value is read once (the choice is
+//! memoized), so set it in the process environment before the first GEMM call.
 
 #[cfg(feature = "std")]
 use std::sync::OnceLock;
@@ -25,6 +27,8 @@ use crate::driver;
 use crate::kernel::FloatGemm;
 use crate::parallel::Parallelism;
 use crate::scalar::Float;
+#[cfg(target_arch = "aarch64")]
+use crate::simd::Neon;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use crate::simd::{Avx512, Fma};
 use crate::simd::{ScalarTok, SimdOps};
@@ -192,6 +196,19 @@ unsafe fn gemm_f64_avx512(t: Task<f64>, par: Parallelism, ws: &mut Workspace) {
     unsafe { run_typed::<f64, Avx512, 2, 12>(Avx512, t, par, ws) }
 }
 
+#[cfg(target_arch = "aarch64")]
+unsafe fn gemm_f32_neon(t: Task<f32>, par: Parallelism, ws: &mut Workspace) {
+    // MR = 3*4 = 12, NR = 8 → 24 acc + 3 lhs + 1 rhs = 28 of the 32 v0–v31
+    // vector registers (no spill). Benchmarked best-and-most-stable across
+    // 512/1024/2048 on Apple Silicon (see the tuning note in the PR).
+    unsafe { run_typed::<f32, Neon, 3, 8>(Neon, t, par, ws) }
+}
+#[cfg(target_arch = "aarch64")]
+unsafe fn gemm_f64_neon(t: Task<f64>, par: Parallelism, ws: &mut Workspace) {
+    // MR = 3*2 = 6, NR = 8 → 24 acc + 3 lhs + 1 rhs = 28 vregs (no spill).
+    unsafe { run_typed::<f64, Neon, 3, 8>(Neon, t, par, ws) }
+}
+
 type GemmFn<T> = unsafe fn(Task<T>, Parallelism, &mut Workspace);
 
 /// An explicitly requested kernel, parsed from `GEMMKIT_REQUIRE_ISA`.
@@ -202,6 +219,7 @@ enum ForcedIsa {
     Scalar,
     Fma,
     Avx512,
+    Neon,
 }
 
 /// Parse the `GEMMKIT_REQUIRE_ISA` pin. Unset/empty ⇒ [`ForcedIsa::Auto`]; an
@@ -221,8 +239,12 @@ fn forced_isa() -> ForcedIsa {
                 ForcedIsa::Fma
             } else if t.eq_ignore_ascii_case("avx512") || t.eq_ignore_ascii_case("avx512f") {
                 ForcedIsa::Avx512
+            } else if t.eq_ignore_ascii_case("neon") {
+                ForcedIsa::Neon
             } else {
-                panic!("GEMMKIT_REQUIRE_ISA: unknown value `{t}` (expected scalar|fma|avx512|auto)")
+                panic!(
+                    "GEMMKIT_REQUIRE_ISA: unknown value `{t}` (expected scalar|fma|avx512|neon|auto)"
+                )
             }
         }
     }
@@ -255,6 +277,12 @@ fn select_f32() -> GemmFn<f32> {
         ForcedIsa::Fma | ForcedIsa::Avx512 => {
             panic!("GEMMKIT_REQUIRE_ISA: requested SIMD ISA is unavailable on this target")
         }
+        #[cfg(target_arch = "aarch64")]
+        ForcedIsa::Neon => return gemm_f32_neon, // NEON is baseline on aarch64
+        #[cfg(not(target_arch = "aarch64"))]
+        ForcedIsa::Neon => {
+            panic!("GEMMKIT_REQUIRE_ISA=neon, but this target is not aarch64")
+        }
         ForcedIsa::Auto => {}
     }
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -266,7 +294,16 @@ fn select_f32() -> GemmFn<f32> {
             return gemm_f32_fma;
         }
     }
-    gemm_f32_scalar
+    // NEON is mandatory on aarch64: it is always the Auto choice there, so the
+    // scalar fallback below is gated out (it would be unreachable) on aarch64.
+    #[cfg(target_arch = "aarch64")]
+    {
+        gemm_f32_neon
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        gemm_f32_scalar
+    }
 }
 
 fn select_f64() -> GemmFn<f64> {
@@ -292,6 +329,12 @@ fn select_f64() -> GemmFn<f64> {
         ForcedIsa::Fma | ForcedIsa::Avx512 => {
             panic!("GEMMKIT_REQUIRE_ISA: requested SIMD ISA is unavailable on this target")
         }
+        #[cfg(target_arch = "aarch64")]
+        ForcedIsa::Neon => return gemm_f64_neon, // NEON is baseline on aarch64
+        #[cfg(not(target_arch = "aarch64"))]
+        ForcedIsa::Neon => {
+            panic!("GEMMKIT_REQUIRE_ISA=neon, but this target is not aarch64")
+        }
         ForcedIsa::Auto => {}
     }
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -303,7 +346,16 @@ fn select_f64() -> GemmFn<f64> {
             return gemm_f64_fma;
         }
     }
-    gemm_f64_scalar
+    // NEON is mandatory on aarch64: it is always the Auto choice there, so the
+    // scalar fallback below is gated out (it would be unreachable) on aarch64.
+    #[cfg(target_arch = "aarch64")]
+    {
+        gemm_f64_neon
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        gemm_f64_scalar
+    }
 }
 
 #[cfg(feature = "std")]

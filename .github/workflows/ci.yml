@@ -149,3 +149,29 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace
+
+  # Apple Silicon: build + run the whole suite natively on an arm64 runner
+  # (NEON is baseline there, so the `isa_neon` driver test and the sysctl cache
+  # backend both execute), then force the NEON kernel end-to-end. A green forced
+  # run proves the public `gemm()` path actually dispatches to NEON.
+  kernel-neon:
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rust: stable
+            target: aarch64-apple-darwin
+    name: kernel-neon/${{ matrix.target }}/${{ matrix.rust }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust }}
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --no-fail-fast
+      - name: force the neon kernel
+        env:
+          GEMMKIT_REQUIRE_ISA: neon
+        run: cargo test -p gemmkit --no-fail-fast

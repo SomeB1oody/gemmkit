@@ -5,7 +5,8 @@ for Rust, in two crates:
 
 - [**`gemmkit`**](/gemmkit/README.md) — the core engine. Zero ndarray dependency; a
   data-type-agnostic `&[T]` + stride API (plus a raw-pointer engine). Picks the
-  best x86 instruction set (scalar / AVX2+FMA / AVX-512) at runtime.
+  best instruction set at runtime — x86 (scalar / AVX2+FMA / AVX-512) and
+  AArch64 (NEON).
 - [**`gemmkit-ndarray`**](/gemmkit-ndarray/README.md) — a thin [`ndarray`] 0.17 adapter.
 
 It computes `C ← α·A·B + β·C` for `f32` and `f64`.
@@ -55,8 +56,13 @@ untouched. See [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Status
 
-v1 ships f32/f64 over scalar + AVX2/FMA + AVX-512 on x86-64. NEON (Apple Silicon),
-f16/bf16, complex, and integer families are designed-for but not yet implemented.
+v1 ships f32/f64 over scalar + AVX2/FMA + AVX-512 on x86-64 and NEON on AArch64
+(Apple Silicon, with `sysctl` cache detection). f16/bf16, complex, and integer
+families are designed-for but not yet implemented. The AArch64 kernel uses a
+lane-indexed FMA fast path (`vfmaq_laneq`, packed RHS) on top of the portable
+`splat`+`vfmaq` path; single-threaded it runs at ~80% of the `gemm` crate on an
+M-series core. The remaining gap is in the analytical `k`-blocking/tile, not the
+FMA primitive, and is left as tuning work.
 
 ## Build, test, bench
 

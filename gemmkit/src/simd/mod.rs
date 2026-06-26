@@ -37,12 +37,16 @@ use crate::scalar::Scalar;
 mod avx512;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod fma;
+#[cfg(target_arch = "aarch64")]
+mod neon;
 mod scalar;
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub use self::avx512::Avx512;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub use self::fma::Fma;
+#[cfg(target_arch = "aarch64")]
+pub use self::neon::Neon;
 pub use self::scalar::ScalarTok;
 
 /// An ISA token: a zero-sized marker carrying a set of target features.
@@ -72,6 +76,15 @@ pub trait SimdOps<T: Scalar>: Simd {
     /// Natural buffer alignment for this ISA in bytes (e.g. 32 for AVX2, 64 for
     /// AVX-512). Packed buffers are aligned to this.
     const ALIGN: usize;
+    /// Whether this ISA has a hardware **lane-indexed FMA** — broadcasting a
+    /// multiplier straight from a vector lane in one fused instruction (NEON
+    /// `vfmaq_laneq`). When `true`, the microkernel takes the lane path via
+    /// [`Self::fma_bvec`] for packed RHS, loading a block of `LANES` B columns
+    /// as one vector instead of issuing a `splat` load per column. The default
+    /// is `false`: per-column `splat` + FMA, which on x86 the assembler already
+    /// folds into a broadcast-from-memory operand, so the lane path is no win
+    /// there.
+    const LANE_FMA: bool = false;
 
     /// A register of all zeros.
     ///
@@ -123,4 +136,42 @@ pub trait SimdOps<T: Scalar>: Simd {
     /// # Safety
     /// See the trait-level note.
     unsafe fn reduce_sum(self, v: Self::Reg) -> T;
+
+    /// Accumulate one contiguous block of `B` columns (loaded as the single
+    /// register `bvec`) against the `MR_REG` already-loaded `A` registers,
+    /// broadcasting each B lane: for `l in 0..acc.len()` and `i in 0..MR_REG`,
+    /// `acc[l][i] = a_regs[i] * bvec[l] + acc[l][i]`. `acc.len()` must be
+    /// `<= LANES`.
+    ///
+    /// This is the fused inner step of the lane-indexed kernel path, taken only
+    /// when [`Self::LANE_FMA`] is set. The default implementation broadcasts
+    /// each lane via a store + [`Self::splat`] (correct for any ISA, but no
+    /// faster than the plain `splat` path); lane-capable ISAs override it with a
+    /// single hardware lane-indexed FMA. The result is bit-identical to the
+    /// `splat` path — same fused `a*b + c`.
+    ///
+    /// # Safety
+    /// See the trait-level note; `acc.len()` must be `<= LANES` and `a_regs`
+    /// valid for `MR_REG` reads.
+    #[inline(always)]
+    unsafe fn fma_bvec<const MR_REG: usize>(
+        self,
+        a_regs: &[Self::Reg; MR_REG],
+        bvec: Self::Reg,
+        acc: &mut [[Self::Reg; MR_REG]],
+    ) {
+        debug_assert!(acc.len() <= Self::LANES);
+        unsafe {
+            // Spill the B-vector to the stack, then broadcast each lane. 16 is
+            // the widest LANES of any ISA (AVX-512 f32), so it always fits.
+            let mut buf = [T::ZERO; 16];
+            self.storeu(buf.as_mut_ptr(), bvec);
+            for l in 0..acc.len() {
+                let bl = self.splat(buf[l]);
+                for i in 0..MR_REG {
+                    acc[l][i] = self.mul_add(a_regs[i], bl, acc[l][i]);
+                }
+            }
+        }
+    }
 }
