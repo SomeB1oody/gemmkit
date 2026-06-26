@@ -1,0 +1,35 @@
+[package]
+name = "gemmkit"
+description = "A clean, extensible, high-performance GEMM (general matrix multiply) engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+
+[features]
+default = ["std", "parallel"]
+# `std` enables runtime cache/feature detection and the thread-local workspace pool.
+std = []
+# `parallel` enables rayon-backed multithreading. With it off, everything still
+# compiles and runs single-threaded (`Parallelism::Serial`).
+parallel = ["std", "dep:rayon"]
+
+[dependencies]
+rayon = { version = "1.10", optional = true }
+
+[target.'cfg(any(target_arch = "x86", target_arch = "x86_64"))'.dependencies]
+raw-cpuid = "11"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+gemm = "0.18"
+matrixmultiply = "0.3"
+
+[[bench]]
+name = "gemm_bench"
+harness = false

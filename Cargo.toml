@@ -1,0 +1,25 @@
+[workspace]
+resolver = "3"
+members = ["gemmkit", "gemmkit-ndarray"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/SomeB1oody/gemmkit"
+authors = ["gemmkit contributors"]
+keywords = ["gemm", "matrix", "blas", "linear-algebra", "simd"]
+categories = ["mathematics", "science"]
+
+# A release-grade profile for benchmarks: single codegen unit + fat LTO so the
+# generic microkernel inlines fully into the per-ISA target-feature trampoline.
+[profile.bench]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

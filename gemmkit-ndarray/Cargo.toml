@@ -1,0 +1,24 @@
+[package]
+name = "gemmkit-ndarray"
+description = "ndarray adapter for the gemmkit GEMM engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+
+[features]
+default = ["parallel"]
+parallel = ["gemmkit/parallel"]
+
+[dependencies]
+gemmkit = { path = "../gemmkit", version = "0.1.0", default-features = false, features = ["std"] }
+ndarray = "0.17"
+
+[dev-dependencies]
+ndarray = { version = "0.17", features = ["approx"] }
+approx = "0.5"

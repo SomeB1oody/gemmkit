@@ -1,0 +1,151 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Default build + tests. Scalar always runs; FMA runs natively on the runner;
+  # the AVX-512 driver unit test skips unless the runner has AVX-512 (the
+  # avx512_test job below covers it under emulation). Also checks `parallel` off.
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rust: stable
+            target: x86_64-unknown-linux-gnu
+    name: test/${{ matrix.target }}/${{ matrix.rust }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust }}
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --no-fail-fast
+      - name: test with the parallel feature off
+        run: cargo test -p gemmkit --no-default-features --features std --no-fail-fast
+
+  # Force a specific kernel end-to-end via GEMMKIT_REQUIRE_ISA and run the whole
+  # suite through it. `scalar` runs everywhere; `fma` runs on any AVX2 runner. If
+  # the ISA is missing, dispatch panics — so a green run proves that kernel really
+  # executed.
+  kernel:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - isa: scalar
+            rust: stable
+            target: x86_64-unknown-linux-gnu
+          - isa: fma
+            rust: stable
+            target: x86_64-unknown-linux-gnu
+    name: kernel-${{ matrix.isa }}/${{ matrix.target }}/${{ matrix.rust }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust }}
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: test ${{ matrix.isa }} kernel
+        env:
+          GEMMKIT_REQUIRE_ISA: ${{ matrix.isa }}
+        run: cargo test -p gemmkit --no-fail-fast
+
+  # Run the test suite under Intel SDE so the AVX-512 kernel is validated even
+  # though GitHub's hosted runners may lack AVX-512. SDE emulates CPUID + the
+  # instructions, so feature detection reports avx512f and GEMMKIT_REQUIRE_ISA
+  # selects (and requires) the AVX-512 kernel.
+  avx512_test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rust: stable
+            target: x86_64-unknown-linux-gnu
+    name: avx512_test/${{ matrix.target }}/${{ matrix.rust }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust }}
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Set up Intel SDE
+        # Sets SDE_PATH to the directory containing the SDE binaries.
+        uses: petarpetrovt/setup-sde@v5.0
+      - name: Tests under SDE (force + ensure avx512f)
+        run: |
+          export PATH="$SDE_PATH:$PATH"
+          cargo test -p gemmkit --release --tests --lib --no-fail-fast
+        env:
+          # Emulate a CPU with avx512f (Sapphire Rapids); the build runs natively,
+          # only the test binaries run under SDE.
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: "sde64 -spr --"
+          GEMMKIT_REQUIRE_ISA: avx512
+
+  lint:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - rust: stable
+            target: x86_64-unknown-linux-gnu
+    name: lint/${{ matrix.target }}/${{ matrix.rust }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust }}
+          targets: ${{ matrix.target }}
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  miri:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - rust: nightly
+            target: x86_64-unknown-linux-gnu
+    name: miri/${{ matrix.target }}/${{ matrix.rust }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+          targets: ${{ matrix.target }}
+          components: miri
+      - name: Miri on the scalar path
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation
+        run: cargo miri test -p gemmkit --test correctness miri_scalar_path
+
+  msrv:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - rust: 1.89.0
+            target: x86_64-unknown-linux-gnu
+    name: msrv/${{ matrix.target }}/${{ matrix.rust }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace
