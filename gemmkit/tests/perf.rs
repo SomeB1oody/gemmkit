@@ -6,7 +6,10 @@ use std::time::Instant;
 
 use gemmkit::driver;
 use gemmkit::kernel::FloatGemm;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use gemmkit::simd::Fma;
+#[cfg(target_arch = "aarch64")]
+use gemmkit::simd::Neon;
 use gemmkit::{MatMut, MatRef, Parallelism, Workspace, gemm};
 
 fn fill(n: usize, seed: u64) -> Vec<f32> {
@@ -125,9 +128,32 @@ fn bench_one(s: usize, parallel: bool) {
     println!();
 }
 
-/// Equal-ISA comparison: gemmkit's FMA path (forced via the driver) vs gemm's
-/// default (also FMA on stable). Single-threaded, column-major.
-fn bench_fma_equal_isa(s: usize) {
+// The native single-ISA token + microkernel tile, matching the production
+// dispatch choice for this architecture (see `dispatch.rs`). Used by the
+// equal-ISA comparison below so gemmkit and the `gemm` crate run the same ISA.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+type NativeTok = Fma;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+const NATIVE_MR: usize = 2;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+const NATIVE_NR: usize = 6;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+const NATIVE_LABEL: &str = "FMA";
+
+#[cfg(target_arch = "aarch64")]
+type NativeTok = Neon;
+#[cfg(target_arch = "aarch64")]
+const NATIVE_MR: usize = 3;
+#[cfg(target_arch = "aarch64")]
+const NATIVE_NR: usize = 8;
+#[cfg(target_arch = "aarch64")]
+const NATIVE_LABEL: &str = "NEON";
+
+/// Equal-ISA comparison: gemmkit's native single-ISA path (forced via the
+/// driver) vs gemm's default (the same ISA on stable). Single-threaded,
+/// column-major.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+fn bench_native_equal_isa(s: usize) {
     let (m, k, n) = (s, s, s);
     let a = fill(m * k, 1);
     let b = fill(k * n, 2);
@@ -136,8 +162,8 @@ fn bench_fma_equal_isa(s: usize) {
     let mut ws = Workspace::new();
 
     let t_kit = time(iters, || unsafe {
-        driver::run::<FloatGemm<f32>, Fma, 2, 6>(
-            Fma,
+        driver::run::<FloatGemm<f32>, NativeTok, NATIVE_MR, NATIVE_NR>(
+            NativeTok::default(),
             m,
             k,
             n,
@@ -181,8 +207,9 @@ fn bench_fma_equal_isa(s: usize) {
     });
     let g_kit = gflops(m, k, n, t_kit);
     let g_gemm = gflops(m, k, n, t_gemm);
+    let label = NATIVE_LABEL;
     println!(
-        "  n={s:<5} ser  gemmkit-FMA={g_kit:7.1}  gemm-FMA={g_gemm:7.1}  ({:.0}% of gemm)",
+        "  n={s:<5} ser  gemmkit-{label}={g_kit:7.1}  gemm-{label}={g_gemm:7.1}  ({:.0}% of gemm)",
         100.0 * g_kit / g_gemm
     );
 }
@@ -190,15 +217,18 @@ fn bench_fma_equal_isa(s: usize) {
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
 fn perf_sgemm() {
-    println!("\nsgemm GFLOP/s (f32, column-major) — gemmkit AVX-512 vs gemm default:");
+    println!("\nsgemm GFLOP/s (f32, column-major) — gemmkit best-ISA vs gemm default:");
     for &s in &[256usize, 512, 1024, 2048] {
         bench_one(s, false);
     }
     for &s in &[512usize, 1024, 2048, 4096] {
         bench_one(s, true);
     }
-    println!("\nequal-ISA (both FMA/AVX2), single-threaded:");
-    for &s in &[256usize, 512, 1024, 2048] {
-        bench_fma_equal_isa(s);
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+    {
+        println!("\nequal-ISA (gemmkit vs gemm, same single ISA), single-threaded:");
+        for &s in &[256usize, 512, 1024, 2048] {
+            bench_native_equal_isa(s);
+        }
     }
 }

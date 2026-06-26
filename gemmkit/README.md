@@ -2,7 +2,8 @@
 
 The core GEMM engine — **zero ndarray dependency**. Computes `C ← α·A·B + β·C` for
 `f32` and `f64` over a data-type-agnostic `&[T]` + stride API, selecting the best
-x86 instruction set (scalar / AVX2+FMA / AVX-512) at runtime.
+instruction set at runtime: x86 (scalar / AVX2+FMA / AVX-512) and AArch64 (NEON,
+baseline on the architecture).
 
 ```rust
 use gemmkit::{gemm, MatRef, MatMut, Parallelism};
@@ -71,13 +72,14 @@ Ryzen 9950X). For example `GEMMKIT_PARALLEL_THRESHOLD`, `GEMMKIT_LHS_PACK_THRESH
 ## Forcing a kernel (testing / CI)
 
 By default the best available ISA is selected at runtime. Set
-`GEMMKIT_REQUIRE_ISA` to `scalar`, `fma`, or `avx512` to **force** exactly that
-kernel through the public API; if the CPU (or an emulator like Intel SDE) does not
-report the feature, dispatch **panics** instead of falling back — so CI can run
-the whole suite against each kernel and a green run proves that kernel really
-executed. Unset (or `auto`) is the normal auto-selecting behavior. See
-`.github/workflows/ci.yml` for the matrix (scalar / FMA natively, AVX-512 under
-SDE).
+`GEMMKIT_REQUIRE_ISA` to `scalar`, `fma`, `avx512`, or `neon` to **force** exactly
+that kernel through the public API; if the CPU (or an emulator like Intel SDE)
+does not report the feature — or the ISA does not exist on this target (`neon` is
+aarch64-only, `fma`/`avx512` x86-only) — dispatch **panics** instead of falling
+back, so CI can run the whole suite against each kernel and a green run proves that
+kernel really executed. Unset (or `auto`) is the normal auto-selecting behavior.
+See `.github/workflows/ci.yml` for the matrix (scalar / FMA natively, AVX-512
+under SDE, NEON on a macOS arm64 runner).
 
 ## Extending it
 

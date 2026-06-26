@@ -24,10 +24,10 @@ and **no `transmute`**.
 
 ```
 L0  scalar.rs        Scalar (+ Float) — the data-type seam
-L0  simd/            Simd + SimdOps<T> — the ISA seam (tokens: ScalarTok/Fma/Avx512)
+L0  simd/            Simd + SimdOps<T> — the ISA seam (tokens: ScalarTok/Fma/Avx512/Neon)
 L1  kernel/          KernelFamily — the operation-family seam; float microkernel
 L2  pack.rs          micropanel packing primitive
-L3  cache/           CacheTopology + analytical BLIS blocking (cpuid backend + fallback)
+L3  cache/           CacheTopology + analytical BLIS blocking (cpuid/sysctl/sysfs backends + fallback)
 L4  driver.rs        the generic five-loop nest
 L5  parallel.rs      Parallelism + 1-D job split + work-gate
 L6  special/gemv.rs  matrix·vector special path
@@ -52,13 +52,23 @@ No arithmetic lives on it, so adding an element type does not grow the trait.
 primitive the whole microkernel needs — `zero`, `splat`, `load`/`loadu`,
 `store`/`storeu`, `mul`, `add`, `mul_add`, `reduce_sum` — plus `LANES` and
 `ALIGN`. Because the ISA *token* and the element *type* are decoupled, `LANES`
-varies with the `(ISA, T)` pair (f32@FMA = 8, f32@AVX-512 = 16, f64 halved).
+varies with the `(ISA, T)` pair (f32@FMA = 8, f32@AVX-512 = 16, f32@NEON = 4, f64
+halved).
 
 This is the direct answer to matrixmultiply's thin-trait trap. matrixmultiply's
 kernel trait abstracts only the multiply-add, so the entire microkernel had to be
 hand-written per ISA (and only one tile per ISA was maintainable). Here, *all* the
 primitives are in `SimdOps`, so the microkernel is one generic function and each
 ISA contributes only a set of primitives plus a one-line trampoline.
+
+ISA-specific *fast paths* fit the same seam without forking the kernel: an
+optional `const LANE_FMA` + `fma_bvec` lets a token opt into a lane-indexed FMA
+(NEON `vfmaq_laneq`, broadcasting B multipliers straight from a loaded vector
+lane). The microkernel branches on the const — `false` for every ISA by default,
+so the branch and the (provided) fallback compile away everywhere except where a
+token overrides them. The path is bit-identical to the `splat` path; on the
+benchmarked M-series it is perf-neutral (that kernel is FMA-throughput-bound, not
+B-load-bound), but it keeps the option in the vocabulary rather than the kernel.
 
 ### `#[target_feature]` correctness
 
@@ -126,8 +136,13 @@ throughput.
 
 `#[cfg]` chooses the *sniffing method*, never the *values*. CPUID is an
 instruction (OS-independent; works in containers/VMs), so the x86 backend reads
-L1/L2/L3 via CPUID (`raw-cpuid`: Intel deterministic leaf, AMD legacy leaves). A
-VM that masks CPUID, or a future aarch64 target, falls through a chain: backend →
+L1/L2/L3 via CPUID (`raw-cpuid`: Intel deterministic leaf, AMD legacy leaves). On
+macOS the `sysctl` backend reads `hw.perflevel0.{l1d,l2}cachesize` etc. through a
+tiny `sysctlbyname` FFI (no `libc` dependency) — the primary source on Apple
+Silicon, where there is no CPUID; it divides the cluster-shared L2 by
+`hw.perflevel0.cpusperl2` for a realistic per-core budget. On Linux a `sysfs`
+backend reads `/sys/devices/system/cpu`. Any backend that fails or returns
+implausible values, or a VM that masks CPUID, falls through a chain: backend →
 micro-arch hint → a static default calibrated on the Ryzen 9950X. Detection runs
 once (memoized) and a plausibility gate rejects half-populated reads.
 
@@ -217,7 +232,11 @@ reversed views all work without copying. `dot` is the `.dot()`-style convenience
   the only `macro_rules!` in the crate generates the *scalar* `SimdOps` impl
   boilerplate, not kernel bodies.
 - **One kernel, all ISAs** — adding an ISA is a `SimdOps` impl + one `vectorize`
-  trampoline + one dispatch line.
+  trampoline + a few dispatch lines, with the driver, packing, blocking,
+  parallelism, API, and microkernel all untouched. The AArch64 NEON token is the
+  worked proof: it was added purely additively (new `simd/neon.rs`, two `mod`
+  lines, the dispatch wiring, one `isa_neon` test) on a different architecture
+  with 32 vector registers and a wider tile than AVX2.
 - **No `transmute`** — `OnceLock<fn>`.
 - **Open/closed** — `tests/open_closed.rs` declares a second `KernelFamily`
   entirely outside the crate and drives it through the unchanged `driver::run`.
