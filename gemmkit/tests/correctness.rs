@@ -427,6 +427,51 @@ fn parallel_equals_serial_bit_identical() {
     }
 }
 
+/// Bit-identity with a **row-major A** (`rsa != 1`), which forces per-row-block LHS
+/// packing and so exercises the dynamic scheduler's whole-row-block ("packed")
+/// grain path under multiple threads — distinct from the column-major case above.
+/// Sizes are chosen so the row-block count straddles the thread count (so both the
+/// `grain = n_nt` branch and its fine-grain fallback run).
+#[test]
+fn parallel_equals_serial_row_major_a() {
+    for (m, k, n) in [(200, 130, 175), (384, 96, 320), (256, 64, 200)] {
+        for &(al, be) in &[(1.0f64, 0.0), (0.7, 1.3)] {
+            let a = Mat::<f32>::rand(m, k, 0xA11 + m as u64);
+            let b = Mat::<f32>::rand(k, n, 0xB22 + n as u64);
+            let c0 = Mat::<f32>::rand(m, n, 0xC33 + k as u64);
+            let (abuf, rsa, csa) = build_view(&a, Layout::Row); // rsa = k != 1 → packs A
+            let (bbuf, rsb, csb) = build_view(&b, Layout::Col);
+            let (cbase, rsc, csc) = build_view(&c0, Layout::Col);
+
+            let mut c_serial = cbase.clone();
+            let mut c_par = cbase.clone();
+            gemm(
+                al as f32,
+                MatRef::new(&abuf, m, k, rsa, csa),
+                MatRef::new(&bbuf, k, n, rsb, csb),
+                be as f32,
+                MatMut::new(&mut c_serial, m, n, rsc, csc),
+                Parallelism::Serial,
+            );
+            for threads in [2usize, 4, 8, 16] {
+                c_par.copy_from_slice(&cbase);
+                gemm(
+                    al as f32,
+                    MatRef::new(&abuf, m, k, rsa, csa),
+                    MatRef::new(&bbuf, k, n, rsb, csb),
+                    be as f32,
+                    MatMut::new(&mut c_par, m, n, rsc, csc),
+                    Parallelism::Rayon(threads),
+                );
+                assert_eq!(
+                    c_serial, c_par,
+                    "row-major A: serial != parallel({threads}) for {m}x{k}x{n} a={al} b={be}"
+                );
+            }
+        }
+    }
+}
+
 /// Negative strides via the unchecked API (reversed-row view of A).
 #[test]
 fn negative_strides_unchecked() {

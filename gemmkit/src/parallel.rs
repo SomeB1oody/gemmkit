@@ -1,10 +1,15 @@
 //! Parallelism control and job splitting (layer L5).
 //!
-//! The driver flattens its inner work into a 1-D list of jobs (column strips)
-//! and hands a contiguous slice to each worker — a single work-gate, no nested
-//! 2×2 tree. Thread count *scales with workload* rather than jumping straight to
-//! all cores. The math is identical for serial and parallel runs, so output is
-//! bit-identical regardless of thread count.
+//! The driver flattens its inner work into a 1-D list of jobs (column strips) and
+//! workers pull contiguous chunks from a shared [`JobCursor`] *on demand* — a
+//! single work-gate, no nested 2×2 tree. Demand-driven pulling means faster cores
+//! (heterogeneous big.LITTLE P/E layouts) absorb proportionally more work instead
+//! of every core getting an equal indivisible slice bounded by the slowest. Thread
+//! count *scales with workload* rather than jumping straight to all cores. The math
+//! is identical for serial and parallel runs and independent of *which* worker
+//! computes a given tile, so output is bit-identical regardless of thread count.
+
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(feature = "parallel")]
 use crate::tuning;
@@ -58,15 +63,54 @@ impl Parallelism {
     }
 }
 
-/// The `[start, end)` job range for worker `tid` of `n_threads`, balanced so the
-/// first `n_jobs % n_threads` workers get one extra job.
+/// A shared, lock-free cursor that hands out contiguous job ranges on demand — the
+/// *dynamic* analogue of a static `n_jobs / n_threads` split.
+///
+/// Build a **fresh** cursor per parallel region — it counts `0..n_jobs` once and is
+/// exhausted thereafter.
+pub(crate) struct JobCursor {
+    next: AtomicUsize,
+    n_jobs: usize,
+    grain: usize,
+}
+
+impl JobCursor {
+    /// A cursor over `[0, n_jobs)` handing out chunks of `grain` (clamped to `>= 1`,
+    /// since a zero grain would never advance the cursor and so spin forever).
+    #[inline]
+    pub(crate) fn new(n_jobs: usize, grain: usize) -> Self {
+        Self {
+            next: AtomicUsize::new(0),
+            n_jobs,
+            grain: grain.max(1),
+        }
+    }
+
+    /// Atomically claim the next `[start, end)` chunk, or `None` once the job space
+    /// is exhausted.
+    #[inline]
+    pub(crate) fn next_chunk(&self) -> Option<(usize, usize)> {
+        let start = self.next.fetch_add(self.grain, Ordering::Relaxed);
+        if start >= self.n_jobs {
+            None
+        } else {
+            Some((start, (start + self.grain).min(self.n_jobs)))
+        }
+    }
+}
+
+/// Chunk size for a [`JobCursor`]: aim for `parallel_oversample` chunks per worker
+/// so faster cores can pull proportionally more, while keeping chunks coarse enough
+/// to amortize the atomic claim. Always `>= 1`. A single worker (serial / feature
+/// off) takes the whole job space in one chunk.
 #[inline]
-pub(crate) fn job_range(n_jobs: usize, tid: usize, n_threads: usize) -> (usize, usize) {
-    let base = n_jobs / n_threads;
-    let rem = n_jobs % n_threads;
-    let start = tid * base + tid.min(rem);
-    let len = base + if tid < rem { 1 } else { 0 };
-    (start, start + len)
+pub(crate) fn job_grain(n_jobs: usize, n_threads: usize) -> usize {
+    if n_threads <= 1 {
+        return n_jobs.max(1);
+    }
+    let oversample = crate::tuning::parallel_oversample();
+
+    (n_jobs / n_threads.saturating_mul(oversample)).max(1)
 }
 
 /// Run `f(tid)` for every worker `tid` in `0..n_threads`, in parallel when the
@@ -92,5 +136,85 @@ where
 {
     for tid in 0..n_threads {
         f(tid);
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod tests {
+    use super::*;
+
+    /// A cursor's chunks must tile `[0, n_jobs)` exactly — adjacent, disjoint, and
+    /// covering — for any grain and any `n_jobs` (incl. the empty range).
+    #[test]
+    fn cursor_tiles_range_exactly() {
+        for &n_jobs in &[0usize, 1, 2, 7, 100, 1000] {
+            for &grain in &[1usize, 3, 8, 64, 1000, 100_000] {
+                let cur = JobCursor::new(n_jobs, grain);
+                let mut seen = Vec::new();
+                while let Some((s, e)) = cur.next_chunk() {
+                    assert!(
+                        s < e && e <= n_jobs,
+                        "chunk [{s}, {e}) escapes [0, {n_jobs})"
+                    );
+                    seen.extend(s..e);
+                }
+                assert_eq!(
+                    seen,
+                    (0..n_jobs).collect::<Vec<_>>(),
+                    "n_jobs={n_jobs} grain={grain}"
+                );
+            }
+        }
+    }
+
+    /// A zero grain is clamped to 1, so the cursor always terminates (never spins).
+    #[test]
+    fn zero_grain_clamped_and_terminates() {
+        let cur = JobCursor::new(5, 0);
+        let mut n = 0;
+        while let Some((s, e)) = cur.next_chunk() {
+            assert_eq!(e - s, 1);
+            n += 1;
+        }
+        assert_eq!(n, 5);
+    }
+
+    /// Under real concurrent pulls the cursor still partitions `[0, n_jobs)`
+    /// bijectively — every index handed to exactly one puller, none skipped or
+    /// duplicated. This is the soundness property the parallel driver relies on.
+    #[test]
+    fn cursor_partition_is_bijective_under_threads() {
+        use std::sync::Mutex;
+        let n_jobs = 10_000usize;
+        let cur = JobCursor::new(n_jobs, 7);
+        let collected = Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    let mut local = Vec::new();
+                    while let Some((s, e)) = cur.next_chunk() {
+                        local.extend(s..e);
+                    }
+                    collected.lock().unwrap().extend(local);
+                });
+            }
+        });
+        let mut all = collected.into_inner().unwrap();
+        all.sort_unstable();
+        assert_eq!(
+            all,
+            (0..n_jobs).collect::<Vec<_>>(),
+            "indices must partition [0, n_jobs)"
+        );
+    }
+
+    /// `job_grain` never returns 0 and never panics, even for the adversarial
+    /// oversample the `saturating_mul` guards against.
+    #[test]
+    fn job_grain_is_robust() {
+        assert_eq!(job_grain(100, 1), 100); // single worker takes the whole space
+        assert_eq!(job_grain(0, 8), 1); // never zero
+        let g = job_grain(10_000, 8);
+        assert!((1..=10_000).contains(&g));
     }
 }
