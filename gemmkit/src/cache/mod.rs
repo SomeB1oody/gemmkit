@@ -110,8 +110,9 @@ pub fn topology() -> &'static CacheTopology {
 /// The OS memory page size in bytes (memoized). Drives the LHS-packing stride
 /// gate.
 ///
-/// `getpagesize` is POSIX/BSD and present on both Linux and macOS
-#[cfg(all(unix, feature = "std"))]
+/// `getpagesize` is POSIX/BSD and present on both Linux and macOS; `std` already
+/// links libc so a bare declaration resolves with no extra dependency
+#[cfg(all(unix, feature = "std", not(miri)))]
 pub(crate) fn page_size() -> usize {
     static PAGE_SIZE: OnceLock<usize> = OnceLock::new();
     *PAGE_SIZE.get_or_init(|| {
@@ -128,8 +129,8 @@ pub(crate) fn page_size() -> usize {
     })
 }
 
-/// Page-size fallback for non-unix / no-std builds (assume the common 4 KiB).
-#[cfg(not(all(unix, feature = "std")))]
+/// Page-size fallback for non-unix / no-std / Miri builds (assume the common 4 KiB)
+#[cfg(not(all(unix, feature = "std", not(miri))))]
 pub(crate) fn page_size() -> usize {
     4096
 }
