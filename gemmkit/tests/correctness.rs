@@ -692,13 +692,13 @@ fn isa_avx512() {
 }
 
 /// NEON is baseline on aarch64, so no feature-detection guard is needed: the
-/// kernel always runs here. Tile matches the production dispatch choice (3×8).
+/// kernel always runs here. Tile matches the production dispatch choice (4×4).
 #[test]
 #[cfg(target_arch = "aarch64")]
 fn isa_neon() {
     for (m, k, n) in isa_shapes() {
-        driver_case::<f32, Neon, 3, 8>(Neon, m, k, n);
-        driver_case::<f64, Neon, 3, 8>(Neon, m, k, n);
+        driver_case::<f32, Neon, 4, 4>(Neon, m, k, n);
+        driver_case::<f64, Neon, 4, 4>(Neon, m, k, n);
     }
 }
 

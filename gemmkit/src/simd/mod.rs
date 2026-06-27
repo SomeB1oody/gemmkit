@@ -185,27 +185,40 @@ pub trait SimdOps<T: Scalar>: Simd {
     /// stride, `MR_REG` vectors of `LANES`); `b` at the RHS panel (`b_rs` depth
     /// stride, `b_cs` column stride — `(nr, 1)` packed or `(rsb, csb)` unpacked).
     ///
-    /// **This is the per-microarchitecture specialization seam (roadmap §2).** The
-    /// default implementation is the portable per-step schedule — one broadcast
-    /// per RHS column, or the lane-indexed fast path when [`Self::LANE_FMA`] is set
-    /// and the RHS block is contiguous. On wide out-of-order x86 cores LLVM already
-    /// compiles this to the canonical register-blocked kernel that saturates the
-    /// FMA pipes (the RHS folds into the FMA as a broadcast operand, so there is no
-    /// operand-delivery stall and a hand schedule buys nothing). An ISA whose
-    /// generic schedule instead leaves the FMA pipes **waiting on operand delivery
-    /// at the kc-loop boundary** — narrow-vector / load-bound ISAs such as AArch64
-    /// NEON, where the RHS must be explicitly loaded before the lane-FMA and cannot
-    /// fold into it — may **override** this with a hand software-pipelined loop that
-    /// hoists step `p+1`'s loads under step `p`'s FMAs.
+    /// The **default** is the portable per-step schedule: one broadcast (`splat`)
+    /// per RHS column, or the lane-indexed fast path ([`Self::fma_bvec`]) when
+    /// [`Self::LANE_FMA`] is set, the RHS block is contiguous (`b_cs == 1`), and `NR`
+    /// is a multiple of `LANES` (so each `LANES`-wide column block is whole);
+    /// otherwise the broadcast path runs.
     ///
-    /// Any override **must** preserve the ascending-`p`, fused `a·b + c`
-    /// accumulation order so results stay **bit-identical** to the default path
-    /// (the driver's determinism contract: full tiles and edge tiles of the same
-    /// matrix must round the same way). Software pipelining reorders *loads*, never
-    /// the arithmetic, so it satisfies this. Called only for full tiles
-    /// (`nr_eff == NR`); partial column tiles stay on the microkernel's edge path.
+    /// **Keep the default on any out-of-order core.** On a wide OoO core LLVM already
+    /// lowers it to the canonical register-blocked kernel that saturates the FMA
+    /// pipes — it schedules the next step's loads in among the FMAs and unrolls the
+    /// `kc` loop on its own.
+    ///
+    /// **Override only for a target whose generated schedule genuinely stalls** in a
+    /// way LLVM will not fix on its own — e.g. an **in-order / narrow-OoO** core, where
+    /// explicitly hoisting the next step's loads (the textbook software pipeline) pays
+    /// because the hardware cannot reorder, or a **scalable-vector** ISA (SVE/SME, RVV)
+    /// whose length is not a compile-time `LANES`, so the fixed-width loop must be
+    /// rewritten. Both still do a per-element fused `a·b + c` in ascending `p`, so they
+    /// can satisfy the bit-identity contract below. Instructions that *reshape* the
+    /// accumulation rounding itself (matrix / dot — `bfmmla`, `sdot`) cannot, so they
+    /// are out of scope for this seam: adopting them means revisiting the driver's
+    /// determinism contract, not just overriding this method. Before keeping any
+    /// override, *prove it pays*: check the disassembly for spills, confirm it stays
+    /// bit-identical to the default, and benchmark it — do not assume a hand schedule
+    /// helps.
+    ///
+    /// Any override **must** preserve the ascending-`p`, fused `a·b + c` order so
+    /// results stay **bit-identical** to the default (the driver's determinism
+    /// contract: full and edge tiles of the same matrix must round the same way).
+    /// Software pipelining reorders *loads*, never the arithmetic, so it is legal.
+    /// Called only for full tiles (`nr_eff == NR`); partial column tiles stay on the
+    /// microkernel's edge path.
     ///
     /// # Safety
+    ///
     /// `a` valid for `MR_REG·LANES` rows × `kc` depth at stride `a_cs`; `b` valid
     /// for `NR` cols × `kc` depth at strides `b_rs`/`b_cs`; `acc` pre-initialized.
     /// Must run inside this token's [`Simd::vectorize`] context.
