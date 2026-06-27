@@ -143,9 +143,9 @@ const NATIVE_LABEL: &str = "FMA";
 #[cfg(target_arch = "aarch64")]
 type NativeTok = Neon;
 #[cfg(target_arch = "aarch64")]
-const NATIVE_MR: usize = 3;
+const NATIVE_MR: usize = 4;
 #[cfg(target_arch = "aarch64")]
-const NATIVE_NR: usize = 8;
+const NATIVE_NR: usize = 4;
 #[cfg(target_arch = "aarch64")]
 const NATIVE_LABEL: &str = "NEON";
 

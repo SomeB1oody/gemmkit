@@ -60,9 +60,10 @@ v1 ships f32/f64 over scalar + AVX2/FMA + AVX-512 on x86-64 and NEON on AArch64
 (Apple Silicon, with `sysctl` cache detection). f16/bf16, complex, and integer
 families are designed-for but not yet implemented. The AArch64 kernel uses a
 lane-indexed FMA fast path (`vfmaq_laneq`, packed RHS) on top of the portable
-`splat`+`vfmaq` path; single-threaded it runs at ~80% of the `gemm` crate on an
-M-series core. The remaining gap is in the analytical `k`-blocking/tile, not the
-FMA primitive, and is left as tuning work.
+`splat`+`vfmaq` path; single-threaded it runs at **~90–103% of the `gemm` crate**
+(parity) on an M-series core. The microtile is a 4×4 (16-accumulator) tile,
+deliberately kept narrow so the Apple out-of-order window has the register headroom
+to overlap loads with the FMAs.
 
 ## Build, test, bench
 

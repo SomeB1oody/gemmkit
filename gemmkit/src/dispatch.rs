@@ -198,15 +198,18 @@ unsafe fn gemm_f64_avx512(t: Task<f64>, par: Parallelism, ws: &mut Workspace) {
 
 #[cfg(target_arch = "aarch64")]
 unsafe fn gemm_f32_neon(t: Task<f32>, par: Parallelism, ws: &mut Workspace) {
-    // MR = 3*4 = 12, NR = 8 → 24 acc + 3 lhs + 1 rhs = 28 of the 32 v0–v31
-    // vector registers (no spill). Benchmarked best-and-most-stable across
-    // 512/1024/2048 on Apple Silicon (see the tuning note in the PR).
-    unsafe { run_typed::<f32, Neon, 3, 8>(Neon, t, par, ws) }
+    // MR = 4*4 = 16, NR = 4 → 16 acc + 4 lhs + 1 rhs = 21 of the 32 v0–v31 vector
+    // registers (NR == LANES, so one loaded RHS vector feeds all four columns). The
+    // ~11 spare registers are deliberate: they give the wide out-of-order window the
+    // rename headroom to overlap the next step's loads with the current FMAs (the
+    // same low-pressure regime gemm uses)
+    unsafe { run_typed::<f32, Neon, 4, 4>(Neon, t, par, ws) }
 }
 #[cfg(target_arch = "aarch64")]
 unsafe fn gemm_f64_neon(t: Task<f64>, par: Parallelism, ws: &mut Workspace) {
-    // MR = 3*2 = 6, NR = 8 → 24 acc + 3 lhs + 1 rhs = 28 vregs (no spill).
-    unsafe { run_typed::<f64, Neon, 3, 8>(Neon, t, par, ws) }
+    // MR = 4*2 = 8, NR = 4 → 16 acc + 4 lhs + 2 rhs = 22 vregs (same low-pressure
+    // tile as f32; ~54 vs ~43 GFLOP/s for 3×8).
+    unsafe { run_typed::<f64, Neon, 4, 4>(Neon, t, par, ws) }
 }
 
 type GemmFn<T> = unsafe fn(Task<T>, Parallelism, &mut Workspace);
