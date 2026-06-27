@@ -135,6 +135,18 @@ pub(crate) fn page_size() -> usize {
     4096
 }
 
+/// The LHS-packing depth-stride gate in *bytes*. The `GEMMKIT_LHS_PACK_STRIDE`
+/// knob overrides it verbatim; `0` (the default) derives it from the OS page size
+/// — half a page, so a column-major A whose K-walk stride (`csa * sizeof`) reaches
+/// it is packed to dodge TLB thrash. Centralized here (rather than inlined in the
+/// driver) so the `0 => auto` derivation has a single home and a direct test.
+pub(crate) fn lhs_pack_stride_bytes() -> usize {
+    match crate::tuning::lhs_pack_stride() {
+        0 => page_size() / 2,
+        v => v,
+    }
+}
+
 /// Run the fallback chain once. Never panics: any backend that fails or returns
 /// implausible values is skipped.
 #[cfg(feature = "std")]
@@ -271,5 +283,24 @@ mod tests {
             (4096..=2 * 1024 * 1024).contains(&p),
             "page size {p} out of range"
         );
+    }
+
+    /// The LHS-pack stride gate: the default `0` knob must resolve to *half the page*
+    /// (the page-derived auto path that bit-identity assertions cannot observe), and
+    /// any non-zero knob must pass through verbatim as a byte threshold. Guards the
+    /// `0 => page_size()/2` derivation and the override branch against regression
+    /// (e.g. an inverted match or a changed divisor).
+    #[test]
+    fn lhs_pack_stride_gate_auto_and_override() {
+        // Auto: 0 => exactly half the page (and never zero, so the gate can fire).
+        crate::tuning::set_lhs_pack_stride(0);
+        let auto = lhs_pack_stride_bytes();
+        assert_eq!(auto, page_size() / 2, "auto gate must be half the page");
+        assert!(auto > 0, "auto gate must be non-zero");
+        // Override: any non-zero value is the byte threshold verbatim.
+        crate::tuning::set_lhs_pack_stride(4096);
+        assert_eq!(lhs_pack_stride_bytes(), 4096, "override must pass through");
+        // Restore the default so concurrent/later tests see auto.
+        crate::tuning::set_lhs_pack_stride(0);
     }
 }

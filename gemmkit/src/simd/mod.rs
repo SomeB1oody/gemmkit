@@ -174,4 +174,86 @@ pub trait SimdOps<T: Scalar>: Simd {
             }
         }
     }
+
+    /// Accumulate one **full** `MR_REG × NR` microtile over `kc` depth steps into
+    /// the register-resident `acc` (pre-zeroed by the caller):
+    /// `acc[j][i] += A[p][i] · B[p][j]` for every `p in 0..kc`, in **ascending
+    /// `p`** with a fused multiply-add. This is the GEMM inner loop and the single
+    /// hottest piece of the library.
+    ///
+    /// `a` points at the LHS micropanel (`a_cs` = depth stride; rows are unit
+    /// stride, `MR_REG` vectors of `LANES`); `b` at the RHS panel (`b_rs` depth
+    /// stride, `b_cs` column stride — `(nr, 1)` packed or `(rsb, csb)` unpacked).
+    ///
+    /// **This is the per-microarchitecture specialization seam (roadmap §2).** The
+    /// default implementation is the portable per-step schedule — one broadcast
+    /// per RHS column, or the lane-indexed fast path when [`Self::LANE_FMA`] is set
+    /// and the RHS block is contiguous. On wide out-of-order x86 cores LLVM already
+    /// compiles this to the canonical register-blocked kernel that saturates the
+    /// FMA pipes (the RHS folds into the FMA as a broadcast operand, so there is no
+    /// operand-delivery stall and a hand schedule buys nothing). An ISA whose
+    /// generic schedule instead leaves the FMA pipes **waiting on operand delivery
+    /// at the kc-loop boundary** — narrow-vector / load-bound ISAs such as AArch64
+    /// NEON, where the RHS must be explicitly loaded before the lane-FMA and cannot
+    /// fold into it — may **override** this with a hand software-pipelined loop that
+    /// hoists step `p+1`'s loads under step `p`'s FMAs.
+    ///
+    /// Any override **must** preserve the ascending-`p`, fused `a·b + c`
+    /// accumulation order so results stay **bit-identical** to the default path
+    /// (the driver's determinism contract: full tiles and edge tiles of the same
+    /// matrix must round the same way). Software pipelining reorders *loads*, never
+    /// the arithmetic, so it satisfies this. Called only for full tiles
+    /// (`nr_eff == NR`); partial column tiles stay on the microkernel's edge path.
+    ///
+    /// # Safety
+    /// `a` valid for `MR_REG·LANES` rows × `kc` depth at stride `a_cs`; `b` valid
+    /// for `NR` cols × `kc` depth at strides `b_rs`/`b_cs`; `acc` pre-initialized.
+    /// Must run inside this token's [`Simd::vectorize`] context.
+    #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+    #[inline(always)]
+    unsafe fn accumulate_tile<const MR_REG: usize, const NR: usize>(
+        self,
+        kc: usize,
+        a: *const T,
+        a_cs: isize,
+        b: *const T,
+        b_rs: isize,
+        b_cs: isize,
+        acc: &mut [[Self::Reg; MR_REG]; NR],
+    ) {
+        let lanes = Self::LANES;
+        unsafe {
+            if Self::LANE_FMA && b_cs == 1 && NR.is_multiple_of(lanes) {
+                // Lane-indexed fast path (NEON): load each contiguous `lanes`-wide
+                // RHS block as one vector and broadcast its lanes via a fused
+                // lane-indexed FMA, replacing `NR` per-column splats.
+                for p in 0..kc {
+                    let pa = a.offset(p as isize * a_cs);
+                    let a_regs: [Self::Reg; MR_REG] =
+                        core::array::from_fn(|i| self.loadu(pa.add(i * lanes)));
+                    let pb = b.offset(p as isize * b_rs);
+                    for jb in (0..NR).step_by(lanes) {
+                        let bvec = self.loadu(pb.add(jb));
+                        self.fma_bvec(&a_regs, bvec, &mut acc[jb..jb + lanes]);
+                    }
+                }
+            } else {
+                // Splat path: one broadcast per RHS column. Correct for any `b_cs`
+                // (packed or unpacked) and the only full-tile path for ISAs without
+                // a lane FMA. The const-bounded `j` loop fully unrolls.
+                for p in 0..kc {
+                    let pa = a.offset(p as isize * a_cs);
+                    let a_regs: [Self::Reg; MR_REG] =
+                        core::array::from_fn(|i| self.loadu(pa.add(i * lanes)));
+                    let pb = b.offset(p as isize * b_rs);
+                    for j in 0..NR {
+                        let bj = self.splat(*pb.offset(j as isize * b_cs));
+                        for i in 0..MR_REG {
+                            acc[j][i] = self.mul_add(a_regs[i], bj, acc[j][i]);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

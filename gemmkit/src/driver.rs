@@ -128,10 +128,7 @@ pub unsafe fn run<Fam, S, const MR_REG: usize, const NR: usize>(
         // so once `csa * sizeof(Lhs)` reaches ~a memory page the strided read thrashes
         // the TLB and packing A into a contiguous panel wins regardless of reuse
         // and it is redundancy-free here
-        let pack_stride = match tuning::lhs_pack_stride() {
-            0 => cache::page_size() / 2,
-            v => v,
-        };
+        let pack_stride = cache::lhs_pack_stride_bytes();
         let strided_lhs = rsa == 1
             && csa
                 .unsigned_abs()
@@ -178,7 +175,13 @@ pub unsafe fn run<Fam, S, const MR_REG: usize, const NR: usize>(
                     BetaStatus::One
                 };
 
-                // Pack the RHS macro-panel in parallel (when packing)
+                // Pack the RHS macro-panel in parallel (when packing): workers pull
+                // NR-wide column panels from a shared cursor. The `for_each_worker`
+                // join below is the write-before-read barrier the compute region
+                // depends on — packed B is the *one* buffer shared (non-disjoint)
+                // across all compute workers, so every panel must be written here
+                // before any worker reads it. Fusing this region into the compute
+                // loop, or moving packing inside it, would reintroduce a data race.
                 if pack_b {
                     let bcur = parallel::JobCursor::new(n_nt, parallel::job_grain(n_nt, n_threads));
                     parallel::for_each_worker(n_threads, |_tid| {
@@ -207,16 +210,23 @@ pub unsafe fn run<Fam, S, const MR_REG: usize, const NR: usize>(
                 let cur = parallel::JobCursor::new(n_jobs, grain);
 
                 parallel::for_each_worker(n_threads, |tid| {
-                    // Force whole-struct capture of the `Send + Sync` pointer shims
+                    // Force whole-struct capture of the `Send + Sync` pointer shims;
+                    // edition-2024 (RFC 2229) closures otherwise capture the inner
+                    // `*mut` fields disjointly, which are not `Sync`, so the closure
+                    // would fail the bound needed to move into the rayon workers.
                     let (a, b, c, a_base, b_base) = (a, b, c, a_base, b_base);
                     let a_buf = a_base.0.add(tid * a_stride);
                     let mut scratch = [const { MaybeUninit::<Fam::Acc>::uninit() }; SCRATCH_LEN];
                     let scratch_ptr = scratch.as_mut_ptr() as *mut Fam::Acc;
 
-                    // Cached LHS pack state for the current row block
+                    // Cached LHS pack state for the current row block. `packed_a` is
+                    // carried explicitly (not re-derived as `a_cs == mr`, which could
+                    // collide for a self-overlapping column-major A whose `csa` equals
+                    // `mr` and then read the in-place A with the packed address formula).
                     let mut cur_ic = usize::MAX;
                     let mut a_panel_base: *const Fam::Lhs = core::ptr::null();
                     let mut a_cs: isize = 0;
+                    let mut packed_a = false;
 
                     while let Some((start, end)) = cur.next_chunk() {
                         for q in start..end {
@@ -233,9 +243,11 @@ pub unsafe fn run<Fam, S, const MR_REG: usize, const NR: usize>(
                                     Fam::pack_lhs(a_buf, src, rsa, csa, mc_eff, kc_eff, mr);
                                     a_panel_base = a_buf as *const Fam::Lhs;
                                     a_cs = mr as isize;
+                                    packed_a = true;
                                 } else {
                                     a_panel_base = src;
                                     a_cs = csa;
+                                    packed_a = false;
                                 }
                             }
 
@@ -257,7 +269,6 @@ pub unsafe fn run<Fam, S, const MR_REG: usize, const NR: usize>(
                                     csb,
                                 )
                             };
-                            let packed_a = a_cs == mr as isize;
 
                             // Process the whole column strip in the ISA's target-feature context
                             simd.vectorize(|| {
