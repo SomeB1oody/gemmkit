@@ -464,7 +464,7 @@ fn perf_scaling() {
 }
 
 // ---------------------------------------------------------------------------
-// Prepacked-RHS reuse (B2)
+// Prepacked-RHS reuse
 // ---------------------------------------------------------------------------
 
 /// Per-call throughput of a reused prepacked B (`gemm_packed_b`) vs plain `gemm`
@@ -521,11 +521,10 @@ fn bench_prepack(k: usize, n: usize, m: usize, b_row_major: bool, par: Paralleli
     );
 }
 
-/// B3 probe: isolate the gather-pack cost. Row-major A packs via the *scalar
-/// gather* (the path B3 would vectorize); col-major A at these sizes packs via the
-/// fast `copy_nonoverlapping` contiguous path. Same FLOPs, same everything else —
-/// so the row/col gap is an upper bound on what a vectorized gather-pack could
-/// recover. Small `n` keeps A-packing from amortizing, the best case for B3.
+/// Pack-path probe: isolate the gather-pack cost. Row-major A packs via the strided
+/// gather; col-major A at these sizes packs via the fast `copy_nonoverlapping`
+/// contiguous path. Same FLOPs otherwise, so the row/col gap is an upper bound on
+/// what a faster gather-pack could recover. Small `n` keeps A-packing unamortized.
 fn bench_pack_probe(m: usize, k: usize, n: usize, par: Parallelism) {
     let a = fill(m * k, 1);
     let b = fill(k * n, 2);
@@ -585,9 +584,7 @@ fn perf_pack_probe() {
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
 fn perf_prepack() {
     let _guard = BENCH_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-    println!(
-        "\nprepacked-RHS reuse (B2) — per-call GFLOP/s, plain gemm vs gemm_packed_b (k=n=1024):"
-    );
+    println!("\nprepacked-RHS reuse — per-call GFLOP/s, plain gemm vs gemm_packed_b (k=n=1024):");
     for &brm in &[true, false] {
         for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
             for &m in &[128usize, 512, 1024, 2048] {

@@ -323,15 +323,14 @@ pub unsafe fn gemm_unchecked<T: GemmScalar>(
 
 /// A right-hand-side matrix pre-packed once into gemmkit's internal
 /// micropanel-major layout, for reuse across many products that share the same
-/// `B` (the classic inference pattern: fixed weights, a stream of activation
-/// batches). Produced by [`prepack_rhs`] and consumed by [`gemm_packed_b`] /
+/// `B` (the inference pattern: fixed weights, a stream of activation batches).
+/// Produced by [`prepack_rhs`] and consumed by [`gemm_packed_b`] /
 /// [`gemm_packed_b_with`], which skip the per-call RHS repack.
 ///
-/// The packed layout is tied to the ISA tile and the blocking geometry the host
-/// resolves for `(k, n)`, both recorded here; the consuming call re-derives them
-/// at its real `m` and **panics** on any mismatch, so a panel can never be read
-/// against a different tiling. Because the buffer is read-only during the GEMM it
-/// is shared immutably across all worker threads with no extra synchronization.
+/// The buffer records the blocking geometry it was built for; the consuming call
+/// reads it back verbatim, so a panel is always read against its own tiling. It is
+/// read-only during the GEMM, so it is shared across worker threads with no
+/// synchronization.
 pub struct PackedRhs<T> {
     buf: Vec<T>,
     k: usize,
@@ -364,9 +363,9 @@ impl<T> PackedRhs<T> {
 pub fn prepack_rhs<T: GemmScalar>(b: MatRef<'_, T>) -> PackedRhs<T> {
     check_view(b.data, b.rows, b.cols, b.rs, b.cs, "B");
     let (k, n) = (b.rows, b.cols);
-    // Resolve the panel geometry through the *same* ISA tile the consuming call
-    // will use; the `m = 65` sentinel dodges the tiny-matrix branch so `kc`/`nc`
-    // are `m`-independent and match any (non-both-tiny) consume.
+    // Resolve the panel geometry through the same ISA tile the consuming call will
+    // use; the `m = 65` sentinel dodges the tiny-matrix branch so the geometry is
+    // `m`-independent (the consume reads it back verbatim).
     let (mr, nr) = <T as GemmScalar>::rhs_tile();
     let blk = crate::cache::topology().blocking(mr, nr, core::mem::size_of::<T>().max(1), 65, n, k);
     let kc = blk.kc.max(1);
@@ -404,12 +403,10 @@ pub fn prepack_rhs<T: GemmScalar>(b: MatRef<'_, T>) -> PackedRhs<T> {
 /// `C <- alpha·A·B + beta·C` reusing a [`PackedRhs`] (pre-packed `B`), via the
 /// thread-local workspace pool. Skips the per-call RHS repack.
 ///
-/// The result is **bit-identical** to a plain [`gemm`] on the same inputs for all
-/// but very small (`m <= 64 && n <= 64`) products: those alone block via a
-/// small-matrix shortcut that the prepacked path bypasses (it reuses the buffer's
-/// own blocking), so the result is still numerically correct but may differ from
-/// plain [`gemm`] in the last ULP. The output is bit-identical across thread counts
-/// regardless.
+/// The result is **bit-identical** to a plain [`gemm`] except for very small
+/// (`m <= 64 && n <= 64`) products, which alone use a small-matrix blocking
+/// shortcut the prepacked path bypasses — those stay correct but may differ in the
+/// last ULP. Output is bit-identical across thread counts regardless.
 ///
 /// # Panics
 /// If the dimensions disagree (`A.cols != B.rows`, `A.rows != C.rows`,

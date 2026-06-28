@@ -472,7 +472,7 @@ fn parallel_equals_serial_row_major_a() {
     }
 }
 
-/// Prepacked-RHS (B2) must be **bit-identical** to a plain `gemm()` on the same
+/// Prepacked-RHS must be **bit-identical** to a plain `gemm()` on the same
 /// inputs, for any thread count and any B layout (C column-major = the supported
 /// no-swap orientation). This is the determinism gate for the reuse path: packing
 /// only rearranges B's values, so the microkernel does the identical fused FMAs in
@@ -649,7 +649,7 @@ fn prepack_row_major_c_panics() {
     );
 }
 
-/// B1 shared-LHS A-pack: with the workload gate forced fully open, the shared
+/// Shared-LHS A-pack: with the workload gate forced fully open, the shared
 /// pre-pack path (one pack per row-block + indexed read) must stay bit-identical
 /// to the serial per-worker path, for every thread count. These sizes sit below
 /// the default gate, so this is the only coverage of the shared pre-pass; bit-
@@ -884,7 +884,7 @@ fn miri_scalar_path() {
         0.0,
         Parallelism::Serial,
     );
-    // Prepacked-RHS path (B2) on the scalar engine: bit-identical to plain gemm.
+    // Prepacked-RHS path on the scalar engine: bit-identical to plain gemm.
     // Shape is not both-tiny (m > 64), so the prepacked geometry matches.
     {
         let (m, k, n) = (66usize, 4, 6);

@@ -104,22 +104,16 @@ pub unsafe fn run<Fam, S, const MR_REG: usize, const NR: usize>(
     }
 }
 
-/// Run a GEMM whose RHS is already prepacked into micropanel-major layout by
-/// [`pack_rhs_full`] — the prepacked-operand reuse path (B2). `packed_b` is the
-/// prepacked buffer base; there are no RHS strides (the layout is baked in at pack
-/// time and read back here in the exact order the driver consumes panels). The
-/// buffer is *read-only* and shared immutably across all workers, so — unlike the
-/// internal per-call B-pack region — it needs no write-before-read barrier.
-///
-/// `kc`/`nc` are the blocking sizes the buffer was packed for (from
-/// [`pack_rhs_full`]); the driver uses them verbatim for the depth/column panel
-/// geometry instead of re-deriving them, so the panel addresses always match the
-/// buffer regardless of how this `m` would otherwise block. (`mc`, the A
-/// row-block size, is still derived from the cache model at the real `m`.)
+/// Run a GEMM whose RHS is already prepacked by [`pack_rhs_full`]. `packed_b` is
+/// the buffer base (no RHS strides — the layout is baked in). It is read-only and
+/// shared immutably across workers, so unlike the per-call B-pack it needs no
+/// barrier. `kc`/`nc` are the sizes the buffer was packed for; the driver uses
+/// them verbatim so panel addresses always match the buffer (`mc` is still derived
+/// at the real `m`).
 ///
 /// # Safety
-/// As [`run`], plus: `packed_b` must point at a buffer produced by [`pack_rhs_full`]
-/// for the *same* `(k, n, kc, nc, nr=NR)` passed here.
+/// As [`run`], plus `packed_b` must come from [`pack_rhs_full`] for the same
+/// `(k, n, kc, nc, nr = NR)`.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn run_packed_rhs<Fam, S, const MR_REG: usize, const NR: usize>(
     simd: S,
@@ -169,21 +163,15 @@ pub unsafe fn run_packed_rhs<Fam, S, const MR_REG: usize, const NR: usize>(
     }
 }
 
-/// Pack the *entire* RHS of a fixed `(k, n)` problem into one micropanel-major
-/// buffer, laid out in the exact order [`run_packed_rhs`] reads panels: `jc` blocks
-/// (step `nc`) outermost, then depth slices `pc` (step `kc`), then the `n_nt`
-/// width-`nr` panels of that slice. The write cursor advances by `kc_eff * nr` per
-/// panel, so the bytes are identical to what the driver's own per-`(jc,pc)` packing
-/// would produce — making a prepacked GEMM bit-identical to a plain one. This is
-/// the single source of truth for the prepacked layout.
-///
-/// `dst` must hold `ceil(n/nr) * nr * k` elements (tail columns zero-filled by
-/// [`pack_panels`](crate::pack)). `kc`/`nc` are the blocking sizes the consuming
-/// call will resolve (the caller pins them).
+/// Pack the entire RHS of a fixed `(k, n)` problem into one micropanel-major
+/// buffer, in the exact order [`run_packed_rhs`] reads panels: `jc` blocks
+/// outermost, then depth slices, then the panels of each slice (cursor advancing
+/// `kc_eff * nr` per panel). The bytes match the driver's own per-slice packing,
+/// so a prepacked GEMM is bit-identical to a plain one — the single source of
+/// truth for the layout. `dst` must hold `ceil(n/nr) * nr * k` elements.
 ///
 /// # Safety
-/// `b` valid for the `k × n` region addressed by `rsb`/`csb`; `dst` valid for the
-/// element count above.
+/// `b` valid for the `k × n` region at `rsb`/`csb`; `dst` valid for the count above.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn pack_rhs_full<Fam: KernelFamily>(
     dst: *mut Fam::Rhs,
@@ -294,21 +282,19 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize>(
                 >= pack_stride;
         let want_pack_lhs = reuse_cols > tuning::lhs_pack_threshold() || strided_lhs;
 
-        // Shared-LHS pre-pack (B1): on the parallel packed-A path, pack each `ic`
-        // row-block's A panel exactly ONCE into a shared region (below) instead of
-        // letting every worker that touches the block re-pack it. Gated to the
-        // packed path (`rsa != 1 || want_pack_lhs` ⇒ `do_pack_lhs` true for every
-        // block), to real parallelism (serial keeps the per-worker path, so its
-        // output and memory footprint are byte-for-byte unchanged), and to a
-        // workload threshold: the pre-pass adds a fork-join per depth slice that
-        // only pays once the redundancy and compute are large (see
-        // `tuning::shared_lhs_mnk` — below the gate it would *regress* mid sizes).
+        // Shared-LHS pre-pack: on the parallel packed-A path, pack each row-block's
+        // A panel once into a shared region (below) instead of every worker that
+        // touches it re-packing. Gated to the packed path (`rsa != 1 ||
+        // want_pack_lhs`), to real parallelism (serial keeps the unchanged
+        // per-worker path), and to a workload threshold (the pre-pass adds a
+        // fork-join per depth slice that only pays at large sizes; see
+        // `tuning::shared_lhs_mnk`).
         let shared_a =
             n_threads > 1 && (rsa != 1 || want_pack_lhs) && mnk >= tuning::shared_lhs_mnk();
 
-        // A prepacked RHS (B2) is supplied whole, in micropanel-major layout, so
-        // the per-call B-pack is disabled and the compute region reads panels from
-        // the caller's read-only buffer instead.
+        // A prepacked RHS is supplied whole in micropanel-major layout, so the
+        // per-call B-pack is disabled and the compute region reads from the caller's
+        // read-only buffer instead.
         let prepacked = packed.is_some();
 
         // Adaptive RHS packing: B (read only via broadcast, so any layout works
@@ -401,12 +387,11 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize>(
                     });
                 }
 
-                // Shared-LHS pre-pack (B1): pack each row-block's A panel ONCE into
-                // `a_base[ic_idx]`. The `for_each_worker` JOIN is the write-before-
-                // read barrier the compute region below depends on — identical
-                // discipline to the packed-B region above. Workers pull disjoint
-                // `ic` ranges and write disjoint, ALIGN-rounded slots, so there is no
-                // intra-region race; the join orders every write before any read.
+                // Shared-LHS pre-pack: pack each row-block's A panel once into
+                // `a_base[ic_idx]`. The `for_each_worker` join is the write-before-
+                // read barrier the compute region depends on — same discipline as the
+                // packed-B region above. Workers pull disjoint `ic` ranges and write
+                // disjoint, ALIGN-rounded slots, so there is no intra-region race.
                 if shared_a {
                     let acur = parallel::JobCursor::new(n_mc, parallel::job_grain(n_mc, n_threads));
                     parallel::for_each_worker(n_threads, |_tid| {

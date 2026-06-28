@@ -67,11 +67,10 @@ pub struct Task<T> {
     pub csc: isize,
 }
 
-/// A GEMM whose RHS is already prepacked (the reuse path, B2):
-/// `C <- alpha·A·(prepacked B) + beta·C`. Carries the blocking geometry the
-/// buffer was packed for (`nr`, `kc`, `nc`), which the consume path re-derives at
-/// the real `m` and asserts matches — so a reused panel can never be read against
-/// a different tiling.
+/// A GEMM whose RHS is already prepacked: `C <- alpha·A·(prepacked B) + beta·C`.
+/// Carries the blocking geometry the buffer was packed for (`nr`, `kc`, `nc`),
+/// which the driver reads back verbatim so a reused panel always matches its
+/// tiling.
 ///
 /// `pub` (like [`Task`]) only so it can appear in the doc-hidden [`GemmScalar`]
 /// methods; the `dispatch` module is private, so it is not nameable externally.
@@ -112,7 +111,7 @@ pub trait GemmScalar: Float<Acc = Self> {
     #[doc(hidden)]
     unsafe fn dispatch(task: Task<Self>, par: Parallelism, ws: &mut Workspace);
 
-    /// Run the dispatched **prepacked-RHS** kernel for this type (B2).
+    /// Run the dispatched prepacked-RHS kernel for this type.
     ///
     /// # Safety
     /// `req`'s pointers must be valid, `c` must not alias `a`/`packed`, and
@@ -148,7 +147,7 @@ pub(crate) unsafe fn execute<T: GemmScalar>(task: Task<T>, par: Parallelism, ws:
     }
 }
 
-/// Top-level entry for the prepacked-RHS path (B2): handle the degenerate cases
+/// Top-level entry for the prepacked-RHS path: handle the degenerate cases
 /// (the A·B term vanishes ⇒ `C <- beta·C`, never touching the packed buffer) and
 /// then run the ISA-dispatched prepacked kernel.
 ///
@@ -237,7 +236,7 @@ unsafe fn run_typed<T, S, const MR_REG: usize, const NR: usize>(
     }
 }
 
-/// Prepacked-RHS driver entry for a concrete `(type, ISA, tile)` (B2). No gemv
+/// Prepacked-RHS driver entry for a concrete `(type, ISA, tile)`. No gemv
 /// route and **no orientation swap** — the API guarantees column-major-ish C
 /// (`|csc| >= |rsc|`), so the prepacked buffer is always the genuine RHS.
 ///
@@ -254,12 +253,9 @@ unsafe fn run_packed_typed<T, S, const MR_REG: usize, const NR: usize>(
     S: SimdOps<T>,
 {
     unsafe {
-        // The buffer carries the blocking geometry (`kc`, `nc`) it was packed for;
-        // the driver reads panels with exactly that geometry, so nothing is
-        // re-derived and the panel addresses always match the buffer regardless of
-        // how this `m` would otherwise block. `nr` is structural (the panel width
-        // is this kernel's `NR`); a single process's memoized ISA choice guarantees
-        // agreement, asserted in debug builds.
+        // The driver reads panels with the buffer's own `(kc, nc)`, so nothing is
+        // re-derived. `nr` is structural (the panel width is this kernel's `NR`);
+        // one process's memoized ISA choice guarantees they agree.
         debug_assert_eq!(NR, req.nr, "prepacked RHS panel width != kernel NR");
         driver::run_packed_rhs::<FloatGemm<T>, S, MR_REG, NR>(
             simd, req.m, req.k, req.n, req.alpha, req.a, req.rsa, req.csa, req.packed, req.kc,
@@ -317,7 +313,7 @@ unsafe fn gemm_f64_neon(t: Task<f64>, par: Parallelism, ws: &mut Workspace) {
     unsafe { run_typed::<f64, Neon, 4, 4>(Neon, t, par, ws) }
 }
 
-// ---- prepacked-RHS (B2) entry points: one per (type, ISA), same tiles ----
+// ---- prepacked-RHS entry points: one per (type, ISA), same tiles ----
 
 unsafe fn gemm_f32_scalar_packed(r: PackedConsume<f32>, par: Parallelism, ws: &mut Workspace) {
     unsafe { run_packed_typed::<f32, ScalarTok, 4, 4>(ScalarTok, r, par, ws) }
@@ -356,11 +352,8 @@ type PackedFn<T> = unsafe fn(PackedConsume<T>, Parallelism, &mut Workspace);
 /// The memoized dispatch slot for one element type: the standard kernel, the
 /// prepacked-RHS kernel, and the microtile `(mr, nr)` they share. Bundling them
 /// keeps adding an ISA a single `select_*` ladder arm. `mr`/`nr` mirror the tile
-/// constants in the wrappers above and are consumed by `prepack_rhs` (via
-/// `rhs_tile`) to resolve the buffer's blocking geometry; the consume path then
-/// reuses that stored geometry verbatim, so pack and consume stay consistent even
-/// if a literal were wrong (the result would be correct but not bit-identical to
-/// plain gemm — caught by `prepack_equals_gemm`).
+/// constants in the wrappers above and feed `prepack_rhs` (via `rhs_tile`) so the
+/// buffer and the consume path agree on the blocking geometry.
 #[derive(Copy, Clone)]
 struct Dispatched<T> {
     run: GemmFn<T>,
