@@ -33,7 +33,17 @@ pub struct Level {
     pub assoc: usize,
     /// Cache line size in bytes.
     pub line: usize,
-    /// Number of logical cores sharing this level (1 = private).
+    /// Number of concurrent GEMM workers that contend for *per-worker* data at
+    /// this level — **not** the raw hardware core-sharing count. It divides
+    /// [`Level::effective_bytes`], which feeds the blocking model, so it must
+    /// reflect contention for the data the driver actually places at this level.
+    /// The driver keeps the *shared* B macro-panel in L3 and *per-worker* A/B
+    /// micropanels in L1d, so **L1d and L3 are always `1`** (budget the whole
+    /// level to that one panel; dividing L3 by the core count would crater `NC`).
+    /// Only **L2** — which holds each worker's private A macro-panel — uses the
+    /// physical-core L2-sharing degree: `1` for a private L2 (x86, Neoverse), the
+    /// cluster size for a shared L2 (Apple). A backend must therefore *derive*
+    /// this value, never store a raw `shared_cpu_list` count.
     pub shared_by: usize,
 }
 
@@ -333,7 +343,11 @@ mod tests {
             "current() must return the one memoized instance"
         );
         assert_eq!(&m.cache, topology(), "topology() must read through Machine");
-        assert_eq!(m.page_size, page_size(), "page_size() must read through Machine");
+        assert_eq!(
+            m.page_size,
+            page_size(),
+            "page_size() must read through Machine"
+        );
     }
 
     /// The detected page size must be a power of two in a sane range (the
