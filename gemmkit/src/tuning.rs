@@ -99,10 +99,24 @@ static THREAD_DIM_STRIDE: Threshold = Threshold::new("GEMMKIT_THREAD_DIM_STRIDE"
 // Minimum `m*n*k` for the shared-LHS A-pack to engage on the parallel packed-A
 // path: below it each worker packs its own A block, above it every row-block's A
 // is packed once into a shared region behind a barrier. The pre-pass adds a
-// fork-join per depth slice that only pays once redundancy and compute are large,
-// so it is gated to large problems (small/mid ones regress). Calibration point —
-// perf-validate per machine. `=1` forces it on, a huge value forces it off.
-static SHARED_LHS_MNK: Threshold = Threshold::new("GEMMKIT_SHARED_LHS_MNK", 8_000_000_000);
+// fork-join per depth slice; it pays only once the *redundancy it removes* (each
+// row-block re-packed by every worker that touches it) outweighs that overhead,
+// so small/mid problems regress and it is gated above the crossover.
+//
+// The crossover is architecture-dependent because the redundancy ratio is
+// `workers ÷ row-blocks`, and the row-block count is `ceil(m / MC)`: a smaller MC
+// cap (`MC_REG_PANELS · MR`) means fewer, wider row-blocks re-packed by more
+// workers, so the pre-pass pays from a *much* smaller problem. The default is
+// therefore split by the MC the native tile implies — a small-MC tile (NEON
+// `MR=16` ⇒ `MC=128`) crosses over near `mnk ~ 5e7`, a large-MC tile (AVX-512
+// `MR=32` ⇒ `MC=256`) only near `mnk ~ 8e9`. Calibration points — perf-validate
+// per machine. `=1` forces it on, a huge value forces it off; the
+// `GEMMKIT_SHARED_LHS_MNK` env / setter overrides either default verbatim.
+#[cfg(target_arch = "aarch64")]
+const SHARED_LHS_MNK_DEFAULT: usize = 50_000_000;
+#[cfg(not(target_arch = "aarch64"))]
+const SHARED_LHS_MNK_DEFAULT: usize = 8_000_000_000;
+static SHARED_LHS_MNK: Threshold = Threshold::new("GEMMKIT_SHARED_LHS_MNK", SHARED_LHS_MNK_DEFAULT);
 
 /// Get the serial/parallel work gate (`m*n*k` threshold).
 pub fn parallel_threshold() -> usize {
