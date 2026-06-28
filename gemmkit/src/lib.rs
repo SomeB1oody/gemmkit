@@ -57,7 +57,10 @@ mod parallel;
 mod special;
 mod workspace;
 
-pub use api::{MatMut, MatRef, gemm, gemm_unchecked, gemm_unchecked_with, gemm_with};
+pub use api::{
+    MatMut, MatRef, PackedRhs, gemm, gemm_packed_b, gemm_packed_b_with, gemm_unchecked,
+    gemm_unchecked_with, gemm_with, prepack_rhs,
+};
 pub use dispatch::GemmScalar;
 pub use parallel::Parallelism;
 pub use scalar::{Float, Scalar};
