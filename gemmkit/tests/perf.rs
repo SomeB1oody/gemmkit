@@ -521,6 +521,66 @@ fn bench_prepack(k: usize, n: usize, m: usize, b_row_major: bool, par: Paralleli
     );
 }
 
+/// B3 probe: isolate the gather-pack cost. Row-major A packs via the *scalar
+/// gather* (the path B3 would vectorize); col-major A at these sizes packs via the
+/// fast `copy_nonoverlapping` contiguous path. Same FLOPs, same everything else —
+/// so the row/col gap is an upper bound on what a vectorized gather-pack could
+/// recover. Small `n` keeps A-packing from amortizing, the best case for B3.
+fn bench_pack_probe(m: usize, k: usize, n: usize, par: Parallelism) {
+    let a = fill(m * k, 1);
+    let b = fill(k * n, 2);
+    let mut c = vec![0.0f32; m * n];
+    let row = measure(m, k, n, || {
+        gemm(
+            1.0,
+            MatRef::new(&a, m, k, k as isize, 1),
+            MatRef::from_col_major(&b, k, n),
+            0.0,
+            MatMut::from_col_major(&mut c, m, n),
+            par,
+        );
+    });
+    let col = measure(m, k, n, || {
+        gemm(
+            1.0,
+            MatRef::from_col_major(&a, m, k),
+            MatRef::from_col_major(&b, k, n),
+            0.0,
+            MatMut::from_col_major(&mut c, m, n),
+            par,
+        );
+    });
+    let mode = if matches!(par, Parallelism::Serial) {
+        "ser"
+    } else {
+        "par"
+    };
+    println!(
+        "  m={m:<5} k={k} n={n:<4} {mode}  rowA(gather)={:7.1} (±{:>2.0}%)  colA(copy)={:7.1}  (gather {:.0}% of copy)",
+        row.median,
+        row.spread_pct(),
+        col.median,
+        100.0 * row.median / col.median.max(1e-9)
+    );
+}
+
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture"]
+fn perf_pack_probe() {
+    let _guard = BENCH_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    println!("\nB3 probe — gather-pack overhead (rowA gather vs colA copy):");
+    for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
+        for &(m, k, n) in &[
+            (2048usize, 2048, 64),
+            (2048, 2048, 128),
+            (4096, 2048, 64),
+            (2048, 2048, 256),
+        ] {
+            bench_pack_probe(m, k, n, par);
+        }
+    }
+}
+
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
 fn perf_prepack() {

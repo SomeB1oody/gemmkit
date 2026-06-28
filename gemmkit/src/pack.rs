@@ -45,17 +45,36 @@ pub(crate) unsafe fn pack_panels<T: Scalar>(
                     d = d.add(width);
                 }
             } else {
-                for p in 0..depth_len {
-                    let col = src.offset(p as isize * depth);
+                // Cache-blocked transpose (B3): walk the source along its
+                // *contiguous* dimension (`depth` — stride 1 for a row-major LHS or
+                // a column-major RHS) in short strips and scatter each strip into
+                // the panel, instead of the naive gather that touches `width` fresh
+                // source cache lines per depth step (a miss per element when `lead`
+                // is large). A pure *reordered* copy — the packed bytes are byte-for-
+                // byte identical — but far cheaper for a strided source.
+                const TILE: usize = 16;
+                let panel = d;
+                let mut p0 = 0;
+                while p0 < depth_len {
+                    let pe = core::cmp::min(p0 + TILE, depth_len);
                     for i in 0..width {
-                        *d = if i < live {
-                            *col.offset((base + i) as isize * lead)
+                        // Address each slot directly (no running pointer past the
+                        // panel end); LLVM strength-reduces the `p` loop. Every
+                        // `p*width + i < depth_len*width`, so it stays in bounds.
+                        if i < live {
+                            let row = src.offset((base + i) as isize * lead);
+                            for p in p0..pe {
+                                *panel.add(p * width + i) = *row.offset(p as isize * depth);
+                            }
                         } else {
-                            T::ZERO
-                        };
-                        d = d.add(1);
+                            for p in p0..pe {
+                                *panel.add(p * width + i) = T::ZERO;
+                            }
+                        }
                     }
+                    p0 = pe;
                 }
+                d = panel.add(depth_len * width);
             }
             base += width;
         }
