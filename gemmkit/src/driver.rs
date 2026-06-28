@@ -294,6 +294,18 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize>(
                 >= pack_stride;
         let want_pack_lhs = reuse_cols > tuning::lhs_pack_threshold() || strided_lhs;
 
+        // Shared-LHS pre-pack (B1): on the parallel packed-A path, pack each `ic`
+        // row-block's A panel exactly ONCE into a shared region (below) instead of
+        // letting every worker that touches the block re-pack it. Gated to the
+        // packed path (`rsa != 1 || want_pack_lhs` ⇒ `do_pack_lhs` true for every
+        // block), to real parallelism (serial keeps the per-worker path, so its
+        // output and memory footprint are byte-for-byte unchanged), and to a
+        // workload threshold: the pre-pass adds a fork-join per depth slice that
+        // only pays once the redundancy and compute are large (see
+        // `tuning::shared_lhs_mnk` — below the gate it would *regress* mid sizes).
+        let shared_a =
+            n_threads > 1 && (rsa != 1 || want_pack_lhs) && mnk >= tuning::shared_lhs_mnk();
+
         // A prepacked RHS (B2) is supplied whole, in micropanel-major layout, so
         // the per-call B-pack is disabled and the compute region reads panels from
         // the caller's read-only buffer instead.
@@ -305,14 +317,18 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize>(
         // read in place. Never packed here when the RHS is already prepacked.
         let pack_b = !prepacked && m > tuning::rhs_pack_threshold();
 
-        // One packing allocation (RHS scratch only when packing here)
-        let a_per_thread = mc.next_multiple_of(mr) * kc;
+        // One packing allocation. The LHS region count is `n_mc` when shared (one
+        // slot per row-block, written once by the pre-pass) or `n_threads` when
+        // per-worker (each worker owns a private scratch slot). For square parallel
+        // problems `n_mc < n_threads`, so shared-A uses *fewer* slots, not more.
+        let a_per_region = mc.next_multiple_of(mr) * kc;
+        let a_regions = if shared_a { n_mc } else { n_threads };
         let b_elems = if pack_b {
             nc.next_multiple_of(nr) * kc
         } else {
             0
         };
-        let regions = ws.regions::<Fam::Lhs>(a_per_thread, n_threads, b_elems);
+        let regions = ws.regions::<Fam::Lhs>(a_per_region, a_regions, b_elems);
         let a_base = Ptr(regions.a_base);
         let a_stride = regions.a_stride;
         // Prepacked: read from the caller buffer; else from the per-call scratch.
@@ -340,7 +356,11 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize>(
             // The packed-LHS path (whole-row-block chunks) is split for load balance; the
             // general path uses the shared `job_grain` oversample. See `packed_block_grain`.
             let n_jobs = n_mc * n_nt;
-            let grain = if (rsa != 1 || want_pack_lhs) && n_mc >= n_threads {
+            let grain = if shared_a {
+                // A is pre-packed once per block below, so whole-block chunking no
+                // longer buys pack reuse — use the fine grain for the best balance.
+                parallel::job_grain(n_jobs, n_threads)
+            } else if (rsa != 1 || want_pack_lhs) && n_mc >= n_threads {
                 parallel::packed_block_grain(n_nt, n_mc, n_threads)
             } else {
                 parallel::job_grain(n_jobs, n_threads)
@@ -381,6 +401,29 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize>(
                     });
                 }
 
+                // Shared-LHS pre-pack (B1): pack each row-block's A panel ONCE into
+                // `a_base[ic_idx]`. The `for_each_worker` JOIN is the write-before-
+                // read barrier the compute region below depends on — identical
+                // discipline to the packed-B region above. Workers pull disjoint
+                // `ic` ranges and write disjoint, ALIGN-rounded slots, so there is no
+                // intra-region race; the join orders every write before any read.
+                if shared_a {
+                    let acur = parallel::JobCursor::new(n_mc, parallel::job_grain(n_mc, n_threads));
+                    parallel::for_each_worker(n_threads, |_tid| {
+                        let (a, a_base) = (a, a_base);
+                        while let Some((s, e)) = acur.next_chunk() {
+                            for ic_idx in s..e {
+                                let ic = ic_idx * mc;
+                                let mc_eff = core::cmp::min(mc, m - ic);
+                                let dst = a_base.0.add(ic_idx * a_stride);
+                                let src = a.0.offset(ic as isize * rsa + pc as isize * csa)
+                                    as *const Fam::Lhs;
+                                Fam::pack_lhs(dst, src, rsa, csa, mc_eff, kc_eff, mr);
+                            }
+                        }
+                    });
+                }
+
                 let cur = parallel::JobCursor::new(n_jobs, grain);
 
                 parallel::for_each_worker(n_threads, |tid| {
@@ -389,7 +432,15 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize>(
                     // `*mut` fields disjointly, which are not `Sync`, so the closure
                     // would fail the bound needed to move into the rayon workers.
                     let (a, b, c, a_base, b_base) = (a, b, c, a_base, b_base);
-                    let a_buf = a_base.0.add(tid * a_stride);
+                    // Per-worker scratch slot (per-worker path only). On the shared-A
+                    // path `tid` may exceed `n_mc`, so `a_base + tid*a_stride` would be
+                    // out-of-bounds pointer arithmetic even though it is never read —
+                    // use a null base there instead.
+                    let a_buf = if shared_a {
+                        core::ptr::null_mut::<Fam::Lhs>()
+                    } else {
+                        a_base.0.add(tid * a_stride)
+                    };
                     let mut scratch = [const { MaybeUninit::<Fam::Acc>::uninit() }; SCRATCH_LEN];
                     let scratch_ptr = scratch.as_mut_ptr() as *mut Fam::Acc;
 
@@ -411,17 +462,27 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize>(
 
                             if ic_idx != cur_ic {
                                 cur_ic = ic_idx;
-                                let src = a.0.offset(ic as isize * rsa + pc as isize * csa)
-                                    as *const Fam::Lhs;
-                                if do_pack_lhs(rsa, mc_eff, mr, want_pack_lhs) {
-                                    Fam::pack_lhs(a_buf, src, rsa, csa, mc_eff, kc_eff, mr);
-                                    a_panel_base = a_buf as *const Fam::Lhs;
+                                if shared_a {
+                                    // Read the block's A panel that the pre-pass
+                                    // packed once (same bytes, same packed read
+                                    // formula as the per-worker case ⇒ bit-identical).
+                                    a_panel_base =
+                                        a_base.0.add(ic_idx * a_stride) as *const Fam::Lhs;
                                     a_cs = mr as isize;
                                     packed_a = true;
                                 } else {
-                                    a_panel_base = src;
-                                    a_cs = csa;
-                                    packed_a = false;
+                                    let src = a.0.offset(ic as isize * rsa + pc as isize * csa)
+                                        as *const Fam::Lhs;
+                                    if do_pack_lhs(rsa, mc_eff, mr, want_pack_lhs) {
+                                        Fam::pack_lhs(a_buf, src, rsa, csa, mc_eff, kc_eff, mr);
+                                        a_panel_base = a_buf as *const Fam::Lhs;
+                                        a_cs = mr as isize;
+                                        packed_a = true;
+                                    } else {
+                                        a_panel_base = src;
+                                        a_cs = csa;
+                                        packed_a = false;
+                                    }
                                 }
                             }
 

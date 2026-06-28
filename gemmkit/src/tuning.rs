@@ -96,6 +96,18 @@ static PARALLEL_OVERSAMPLE: Threshold = Threshold::new("GEMMKIT_PARALLEL_OVERSAM
 // [`thread_dim_stride`]); any non-zero env/setter value overrides verbatim.
 static THREAD_DIM_STRIDE: Threshold = Threshold::new("GEMMKIT_THREAD_DIM_STRIDE", 0);
 
+// Minimum `m*n*k` for the **shared-LHS A-pack** (B1) to engage on the parallel
+// packed-A path. Below it, each worker packs its own A block (the proven path);
+// above it, every `ic` row-block's A is packed once into a shared region behind a
+// barrier. **Calibration point** (Ryzen 9950X): the shared pre-pass adds a
+// fork-join per depth slice whose cost only pays once the per-worker re-pack
+// redundancy and the compute are both large. Measured crossover on this box is
+// between 1024³ (a ~9-17% *regression* at 512-1024, where `n_mc` is tiny and
+// compute is short) and 2048³ (a ~+20% gain). The default sits just under 2048³
+// so only clearly-large problems take the shared path; `GEMMKIT_SHARED_LHS_MNK=1`
+// forces it on for testing and `=<huge>` forces it off. Perf-validate per machine.
+static SHARED_LHS_MNK: Threshold = Threshold::new("GEMMKIT_SHARED_LHS_MNK", 8_000_000_000);
+
 /// Get the serial/parallel work gate (`m*n*k` threshold).
 pub fn parallel_threshold() -> usize {
     PARALLEL_THRESHOLD.get()
@@ -152,6 +164,16 @@ pub fn parallel_oversample() -> usize {
 /// Override the parallel dynamic-scheduling oversample factor.
 pub fn set_parallel_oversample(v: usize) {
     PARALLEL_OVERSAMPLE.set(v);
+}
+
+/// Get the shared-LHS A-pack workload gate (`m*n*k` threshold). The B1 shared
+/// pre-pack engages only at or above this; below it the per-worker pack is used.
+pub fn shared_lhs_mnk() -> usize {
+    SHARED_LHS_MNK.get()
+}
+/// Override the shared-LHS A-pack workload gate (`m*n*k`).
+pub fn set_shared_lhs_mnk(v: usize) {
+    SHARED_LHS_MNK.set(v);
 }
 
 /// Get the auto worker-count ramp granularity (units of linear problem dimension
