@@ -390,6 +390,7 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "gemm",
+ "half",
  "matrixmultiply",
  "raw-cpuid",
  "rayon",

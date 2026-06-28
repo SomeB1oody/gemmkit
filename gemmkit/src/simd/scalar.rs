@@ -4,7 +4,10 @@
 //! also what makes the `SimdOps` abstraction honest: the exact same generic
 //! kernel that drives AVX-512 drives this token with a one-element "register".
 
-use super::{Simd, SimdOps};
+use half::{bf16, f16};
+
+use super::{KernelSimd, Simd, SimdOps};
+use crate::scalar::NarrowFloat;
 
 /// The scalar (1-lane) ISA token. Always available.
 #[derive(Copy, Clone, Default)]
@@ -73,3 +76,44 @@ macro_rules! impl_scalar_ops {
 
 impl_scalar_ops!(f32);
 impl_scalar_ops!(f64);
+
+// Mixed-precision (scalar fallback): `f16`/`bf16` widen to `f32` on load and round
+// back on store, one element at a time (LANES == 1, so the `Reg` is a bare `f32`).
+// This is the portability floor and the Miri-checked reference for the narrow types.
+impl KernelSimd<f16, f16, f32, f16> for ScalarTok {
+    #[inline(always)]
+    unsafe fn load_lhs(self, p: *const f16) -> f32 {
+        unsafe { (*p).widen() }
+    }
+    #[inline(always)]
+    unsafe fn splat_rhs(self, v: f16) -> f32 {
+        v.widen()
+    }
+    #[inline(always)]
+    unsafe fn load_out(self, p: *const f16) -> f32 {
+        unsafe { (*p).widen() }
+    }
+    #[inline(always)]
+    unsafe fn store_out(self, p: *mut f16, v: f32) {
+        unsafe { *p = f16::narrow(v) }
+    }
+}
+
+impl KernelSimd<bf16, bf16, f32, bf16> for ScalarTok {
+    #[inline(always)]
+    unsafe fn load_lhs(self, p: *const bf16) -> f32 {
+        unsafe { (*p).widen() }
+    }
+    #[inline(always)]
+    unsafe fn splat_rhs(self, v: bf16) -> f32 {
+        v.widen()
+    }
+    #[inline(always)]
+    unsafe fn load_out(self, p: *const bf16) -> f32 {
+        unsafe { (*p).widen() }
+    }
+    #[inline(always)]
+    unsafe fn store_out(self, p: *mut bf16, v: f32) {
+        unsafe { *p = bf16::narrow(v) }
+    }
+}

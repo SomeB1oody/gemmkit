@@ -17,7 +17,7 @@ use crate::cache;
 use crate::kernel::{AlphaStatus, BetaStatus, KernelFamily, SCRATCH_LEN};
 use crate::parallel::{self, Parallelism};
 use crate::scalar::Scalar;
-use crate::simd::SimdOps;
+use crate::simd::{KernelSimd, SimdOps};
 use crate::tuning;
 use crate::workspace::Workspace;
 
@@ -94,7 +94,7 @@ pub unsafe fn run<Fam, S, const MR_REG: usize, const NR: usize>(
     ws: &mut Workspace,
 ) where
     Fam: KernelFamily,
-    S: SimdOps<Fam::Lhs> + SimdOps<Fam::Acc>,
+    S: KernelSimd<Fam::Lhs, Fam::Rhs, Fam::Acc, Fam::Out>,
 {
     // SAFETY: forwarded to `run_inner` with no prepacked RHS (the standard path).
     unsafe {
@@ -135,7 +135,7 @@ pub unsafe fn run_packed_rhs<Fam, S, const MR_REG: usize, const NR: usize>(
     ws: &mut Workspace,
 ) where
     Fam: KernelFamily,
-    S: SimdOps<Fam::Lhs> + SimdOps<Fam::Acc>,
+    S: KernelSimd<Fam::Lhs, Fam::Rhs, Fam::Acc, Fam::Out>,
 {
     // SAFETY: forwarded with the prepacked buffer and its packed (kc, nc); `rsb`/
     // `csb` are unused on the prepacked path (the panel layout is baked in).
@@ -273,10 +273,14 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize>(
     packed: Option<(*const Fam::Rhs, usize, usize)>,
 ) where
     Fam: KernelFamily,
-    S: SimdOps<Fam::Lhs> + SimdOps<Fam::Acc>,
+    S: KernelSimd<Fam::Lhs, Fam::Rhs, Fam::Acc, Fam::Out>,
 {
     unsafe {
-        let lanes = <S as SimdOps<Fam::Lhs>>::LANES;
+        // `mr` is in *accumulator* lanes: the microkernel widens the narrow inputs
+        // into `Acc` registers, so a panel row maps to an `Acc` lane. For a
+        // homogeneous float family `Lhs == Acc`, so this is unchanged; for mixed
+        // precision (`f16` in, `f32` acc) it is the `f32` lane count.
+        let lanes = <S as SimdOps<Fam::Acc>>::LANES;
         let mr = MR_REG * lanes;
         let nr = NR;
         debug_assert!(mr * nr <= SCRATCH_LEN, "microtile exceeds scratch capacity");
@@ -296,7 +300,15 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize>(
         // A row-block size `mc` is still model-derived at the real `m`).
         let (kc, nc) = match packed {
             Some((_, pkc, pnc)) => (pkc.max(1), pnc.next_multiple_of(nr).max(nr)),
-            None => (blk.kc.max(1), blk.nc.next_multiple_of(nr).max(nr)),
+            None => {
+                // A family whose `Out` is narrower than `Acc` (mixed precision) must
+                // not split K — the running sum would round to `Out` between panels.
+                // Use the whole contraction as one panel so it accumulates in the
+                // `Acc` registers and rounds once. Homogeneous families keep the
+                // cache-model `kc`.
+                let kc = if Fam::OUT_IS_ACC { blk.kc } else { k };
+                (kc.max(1), blk.nc.next_multiple_of(nr).max(nr))
+            }
         };
 
         let n_mc = m.div_ceil(mc); // row macro-blocks (constant across panels)

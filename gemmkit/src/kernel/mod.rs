@@ -14,11 +14,13 @@
 //! new tile is a new instantiation, never a new type or macro.
 
 use crate::scalar::Scalar;
-use crate::simd::SimdOps;
+use crate::simd::KernelSimd;
 
 pub mod float;
+pub mod mixed;
 
 pub use float::FloatGemm;
+pub use mixed::MixedGemm;
 
 /// State of the `alpha` scale, precomputed once by the driver so the microkernel
 /// never compares floats. `Zero` never reaches the microkernel (the driver
@@ -66,6 +68,19 @@ pub trait KernelFamily: Copy + Send + Sync + 'static {
     /// Output element type.
     type Out: Scalar;
 
+    /// Whether `Out` holds the accumulator at full `Acc` precision — i.e. whether a
+    /// running partial sum can round-trip through `C` between depth (`kc`) panels
+    /// **without losing precision**. `true` exactly when `Out == Acc` (every
+    /// homogeneous float family; the default).
+    ///
+    /// The driver accumulates across K by reading and re-writing `C` once per `kc`
+    /// panel (`beta == 1` after the first). For a homogeneous family that is exact.
+    /// For a **mixed-precision** family (`Out = f16/bf16`, `Acc = f32`) it would
+    /// round the running sum to 16 bits at every `kc` boundary, so such a family
+    /// sets this `false` and the driver then uses `kc = k` (one panel — the whole
+    /// contraction accumulates in the `f32` registers and rounds to `Out` once).
+    const OUT_IS_ACC: bool = true;
+
     /// Pack an `mc × kc` LHS block into micropanel-major layout: a sequence of
     /// panels each `mr` rows tall, every panel stored column-by-column with `mr`
     /// contiguous rows per column (tail rows zero-filled). `mr == MR_REG*LANES`.
@@ -100,8 +115,8 @@ pub trait KernelFamily: Copy + Send + Sync + 'static {
         nr: usize,
     );
 
-    /// Compute one `MR × NR` tile (`MR == MR_REG*LANES`) and apply the epilogue
-    /// `C <- combine(alpha·A·B, beta·C)`.
+    /// Compute one `MR × NR` tile (`MR == MR_REG*LANES`, with `LANES` the **`Acc`**
+    /// lane count) and apply the epilogue `C <- combine(alpha·A·B, beta·C)`.
     ///
     /// * `a`/`a_cs`: LHS panel base and column (depth) stride. For packed input
     ///   `a_cs == mr`; for adaptive (unpacked) column-major input `a_cs == csa`.
@@ -137,5 +152,5 @@ pub trait KernelFamily: Copy + Send + Sync + 'static {
         nr_eff: usize,
         scratch: *mut Self::Acc,
     ) where
-        S: SimdOps<Self::Lhs> + SimdOps<Self::Acc>;
+        S: KernelSimd<Self::Lhs, Self::Rhs, Self::Acc, Self::Out>;
 }

@@ -21,6 +21,11 @@ parallel = ["std", "dep:rayon"]
 
 [dependencies]
 rayon = { version = "1.10", optional = true }
+# `half` (f16 / bf16) is a light, no_std, ecosystem-standard element type callers
+# expect for interop; `default-features = false` keeps it `core`-only so gemmkit's
+# no_std build stays clean (the `gemm` dev-dep re-enables std in bench builds via
+# feature unification, which is fine — it never reaches the lib).
+half = { version = "2", default-features = false }
 
 [target.'cfg(any(target_arch = "x86", target_arch = "x86_64"))'.dependencies]
 raw-cpuid = "11"

@@ -103,10 +103,28 @@ token's `vectorize` is the identity.
 
 The driver is generic over [`KernelFamily`], not over "do an FMA on `T`". A family
 bundles the input/accumulator/output types, the pack layout, the microkernel, and
-the epilogue. v1 ships one family, `FloatGemm<T>`. Complex or integer GEMM would
-arrive as *new families* (complex: an `fmaddsub` two-step kernel; integer: a VNNI
-dot kernel with interleaved-K packing and a requantize epilogue) with the driver,
-packing framework, cache model, and parallelism untouched.
+the epilogue. It ships two families: `FloatGemm<T>` (homogeneous `f32`/`f64`) and
+`MixedGemm<N>` (mixed precision — `f16`/`bf16` in, **`f32` accumulator**, narrow
+out). Complex or integer GEMM would arrive as further *new families* (complex: an
+`fmaddsub` two-step kernel; integer: a VNNI dot kernel with interleaved-K packing
+and a requantize epilogue) with the driver, packing framework, cache model, and
+parallelism untouched.
+
+**Mixed precision (`Acc != Lhs`).** `MixedGemm<N>` is the seam's first asymmetric
+family: it packs narrow `N` panels (plain micropanels, like the float pack),
+**widens them to `f32` registers on load**, accumulates in `f32`, and **rounds back
+to `N` on store** (reading a narrow `C` widened for the `β != 0` term). The widening
+lives entirely behind a small L0 capability, `KernelSimd<L, R, A, O>`, whose
+`load_lhs`/`splat_rhs`/`load_out`/`store_out` are the widen-load / narrow-store
+primitives an ISA token must provide. A single blanket impl makes the homogeneous
+case (`L = R = A = O`) plain `SimdOps` load/splat/store, so `FloatGemm` and every
+external homogeneous family get it for free; the all-equal blanket can never overlap
+a mixed impl (which has `L != A`), so coherence is clean. The microkernel and driver
+bound on `KernelSimd` instead of `SimdOps`, and the driver derives `MR` from the
+**accumulator** lane count — so the five-loop nest carries no per-type branch. The
+dispatch bound is `GemmScalar: Scalar` (not `Float<Acc = Self>`); per-type details
+that can't be expressed generically (the `f32`-mediated `β`-scale; which family to
+pack/dispatch through) are `GemmScalar` methods.
 
 **Tile geometry is not on the trait.** `MR_REG` (register rows) and `NR` (columns)
 are const generics on the driver/microkernel, chosen per `(family, ISA)` at the

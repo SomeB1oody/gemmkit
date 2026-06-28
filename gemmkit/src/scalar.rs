@@ -34,6 +34,59 @@ impl Scalar for f64 {
     const ONE: Self = 1.0;
 }
 
+// f16 / bf16 are the *mixed-precision* element types: they are stored as 16-bit
+// inputs/outputs but **accumulate in `f32`** (`Acc = f32`), so they are `Scalar`
+// but deliberately **not** [`Float`] — they carry no native arithmetic. The kernel
+// widens them to `f32` on load and rounds back on store; the arithmetic happens in
+// `f32` via [`SimdOps`] and the [`NarrowFloat`] scalar conversions below. This is
+// the first place `Acc != Self`, the seam the mixed-precision family relies on.
+impl Scalar for half::f16 {
+    type Acc = f32;
+    const ZERO: Self = half::f16::from_bits(0x0000);
+    const ONE: Self = half::f16::from_bits(0x3C00);
+}
+
+impl Scalar for half::bf16 {
+    type Acc = f32;
+    const ZERO: Self = half::bf16::from_bits(0x0000);
+    const ONE: Self = half::bf16::from_bits(0x3F80);
+}
+
+/// A narrow floating-point input type that accumulates in `f32` (`Acc = f32`):
+/// `f16` and `bf16`. It supplies only the **scalar** widen / narrow conversions the
+/// kernel epilogue's strided copy-back path needs; the vectorized hot loop uses the
+/// SIMD widen-load / narrow-store on [`crate::simd::SimdOps`] instead. Kept separate
+/// from [`Float`] precisely because these types have no native arithmetic — the
+/// point of mixed precision.
+pub trait NarrowFloat: Scalar<Acc = f32> {
+    /// Widen one value to `f32` (exact — `f16`/`bf16` are a subset of `f32`).
+    fn widen(self) -> f32;
+    /// Round one `f32` to this narrow type (round-to-nearest-even).
+    fn narrow(x: f32) -> Self;
+}
+
+impl NarrowFloat for half::f16 {
+    #[inline(always)]
+    fn widen(self) -> f32 {
+        self.to_f32()
+    }
+    #[inline(always)]
+    fn narrow(x: f32) -> Self {
+        half::f16::from_f32(x)
+    }
+}
+
+impl NarrowFloat for half::bf16 {
+    #[inline(always)]
+    fn widen(self) -> f32 {
+        self.to_f32()
+    }
+    #[inline(always)]
+    fn narrow(x: f32) -> Self {
+        half::bf16::from_f32(x)
+    }
+}
+
 /// Real floating-point elements: a `Scalar` that additionally supports the
 /// scalar arithmetic the kernel epilogues need (`alpha`/`beta` scaling and the
 /// strided copy-back path). Implemented for `f32` and `f64`.
