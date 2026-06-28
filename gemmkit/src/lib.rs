@@ -58,8 +58,8 @@ mod special;
 mod workspace;
 
 pub use api::{
-    MatMut, MatRef, PackedRhs, gemm, gemm_packed_b, gemm_packed_b_with, gemm_unchecked,
-    gemm_unchecked_with, gemm_with, prepack_rhs,
+    MatMut, MatRef, PackedLhs, PackedRhs, gemm, gemm_packed_a, gemm_packed_a_with, gemm_packed_b,
+    gemm_packed_b_with, gemm_unchecked, gemm_unchecked_with, gemm_with, prepack_lhs, prepack_rhs,
 };
 pub use dispatch::GemmScalar;
 pub use parallel::Parallelism;

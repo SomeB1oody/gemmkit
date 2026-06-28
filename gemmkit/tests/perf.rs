@@ -599,6 +599,80 @@ fn perf_prepack() {
     }
 }
 
+/// Per-call throughput of a reused prepacked A (`gemm_packed_a`) vs plain `gemm`
+/// (which re-reads / re-packs A every call) for a fixed `(m, k)` operator A and a
+/// varying `n` (the batch width of the streamed B). The packed-LHS path drives the
+/// product transposed, so C is row-major here (its supported orientation) and `A`
+/// plays the transposed RHS. `a_col_major` is the strided case: after the transpose
+/// a column-major A is read by the driver with a large K-stride (`= m`) each call
+/// and, below the pack gate (transposed `m = n > 2048`), never packed — so the
+/// contiguous prepacked panel should win per call. Row-major A is the contiguous
+/// control. The win is the per-call speedup (the one-time pack amortizes away).
+fn bench_prepack_lhs(m: usize, k: usize, n: usize, a_col_major: bool, par: Parallelism) {
+    let a = fill(m * k, 1);
+    let b = fill(k * n, 2);
+    let (ars, acs) = if a_col_major {
+        (1, m as isize)
+    } else {
+        (k as isize, 1)
+    };
+    // Row-major C: the supported orientation for the prepacked-LHS path.
+    let mut c = vec![0.0f32; m * n];
+
+    let s_plain = measure(m, k, n, || {
+        gemm(
+            1.0,
+            MatRef::new(&a, m, k, ars, acs),
+            MatRef::from_col_major(&b, k, n),
+            0.0,
+            MatMut::from_row_major(&mut c, m, n),
+            par,
+        );
+    });
+    let packed = gemmkit::prepack_lhs(MatRef::new(&a, m, k, ars, acs));
+    let s_packed = measure(m, k, n, || {
+        gemmkit::gemm_packed_a(
+            1.0,
+            &packed,
+            MatRef::from_col_major(&b, k, n),
+            0.0,
+            MatMut::from_row_major(&mut c, m, n),
+            par,
+        );
+    });
+
+    let layout = if a_col_major { "colA" } else { "rowA" };
+    let mode = if matches!(par, Parallelism::Serial) {
+        "ser"
+    } else {
+        "par"
+    };
+    println!(
+        "  n={n:<5} m={m} k={k} {layout} {mode}  plain={:7.1} (±{:>2.0}%)  packed={:7.1} (±{:>2.0}%)  ({:.0}% of plain)",
+        s_plain.median,
+        s_plain.spread_pct(),
+        s_packed.median,
+        s_packed.spread_pct(),
+        100.0 * s_packed.median / s_plain.median.max(1e-9)
+    );
+}
+
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture"]
+fn perf_prepack_lhs() {
+    let _guard = BENCH_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    println!("\nprepacked-LHS reuse — per-call GFLOP/s, plain gemm vs gemm_packed_a (m=k=1024):");
+    for &acm in &[true, false] {
+        for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
+            // n past 2048 crosses the RHS-pack gate, where plain gemm re-packs the
+            // (fixed) A every call — the case prepacking should win most.
+            for &n in &[128usize, 512, 1024, 2048, 4096, 6144] {
+                bench_prepack_lhs(1024, 1024, n, acm, par);
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shared-LHS A-pack gate calibration
 // ---------------------------------------------------------------------------
