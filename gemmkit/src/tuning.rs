@@ -156,7 +156,7 @@ pub fn set_parallel_oversample(v: usize) {
 
 /// Get the auto worker-count ramp granularity (units of linear problem dimension
 /// per worker). `0` (the default) derives the stride from the machine's core count
-/// (see [`auto_thread_dim_stride`]); any non-zero env/setter value is used verbatim.
+/// (see `auto_thread_dim_stride`); any non-zero env/setter value is used verbatim.
 /// Always `>= 1` so the `cbrt(mnk).div_ceil(stride)` ramp cannot divide by zero.
 pub fn thread_dim_stride() -> usize {
     match THREAD_DIM_STRIDE.get() {

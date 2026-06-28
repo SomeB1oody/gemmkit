@@ -64,4 +64,4 @@ pub use scalar::{Float, Scalar};
 pub use workspace::Workspace;
 
 #[doc(no_inline)]
-pub use cache::{CacheTopology, topology};
+pub use cache::{CacheTopology, Machine, topology};

@@ -91,48 +91,76 @@ pub const ZEN5_FALLBACK: CacheTopology = CacheTopology {
     }),
 };
 
-#[cfg(feature = "std")]
-static TOPOLOGY: OnceLock<CacheTopology> = OnceLock::new();
-
-/// The detected cache topology (memoized; detection runs at most once).
-#[cfg(feature = "std")]
-pub fn topology() -> &'static CacheTopology {
-    TOPOLOGY.get_or_init(detect)
+/// Aggregated host facts detected once from the machine: the data-cache hierarchy
+/// used for blocking and the OS memory page size used for the LHS-packing stride
+/// gate. Detection runs at most once and is memoized behind a single `OnceLock`;
+/// [`topology`] and the crate-internal page-size accessor both read through here.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Machine {
+    /// The data-cache hierarchy used for blocking.
+    pub cache: CacheTopology,
+    /// The OS memory page size in bytes.
+    pub page_size: usize,
 }
 
-/// The detected cache topology. Without `std` there is no memoization or
-/// detection, so the calibrated fallback is returned.
-#[cfg(not(feature = "std"))]
-pub fn topology() -> &'static CacheTopology {
-    &ZEN5_FALLBACK
+#[cfg(feature = "std")]
+static MACHINE: OnceLock<Machine> = OnceLock::new();
+
+impl Machine {
+    /// The detected host facts (memoized; detection runs at most once).
+    #[cfg(feature = "std")]
+    pub fn current() -> &'static Machine {
+        MACHINE.get_or_init(|| Machine {
+            cache: detect(),
+            page_size: detect_page_size(),
+        })
+    }
+
+    /// Without `std` there is no memoization or detection, so the calibrated
+    /// fallback is returned (Zen5 cache geometry, 4 KiB page).
+    #[cfg(not(feature = "std"))]
+    pub fn current() -> &'static Machine {
+        static FALLBACK: Machine = Machine {
+            cache: ZEN5_FALLBACK,
+            page_size: 4096,
+        };
+        &FALLBACK
+    }
 }
 
-/// The OS memory page size in bytes (memoized). Drives the LHS-packing stride
-/// gate.
-///
-/// `getpagesize` is POSIX/BSD and present on both Linux and macOS; `std` already
-/// links libc so a bare declaration resolves with no extra dependency
+/// The detected cache topology (memoized via [`Machine`]; detection runs once).
+pub fn topology() -> &'static CacheTopology {
+    &Machine::current().cache
+}
+
+/// Detect the OS memory page size. `getpagesize` is POSIX/BSD and present on both
+/// Linux and macOS; `std` already links libc so a bare declaration resolves with
+/// no extra dependency. Called once from [`Machine::current`].
 #[cfg(all(unix, feature = "std", not(miri)))]
-pub(crate) fn page_size() -> usize {
-    static PAGE_SIZE: OnceLock<usize> = OnceLock::new();
-    *PAGE_SIZE.get_or_init(|| {
-        unsafe extern "C" {
-            fn getpagesize() -> core::ffi::c_int;
-        }
-        let p = unsafe { getpagesize() } as usize;
-        // A real base page is a power of two in a sane range; else fall back.
-        if p.is_power_of_two() && (4096..=2 * 1024 * 1024).contains(&p) {
-            p
-        } else {
-            4096
-        }
-    })
+fn detect_page_size() -> usize {
+    unsafe extern "C" {
+        fn getpagesize() -> core::ffi::c_int;
+    }
+    let p = unsafe { getpagesize() } as usize;
+    // A real base page is a power of two in a sane range; else fall back.
+    if p.is_power_of_two() && (4096..=2 * 1024 * 1024).contains(&p) {
+        p
+    } else {
+        4096
+    }
 }
 
-/// Page-size fallback for non-unix / no-std / Miri builds (assume the common 4 KiB)
-#[cfg(not(all(unix, feature = "std", not(miri))))]
-pub(crate) fn page_size() -> usize {
+/// Page-size detection fallback for non-unix / Miri `std` builds (assume the common
+/// 4 KiB). The no-`std` build skips detection entirely (see [`Machine::current`]).
+#[cfg(all(feature = "std", not(all(unix, not(miri)))))]
+fn detect_page_size() -> usize {
     4096
+}
+
+/// The OS memory page size in bytes (memoized via [`Machine`]). Drives the
+/// LHS-packing stride gate.
+pub(crate) fn page_size() -> usize {
+    Machine::current().page_size
 }
 
 /// The LHS-packing depth-stride gate in *bytes*. The `GEMMKIT_LHS_PACK_STRIDE`
@@ -293,6 +321,20 @@ impl CacheTopology {
 #[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
+
+    /// The aggregate is the single source of truth: it is memoized (every
+    /// `current()` hands back the same instance) and the back-compat accessors
+    /// `topology()` / `page_size()` read straight through it.
+    #[test]
+    fn machine_aggregates_and_memoizes() {
+        let m = Machine::current();
+        assert!(
+            core::ptr::eq(m, Machine::current()),
+            "current() must return the one memoized instance"
+        );
+        assert_eq!(&m.cache, topology(), "topology() must read through Machine");
+        assert_eq!(m.page_size, page_size(), "page_size() must read through Machine");
+    }
 
     /// The detected page size must be a power of two in a sane range (the
     /// LHS-packing stride gate is derived from it), on whatever host runs the test.
