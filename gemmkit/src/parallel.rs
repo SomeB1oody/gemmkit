@@ -52,12 +52,22 @@ impl Parallelism {
                 if mnk < gate {
                     return 1;
                 }
-                let max = if req == 0 { auto_threads() } else { req };
-                // Half the gate, so the gate behaves as a clean serial→2-thread
-                // step: just above it we get two workers, then it scales up.
-                let work_per_thread = (gate / 2).max(1);
-                let want = (mnk / work_per_thread).max(1);
-                want.min(max).min(n_jobs).max(1)
+                // Explicit count: honor it, capped by cores and jobs so
+                // `Rayon(huge)` can't over-subscribe or over-allocate pack regions.
+                // Only auto (below) is heuristic, so `Rayon(n)` gives the exact
+                // width the tests and scaling diagnostic ask for.
+                if req != 0 {
+                    return req.min(auto_threads()).min(n_jobs).max(1);
+                }
+                // Auto: ramp workers with the *linear* dimension (≈ cbrt of the
+                // work), not the total work — per-region fork/join + cursor
+                // contention grows with the worker count, so the optimum tracks ~n,
+                // not n³ (Zen5: 512→8, 1024→16, 2048→32). `div_ceil` avoids a dead
+                // band just above the gate and absorbs cbrt truncation. Stride is
+                // per-machine (`GEMMKIT_THREAD_DIM_STRIDE`, default 64).
+                let dim = (mnk as f64).cbrt() as usize; // ≈ n for square problems
+                let want = dim.div_ceil(tuning::thread_dim_stride());
+                want.min(auto_threads()).min(n_jobs).max(1)
             }
         }
     }

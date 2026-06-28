@@ -90,6 +90,13 @@ static GEMV_THRESHOLD: Threshold = Threshold::new("GEMMKIT_GEMV_THRESHOLD", usiz
 // rare packed-LHS path, more re-packing at chunk edges); lower = coarser
 static PARALLEL_OVERSAMPLE: Threshold = Threshold::new("GEMMKIT_PARALLEL_OVERSAMPLE", 8);
 
+// Auto worker-count ramp granularity (units of linear problem dimension per
+// worker): the auto `Rayon(0)` path targets `cbrt(m*n*k).div_ceil(this)` workers.
+// Default 64 is calibrated on the Zen5 9950X (16c/32t) so n=512→8, 1024→16,
+// 2048→32. Per-machine — override on other topologies until the value is derived
+// from the core/cache geometry rather than hard-coded.
+static THREAD_DIM_STRIDE: Threshold = Threshold::new("GEMMKIT_THREAD_DIM_STRIDE", 64);
+
 /// Get the serial/parallel work gate (`m*n*k` threshold).
 pub fn parallel_threshold() -> usize {
     PARALLEL_THRESHOLD.get()
@@ -146,4 +153,15 @@ pub fn parallel_oversample() -> usize {
 /// Override the parallel dynamic-scheduling oversample factor.
 pub fn set_parallel_oversample(v: usize) {
     PARALLEL_OVERSAMPLE.set(v);
+}
+
+/// Get the auto worker-count ramp granularity (units of linear problem dimension
+/// per worker). Always `>= 1` so the `cbrt(mnk).div_ceil(stride)` ramp cannot
+/// divide by zero.
+pub fn thread_dim_stride() -> usize {
+    THREAD_DIM_STRIDE.get().max(1)
+}
+/// Override the auto worker-count ramp granularity.
+pub fn set_thread_dim_stride(v: usize) {
+    THREAD_DIM_STRIDE.set(v);
 }

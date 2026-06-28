@@ -189,6 +189,23 @@ fn round_down(a: usize, b: usize) -> usize {
     (a / b) * b
 }
 
+/// MC cap, in microtile rows: the A macro-panel is bounded to `MC_REG_PANELS · MR`
+/// rows (BLIS keeps `MC` a small multiple of `MR`). This is a **per-cache-hierarchy
+/// calibration point, not an invariant**: it currently *binds* on every measured
+/// topology — Zen5 and Apple-class alike — so it overrides the L2-capacity-derived
+/// `MC`, which is why a larger (or cluster-shared) L2 does not actually move `MC`
+/// today. Revisit per hierarchy class and perf-validate on the target before
+/// changing the value.
+const MC_REG_PANELS: usize = 8;
+
+/// `NC` fallback when the machine reports no L3 (e.g. Apple Silicon, which exposes
+/// no conventional L3): a fixed, cache-agnostic column block of `NC_NO_L3_PANELS ·
+/// NR`. **Calibration point** — it ignores L2 size entirely, so the cluster-shared
+/// L2 does not influence `NC`. Deriving it from L2 (the de-facto last level when
+/// there is no L3) so the packed B macro-panel `KC·NC` fits the per-core L2 budget
+/// is the Apple-phase change; perf-validate on the target before changing it.
+const NC_NO_L3_PANELS: usize = 128;
+
 impl CacheTopology {
     /// Compute `(MC, KC, NC)` analytically (BLIS model) for the given microtile
     /// geometry and problem size.
@@ -250,12 +267,12 @@ impl CacheTopology {
         let mut mc = round_down(mc_from, mr).max(mr);
         let m_iter = m.div_ceil(mc).max(1);
         mc = (m.div_ceil(m_iter * mr) * mr).max(mr);
-        mc = mc.min(8 * mr); // BLIS hard cap
+        mc = mc.min(MC_REG_PANELS * mr); // BLIS hard cap (calibration point)
 
         // --- NC: B macro-panel resides in L3 (reserve one way for A) ---
         let nc = if l3 == 0 {
-            // No L3: a fixed, cache-agnostic column block.
-            (128 * nr).min(n.next_multiple_of(nr)).max(nr)
+            // No L3: a fixed, cache-agnostic column block (calibration point).
+            (NC_NO_L3_PANELS * nr).min(n.next_multiple_of(nr)).max(nr)
         } else {
             let rhs_l3_assoc = l3_assoc.saturating_sub(1).max(1);
             let rhs_macro_max = (rhs_l3_assoc * l3) / l3_assoc;

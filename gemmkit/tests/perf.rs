@@ -1,6 +1,13 @@
 //! Quick performance comparison vs the `gemm` crate and `matrixmultiply`.
-//! Ignored by default (it is a benchmark, not a correctness gate). Run with:
+//! Ignored by default (it is a benchmark, not a correctness gate).
+//!
+//! Each benchmark saturates every core, so the two `#[ignore]` tests
+//! (`perf_sgemm`, `perf_scaling`) must not run concurrently. They take a shared
+//! `BENCH_GUARD` lock, so even the default multi-threaded harness serializes them
+//! and `--test-threads=1` is optional. Run with:
 //!   cargo test -p gemmkit --release --test perf -- --ignored --nocapture
+//! or one at a time:
+//!   cargo test -p gemmkit --release --test perf perf_scaling -- --ignored --nocapture
 
 use std::time::Instant;
 
@@ -11,6 +18,12 @@ use gemmkit::simd::Fma;
 #[cfg(target_arch = "aarch64")]
 use gemmkit::simd::Neon;
 use gemmkit::{MatMut, MatRef, Parallelism, Workspace, gemm};
+
+/// Serializes the two core-saturating `#[ignore]` benches so the default
+/// multi-threaded test harness can't run them concurrently (which would make every
+/// GFLOP/s figure meaningless). Poisoning is ignored — a panicking bench must not
+/// wedge the other.
+static BENCH_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn fill(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed | 1;
@@ -24,15 +37,51 @@ fn fill(n: usize, seed: u64) -> Vec<f32> {
         .collect()
 }
 
-fn time<F: FnMut()>(iters: usize, mut f: F) -> f64 {
-    for _ in 0..2 {
-        f();
-    } // warmup
-    let t = Instant::now();
-    for _ in 0..iters {
-        f();
+/// Reps and per-batch target for the robust estimator below.
+const REPS: usize = 9;
+const BATCH_SECS: f64 = 0.07;
+
+/// A throughput sample: median GFLOP/s plus the min/max so run-to-run spread
+/// (this box swings ~15-20% on quick benches) is *visible* and tuning decisions
+/// are not made on noise.
+struct Stat {
+    median: f64,
+    min: f64,
+    max: f64,
+}
+
+impl Stat {
+    fn spread_pct(&self) -> f64 {
+        100.0 * (self.max - self.min) / self.median.max(1e-9)
     }
-    t.elapsed().as_secs_f64() / iters as f64
+}
+
+/// Robust throughput estimate: warm up, auto-calibrate the batch size to
+/// ~`BATCH_SECS`, then report the median GFLOP/s (and spread) over `REPS`
+/// batches. Far steadier than a single fixed-iter timing.
+fn measure<F: FnMut()>(m: usize, k: usize, n: usize, mut f: F) -> Stat {
+    for _ in 0..3 {
+        f();
+    } // warmup + thread-pool spin-up
+    let t0 = Instant::now();
+    f();
+    let one = t0.elapsed().as_secs_f64().max(1e-9);
+    let iters = ((BATCH_SECS / one).ceil() as usize).clamp(1, 200_000);
+    let mut g: Vec<f64> = Vec::with_capacity(REPS);
+    for _ in 0..REPS {
+        let t = Instant::now();
+        for _ in 0..iters {
+            f();
+        }
+        let secs = t.elapsed().as_secs_f64() / iters as f64;
+        g.push(gflops(m, k, n, secs));
+    }
+    g.sort_by(f64::total_cmp);
+    Stat {
+        median: g[REPS / 2],
+        min: g[0],
+        max: g[REPS - 1],
+    }
 }
 
 fn gflops(m: usize, k: usize, n: usize, secs: f64) -> f64 {
@@ -44,14 +93,13 @@ fn bench_one(s: usize, parallel: bool) {
     let a = fill(m * k, 1);
     let b = fill(k * n, 2);
     let mut c = vec![0.0f32; m * n];
-    let iters = if s <= 512 { 20 } else { 5 };
 
     let par = if parallel {
         Parallelism::Rayon(0)
     } else {
         Parallelism::Serial
     };
-    let t_kit = time(iters, || {
+    let s_kit = measure(m, k, n, || {
         gemm(
             1.0,
             MatRef::from_col_major(&a, m, k),
@@ -67,7 +115,7 @@ fn bench_one(s: usize, parallel: bool) {
     } else {
         gemm::Parallelism::None
     };
-    let t_gemm = time(iters, || unsafe {
+    let s_gemm = measure(m, k, n, || unsafe {
         gemm::gemm(
             m,
             n,
@@ -91,8 +139,17 @@ fn bench_one(s: usize, parallel: bool) {
         );
     });
 
-    let mm = if !parallel {
-        Some(time(iters, || unsafe {
+    let mode = if parallel { "par" } else { "ser" };
+    print!(
+        "  n={s:<5} {mode}  gemmkit={:7.1} (±{:>2.0}%)  gemm={:7.1} (±{:>2.0}%)  ({:.0}% of gemm)",
+        s_kit.median,
+        s_kit.spread_pct(),
+        s_gemm.median,
+        s_gemm.spread_pct(),
+        100.0 * s_kit.median / s_gemm.median.max(1e-9)
+    );
+    if !parallel {
+        let s_mm = measure(m, k, n, || unsafe {
             matrixmultiply::sgemm(
                 m,
                 k,
@@ -109,21 +166,12 @@ fn bench_one(s: usize, parallel: bool) {
                 1,
                 m as isize,
             );
-        }))
-    } else {
-        None
-    };
-
-    let g_kit = gflops(m, k, n, t_kit);
-    let g_gemm = gflops(m, k, n, t_gemm);
-    let mode = if parallel { "par" } else { "ser" };
-    print!(
-        "  n={s:<5} {mode}  gemmkit={g_kit:7.1}  gemm={g_gemm:7.1}  ({:.0}% of gemm)",
-        100.0 * g_kit / g_gemm
-    );
-    if let Some(t_mm) = mm {
-        let g_mm = gflops(m, k, n, t_mm);
-        print!("  mm={g_mm:7.1}  ({:.2}x mm)", g_kit / g_mm);
+        });
+        print!(
+            "  mm={:7.1}  ({:.2}x mm)",
+            s_mm.median,
+            s_kit.median / s_mm.median.max(1e-9)
+        );
     }
     println!();
 }
@@ -158,10 +206,9 @@ fn bench_native_equal_isa(s: usize) {
     let a = fill(m * k, 1);
     let b = fill(k * n, 2);
     let mut c = vec![0.0f32; m * n];
-    let iters = if s <= 512 { 20 } else { 5 };
     let mut ws = Workspace::new();
 
-    let t_kit = time(iters, || unsafe {
+    let s_kit = measure(m, k, n, || unsafe {
         driver::run::<FloatGemm<f32>, NativeTok, NATIVE_MR, NATIVE_NR>(
             NativeTok::default(),
             m,
@@ -182,7 +229,7 @@ fn bench_native_equal_isa(s: usize) {
             &mut ws,
         );
     });
-    let t_gemm = time(iters, || unsafe {
+    let s_gemm = measure(m, k, n, || unsafe {
         gemm::gemm(
             m,
             n,
@@ -205,18 +252,20 @@ fn bench_native_equal_isa(s: usize) {
             gemm::Parallelism::None,
         );
     });
-    let g_kit = gflops(m, k, n, t_kit);
-    let g_gemm = gflops(m, k, n, t_gemm);
     let label = NATIVE_LABEL;
     println!(
-        "  n={s:<5} ser  gemmkit-{label}={g_kit:7.1}  gemm-{label}={g_gemm:7.1}  ({:.0}% of gemm)",
-        100.0 * g_kit / g_gemm
+        "  n={s:<5} ser  gemmkit-{label}={:7.1} (±{:>2.0}%)  gemm-{label}={:7.1}  ({:.0}% of gemm)",
+        s_kit.median,
+        s_kit.spread_pct(),
+        s_gemm.median,
+        100.0 * s_kit.median / s_gemm.median
     );
 }
 
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
 fn perf_sgemm() {
+    let _guard = BENCH_GUARD.lock().unwrap_or_else(|e| e.into_inner());
     println!("\nsgemm GFLOP/s (f32, column-major) — gemmkit best-ISA vs gemm default:");
     for &s in &[256usize, 512, 1024, 2048] {
         bench_one(s, false);
@@ -230,5 +279,186 @@ fn perf_sgemm() {
         for &s in &[256usize, 512, 1024, 2048] {
             bench_native_equal_isa(s);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Parallel thread-scaling diagnostic (the mid-size-parallel gap)
+// ---------------------------------------------------------------------------
+
+/// The (MR, NR) tile the default `gemm()` dispatch uses on this target — used
+/// only to *estimate* the per-region job count (the parallel work granularity).
+/// Assumes the best available x86 ISA is AVX-512; if the box only has AVX2 the
+/// real tile is 16x6 and the printed job estimate is a lower bound.
+fn native_default_tile() -> (usize, usize) {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        (32, 12)
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        (16, 4)
+    }
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        (4, 4)
+    }
+}
+
+/// Print gemmkit's parallel *self*-scaling (and gemm's, for reference) at a fixed
+/// size across thread counts, so we can see *where* scaling breaks: poor speedup
+/// already at 2-4 threads => per-call fork/join + atomics overhead dominates the
+/// tiny work; a plateau after 8-16 => memory bandwidth or job starvation (compare
+/// against the printed ~jobs/region). Throughput is the median of `REPS`
+/// calibrated batches; the spread column flags differences smaller than the noise.
+fn bench_scaling(s: usize) {
+    let (m, k, n) = (s, s, s);
+    let a = fill(m * k, 1);
+    let b = fill(k * n, 2);
+    let mut c = vec![0.0f32; m * n];
+
+    let (mr, nr) = native_default_tile();
+    let blk = gemmkit::topology().blocking(mr, nr, 4, m, n, k);
+    let mc = blk.mc.next_multiple_of(mr).max(mr);
+    let nc = blk.nc.next_multiple_of(nr).max(nr);
+    let n_jobs = m.div_ceil(mc) * n.min(nc).div_ceil(nr);
+    println!(
+        "\n  n={s}  kc={} mc={} nc={}  ~{} jobs/region (tile {mr}x{nr}):",
+        blk.kc, mc, nc, n_jobs
+    );
+    println!("    thr |   gemmkit  spd  eff% | spread |     gemm  spd");
+
+    let base = measure(m, k, n, || {
+        gemm(
+            1.0,
+            MatRef::from_col_major(&a, m, k),
+            MatRef::from_col_major(&b, k, n),
+            0.0,
+            MatMut::from_col_major(&mut c, m, n),
+            Parallelism::Serial,
+        );
+    });
+    let gbase = measure(m, k, n, || unsafe {
+        gemm::gemm(
+            m,
+            n,
+            k,
+            c.as_mut_ptr(),
+            m as isize,
+            1,
+            false,
+            a.as_ptr(),
+            m as isize,
+            1,
+            b.as_ptr(),
+            k as isize,
+            1,
+            0.0,
+            1.0,
+            false,
+            false,
+            false,
+            gemm::Parallelism::None,
+        );
+    });
+
+    // The t=1 row is the serial `base`/`gbase` already measured (Rayon(1) resolves
+    // to the same single-worker path), so reuse them instead of re-measuring.
+    println!(
+        "      1 | {:9.1}  1.0x 100% | {:5.0}% | {:8.1}  1.0x",
+        base.median,
+        base.spread_pct(),
+        gbase.median
+    );
+
+    let avail = std::thread::available_parallelism()
+        .map(|x| x.get())
+        .unwrap_or(1);
+    for &t in &[2usize, 4, 8, 16, 32] {
+        let sk = measure(m, k, n, || {
+            gemm(
+                1.0,
+                MatRef::from_col_major(&a, m, k),
+                MatRef::from_col_major(&b, k, n),
+                0.0,
+                MatMut::from_col_major(&mut c, m, n),
+                Parallelism::Rayon(t),
+            );
+        });
+        let sg = measure(m, k, n, || unsafe {
+            gemm::gemm(
+                m,
+                n,
+                k,
+                c.as_mut_ptr(),
+                m as isize,
+                1,
+                false,
+                a.as_ptr(),
+                m as isize,
+                1,
+                b.as_ptr(),
+                k as isize,
+                1,
+                0.0,
+                1.0,
+                false,
+                false,
+                false,
+                gemm::Parallelism::Rayon(t),
+            );
+        });
+        let spd = sk.median / base.median.max(1e-9);
+        // Effective workers = what resolve() actually grants (capped by cores and
+        // the per-region job count), not the requested t — else eff% reads low
+        // where n_jobs throttles below t and masquerades as a bandwidth wall.
+        let workers = t.min(avail).min(n_jobs).max(1);
+        println!(
+            "    {t:3} | {:9.1} {:4.1}x {:3.0}% | {:5.0}% | {:8.1} {:4.1}x",
+            sk.median,
+            spd,
+            100.0 * spd / workers as f64,
+            sk.spread_pct(),
+            sg.median,
+            sg.median / gbase.median.max(1e-9)
+        );
+    }
+
+    // Auto row: the forced-t curve above never exercises the default `Rayon(0)`
+    // path production uses, so this is the only line that shows what the auto ramp
+    // actually selects and delivers. `auto_w` mirrors `resolve`'s auto branch
+    // (cbrt(mnk).div_ceil(stride), capped) for sizes above the serial gate.
+    let auto_w = (((m * k * n) as f64).cbrt() as usize)
+        .div_ceil(gemmkit::tuning::thread_dim_stride())
+        .min(avail)
+        .min(n_jobs)
+        .max(1);
+    let sk = measure(m, k, n, || {
+        gemm(
+            1.0,
+            MatRef::from_col_major(&a, m, k),
+            MatRef::from_col_major(&b, k, n),
+            0.0,
+            MatMut::from_col_major(&mut c, m, n),
+            Parallelism::Rayon(0),
+        );
+    });
+    let spd = sk.median / base.median.max(1e-9);
+    println!(
+        "   auto | {:9.1} {:4.1}x {:3.0}% | {:5.0}% | picks {auto_w} workers",
+        sk.median,
+        spd,
+        100.0 * spd / auto_w as f64,
+        sk.spread_pct()
+    );
+}
+
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture"]
+fn perf_scaling() {
+    let _guard = BENCH_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    println!("\nparallel thread-scaling (f32 col-major) — gemmkit default ISA vs gemm:");
+    for &s in &[256usize, 512, 1024, 2048] {
+        bench_scaling(s);
     }
 }
