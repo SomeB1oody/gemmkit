@@ -96,6 +96,158 @@ pub unsafe fn run<Fam, S, const MR_REG: usize, const NR: usize>(
     Fam: KernelFamily,
     S: SimdOps<Fam::Lhs> + SimdOps<Fam::Acc>,
 {
+    // SAFETY: forwarded to `run_inner` with no prepacked RHS (the standard path).
+    unsafe {
+        run_inner::<Fam, S, MR_REG, NR>(
+            simd, m, k, n, alpha, a, rsa, csa, b, rsb, csb, beta, c, rsc, csc, par, ws, None,
+        )
+    }
+}
+
+/// Run a GEMM whose RHS is already prepacked into micropanel-major layout by
+/// [`pack_rhs_full`] — the prepacked-operand reuse path (B2). `packed_b` is the
+/// prepacked buffer base; there are no RHS strides (the layout is baked in at pack
+/// time and read back here in the exact order the driver consumes panels). The
+/// buffer is *read-only* and shared immutably across all workers, so — unlike the
+/// internal per-call B-pack region — it needs no write-before-read barrier.
+///
+/// `kc`/`nc` are the blocking sizes the buffer was packed for (from
+/// [`pack_rhs_full`]); the driver uses them verbatim for the depth/column panel
+/// geometry instead of re-deriving them, so the panel addresses always match the
+/// buffer regardless of how this `m` would otherwise block. (`mc`, the A
+/// row-block size, is still derived from the cache model at the real `m`.)
+///
+/// # Safety
+/// As [`run`], plus: `packed_b` must point at a buffer produced by [`pack_rhs_full`]
+/// for the *same* `(k, n, kc, nc, nr=NR)` passed here.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn run_packed_rhs<Fam, S, const MR_REG: usize, const NR: usize>(
+    simd: S,
+    m: usize,
+    k: usize,
+    n: usize,
+    alpha: Fam::Acc,
+    a: *const Fam::Lhs,
+    rsa: isize,
+    csa: isize,
+    packed_b: *const Fam::Rhs,
+    kc: usize,
+    nc: usize,
+    beta: Fam::Acc,
+    c: *mut Fam::Out,
+    rsc: isize,
+    csc: isize,
+    par: Parallelism,
+    ws: &mut Workspace,
+) where
+    Fam: KernelFamily,
+    S: SimdOps<Fam::Lhs> + SimdOps<Fam::Acc>,
+{
+    // SAFETY: forwarded with the prepacked buffer and its packed (kc, nc); `rsb`/
+    // `csb` are unused on the prepacked path (the panel layout is baked in).
+    unsafe {
+        run_inner::<Fam, S, MR_REG, NR>(
+            simd,
+            m,
+            k,
+            n,
+            alpha,
+            a,
+            rsa,
+            csa,
+            packed_b,
+            0,
+            0,
+            beta,
+            c,
+            rsc,
+            csc,
+            par,
+            ws,
+            Some((packed_b, kc, nc)),
+        )
+    }
+}
+
+/// Pack the *entire* RHS of a fixed `(k, n)` problem into one micropanel-major
+/// buffer, laid out in the exact order [`run_packed_rhs`] reads panels: `jc` blocks
+/// (step `nc`) outermost, then depth slices `pc` (step `kc`), then the `n_nt`
+/// width-`nr` panels of that slice. The write cursor advances by `kc_eff * nr` per
+/// panel, so the bytes are identical to what the driver's own per-`(jc,pc)` packing
+/// would produce — making a prepacked GEMM bit-identical to a plain one. This is
+/// the single source of truth for the prepacked layout.
+///
+/// `dst` must hold `ceil(n/nr) * nr * k` elements (tail columns zero-filled by
+/// [`pack_panels`](crate::pack)). `kc`/`nc` are the blocking sizes the consuming
+/// call will resolve (the caller pins them).
+///
+/// # Safety
+/// `b` valid for the `k × n` region addressed by `rsb`/`csb`; `dst` valid for the
+/// element count above.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn pack_rhs_full<Fam: KernelFamily>(
+    dst: *mut Fam::Rhs,
+    b: *const Fam::Rhs,
+    rsb: isize,
+    csb: isize,
+    k: usize,
+    n: usize,
+    kc: usize,
+    nc: usize,
+    nr: usize,
+) {
+    unsafe {
+        let mut d = dst;
+        let mut jc = 0;
+        while jc < n {
+            let nc_eff = core::cmp::min(nc, n - jc);
+            let n_nt = nc_eff.div_ceil(nr);
+            let mut pc = 0;
+            while pc < k {
+                let kc_eff = core::cmp::min(kc, k - pc);
+                for jt in 0..n_nt {
+                    let col = jc + jt * nr;
+                    let nr_eff = core::cmp::min(nr, nc_eff - jt * nr);
+                    let src = b.offset(pc as isize * rsb + col as isize * csb);
+                    Fam::pack_rhs(d, src, rsb, csb, kc_eff, nr_eff, nr);
+                    d = d.add(kc_eff * nr);
+                }
+                pc += kc;
+            }
+            jc += nc;
+        }
+    }
+}
+
+/// The shared GEMM engine behind [`run`] (no prepacked RHS) and [`run_packed_rhs`]
+/// (`packed_b = Some(..)`). When prepacked, the per-call B-pack region is skipped
+/// and the compute region reads panels from the prepacked buffer instead.
+#[allow(clippy::too_many_arguments)]
+unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize>(
+    simd: S,
+    m: usize,
+    k: usize,
+    n: usize,
+    alpha: Fam::Acc,
+    a: *const Fam::Lhs,
+    rsa: isize,
+    csa: isize,
+    b: *const Fam::Rhs,
+    rsb: isize,
+    csb: isize,
+    beta: Fam::Acc,
+    c: *mut Fam::Out,
+    rsc: isize,
+    csc: isize,
+    par: Parallelism,
+    ws: &mut Workspace,
+    // `Some((buffer, kc, nc))` on the prepacked-RHS path: the buffer base plus the
+    // blocking sizes it was packed for (used verbatim so panel addresses match).
+    packed: Option<(*const Fam::Rhs, usize, usize)>,
+) where
+    Fam: KernelFamily,
+    S: SimdOps<Fam::Lhs> + SimdOps<Fam::Acc>,
+{
     unsafe {
         let lanes = <S as SimdOps<Fam::Lhs>>::LANES;
         let mr = MR_REG * lanes;
@@ -111,8 +263,14 @@ pub unsafe fn run<Fam, S, const MR_REG: usize, const NR: usize>(
         let sizeof_acc = core::mem::size_of::<Fam::Acc>().max(1);
         let blk = cache::topology().blocking(mr, nr, sizeof_acc, m, n, k);
         let mc = blk.mc.next_multiple_of(mr).max(mr);
-        let kc = blk.kc.max(1);
-        let nc = blk.nc.next_multiple_of(nr).max(nr);
+        // Depth/column panel sizes: from the cache model normally, but taken
+        // verbatim from the prepacked buffer's recorded geometry on the prepacked
+        // path so the global panel addressing always matches what was packed (the
+        // A row-block size `mc` is still model-derived at the real `m`).
+        let (kc, nc) = match packed {
+            Some((_, pkc, pnc)) => (pkc.max(1), pnc.next_multiple_of(nr).max(nr)),
+            None => (blk.kc.max(1), blk.nc.next_multiple_of(nr).max(nr)),
+        };
 
         let n_mc = m.div_ceil(mc); // row macro-blocks (constant across panels)
         let n_nt_max = nc.div_ceil(nr);
@@ -136,13 +294,18 @@ pub unsafe fn run<Fam, S, const MR_REG: usize, const NR: usize>(
                 >= pack_stride;
         let want_pack_lhs = reuse_cols > tuning::lhs_pack_threshold() || strided_lhs;
 
+        // A prepacked RHS (B2) is supplied whole, in micropanel-major layout, so
+        // the per-call B-pack is disabled and the compute region reads panels from
+        // the caller's read-only buffer instead.
+        let prepacked = packed.is_some();
+
         // Adaptive RHS packing: B (read only via broadcast, so any layout works
         // unpacked) is packed once and reused across all `n_mc` row blocks. The
         // copy amortizes only when that reuse is high (large `m`); otherwise B is
-        // read in place
-        let pack_b = m > tuning::rhs_pack_threshold();
+        // read in place. Never packed here when the RHS is already prepacked.
+        let pack_b = !prepacked && m > tuning::rhs_pack_threshold();
 
-        // One packing allocation
+        // One packing allocation (RHS scratch only when packing here)
         let a_per_thread = mc.next_multiple_of(mr) * kc;
         let b_elems = if pack_b {
             nc.next_multiple_of(nr) * kc
@@ -152,13 +315,21 @@ pub unsafe fn run<Fam, S, const MR_REG: usize, const NR: usize>(
         let regions = ws.regions::<Fam::Lhs>(a_per_thread, n_threads, b_elems);
         let a_base = Ptr(regions.a_base);
         let a_stride = regions.a_stride;
-        let b_base = Ptr(regions.b_base as *mut Fam::Rhs);
+        // Prepacked: read from the caller buffer; else from the per-call scratch.
+        let b_base = match packed {
+            Some((pb, _, _)) => Ptr(pb as *mut Fam::Rhs),
+            None => Ptr(regions.b_base as *mut Fam::Rhs),
+        };
 
         let a = Ptr(a as *mut Fam::Lhs);
         let b = Ptr(b as *mut Fam::Rhs);
         let c = Ptr(c);
         let ash = alpha_status(alpha);
 
+        // Running element offset of the current `jc` block inside a prepacked RHS
+        // buffer: each block holds `n_nt * nr * k` elements (every padded column
+        // appears once per depth row). Unused when not prepacked.
+        let mut jc_off = 0usize;
         let mut jc = 0;
         while jc < n {
             let nc_eff = core::cmp::min(nc, n - jc);
@@ -256,9 +427,20 @@ pub unsafe fn run<Fam, S, const MR_REG: usize, const NR: usize>(
 
                             let col = jc + jt * nr;
                             let nr_eff = core::cmp::min(nr, nc_eff - jt * nr);
-                            // Packed B -> contiguous panel with (NR, 1) strides
+                            // Prepacked B -> global panel at the layout-identity
+                            //   offset jc_off + nr*(n_nt*pc + jt*kc_eff)
+                            //   (pc == sum of prior kc_eff, so this matches the
+                            //   per-(jc,pc) layout pack_rhs_full wrote)
+                            // packed B -> per-slice contiguous panel with (NR, 1)
                             // unpacked B -> read in place with the original strides
-                            let (bpan, b_rs_k, b_cs_k) = if pack_b {
+                            let (bpan, b_rs_k, b_cs_k) = if prepacked {
+                                (
+                                    b_base.0.add(jc_off + nr * (n_nt * pc + jt * kc_eff))
+                                        as *const Fam::Rhs,
+                                    nr as isize,
+                                    1,
+                                )
+                            } else if pack_b {
                                 (
                                     b_base.0.add(jt * kc_eff * nr) as *const Fam::Rhs,
                                     nr as isize,
@@ -313,6 +495,7 @@ pub unsafe fn run<Fam, S, const MR_REG: usize, const NR: usize>(
 
                 pc += kc;
             }
+            jc_off += n_nt * nr * k;
             jc += nc;
         }
     }

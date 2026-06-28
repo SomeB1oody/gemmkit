@@ -462,3 +462,77 @@ fn perf_scaling() {
         bench_scaling(s);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Prepacked-RHS reuse (B2)
+// ---------------------------------------------------------------------------
+
+/// Per-call throughput of a reused prepacked B (`gemm_packed_b`) vs plain `gemm`
+/// (which re-reads / re-packs B every call) for a fixed `(k, n)` B and a varying
+/// `m` (the activation batch). `b_row_major` is the strided case: plain gemm reads
+/// B with a large K-stride each call and, below `m > 2048`, never packs it, so the
+/// contiguous prepacked panel should win per call. `colB` is the control. The win
+/// is the per-call speedup (the one-time pack amortizes away over many calls).
+fn bench_prepack(k: usize, n: usize, m: usize, b_row_major: bool, par: Parallelism) {
+    let a = fill(m * k, 1);
+    let b = fill(k * n, 2);
+    let (brs, bcs) = if b_row_major {
+        (n as isize, 1)
+    } else {
+        (1, k as isize)
+    };
+    let mut c = vec![0.0f32; m * n];
+
+    let s_plain = measure(m, k, n, || {
+        gemm(
+            1.0,
+            MatRef::from_col_major(&a, m, k),
+            MatRef::new(&b, k, n, brs, bcs),
+            0.0,
+            MatMut::from_col_major(&mut c, m, n),
+            par,
+        );
+    });
+    let packed = gemmkit::prepack_rhs(MatRef::new(&b, k, n, brs, bcs));
+    let s_packed = measure(m, k, n, || {
+        gemmkit::gemm_packed_b(
+            1.0,
+            MatRef::from_col_major(&a, m, k),
+            &packed,
+            0.0,
+            MatMut::from_col_major(&mut c, m, n),
+            par,
+        );
+    });
+
+    let layout = if b_row_major { "rowB" } else { "colB" };
+    let mode = if matches!(par, Parallelism::Serial) {
+        "ser"
+    } else {
+        "par"
+    };
+    println!(
+        "  m={m:<5} k={k} n={n} {layout} {mode}  plain={:7.1} (±{:>2.0}%)  packed={:7.1} (±{:>2.0}%)  ({:.0}% of plain)",
+        s_plain.median,
+        s_plain.spread_pct(),
+        s_packed.median,
+        s_packed.spread_pct(),
+        100.0 * s_packed.median / s_plain.median.max(1e-9)
+    );
+}
+
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture"]
+fn perf_prepack() {
+    let _guard = BENCH_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    println!(
+        "\nprepacked-RHS reuse (B2) — per-call GFLOP/s, plain gemm vs gemm_packed_b (k=n=1024):"
+    );
+    for &brm in &[true, false] {
+        for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
+            for &m in &[128usize, 512, 1024, 2048] {
+                bench_prepack(1024, 1024, m, brm, par);
+            }
+        }
+    }
+}

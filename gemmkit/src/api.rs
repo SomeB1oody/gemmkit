@@ -12,7 +12,7 @@
 //! through strides (a transposed view swaps `rs`/`cs`, no copy). When `beta == 0`
 //! the output C is **not read**, so it may be uninitialized.
 
-use crate::dispatch::{self, GemmScalar, Task};
+use crate::dispatch::{self, GemmScalar, PackedConsume, Task};
 use crate::parallel::Parallelism;
 use crate::workspace::{self, Workspace};
 
@@ -318,6 +318,199 @@ pub unsafe fn gemm_unchecked<T: GemmScalar>(
                 ws,
             );
         });
+    }
+}
+
+/// A right-hand-side matrix pre-packed once into gemmkit's internal
+/// micropanel-major layout, for reuse across many products that share the same
+/// `B` (the classic inference pattern: fixed weights, a stream of activation
+/// batches). Produced by [`prepack_rhs`] and consumed by [`gemm_packed_b`] /
+/// [`gemm_packed_b_with`], which skip the per-call RHS repack.
+///
+/// The packed layout is tied to the ISA tile and the blocking geometry the host
+/// resolves for `(k, n)`, both recorded here; the consuming call re-derives them
+/// at its real `m` and **panics** on any mismatch, so a panel can never be read
+/// against a different tiling. Because the buffer is read-only during the GEMM it
+/// is shared immutably across all worker threads with no extra synchronization.
+pub struct PackedRhs<T> {
+    buf: Vec<T>,
+    k: usize,
+    n: usize,
+    nr: usize,
+    kc: usize,
+    nc: usize,
+}
+
+impl<T> PackedRhs<T> {
+    /// Rows of the original `B` (the shared `k` dimension).
+    pub fn rows(&self) -> usize {
+        self.k
+    }
+    /// Columns of the original `B` (the `n` dimension).
+    pub fn cols(&self) -> usize {
+        self.n
+    }
+}
+
+/// Pre-pack a `k × n` RHS into [`PackedRhs`] for reuse across many [`gemm_packed_b`]
+/// calls. The pack happens once, single-threaded, here; later products skip it.
+///
+/// Any layout of `B` is accepted (the pack reads it through its strides). The
+/// resulting buffer is valid for products whose `(k, n)` match this `B` and whose
+/// `C` is column-major-ish (`|csc| >= |rsc|`); [`gemm_packed_b`] enforces both.
+///
+/// # Panics
+/// If `B`'s view addresses outside its slice (same bounds check as [`gemm`]).
+pub fn prepack_rhs<T: GemmScalar>(b: MatRef<'_, T>) -> PackedRhs<T> {
+    check_view(b.data, b.rows, b.cols, b.rs, b.cs, "B");
+    let (k, n) = (b.rows, b.cols);
+    // Resolve the panel geometry through the *same* ISA tile the consuming call
+    // will use; the `m = 65` sentinel dodges the tiny-matrix branch so `kc`/`nc`
+    // are `m`-independent and match any (non-both-tiny) consume.
+    let (mr, nr) = <T as GemmScalar>::rhs_tile();
+    let blk = crate::cache::topology().blocking(mr, nr, core::mem::size_of::<T>().max(1), 65, n, k);
+    let kc = blk.kc.max(1);
+    let nc = blk.nc.next_multiple_of(nr).max(nr);
+
+    let total = n.div_ceil(nr) * nr * k;
+    let mut buf = vec![T::ZERO; total];
+    if total > 0 {
+        // SAFETY: `buf` holds `ceil(n/nr)*nr*k` elements (the exact layout size);
+        // `b` is validated in-bounds above; `pack_rhs_full` writes only that range.
+        unsafe {
+            crate::driver::pack_rhs_full::<crate::kernel::FloatGemm<T>>(
+                buf.as_mut_ptr(),
+                b.data.as_ptr(),
+                b.rs,
+                b.cs,
+                k,
+                n,
+                kc,
+                nc,
+                nr,
+            );
+        }
+    }
+    PackedRhs {
+        buf,
+        k,
+        n,
+        nr,
+        kc,
+        nc,
+    }
+}
+
+/// `C <- alpha·A·B + beta·C` reusing a [`PackedRhs`] (pre-packed `B`), via the
+/// thread-local workspace pool. Skips the per-call RHS repack.
+///
+/// The result is **bit-identical** to a plain [`gemm`] on the same inputs for all
+/// but very small (`m <= 64 && n <= 64`) products: those alone block via a
+/// small-matrix shortcut that the prepacked path bypasses (it reuses the buffer's
+/// own blocking), so the result is still numerically correct but may differ from
+/// plain [`gemm`] in the last ULP. The output is bit-identical across thread counts
+/// regardless.
+///
+/// # Panics
+/// If the dimensions disagree (`A.cols != B.rows`, `A.rows != C.rows`,
+/// `B.cols != C.cols`), if `A` or `C` addresses outside its slice, if `C` aliases
+/// itself or `A`, or if `C` is **not** column-major-ish (`|csc| >= |rsc|`) — a
+/// row-major `C` would make the engine swap `A`/`B`, which a prepacked `B` cannot
+/// support (use plain [`gemm`] there).
+pub fn gemm_packed_b<T: GemmScalar>(
+    alpha: T,
+    a: MatRef<'_, T>,
+    packed: &PackedRhs<T>,
+    beta: T,
+    c: MatMut<'_, T>,
+    par: Parallelism,
+) {
+    workspace::with_thread_pool(|ws| gemm_packed_b_with(ws, alpha, a, packed, beta, c, par));
+}
+
+/// Like [`gemm_packed_b`] but reuses a caller-owned [`Workspace`].
+///
+/// # Panics
+/// Same conditions as [`gemm_packed_b`].
+pub fn gemm_packed_b_with<T: GemmScalar>(
+    ws: &mut Workspace,
+    alpha: T,
+    a: MatRef<'_, T>,
+    packed: &PackedRhs<T>,
+    beta: T,
+    c: MatMut<'_, T>,
+    par: Parallelism,
+) {
+    assert_eq!(
+        a.cols, packed.k,
+        "gemmkit: A.cols ({}) != packed B.rows ({})",
+        a.cols, packed.k
+    );
+    assert_eq!(
+        packed.n, c.cols,
+        "gemmkit: packed B.cols ({}) != C.cols ({})",
+        packed.n, c.cols
+    );
+    assert_eq!(
+        a.rows, c.rows,
+        "gemmkit: A.rows ({}) != C.rows ({})",
+        a.rows, c.rows
+    );
+
+    check_view(a.data, a.rows, a.cols, a.rs, a.cs, "A");
+    check_view(c.data, c.rows, c.cols, c.rs, c.cs, "C");
+
+    if self_aliases(c.rows, c.cols, c.rs, c.cs) {
+        panic!(
+            "gemmkit: C view aliases itself (strides {},{} map distinct elements to the same \
+             memory); C must address each (i,j) uniquely",
+            c.rs, c.cs
+        );
+    }
+
+    // C must not alias A (it is written). The prepacked B is a separate owned
+    // buffer, so it cannot alias C.
+    let cp = c.data.as_ptr();
+    let cl = c.data.len();
+    if overlaps(cp, cl, a.data.as_ptr(), a.data.len()) {
+        panic!("gemmkit: C aliases A");
+    }
+
+    // A prepacked B is only valid for the no-swap orientation. The engine computes
+    // Cᵀ = Bᵀ·Aᵀ when C is row-major-ish (|csc| < |rsc|), which would make the
+    // prepacked operand play the LHS role — wrong layout. Require column-major-ish
+    // C and direct callers to plain `gemm` otherwise.
+    assert!(
+        c.cs.unsigned_abs() >= c.rs.unsigned_abs(),
+        "gemmkit: gemm_packed_b requires column-major-ish C (|csc| >= |rsc|); a row-major C \
+         would swap A/B and invalidate the prepacked RHS — use gemm() for that layout"
+    );
+
+    // SAFETY: validated above — shapes agree, A/C strides are in bounds, C does not
+    // alias A, and the packed buffer (owned by `packed`, read-only) outlives the
+    // call and matches the recorded (nr, kc, nc) geometry.
+    unsafe {
+        dispatch::execute_packed(
+            PackedConsume {
+                m: a.rows,
+                k: a.cols,
+                n: packed.n,
+                alpha,
+                a: a.data.as_ptr(),
+                rsa: a.rs,
+                csa: a.cs,
+                packed: packed.buf.as_ptr(),
+                nr: packed.nr,
+                kc: packed.kc,
+                nc: packed.nc,
+                beta,
+                c: c.data.as_mut_ptr(),
+                rsc: c.rs,
+                csc: c.cs,
+            },
+            par,
+            ws,
+        );
     }
 }
 

@@ -67,6 +67,41 @@ pub struct Task<T> {
     pub csc: isize,
 }
 
+/// A GEMM whose RHS is already prepacked (the reuse path, B2):
+/// `C <- alpha·A·(prepacked B) + beta·C`. Carries the blocking geometry the
+/// buffer was packed for (`nr`, `kc`, `nc`), which the consume path re-derives at
+/// the real `m` and asserts matches — so a reused panel can never be read against
+/// a different tiling.
+///
+/// `pub` (like [`Task`]) only so it can appear in the doc-hidden [`GemmScalar`]
+/// methods; the `dispatch` module is private, so it is not nameable externally.
+pub struct PackedConsume<T> {
+    /// Rows of A and C.
+    pub m: usize,
+    /// Shared dimension (cols of A == prepacked B's depth).
+    pub k: usize,
+    /// Cols of the prepacked B and of C.
+    pub n: usize,
+    /// Product scale.
+    pub alpha: T,
+    /// LHS base pointer + strides.
+    pub a: *const T,
+    pub rsa: isize,
+    pub csa: isize,
+    /// Prepacked RHS micropanel buffer base (see [`crate::driver::pack_rhs_full`]).
+    pub packed: *const T,
+    /// Blocking geometry baked into `packed` at pack time.
+    pub nr: usize,
+    pub kc: usize,
+    pub nc: usize,
+    /// Accumulator scale.
+    pub beta: T,
+    /// Output base pointer + strides.
+    pub c: *mut T,
+    pub rsc: isize,
+    pub csc: isize,
+}
+
 /// Element types gemmkit can dispatch. Sealed in practice: only `f32` and `f64`
 /// have a registered dispatch table in v1.
 pub trait GemmScalar: Float<Acc = Self> {
@@ -76,6 +111,21 @@ pub trait GemmScalar: Float<Acc = Self> {
     /// `task`'s pointers must be valid and `c` must not alias `a`/`b`.
     #[doc(hidden)]
     unsafe fn dispatch(task: Task<Self>, par: Parallelism, ws: &mut Workspace);
+
+    /// Run the dispatched **prepacked-RHS** kernel for this type (B2).
+    ///
+    /// # Safety
+    /// `req`'s pointers must be valid, `c` must not alias `a`/`packed`, and
+    /// `packed` must have been produced by [`crate::driver::pack_rhs_full`] for
+    /// the geometry recorded in `req`.
+    #[doc(hidden)]
+    unsafe fn dispatch_packed(req: PackedConsume<Self>, par: Parallelism, ws: &mut Workspace);
+
+    /// The selected kernel's microtile `(mr, nr)` = `(MR_REG·LANES, NR)`. Used by
+    /// the prepack constructor to compute the buffer's blocking geometry through
+    /// the *same* ISA choice the consuming call will make.
+    #[doc(hidden)]
+    fn rhs_tile() -> (usize, usize);
 }
 
 /// Top-level entry used by the API layer: handle the degenerate cases (here,
@@ -95,6 +145,30 @@ pub(crate) unsafe fn execute<T: GemmScalar>(task: Task<T>, par: Parallelism, ws:
             return;
         }
         T::dispatch(task, par, ws);
+    }
+}
+
+/// Top-level entry for the prepacked-RHS path (B2): handle the degenerate cases
+/// (the A·B term vanishes ⇒ `C <- beta·C`, never touching the packed buffer) and
+/// then run the ISA-dispatched prepacked kernel.
+///
+/// # Safety
+/// As [`execute`], plus `req.packed` valid for the recorded geometry and not
+/// aliasing `c`.
+pub(crate) unsafe fn execute_packed<T: GemmScalar>(
+    req: PackedConsume<T>,
+    par: Parallelism,
+    ws: &mut Workspace,
+) {
+    unsafe {
+        if req.m == 0 || req.n == 0 {
+            return;
+        }
+        if req.k == 0 || req.alpha == T::ZERO {
+            scale_c::<T>(req.beta, req.c, req.m, req.n, req.rsc, req.csc);
+            return;
+        }
+        T::dispatch_packed(req, par, ws);
     }
 }
 
@@ -163,6 +237,37 @@ unsafe fn run_typed<T, S, const MR_REG: usize, const NR: usize>(
     }
 }
 
+/// Prepacked-RHS driver entry for a concrete `(type, ISA, tile)` (B2). No gemv
+/// route and **no orientation swap** — the API guarantees column-major-ish C
+/// (`|csc| >= |rsc|`), so the prepacked buffer is always the genuine RHS.
+///
+/// # Safety
+/// As [`run_typed`], plus `req.packed` valid for the recorded geometry.
+#[inline]
+unsafe fn run_packed_typed<T, S, const MR_REG: usize, const NR: usize>(
+    simd: S,
+    req: PackedConsume<T>,
+    par: Parallelism,
+    ws: &mut Workspace,
+) where
+    T: Float<Acc = T>,
+    S: SimdOps<T>,
+{
+    unsafe {
+        // The buffer carries the blocking geometry (`kc`, `nc`) it was packed for;
+        // the driver reads panels with exactly that geometry, so nothing is
+        // re-derived and the panel addresses always match the buffer regardless of
+        // how this `m` would otherwise block. `nr` is structural (the panel width
+        // is this kernel's `NR`); a single process's memoized ISA choice guarantees
+        // agreement, asserted in debug builds.
+        debug_assert_eq!(NR, req.nr, "prepacked RHS panel width != kernel NR");
+        driver::run_packed_rhs::<FloatGemm<T>, S, MR_REG, NR>(
+            simd, req.m, req.k, req.n, req.alpha, req.a, req.rsa, req.csa, req.packed, req.kc,
+            req.nc, req.beta, req.c, req.rsc, req.csc, par, ws,
+        );
+    }
+}
+
 // ---- per-type, per-ISA monomorphized entry points (the dispatch slots) ----
 //
 // Tile geometry (MR_REG, NR) is the *only* per-(type, ISA) knob; everything else
@@ -212,7 +317,113 @@ unsafe fn gemm_f64_neon(t: Task<f64>, par: Parallelism, ws: &mut Workspace) {
     unsafe { run_typed::<f64, Neon, 4, 4>(Neon, t, par, ws) }
 }
 
+// ---- prepacked-RHS (B2) entry points: one per (type, ISA), same tiles ----
+
+unsafe fn gemm_f32_scalar_packed(r: PackedConsume<f32>, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_packed_typed::<f32, ScalarTok, 4, 4>(ScalarTok, r, par, ws) }
+}
+unsafe fn gemm_f64_scalar_packed(r: PackedConsume<f64>, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_packed_typed::<f64, ScalarTok, 4, 4>(ScalarTok, r, par, ws) }
+}
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+unsafe fn gemm_f32_fma_packed(r: PackedConsume<f32>, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_packed_typed::<f32, Fma, 2, 6>(Fma, r, par, ws) }
+}
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+unsafe fn gemm_f64_fma_packed(r: PackedConsume<f64>, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_packed_typed::<f64, Fma, 2, 6>(Fma, r, par, ws) }
+}
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+unsafe fn gemm_f32_avx512_packed(r: PackedConsume<f32>, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_packed_typed::<f32, Avx512, 2, 12>(Avx512, r, par, ws) }
+}
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+unsafe fn gemm_f64_avx512_packed(r: PackedConsume<f64>, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_packed_typed::<f64, Avx512, 2, 12>(Avx512, r, par, ws) }
+}
+#[cfg(target_arch = "aarch64")]
+unsafe fn gemm_f32_neon_packed(r: PackedConsume<f32>, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_packed_typed::<f32, Neon, 4, 4>(Neon, r, par, ws) }
+}
+#[cfg(target_arch = "aarch64")]
+unsafe fn gemm_f64_neon_packed(r: PackedConsume<f64>, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_packed_typed::<f64, Neon, 4, 4>(Neon, r, par, ws) }
+}
+
 type GemmFn<T> = unsafe fn(Task<T>, Parallelism, &mut Workspace);
+type PackedFn<T> = unsafe fn(PackedConsume<T>, Parallelism, &mut Workspace);
+
+/// The memoized dispatch slot for one element type: the standard kernel, the
+/// prepacked-RHS kernel, and the microtile `(mr, nr)` they share. Bundling them
+/// keeps adding an ISA a single `select_*` ladder arm. `mr`/`nr` mirror the tile
+/// constants in the wrappers above; the consume path re-derives `mr` from
+/// `MR_REG·LANES` and asserts the resulting blocking matches, so a stale literal
+/// fails loudly rather than silently.
+#[derive(Copy, Clone)]
+struct Dispatched<T> {
+    run: GemmFn<T>,
+    run_packed: PackedFn<T>,
+    mr: usize,
+    nr: usize,
+}
+
+// One descriptor per (type, ISA). `mr = MR_REG·LANES`, `nr = NR` — mirrors the
+// tile in each wrapper's comment (scalar 4×4; FMA 16×6 / f64 8×6; AVX-512 32×12 /
+// f64 16×12; NEON 16×4 / f64 8×4).
+const DISP_F32_SCALAR: Dispatched<f32> = Dispatched {
+    run: gemm_f32_scalar,
+    run_packed: gemm_f32_scalar_packed,
+    mr: 4,
+    nr: 4,
+};
+const DISP_F64_SCALAR: Dispatched<f64> = Dispatched {
+    run: gemm_f64_scalar,
+    run_packed: gemm_f64_scalar_packed,
+    mr: 4,
+    nr: 4,
+};
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+const DISP_F32_FMA: Dispatched<f32> = Dispatched {
+    run: gemm_f32_fma,
+    run_packed: gemm_f32_fma_packed,
+    mr: 16,
+    nr: 6,
+};
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+const DISP_F64_FMA: Dispatched<f64> = Dispatched {
+    run: gemm_f64_fma,
+    run_packed: gemm_f64_fma_packed,
+    mr: 8,
+    nr: 6,
+};
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+const DISP_F32_AVX512: Dispatched<f32> = Dispatched {
+    run: gemm_f32_avx512,
+    run_packed: gemm_f32_avx512_packed,
+    mr: 32,
+    nr: 12,
+};
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+const DISP_F64_AVX512: Dispatched<f64> = Dispatched {
+    run: gemm_f64_avx512,
+    run_packed: gemm_f64_avx512_packed,
+    mr: 16,
+    nr: 12,
+};
+#[cfg(target_arch = "aarch64")]
+const DISP_F32_NEON: Dispatched<f32> = Dispatched {
+    run: gemm_f32_neon,
+    run_packed: gemm_f32_neon_packed,
+    mr: 16,
+    nr: 4,
+};
+#[cfg(target_arch = "aarch64")]
+const DISP_F64_NEON: Dispatched<f64> = Dispatched {
+    run: gemm_f64_neon,
+    run_packed: gemm_f64_neon_packed,
+    mr: 8,
+    nr: 4,
+};
 
 /// An explicitly requested kernel, parsed from `GEMMKIT_REQUIRE_ISA`.
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -257,16 +468,16 @@ fn forced_isa() -> ForcedIsa {
     ForcedIsa::Auto
 }
 
-fn select_f32() -> GemmFn<f32> {
+fn select_f32() -> Dispatched<f32> {
     match forced_isa() {
-        ForcedIsa::Scalar => return gemm_f32_scalar,
+        ForcedIsa::Scalar => return DISP_F32_SCALAR,
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         ForcedIsa::Fma => {
             assert!(
                 is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma"),
                 "GEMMKIT_REQUIRE_ISA=fma, but this CPU/emulator does not report avx2+fma"
             );
-            return gemm_f32_fma;
+            return DISP_F32_FMA;
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         ForcedIsa::Avx512 => {
@@ -274,14 +485,14 @@ fn select_f32() -> GemmFn<f32> {
                 is_x86_feature_detected!("avx512f"),
                 "GEMMKIT_REQUIRE_ISA=avx512, but this CPU/emulator does not report avx512f"
             );
-            return gemm_f32_avx512;
+            return DISP_F32_AVX512;
         }
         #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
         ForcedIsa::Fma | ForcedIsa::Avx512 => {
             panic!("GEMMKIT_REQUIRE_ISA: requested SIMD ISA is unavailable on this target")
         }
         #[cfg(target_arch = "aarch64")]
-        ForcedIsa::Neon => return gemm_f32_neon, // NEON is baseline on aarch64
+        ForcedIsa::Neon => return DISP_F32_NEON, // NEON is baseline on aarch64
         #[cfg(not(target_arch = "aarch64"))]
         ForcedIsa::Neon => {
             panic!("GEMMKIT_REQUIRE_ISA=neon, but this target is not aarch64")
@@ -291,34 +502,34 @@ fn select_f32() -> GemmFn<f32> {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         if is_x86_feature_detected!("avx512f") {
-            return gemm_f32_avx512;
+            return DISP_F32_AVX512;
         }
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            return gemm_f32_fma;
+            return DISP_F32_FMA;
         }
     }
     // NEON is mandatory on aarch64: it is always the Auto choice there, so the
     // scalar fallback below is gated out (it would be unreachable) on aarch64.
     #[cfg(target_arch = "aarch64")]
     {
-        gemm_f32_neon
+        DISP_F32_NEON
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
-        gemm_f32_scalar
+        DISP_F32_SCALAR
     }
 }
 
-fn select_f64() -> GemmFn<f64> {
+fn select_f64() -> Dispatched<f64> {
     match forced_isa() {
-        ForcedIsa::Scalar => return gemm_f64_scalar,
+        ForcedIsa::Scalar => return DISP_F64_SCALAR,
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         ForcedIsa::Fma => {
             assert!(
                 is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma"),
                 "GEMMKIT_REQUIRE_ISA=fma, but this CPU/emulator does not report avx2+fma"
             );
-            return gemm_f64_fma;
+            return DISP_F64_FMA;
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         ForcedIsa::Avx512 => {
@@ -326,14 +537,14 @@ fn select_f64() -> GemmFn<f64> {
                 is_x86_feature_detected!("avx512f"),
                 "GEMMKIT_REQUIRE_ISA=avx512, but this CPU/emulator does not report avx512f"
             );
-            return gemm_f64_avx512;
+            return DISP_F64_AVX512;
         }
         #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
         ForcedIsa::Fma | ForcedIsa::Avx512 => {
             panic!("GEMMKIT_REQUIRE_ISA: requested SIMD ISA is unavailable on this target")
         }
         #[cfg(target_arch = "aarch64")]
-        ForcedIsa::Neon => return gemm_f64_neon, // NEON is baseline on aarch64
+        ForcedIsa::Neon => return DISP_F64_NEON, // NEON is baseline on aarch64
         #[cfg(not(target_arch = "aarch64"))]
         ForcedIsa::Neon => {
             panic!("GEMMKIT_REQUIRE_ISA=neon, but this target is not aarch64")
@@ -343,47 +554,83 @@ fn select_f64() -> GemmFn<f64> {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         if is_x86_feature_detected!("avx512f") {
-            return gemm_f64_avx512;
+            return DISP_F64_AVX512;
         }
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            return gemm_f64_fma;
+            return DISP_F64_FMA;
         }
     }
     // NEON is mandatory on aarch64: it is always the Auto choice there, so the
     // scalar fallback below is gated out (it would be unreachable) on aarch64.
     #[cfg(target_arch = "aarch64")]
     {
-        gemm_f64_neon
+        DISP_F64_NEON
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
-        gemm_f64_scalar
+        DISP_F64_SCALAR
     }
 }
 
 #[cfg(feature = "std")]
-static GEMM_F32: OnceLock<GemmFn<f32>> = OnceLock::new();
+static GEMM_F32: OnceLock<Dispatched<f32>> = OnceLock::new();
 #[cfg(feature = "std")]
-static GEMM_F64: OnceLock<GemmFn<f64>> = OnceLock::new();
+static GEMM_F64: OnceLock<Dispatched<f64>> = OnceLock::new();
+
+/// The memoized dispatch descriptor for `f32` (selection runs once).
+#[inline]
+fn dispatched_f32() -> Dispatched<f32> {
+    #[cfg(feature = "std")]
+    {
+        *GEMM_F32.get_or_init(select_f32)
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        select_f32()
+    }
+}
+
+/// The memoized dispatch descriptor for `f64` (selection runs once).
+#[inline]
+fn dispatched_f64() -> Dispatched<f64> {
+    #[cfg(feature = "std")]
+    {
+        *GEMM_F64.get_or_init(select_f64)
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        select_f64()
+    }
+}
 
 impl GemmScalar for f32 {
     #[inline]
     unsafe fn dispatch(task: Task<f32>, par: Parallelism, ws: &mut Workspace) {
-        #[cfg(feature = "std")]
-        let f = *GEMM_F32.get_or_init(select_f32);
-        #[cfg(not(feature = "std"))]
-        let f = select_f32();
-        unsafe { f(task, par, ws) }
+        unsafe { (dispatched_f32().run)(task, par, ws) }
+    }
+    #[inline]
+    unsafe fn dispatch_packed(req: PackedConsume<f32>, par: Parallelism, ws: &mut Workspace) {
+        unsafe { (dispatched_f32().run_packed)(req, par, ws) }
+    }
+    #[inline]
+    fn rhs_tile() -> (usize, usize) {
+        let d = dispatched_f32();
+        (d.mr, d.nr)
     }
 }
 
 impl GemmScalar for f64 {
     #[inline]
     unsafe fn dispatch(task: Task<f64>, par: Parallelism, ws: &mut Workspace) {
-        #[cfg(feature = "std")]
-        let f = *GEMM_F64.get_or_init(select_f64);
-        #[cfg(not(feature = "std"))]
-        let f = select_f64();
-        unsafe { f(task, par, ws) }
+        unsafe { (dispatched_f64().run)(task, par, ws) }
+    }
+    #[inline]
+    unsafe fn dispatch_packed(req: PackedConsume<f64>, par: Parallelism, ws: &mut Workspace) {
+        unsafe { (dispatched_f64().run_packed)(req, par, ws) }
+    }
+    #[inline]
+    fn rhs_tile() -> (usize, usize) {
+        let d = dispatched_f64();
+        (d.mr, d.nr)
     }
 }
