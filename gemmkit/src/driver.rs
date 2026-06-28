@@ -164,6 +164,17 @@ pub unsafe fn run<Fam, S, const MR_REG: usize, const NR: usize>(
             let nc_eff = core::cmp::min(nc, n - jc);
             let n_nt = nc_eff.div_ceil(nr);
 
+            // Job count and cursor grain depend only on this column panel and the worker
+            // count — invariant across the depth (`pc`) loop, so compute them once here.
+            // The packed-LHS path (whole-row-block chunks) is split for load balance; the
+            // general path uses the shared `job_grain` oversample. See `packed_block_grain`.
+            let n_jobs = n_mc * n_nt;
+            let grain = if (rsa != 1 || want_pack_lhs) && n_mc >= n_threads {
+                parallel::packed_block_grain(n_nt, n_mc, n_threads)
+            } else {
+                parallel::job_grain(n_jobs, n_threads)
+            };
+
             let mut pc = 0;
             while pc < k {
                 let kc_eff = core::cmp::min(kc, k - pc);
@@ -199,14 +210,6 @@ pub unsafe fn run<Fam, S, const MR_REG: usize, const NR: usize>(
                     });
                 }
 
-                let n_jobs = n_mc * n_nt;
-
-                // Dynamic self-scheduling for big.LITTLE heterogeneous layouts
-                let grain = if (rsa != 1 || want_pack_lhs) && n_mc >= n_threads {
-                    n_nt
-                } else {
-                    parallel::job_grain(n_jobs, n_threads)
-                };
                 let cur = parallel::JobCursor::new(n_jobs, grain);
 
                 parallel::for_each_worker(n_threads, |tid| {

@@ -200,10 +200,14 @@ const MC_REG_PANELS: usize = 8;
 
 /// `NC` fallback when the machine reports no L3 (e.g. Apple Silicon, which exposes
 /// no conventional L3): a fixed, cache-agnostic column block of `NC_NO_L3_PANELS ·
-/// NR`. **Calibration point** — it ignores L2 size entirely, so the cluster-shared
-/// L2 does not influence `NC`. Deriving it from L2 (the de-facto last level when
-/// there is no L3) so the packed B macro-panel `KC·NC` fits the per-core L2 budget
-/// is the Apple-phase change; perf-validate on the target before changing it.
+/// NR`. **Calibration point** — it ignores L2 size entirely.
+///
+/// Per the BLIS model, with no L3 `NC` is redundant and should stay *large* (B streams
+/// from DRAM; the `MC·KC` A panel is what fits the last-level cache) — shrinking it to
+/// an L2 fit is the wrong direction (more jc panels = more barriers, measured slower).
+/// Going to full-`N` does lift parallel throughput but hurts serial, and
+/// thread-count-independent blocking (a bit-identity invariant) can't branch the two;
+/// `512` (= `128·NR`) is the kept middle ground. Perf-validate before changing.
 const NC_NO_L3_PANELS: usize = 128;
 
 impl CacheTopology {
