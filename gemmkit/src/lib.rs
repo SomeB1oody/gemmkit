@@ -63,8 +63,14 @@ pub use api::{
 };
 pub use dispatch::GemmScalar;
 pub use parallel::Parallelism;
-pub use scalar::{Float, Scalar};
+pub use scalar::{Float, NarrowFloat, Scalar};
 pub use workspace::Workspace;
 
 #[doc(no_inline)]
 pub use cache::{CacheTopology, Machine, topology};
+
+/// Re-exported [`half`] narrow float types (`f16`, `bf16`), so callers can run a
+/// mixed-precision GEMM without depending on `half` directly. They accumulate in
+/// `f32` (their [`Scalar::Acc`]).
+#[doc(no_inline)]
+pub use half::{bf16, f16};

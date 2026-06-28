@@ -11,7 +11,7 @@ use core::marker::PhantomData;
 use super::{AlphaStatus, BetaStatus, KernelFamily};
 use crate::pack::pack_panels;
 use crate::scalar::Float;
-use crate::simd::SimdOps;
+use crate::simd::{KernelSimd, SimdOps};
 
 /// The real floating-point GEMM family (`Lhs = Rhs = Acc = Out = T`).
 pub struct FloatGemm<T>(PhantomData<T>);
@@ -94,7 +94,7 @@ where
         nr_eff: usize,
         scratch: *mut T,
     ) where
-        S: SimdOps<T>,
+        S: KernelSimd<T, T, T, T>,
     {
         unsafe {
             let lanes = <S as SimdOps<T>>::LANES;

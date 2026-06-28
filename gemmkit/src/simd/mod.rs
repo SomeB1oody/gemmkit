@@ -49,6 +49,66 @@ pub use self::fma::Fma;
 pub use self::neon::Neon;
 pub use self::scalar::ScalarTok;
 
+/// The SIMD capability an ISA token must provide to drive a [`crate::kernel::KernelFamily`]
+/// with input types `L`/`R`, accumulator `A`, and output `O`: accumulate in `A`
+/// (the [`SimdOps<A>`] supertrait) and move family inputs/outputs in and out of the
+/// `A`-typed registers, **widening on load and narrowing on store** when the element
+/// types are narrower than `A`.
+///
+/// This is the seam that makes **mixed precision** (`A != L`) work without a per-type
+/// branch in the driver. The homogeneous case (`L = R = A = O`, every float family
+/// today) is covered by a single blanket impl that forwards to plain
+/// [`SimdOps`] load/splat/store; a narrow family (`f16`/`bf16` inputs, `f32`
+/// accumulator) adds an ISA impl whose `load_*` widens and `store_out` narrows. The
+/// all-equal blanket and a mixed impl (which has `L != A`) can never overlap, so the
+/// two coexist cleanly.
+pub trait KernelSimd<L: Scalar, R: Scalar, A: Scalar, O: Scalar>: SimdOps<A> {
+    /// Load `LANES` LHS values and widen to one `A` register (plain load if `L == A`).
+    ///
+    /// # Safety
+    /// `p` valid for `LANES` reads; run inside this token's [`Simd::vectorize`].
+    unsafe fn load_lhs(self, p: *const L) -> <Self as SimdOps<A>>::Reg;
+    /// Widen one RHS scalar and broadcast to all `A` lanes (plain splat if `R == A`).
+    ///
+    /// # Safety
+    /// See the trait-level note.
+    unsafe fn splat_rhs(self, v: R) -> <Self as SimdOps<A>>::Reg;
+    /// Load `LANES` output values and widen to one `A` register, for the `beta != 0`
+    /// read of `C` (plain load if `O == A`).
+    ///
+    /// # Safety
+    /// `p` valid for `LANES` reads; run inside [`Simd::vectorize`].
+    unsafe fn load_out(self, p: *const O) -> <Self as SimdOps<A>>::Reg;
+    /// Narrow one `A` register to `LANES` output values and store (plain store if
+    /// `O == A`; rounds to nearest-even when narrowing).
+    ///
+    /// # Safety
+    /// `p` valid for `LANES` writes; run inside [`Simd::vectorize`].
+    unsafe fn store_out(self, p: *mut O, v: <Self as SimdOps<A>>::Reg);
+}
+
+/// Homogeneous blanket: when every family type is the accumulator type, the
+/// widen/narrow ops are plain [`SimdOps`] load/splat/store. Covers `FloatGemm<f32>`
+/// / `FloatGemm<f64>` (and any external homogeneous family) with zero per-ISA code.
+impl<A: Scalar, S: SimdOps<A>> KernelSimd<A, A, A, A> for S {
+    #[inline(always)]
+    unsafe fn load_lhs(self, p: *const A) -> <S as SimdOps<A>>::Reg {
+        unsafe { self.loadu(p) }
+    }
+    #[inline(always)]
+    unsafe fn splat_rhs(self, v: A) -> <S as SimdOps<A>>::Reg {
+        unsafe { self.splat(v) }
+    }
+    #[inline(always)]
+    unsafe fn load_out(self, p: *const A) -> <S as SimdOps<A>>::Reg {
+        unsafe { self.loadu(p) }
+    }
+    #[inline(always)]
+    unsafe fn store_out(self, p: *mut A, v: <S as SimdOps<A>>::Reg) {
+        unsafe { self.storeu(p, v) }
+    }
+}
+
 /// An ISA token: a zero-sized marker carrying a set of target features.
 ///
 /// The only behaviour is [`Simd::vectorize`], which establishes the

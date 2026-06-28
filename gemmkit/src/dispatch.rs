@@ -23,15 +23,17 @@
 #[cfg(feature = "std")]
 use std::sync::OnceLock;
 
+use half::{bf16, f16};
+
 use crate::driver;
-use crate::kernel::FloatGemm;
+use crate::kernel::{FloatGemm, MixedGemm};
 use crate::parallel::Parallelism;
-use crate::scalar::Float;
+use crate::scalar::{Float, NarrowFloat, Scalar};
 #[cfg(target_arch = "aarch64")]
 use crate::simd::Neon;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use crate::simd::{Avx512, Fma};
-use crate::simd::{ScalarTok, SimdOps};
+use crate::simd::{KernelSimd, ScalarTok, SimdOps};
 use crate::special::gemv;
 use crate::tuning;
 use crate::workspace::Workspace;
@@ -101,9 +103,72 @@ pub struct PackedConsume<T> {
     pub csc: isize,
 }
 
-/// Element types gemmkit can dispatch. Sealed in practice: only `f32` and `f64`
-/// have a registered dispatch table in v1.
-pub trait GemmScalar: Float<Acc = Self> {
+/// Element types gemmkit can dispatch. Sealed in practice: `f32`/`f64` (the
+/// homogeneous float family) and `f16`/`bf16` (the mixed-precision family,
+/// `Acc = f32`) have registered dispatch tables.
+///
+/// The bound is just [`Scalar`] — **not** `Float<Acc = Self>` — so the accumulator
+/// may differ from the element type (the mixed-precision seam). Everything a type's
+/// kernel family needs that is *not* expressible generically (its degenerate
+/// `beta`-scale, which is `f32`-mediated for the narrow types; and which family to
+/// pack/dispatch through) is supplied by the methods below, so the driver and the
+/// public API stay entirely type-agnostic.
+pub trait GemmScalar: Scalar {
+    /// Mirror of [`crate::kernel::KernelFamily::OUT_IS_ACC`] for this type's family:
+    /// `true` for `f32`/`f64` (homogeneous), `false` for `f16`/`bf16` (mixed). The
+    /// prepack constructor reads it to compute the same `kc` the driver will use, so
+    /// the prepacked and plain paths block identically.
+    const OUT_IS_ACC: bool;
+
+    /// `C <- beta·C` over the strided output — the degenerate path when the `A·B`
+    /// term vanishes (`k == 0` or `alpha == 0`). For the narrow types this scales in
+    /// `f32` and rounds back.
+    ///
+    /// # Safety
+    /// `c` valid for the `m × n` region at `rsc`/`csc`.
+    #[doc(hidden)]
+    unsafe fn scale_c(beta: Self, c: *mut Self, m: usize, n: usize, rsc: isize, csc: isize);
+
+    /// Pack a full RHS into the prepacked micropanel buffer through this type's
+    /// kernel family. The layout is family-independent (plain micropanels), but the
+    /// family *type* differs (`FloatGemm` vs `MixedGemm`), so the call is dispatched
+    /// here rather than hard-wired in [`crate::prepack_rhs`].
+    ///
+    /// # Safety
+    /// As [`crate::driver::pack_rhs_full`].
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn pack_rhs_full(
+        dst: *mut Self,
+        b: *const Self,
+        rsb: isize,
+        csb: isize,
+        k: usize,
+        n: usize,
+        kc: usize,
+        nc: usize,
+        nr: usize,
+    );
+
+    /// Pack a full LHS (in the transposed-RHS layout) for the prepacked-LHS path,
+    /// through this type's kernel family. Mirror of [`GemmScalar::pack_rhs_full`].
+    ///
+    /// # Safety
+    /// As [`crate::driver::pack_lhs_full`].
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn pack_lhs_full(
+        dst: *mut Self,
+        a: *const Self,
+        rsa: isize,
+        csa: isize,
+        m: usize,
+        k: usize,
+        kc: usize,
+        nc: usize,
+        nr: usize,
+    );
+
     /// Run the dispatched kernel for this type. Used by the API layer.
     ///
     /// # Safety
@@ -115,8 +180,8 @@ pub trait GemmScalar: Float<Acc = Self> {
     ///
     /// # Safety
     /// `req`'s pointers must be valid, `c` must not alias `a`/`packed`, and
-    /// `packed` must have been produced by [`crate::driver::pack_rhs_full`] for
-    /// the geometry recorded in `req`.
+    /// `packed` must have been produced by [`GemmScalar::pack_rhs_full`] for the
+    /// geometry recorded in `req`.
     #[doc(hidden)]
     unsafe fn dispatch_packed(req: PackedConsume<Self>, par: Parallelism, ws: &mut Workspace);
 
@@ -140,7 +205,7 @@ pub(crate) unsafe fn execute<T: GemmScalar>(task: Task<T>, par: Parallelism, ws:
         }
         // k == 0 or alpha == 0 ⇒ the A·B term vanishes: C <- beta·C only.
         if task.k == 0 || task.alpha == T::ZERO {
-            scale_c::<T>(task.beta, task.c, task.m, task.n, task.rsc, task.csc);
+            T::scale_c(task.beta, task.c, task.m, task.n, task.rsc, task.csc);
             return;
         }
         T::dispatch(task, par, ws);
@@ -164,15 +229,17 @@ pub(crate) unsafe fn execute_packed<T: GemmScalar>(
             return;
         }
         if req.k == 0 || req.alpha == T::ZERO {
-            scale_c::<T>(req.beta, req.c, req.m, req.n, req.rsc, req.csc);
+            T::scale_c(req.beta, req.c, req.m, req.n, req.rsc, req.csc);
             return;
         }
         T::dispatch_packed(req, par, ws);
     }
 }
 
-/// `C <- beta·C` (with `beta == 0` overwriting to zero without reading C).
-unsafe fn scale_c<T: Float>(beta: T, c: *mut T, m: usize, n: usize, rsc: isize, csc: isize) {
+/// `C <- beta·C` for a **homogeneous float** type (`f32`/`f64`): in-place scale,
+/// with `beta == 0` overwriting to zero without reading C. The `GemmScalar::scale_c`
+/// for the float types forwards here; the narrow types use [`scale_c_narrow`].
+unsafe fn scale_c_float<T: Float>(beta: T, c: *mut T, m: usize, n: usize, rsc: isize, csc: isize) {
     unsafe {
         for j in 0..n {
             for i in 0..m {
@@ -181,6 +248,31 @@ unsafe fn scale_c<T: Float>(beta: T, c: *mut T, m: usize, n: usize, rsc: isize, 
                     *p = T::ZERO;
                 } else if beta != T::ONE {
                     *p = beta * *p;
+                }
+            }
+        }
+    }
+}
+
+/// `C <- beta·C` for a **narrow** type (`f16`/`bf16`): widen each element to `f32`,
+/// scale, and round back. Matches the mixed kernel's epilogue precision.
+unsafe fn scale_c_narrow<N: NarrowFloat>(
+    beta: N,
+    c: *mut N,
+    m: usize,
+    n: usize,
+    rsc: isize,
+    csc: isize,
+) {
+    unsafe {
+        let b = beta.widen();
+        for j in 0..n {
+            for i in 0..m {
+                let p = c.offset(i as isize * rsc + j as isize * csc);
+                if beta == N::ZERO {
+                    *p = N::ZERO;
+                } else if beta != N::ONE {
+                    *p = N::narrow(b * (*p).widen());
                 }
             }
         }
@@ -260,6 +352,98 @@ unsafe fn run_packed_typed<T, S, const MR_REG: usize, const NR: usize>(
         driver::run_packed_rhs::<FloatGemm<T>, S, MR_REG, NR>(
             simd, req.m, req.k, req.n, req.alpha, req.a, req.rsa, req.csa, req.packed, req.kc,
             req.nc, req.beta, req.c, req.rsc, req.csc, par, ws,
+        );
+    }
+}
+
+/// Mixed-precision driver entry for a concrete `(narrow type, ISA, tile)`. Mirror
+/// of [`run_typed`] but driving [`MixedGemm`]: no gemv special path (the general
+/// driver is correct for those shapes; narrow gemv is a deferred optimization), the
+/// same orientation swap, and `alpha`/`beta` **widened to the `f32` accumulator**
+/// before the driver call.
+///
+/// # Safety
+/// As [`run_typed`].
+#[inline]
+unsafe fn run_typed_mixed<N, S, const MR_REG: usize, const NR: usize>(
+    simd: S,
+    mut t: Task<N>,
+    par: Parallelism,
+    ws: &mut Workspace,
+) where
+    N: NarrowFloat,
+    S: KernelSimd<N, N, f32, N>,
+{
+    unsafe {
+        if t.csc.unsigned_abs() < t.rsc.unsigned_abs() {
+            let (oa, orsa, ocsa) = (t.a, t.rsa, t.csa);
+            let (ob, orsb, ocsb) = (t.b, t.rsb, t.csb);
+            core::mem::swap(&mut t.m, &mut t.n);
+            t.a = ob;
+            t.rsa = ocsb;
+            t.csa = orsb;
+            t.b = oa;
+            t.rsb = ocsa;
+            t.csb = orsa;
+            core::mem::swap(&mut t.rsc, &mut t.csc);
+        }
+        driver::run::<MixedGemm<N>, S, MR_REG, NR>(
+            simd,
+            t.m,
+            t.k,
+            t.n,
+            t.alpha.widen(),
+            t.a,
+            t.rsa,
+            t.csa,
+            t.b,
+            t.rsb,
+            t.csb,
+            t.beta.widen(),
+            t.c,
+            t.rsc,
+            t.csc,
+            par,
+            ws,
+        );
+    }
+}
+
+/// Prepacked-RHS mixed-precision entry (mirror of [`run_packed_typed`] for
+/// [`MixedGemm`]); no swap, `alpha`/`beta` widened to `f32`.
+///
+/// # Safety
+/// As [`run_packed_typed`].
+#[inline]
+unsafe fn run_packed_typed_mixed<N, S, const MR_REG: usize, const NR: usize>(
+    simd: S,
+    req: PackedConsume<N>,
+    par: Parallelism,
+    ws: &mut Workspace,
+) where
+    N: NarrowFloat,
+    S: KernelSimd<N, N, f32, N>,
+{
+    unsafe {
+        debug_assert_eq!(NR, req.nr, "prepacked RHS panel width != kernel NR");
+        driver::run_packed_rhs::<MixedGemm<N>, S, MR_REG, NR>(
+            simd,
+            req.m,
+            req.k,
+            req.n,
+            req.alpha.widen(),
+            req.a,
+            req.rsa,
+            req.csa,
+            req.packed,
+            req.kc,
+            req.nc,
+            req.beta.widen(),
+            req.c,
+            req.rsc,
+            req.csc,
+            par,
+            ws,
         );
     }
 }
@@ -346,6 +530,72 @@ unsafe fn gemm_f64_neon_packed(r: PackedConsume<f64>, par: Parallelism, ws: &mut
     unsafe { run_packed_typed::<f64, Neon, 4, 4>(Neon, r, par, ws) }
 }
 
+// ---- mixed-precision (f16 / bf16) entry points: same tiles as f32 (the
+// accumulator is f32, so the register budget matches) ----
+
+unsafe fn gemm_f16_scalar(t: Task<f16>, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_typed_mixed::<f16, ScalarTok, 4, 4>(ScalarTok, t, par, ws) }
+}
+unsafe fn gemm_bf16_scalar(t: Task<bf16>, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_typed_mixed::<bf16, ScalarTok, 4, 4>(ScalarTok, t, par, ws) }
+}
+unsafe fn gemm_f16_scalar_packed(r: PackedConsume<f16>, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_packed_typed_mixed::<f16, ScalarTok, 4, 4>(ScalarTok, r, par, ws) }
+}
+unsafe fn gemm_bf16_scalar_packed(r: PackedConsume<bf16>, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_packed_typed_mixed::<bf16, ScalarTok, 4, 4>(ScalarTok, r, par, ws) }
+}
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+unsafe fn gemm_f16_fma(t: Task<f16>, par: Parallelism, ws: &mut Workspace) {
+    // f32 accumulator → MR = 2*8 = 16, NR = 6 (the f32 FMA tile).
+    unsafe { run_typed_mixed::<f16, Fma, 2, 6>(Fma, t, par, ws) }
+}
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+unsafe fn gemm_bf16_fma(t: Task<bf16>, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_typed_mixed::<bf16, Fma, 2, 6>(Fma, t, par, ws) }
+}
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+unsafe fn gemm_f16_fma_packed(r: PackedConsume<f16>, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_packed_typed_mixed::<f16, Fma, 2, 6>(Fma, r, par, ws) }
+}
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+unsafe fn gemm_bf16_fma_packed(r: PackedConsume<bf16>, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_packed_typed_mixed::<bf16, Fma, 2, 6>(Fma, r, par, ws) }
+}
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+unsafe fn gemm_f16_avx512(t: Task<f16>, par: Parallelism, ws: &mut Workspace) {
+    // f32 accumulator → MR = 2*16 = 32, NR = 12 (the f32 AVX-512 tile).
+    unsafe { run_typed_mixed::<f16, Avx512, 2, 12>(Avx512, t, par, ws) }
+}
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+unsafe fn gemm_bf16_avx512(t: Task<bf16>, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_typed_mixed::<bf16, Avx512, 2, 12>(Avx512, t, par, ws) }
+}
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+unsafe fn gemm_f16_avx512_packed(r: PackedConsume<f16>, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_packed_typed_mixed::<f16, Avx512, 2, 12>(Avx512, r, par, ws) }
+}
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+unsafe fn gemm_bf16_avx512_packed(r: PackedConsume<bf16>, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_packed_typed_mixed::<bf16, Avx512, 2, 12>(Avx512, r, par, ws) }
+}
+#[cfg(target_arch = "aarch64")]
+unsafe fn gemm_f16_neon(t: Task<f16>, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_typed_mixed::<f16, Neon, 4, 4>(Neon, t, par, ws) }
+}
+#[cfg(target_arch = "aarch64")]
+unsafe fn gemm_bf16_neon(t: Task<bf16>, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_typed_mixed::<bf16, Neon, 4, 4>(Neon, t, par, ws) }
+}
+#[cfg(target_arch = "aarch64")]
+unsafe fn gemm_f16_neon_packed(r: PackedConsume<f16>, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_packed_typed_mixed::<f16, Neon, 4, 4>(Neon, r, par, ws) }
+}
+#[cfg(target_arch = "aarch64")]
+unsafe fn gemm_bf16_neon_packed(r: PackedConsume<bf16>, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_packed_typed_mixed::<bf16, Neon, 4, 4>(Neon, r, par, ws) }
+}
+
 type GemmFn<T> = unsafe fn(Task<T>, Parallelism, &mut Workspace);
 type PackedFn<T> = unsafe fn(PackedConsume<T>, Parallelism, &mut Workspace);
 
@@ -417,6 +667,63 @@ const DISP_F64_NEON: Dispatched<f64> = Dispatched {
     run: gemm_f64_neon,
     run_packed: gemm_f64_neon_packed,
     mr: 8,
+    nr: 4,
+};
+
+// Mixed-precision descriptors. `mr = MR_REG · f32-LANES` (the accumulator width):
+// scalar 4×4, FMA 16×6, AVX-512 32×12, NEON 16×4 — the same tiles as f32.
+const DISP_F16_SCALAR: Dispatched<f16> = Dispatched {
+    run: gemm_f16_scalar,
+    run_packed: gemm_f16_scalar_packed,
+    mr: 4,
+    nr: 4,
+};
+const DISP_BF16_SCALAR: Dispatched<bf16> = Dispatched {
+    run: gemm_bf16_scalar,
+    run_packed: gemm_bf16_scalar_packed,
+    mr: 4,
+    nr: 4,
+};
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+const DISP_F16_FMA: Dispatched<f16> = Dispatched {
+    run: gemm_f16_fma,
+    run_packed: gemm_f16_fma_packed,
+    mr: 16,
+    nr: 6,
+};
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+const DISP_BF16_FMA: Dispatched<bf16> = Dispatched {
+    run: gemm_bf16_fma,
+    run_packed: gemm_bf16_fma_packed,
+    mr: 16,
+    nr: 6,
+};
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+const DISP_F16_AVX512: Dispatched<f16> = Dispatched {
+    run: gemm_f16_avx512,
+    run_packed: gemm_f16_avx512_packed,
+    mr: 32,
+    nr: 12,
+};
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+const DISP_BF16_AVX512: Dispatched<bf16> = Dispatched {
+    run: gemm_bf16_avx512,
+    run_packed: gemm_bf16_avx512_packed,
+    mr: 32,
+    nr: 12,
+};
+#[cfg(target_arch = "aarch64")]
+const DISP_F16_NEON: Dispatched<f16> = Dispatched {
+    run: gemm_f16_neon,
+    run_packed: gemm_f16_neon_packed,
+    mr: 16,
+    nr: 4,
+};
+#[cfg(target_arch = "aarch64")]
+const DISP_BF16_NEON: Dispatched<bf16> = Dispatched {
+    run: gemm_bf16_neon,
+    run_packed: gemm_bf16_neon_packed,
+    mr: 16,
     nr: 4,
 };
 
@@ -567,10 +874,121 @@ fn select_f64() -> Dispatched<f64> {
     }
 }
 
+/// `f16` ISA selection. The mixed-precision FMA path additionally needs **F16C**
+/// (`vcvtph2ps`/`vcvtps2ph`) — universal on AVX2+FMA hardware but checked here so a
+/// forced or auto FMA selection on a (hypothetical) F16C-less part falls back rather
+/// than faulting. AVX-512 covers `f16` within `avx512f`.
+fn select_f16() -> Dispatched<f16> {
+    match forced_isa() {
+        ForcedIsa::Scalar => return DISP_F16_SCALAR,
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        ForcedIsa::Fma => {
+            assert!(
+                is_x86_feature_detected!("avx2")
+                    && is_x86_feature_detected!("fma")
+                    && is_x86_feature_detected!("f16c"),
+                "GEMMKIT_REQUIRE_ISA=fma for f16, but this CPU does not report avx2+fma+f16c"
+            );
+            return DISP_F16_FMA;
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        ForcedIsa::Avx512 => {
+            assert!(
+                is_x86_feature_detected!("avx512f"),
+                "GEMMKIT_REQUIRE_ISA=avx512, but this CPU/emulator does not report avx512f"
+            );
+            return DISP_F16_AVX512;
+        }
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        ForcedIsa::Fma | ForcedIsa::Avx512 => {
+            panic!("GEMMKIT_REQUIRE_ISA: requested SIMD ISA is unavailable on this target")
+        }
+        #[cfg(target_arch = "aarch64")]
+        ForcedIsa::Neon => return DISP_F16_NEON,
+        #[cfg(not(target_arch = "aarch64"))]
+        ForcedIsa::Neon => panic!("GEMMKIT_REQUIRE_ISA=neon, but this target is not aarch64"),
+        ForcedIsa::Auto => {}
+    }
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if is_x86_feature_detected!("avx512f") {
+            return DISP_F16_AVX512;
+        }
+        if is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("fma")
+            && is_x86_feature_detected!("f16c")
+        {
+            return DISP_F16_FMA;
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        DISP_F16_NEON
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        DISP_F16_SCALAR
+    }
+}
+
+/// `bf16` ISA selection. The FMA path uses only AVX2 integer ops (shift / pack), so
+/// no F16C is required; AVX-512 covers `bf16` within `avx512f`.
+fn select_bf16() -> Dispatched<bf16> {
+    match forced_isa() {
+        ForcedIsa::Scalar => return DISP_BF16_SCALAR,
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        ForcedIsa::Fma => {
+            assert!(
+                is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma"),
+                "GEMMKIT_REQUIRE_ISA=fma, but this CPU/emulator does not report avx2+fma"
+            );
+            return DISP_BF16_FMA;
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        ForcedIsa::Avx512 => {
+            assert!(
+                is_x86_feature_detected!("avx512f"),
+                "GEMMKIT_REQUIRE_ISA=avx512, but this CPU/emulator does not report avx512f"
+            );
+            return DISP_BF16_AVX512;
+        }
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        ForcedIsa::Fma | ForcedIsa::Avx512 => {
+            panic!("GEMMKIT_REQUIRE_ISA: requested SIMD ISA is unavailable on this target")
+        }
+        #[cfg(target_arch = "aarch64")]
+        ForcedIsa::Neon => return DISP_BF16_NEON,
+        #[cfg(not(target_arch = "aarch64"))]
+        ForcedIsa::Neon => panic!("GEMMKIT_REQUIRE_ISA=neon, but this target is not aarch64"),
+        ForcedIsa::Auto => {}
+    }
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if is_x86_feature_detected!("avx512f") {
+            return DISP_BF16_AVX512;
+        }
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return DISP_BF16_FMA;
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        DISP_BF16_NEON
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        DISP_BF16_SCALAR
+    }
+}
+
 #[cfg(feature = "std")]
 static GEMM_F32: OnceLock<Dispatched<f32>> = OnceLock::new();
 #[cfg(feature = "std")]
 static GEMM_F64: OnceLock<Dispatched<f64>> = OnceLock::new();
+#[cfg(feature = "std")]
+static GEMM_F16: OnceLock<Dispatched<f16>> = OnceLock::new();
+#[cfg(feature = "std")]
+static GEMM_BF16: OnceLock<Dispatched<bf16>> = OnceLock::new();
 
 /// The memoized dispatch descriptor for `f32` (selection runs once).
 #[inline]
@@ -598,7 +1016,66 @@ fn dispatched_f64() -> Dispatched<f64> {
     }
 }
 
+/// The memoized dispatch descriptor for `f16` (selection runs once).
+#[inline]
+fn dispatched_f16() -> Dispatched<f16> {
+    #[cfg(feature = "std")]
+    {
+        *GEMM_F16.get_or_init(select_f16)
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        select_f16()
+    }
+}
+
+/// The memoized dispatch descriptor for `bf16` (selection runs once).
+#[inline]
+fn dispatched_bf16() -> Dispatched<bf16> {
+    #[cfg(feature = "std")]
+    {
+        *GEMM_BF16.get_or_init(select_bf16)
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        select_bf16()
+    }
+}
+
 impl GemmScalar for f32 {
+    const OUT_IS_ACC: bool = true;
+    #[inline]
+    unsafe fn scale_c(beta: f32, c: *mut f32, m: usize, n: usize, rsc: isize, csc: isize) {
+        unsafe { scale_c_float(beta, c, m, n, rsc, csc) }
+    }
+    #[inline]
+    unsafe fn pack_rhs_full(
+        dst: *mut f32,
+        b: *const f32,
+        rsb: isize,
+        csb: isize,
+        k: usize,
+        n: usize,
+        kc: usize,
+        nc: usize,
+        nr: usize,
+    ) {
+        unsafe { driver::pack_rhs_full::<FloatGemm<f32>>(dst, b, rsb, csb, k, n, kc, nc, nr) }
+    }
+    #[inline]
+    unsafe fn pack_lhs_full(
+        dst: *mut f32,
+        a: *const f32,
+        rsa: isize,
+        csa: isize,
+        m: usize,
+        k: usize,
+        kc: usize,
+        nc: usize,
+        nr: usize,
+    ) {
+        unsafe { driver::pack_lhs_full::<FloatGemm<f32>>(dst, a, rsa, csa, m, k, kc, nc, nr) }
+    }
     #[inline]
     unsafe fn dispatch(task: Task<f32>, par: Parallelism, ws: &mut Workspace) {
         unsafe { (dispatched_f32().run)(task, par, ws) }
@@ -615,6 +1092,39 @@ impl GemmScalar for f32 {
 }
 
 impl GemmScalar for f64 {
+    const OUT_IS_ACC: bool = true;
+    #[inline]
+    unsafe fn scale_c(beta: f64, c: *mut f64, m: usize, n: usize, rsc: isize, csc: isize) {
+        unsafe { scale_c_float(beta, c, m, n, rsc, csc) }
+    }
+    #[inline]
+    unsafe fn pack_rhs_full(
+        dst: *mut f64,
+        b: *const f64,
+        rsb: isize,
+        csb: isize,
+        k: usize,
+        n: usize,
+        kc: usize,
+        nc: usize,
+        nr: usize,
+    ) {
+        unsafe { driver::pack_rhs_full::<FloatGemm<f64>>(dst, b, rsb, csb, k, n, kc, nc, nr) }
+    }
+    #[inline]
+    unsafe fn pack_lhs_full(
+        dst: *mut f64,
+        a: *const f64,
+        rsa: isize,
+        csa: isize,
+        m: usize,
+        k: usize,
+        kc: usize,
+        nc: usize,
+        nr: usize,
+    ) {
+        unsafe { driver::pack_lhs_full::<FloatGemm<f64>>(dst, a, rsa, csa, m, k, kc, nc, nr) }
+    }
     #[inline]
     unsafe fn dispatch(task: Task<f64>, par: Parallelism, ws: &mut Workspace) {
         unsafe { (dispatched_f64().run)(task, par, ws) }
@@ -626,6 +1136,104 @@ impl GemmScalar for f64 {
     #[inline]
     fn rhs_tile() -> (usize, usize) {
         let d = dispatched_f64();
+        (d.mr, d.nr)
+    }
+}
+
+impl GemmScalar for f16 {
+    const OUT_IS_ACC: bool = false;
+    #[inline]
+    unsafe fn scale_c(beta: f16, c: *mut f16, m: usize, n: usize, rsc: isize, csc: isize) {
+        unsafe { scale_c_narrow(beta, c, m, n, rsc, csc) }
+    }
+    #[inline]
+    unsafe fn pack_rhs_full(
+        dst: *mut f16,
+        b: *const f16,
+        rsb: isize,
+        csb: isize,
+        k: usize,
+        n: usize,
+        kc: usize,
+        nc: usize,
+        nr: usize,
+    ) {
+        unsafe { driver::pack_rhs_full::<MixedGemm<f16>>(dst, b, rsb, csb, k, n, kc, nc, nr) }
+    }
+    #[inline]
+    unsafe fn pack_lhs_full(
+        dst: *mut f16,
+        a: *const f16,
+        rsa: isize,
+        csa: isize,
+        m: usize,
+        k: usize,
+        kc: usize,
+        nc: usize,
+        nr: usize,
+    ) {
+        unsafe { driver::pack_lhs_full::<MixedGemm<f16>>(dst, a, rsa, csa, m, k, kc, nc, nr) }
+    }
+    #[inline]
+    unsafe fn dispatch(task: Task<f16>, par: Parallelism, ws: &mut Workspace) {
+        unsafe { (dispatched_f16().run)(task, par, ws) }
+    }
+    #[inline]
+    unsafe fn dispatch_packed(req: PackedConsume<f16>, par: Parallelism, ws: &mut Workspace) {
+        unsafe { (dispatched_f16().run_packed)(req, par, ws) }
+    }
+    #[inline]
+    fn rhs_tile() -> (usize, usize) {
+        let d = dispatched_f16();
+        (d.mr, d.nr)
+    }
+}
+
+impl GemmScalar for bf16 {
+    const OUT_IS_ACC: bool = false;
+    #[inline]
+    unsafe fn scale_c(beta: bf16, c: *mut bf16, m: usize, n: usize, rsc: isize, csc: isize) {
+        unsafe { scale_c_narrow(beta, c, m, n, rsc, csc) }
+    }
+    #[inline]
+    unsafe fn pack_rhs_full(
+        dst: *mut bf16,
+        b: *const bf16,
+        rsb: isize,
+        csb: isize,
+        k: usize,
+        n: usize,
+        kc: usize,
+        nc: usize,
+        nr: usize,
+    ) {
+        unsafe { driver::pack_rhs_full::<MixedGemm<bf16>>(dst, b, rsb, csb, k, n, kc, nc, nr) }
+    }
+    #[inline]
+    unsafe fn pack_lhs_full(
+        dst: *mut bf16,
+        a: *const bf16,
+        rsa: isize,
+        csa: isize,
+        m: usize,
+        k: usize,
+        kc: usize,
+        nc: usize,
+        nr: usize,
+    ) {
+        unsafe { driver::pack_lhs_full::<MixedGemm<bf16>>(dst, a, rsa, csa, m, k, kc, nc, nr) }
+    }
+    #[inline]
+    unsafe fn dispatch(task: Task<bf16>, par: Parallelism, ws: &mut Workspace) {
+        unsafe { (dispatched_bf16().run)(task, par, ws) }
+    }
+    #[inline]
+    unsafe fn dispatch_packed(req: PackedConsume<bf16>, par: Parallelism, ws: &mut Workspace) {
+        unsafe { (dispatched_bf16().run_packed)(req, par, ws) }
+    }
+    #[inline]
+    fn rhs_tile() -> (usize, usize) {
+        let d = dispatched_bf16();
         (d.mr, d.nr)
     }
 }

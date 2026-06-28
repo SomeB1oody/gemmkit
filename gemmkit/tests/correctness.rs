@@ -41,6 +41,27 @@ impl Elem for f64 {
         x
     }
 }
+// Narrow types accumulate in f32 and round outputs to 16 bits, so their `EPS` is the
+// 16-bit machine epsilon (f16 ≈ 9.8e-4, bf16 ≈ 7.8e-3) — the dominant error is the
+// final round, the f32 accumulation being far more accurate.
+impl Elem for gemmkit::f16 {
+    const EPS: f64 = 9.765625e-4; // 2^-10
+    fn to_f64(self) -> f64 {
+        self.to_f64()
+    }
+    fn from_f64(x: f64) -> Self {
+        gemmkit::f16::from_f64(x)
+    }
+}
+impl Elem for gemmkit::bf16 {
+    const EPS: f64 = 7.8125e-3; // 2^-7
+    fn to_f64(self) -> f64 {
+        self.to_f64()
+    }
+    fn from_f64(x: f64) -> Self {
+        gemmkit::bf16::from_f64(x)
+    }
+}
 
 /// Deterministic pseudo-random fill in [-1, 1).
 fn rand_vec<T: Elem>(n: usize, seed: u64) -> Vec<T> {
@@ -279,6 +300,192 @@ fn correctness_f64_layouts() {
                 Parallelism::Serial,
             );
         }
+    }
+}
+
+/// Mixed-precision accuracy: `f16`/`bf16` inputs, `f32` accumulator, narrow output,
+/// across shapes / layouts / alpha-beta — checked against the (f64) reference at the
+/// 16-bit tolerance (the kernel's f32 accumulation is far tighter than the final
+/// round, so the gate is dominated by `T::EPS`).
+fn mixed_dims() -> [(usize, usize, usize); 9] {
+    [
+        (1, 1, 1),
+        (3, 4, 5),
+        (16, 8, 7),
+        (32, 32, 32),
+        (33, 17, 19),
+        (40, 33, 28),
+        (64, 80, 48),
+        (65, 64, 64),
+        (128, 96, 112),
+    ]
+}
+
+#[test]
+fn correctness_f16_layouts() {
+    for (m, k, n) in mixed_dims() {
+        for &lc in &[Layout::Row, Layout::Col] {
+            for &(al, be) in &[(1.0f64, 0.0), (1.0, 1.0), (0.75, -0.5)] {
+                run_case::<gemmkit::f16>(
+                    m,
+                    k,
+                    n,
+                    Layout::Row,
+                    Layout::Col,
+                    lc,
+                    gemmkit::f16::from_f64(al),
+                    gemmkit::f16::from_f64(be),
+                    Parallelism::Serial,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn correctness_bf16_layouts() {
+    for (m, k, n) in mixed_dims() {
+        for &lc in &[Layout::Row, Layout::Col] {
+            for &(al, be) in &[(1.0f64, 0.0), (1.0, 1.0), (0.75, -0.5)] {
+                run_case::<gemmkit::bf16>(
+                    m,
+                    k,
+                    n,
+                    Layout::Col,
+                    Layout::Row,
+                    lc,
+                    gemmkit::bf16::from_f64(al),
+                    gemmkit::bf16::from_f64(be),
+                    Parallelism::Serial,
+                );
+            }
+        }
+    }
+}
+
+/// Mixed-precision serial == parallel **bit-identity** across thread counts (the
+/// hard determinism invariant must hold for the new types too — narrowing is a pure
+/// per-position function of the f32 result, and the blocking is thread-independent).
+#[test]
+fn parallel_equals_serial_mixed() {
+    fn check<T: Elem>(la: Layout) {
+        for (m, k, n) in [(200, 130, 175), (256, 64, 200), (384, 96, 320)] {
+            for &(al, be) in &[(1.0f64, 0.0), (0.7, 1.3)] {
+                let a = Mat::<T>::rand(m, k, 0xF16 + m as u64);
+                let b = Mat::<T>::rand(k, n, 0xBF + n as u64);
+                let c0 = Mat::<T>::rand(m, n, 0xCD + k as u64);
+                let (abuf, rsa, csa) = build_view(&a, la);
+                let (bbuf, rsb, csb) = build_view(&b, Layout::Col);
+                let (cbase, rsc, csc) = build_view(&c0, Layout::Col);
+                let (al, be) = (T::from_f64(al), T::from_f64(be));
+
+                let mut c_ser = cbase.clone();
+                gemm(
+                    al,
+                    MatRef::new(&abuf, m, k, rsa, csa),
+                    MatRef::new(&bbuf, k, n, rsb, csb),
+                    be,
+                    MatMut::new(&mut c_ser, m, n, rsc, csc),
+                    Parallelism::Serial,
+                );
+                for t in [2usize, 4, 8, 16] {
+                    let mut c_par = cbase.clone();
+                    gemm(
+                        al,
+                        MatRef::new(&abuf, m, k, rsa, csa),
+                        MatRef::new(&bbuf, k, n, rsb, csb),
+                        be,
+                        MatMut::new(&mut c_par, m, n, rsc, csc),
+                        Parallelism::Rayon(t),
+                    );
+                    assert!(
+                        c_ser
+                            .iter()
+                            .zip(&c_par)
+                            .all(|(a, b)| a.to_f64().to_bits() == b.to_f64().to_bits()),
+                        "mixed serial != parallel({t}) for {m}x{k}x{n}"
+                    );
+                }
+            }
+        }
+    }
+    check::<gemmkit::f16>(Layout::Row);
+    check::<gemmkit::bf16>(Layout::Col);
+}
+
+/// Cross-check `f16` against the `gemm` crate (the ecosystem oracle, which also
+/// accumulates `f16` in `f32`): the two must agree to a tight `f16` tolerance.
+/// `gemm`'s `f16` *is* `half::f16` *is* `gemmkit::f16`, so the comparison is direct.
+/// Gated out of Miri (the `gemm` dev-dep is `cfg(not(miri))`).
+#[test]
+#[cfg(not(miri))]
+fn mixed_f16_matches_gemm_crate() {
+    // Includes a large-k case (k > the f32 kc blocking ≈ 512) to exercise the
+    // cross-depth-panel accumulation, where the running sum round-trips through the
+    // narrow C between kc panels.
+    for (m, k, n) in [(64, 48, 40), (96, 65, 72), (33, 17, 19), (64, 2048, 64)] {
+        let a = Mat::<gemmkit::f16>::rand(m, k, 0x16A + m as u64);
+        let b = Mat::<gemmkit::f16>::rand(k, n, 0x16B + n as u64);
+        // Column-major buffers (gemm's preferred orientation), zero beta.
+        let (abuf, rsa, csa) = build_view(&a, Layout::Col);
+        let (bbuf, rsb, csb) = build_view(&b, Layout::Col);
+        let mut c_kit = vec![gemmkit::f16::from_f64(0.0); m * n];
+        let mut c_gemm = vec![gemmkit::f16::from_f64(0.0); m * n];
+
+        gemm(
+            gemmkit::f16::from_f64(1.0),
+            MatRef::new(&abuf, m, k, rsa, csa),
+            MatRef::new(&bbuf, k, n, rsb, csb),
+            gemmkit::f16::from_f64(0.0),
+            MatMut::from_col_major(&mut c_kit, m, n),
+            Parallelism::Serial,
+        );
+        // gemm crate: column-major operands → (cs = leading dim, rs = 1), matching
+        // the bench harness; read_dst=false (beta=0).
+        unsafe {
+            gemm::gemm(
+                m,
+                n,
+                k,
+                c_gemm.as_mut_ptr(),
+                m as isize,
+                1,
+                false,
+                abuf.as_ptr(),
+                m as isize,
+                1,
+                bbuf.as_ptr(),
+                k as isize,
+                1,
+                gemmkit::f16::from_f64(0.0),
+                gemmkit::f16::from_f64(1.0),
+                false,
+                false,
+                false,
+                gemm::Parallelism::None,
+            );
+        }
+        // Both accumulate in f32 then round to f16; allow a few f16 ULPs of slack
+        // (the accumulation order differs). `assert_accurate` wants a *row-major*
+        // reference, so transpose the column-major `c_gemm` into one.
+        let mut cref = vec![0.0f64; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                cref[i * n + j] = c_gemm[i + j * m].to_f64();
+            }
+        }
+        assert_accurate(
+            &c_kit,
+            1,
+            m as isize,
+            m,
+            n,
+            &cref,
+            &a,
+            &b,
+            k,
+            "f16 vs gemm crate",
+        );
     }
 }
 
@@ -534,6 +741,59 @@ fn prepack_equals_gemm() {
             }
         }
     }
+}
+
+/// Mixed-precision prepacked-RHS must be **bit-identical** to plain `gemm()` for
+/// the narrow types too — the prepack now blocks with the accumulator size and the
+/// same `kc = k` (mixed) the driver uses, so packed and unpacked never diverge.
+/// Includes a `k > 512` case (the cross-panel regime the blocking-size mismatch
+/// would have broken).
+#[test]
+fn prepack_equals_gemm_mixed() {
+    fn check<T: Elem>() {
+        for (m, k, n) in [(200, 130, 175), (96, 65, 72), (128, 1024, 96)] {
+            for &(al, be) in &[(1.0f64, 0.0), (0.7, 1.3)] {
+                let a = Mat::<T>::rand(m, k, 0x9A + (m * 3 + n) as u64);
+                let b = Mat::<T>::rand(k, n, 0x9B + (n + k) as u64);
+                let c0 = Mat::<T>::rand(m, n, 0x9C + (k + m) as u64);
+                let (abuf, rsa, csa) = build_view(&a, Layout::Col);
+                let (bbuf, rsb, csb) = build_view(&b, Layout::Col);
+                let (cbase, rsc, csc) = build_view(&c0, Layout::Col);
+                let (al, be) = (T::from_f64(al), T::from_f64(be));
+
+                let mut c_ref = cbase.clone();
+                gemm(
+                    al,
+                    MatRef::new(&abuf, m, k, rsa, csa),
+                    MatRef::new(&bbuf, k, n, rsb, csb),
+                    be,
+                    MatMut::new(&mut c_ref, m, n, rsc, csc),
+                    Parallelism::Serial,
+                );
+                let packed = gemmkit::prepack_rhs(MatRef::new(&bbuf, k, n, rsb, csb));
+                for par in [Parallelism::Serial, Parallelism::Rayon(4)] {
+                    let mut c_pk = cbase.clone();
+                    gemmkit::gemm_packed_b(
+                        al,
+                        MatRef::new(&abuf, m, k, rsa, csa),
+                        &packed,
+                        be,
+                        MatMut::new(&mut c_pk, m, n, rsc, csc),
+                        par,
+                    );
+                    assert!(
+                        c_ref
+                            .iter()
+                            .zip(&c_pk)
+                            .all(|(a, b)| a.to_f64().to_bits() == b.to_f64().to_bits()),
+                        "mixed prepack != gemm for {m}x{k}x{n} par={par:?}"
+                    );
+                }
+            }
+        }
+    }
+    check::<gemmkit::f16>();
+    check::<gemmkit::bf16>();
 }
 
 /// f64 prepacked path is bit-identical too (exercises the f64 tile + the packed
@@ -1078,6 +1338,30 @@ fn miri_scalar_path() {
         2.0,
         Parallelism::Serial,
     );
+    // Mixed-precision (f16 / bf16) scalar path: widen-load, f32 accumulate, narrow
+    // store, plus the strided copy-back epilogue and beta != 0 read of narrow C.
+    run_case::<gemmkit::f16>(
+        7,
+        9,
+        5,
+        Layout::Row,
+        Layout::Col,
+        Layout::Row,
+        gemmkit::f16::from_f64(1.0),
+        gemmkit::f16::from_f64(0.5),
+        Parallelism::Serial,
+    );
+    run_case::<gemmkit::bf16>(
+        6,
+        6,
+        6,
+        Layout::Col,
+        Layout::Row,
+        Layout::Col,
+        gemmkit::bf16::from_f64(0.75),
+        gemmkit::bf16::from_f64(-0.5),
+        Parallelism::Serial,
+    );
     // gemv shapes.
     run_case::<f32>(
         8,
@@ -1196,6 +1480,96 @@ fn isa_neon() {
     for (m, k, n) in isa_shapes() {
         driver_case::<f32, Neon, 4, 4>(Neon, m, k, n);
         driver_case::<f64, Neon, 4, 4>(Neon, m, k, n);
+    }
+}
+
+/// The SIMD narrow-store (`KernelSimd::store_out`) must be **bit-identical** to the
+/// scalar `NarrowFloat::narrow` (= `half::from_f32`) across edge values — normals,
+/// subnormals, ±0, ±Inf, and NaN — so the full-tile vector path and the partial-tile
+/// scalar path never disagree (and the bf16 NaN fix is real). AVX-512, 16-wide.
+#[test]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg_attr(miri, ignore = "Miri cannot execute AVX intrinsics")]
+fn simd_narrow_store_matches_half_avx512() {
+    use gemmkit::simd::{Avx512, KernelSimd, Simd, SimdOps};
+    if !is_x86_feature_detected!("avx512f") {
+        eprintln!("skipping: no avx512f");
+        return;
+    }
+    // A spread of representative f32 bit patterns.
+    let vals: Vec<f32> = vec![
+        0.0,
+        -0.0,
+        1.0,
+        -1.0,
+        0.5,
+        1.0 / 3.0,
+        65504.0,    // f16 max
+        70000.0,    // overflows f16 -> Inf
+        1.0e-5,     // f16 subnormal-ish
+        1.0e-8,    // underflows to 0 in f16
+        1.2340001, // rounding
+        2.5001,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NAN,
+        -f32::NAN,
+        f32::from_bits(0x7F800001), // sNaN-ish (exp all 1, low mantissa)
+        f32::from_bits(0x7FFFFFFF), // NaN, all mantissa bits set
+        f32::from_bits(0xFFC00000), // negative qNaN
+        123.456,
+    ];
+    // Pad to a multiple of 16 lanes.
+    let mut padded = vals.clone();
+    while !padded.len().is_multiple_of(16) {
+        padded.push(0.0);
+    }
+
+    // f16
+    unsafe {
+        Avx512.vectorize(|| {
+            for chunk in padded.chunks(16) {
+                let reg = <Avx512 as SimdOps<f32>>::loadu(Avx512, chunk.as_ptr());
+                let mut out = [gemmkit::f16::from_f32(0.0); 16];
+                <Avx512 as KernelSimd<gemmkit::f16, gemmkit::f16, f32, gemmkit::f16>>::store_out(
+                    Avx512,
+                    out.as_mut_ptr(),
+                    reg,
+                );
+                for (i, &v) in chunk.iter().enumerate() {
+                    let scalar = gemmkit::f16::from_f32(v);
+                    assert_eq!(
+                        out[i].to_bits(),
+                        scalar.to_bits(),
+                        "f16 narrow mismatch for {v:?} (bits {:#010x})",
+                        v.to_bits()
+                    );
+                }
+            }
+        });
+    }
+    // bf16
+    unsafe {
+        Avx512.vectorize(|| {
+            for chunk in padded.chunks(16) {
+                let reg = <Avx512 as SimdOps<f32>>::loadu(Avx512, chunk.as_ptr());
+                let mut out = [gemmkit::bf16::from_f32(0.0); 16];
+                <Avx512 as KernelSimd<gemmkit::bf16, gemmkit::bf16, f32, gemmkit::bf16>>::store_out(
+                    Avx512,
+                    out.as_mut_ptr(),
+                    reg,
+                );
+                for (i, &v) in chunk.iter().enumerate() {
+                    let scalar = gemmkit::bf16::from_f32(v);
+                    assert_eq!(
+                        out[i].to_bits(),
+                        scalar.to_bits(),
+                        "bf16 narrow mismatch for {v:?} (bits {:#010x})",
+                        v.to_bits()
+                    );
+                }
+            }
+        });
     }
 }
 

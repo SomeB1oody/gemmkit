@@ -366,9 +366,17 @@ pub fn prepack_rhs<T: GemmScalar>(b: MatRef<'_, T>) -> PackedRhs<T> {
     // Resolve the panel geometry through the same ISA tile the consuming call will
     // use; the `m = 65` sentinel dodges the tiny-matrix branch so the geometry is
     // `m`-independent (the consume reads it back verbatim).
+    // Block with the **accumulator** element size (what the driver uses), and pick
+    // the same `kc`: a mixed-precision type accumulates the whole `k` in one panel
+    // (`kc = k`), so the prepacked buffer blocks exactly as `gemm()` would.
     let (mr, nr) = <T as GemmScalar>::rhs_tile();
-    let blk = crate::cache::topology().blocking(mr, nr, core::mem::size_of::<T>().max(1), 65, n, k);
-    let kc = blk.kc.max(1);
+    let acc_size = core::mem::size_of::<<T as crate::Scalar>::Acc>().max(1);
+    let blk = crate::cache::topology().blocking(mr, nr, acc_size, 65, n, k);
+    let kc = if T::OUT_IS_ACC {
+        blk.kc.max(1)
+    } else {
+        k.max(1)
+    };
     let nc = blk.nc.next_multiple_of(nr).max(nr);
 
     let total = n.div_ceil(nr) * nr * k;
@@ -376,8 +384,10 @@ pub fn prepack_rhs<T: GemmScalar>(b: MatRef<'_, T>) -> PackedRhs<T> {
     if total > 0 {
         // SAFETY: `buf` holds `ceil(n/nr)*nr*k` elements (the exact layout size);
         // `b` is validated in-bounds above; `pack_rhs_full` writes only that range.
+        // The type's `GemmScalar::pack_rhs_full` selects the right kernel family
+        // (`FloatGemm` for f32/f64, `MixedGemm` for the narrow types).
         unsafe {
-            crate::driver::pack_rhs_full::<crate::kernel::FloatGemm<T>>(
+            T::pack_rhs_full(
                 buf.as_mut_ptr(),
                 b.data.as_ptr(),
                 b.rs,
@@ -561,8 +571,13 @@ pub fn prepack_lhs<T: GemmScalar>(a: MatRef<'_, T>) -> PackedLhs<T> {
     // (the genuine, unknown-here `n`) dodges the tiny-matrix branch so the geometry
     // is `n`-independent (the consume reads it back verbatim).
     let (mr, nr) = <T as GemmScalar>::rhs_tile();
-    let blk = crate::cache::topology().blocking(mr, nr, core::mem::size_of::<T>().max(1), 65, m, k);
-    let kc = blk.kc.max(1);
+    let acc_size = core::mem::size_of::<<T as crate::Scalar>::Acc>().max(1);
+    let blk = crate::cache::topology().blocking(mr, nr, acc_size, 65, m, k);
+    let kc = if T::OUT_IS_ACC {
+        blk.kc.max(1)
+    } else {
+        k.max(1)
+    };
     let nc = blk.nc.next_multiple_of(nr).max(nr);
 
     let total = m.div_ceil(nr) * nr * k;
@@ -570,8 +585,9 @@ pub fn prepack_lhs<T: GemmScalar>(a: MatRef<'_, T>) -> PackedLhs<T> {
     if total > 0 {
         // SAFETY: `buf` holds `ceil(m/nr)*nr*k` elements (the exact layout size);
         // `a` is validated in-bounds above; `pack_lhs_full` writes only that range.
+        // `GemmScalar::pack_lhs_full` selects the right kernel family per type.
         unsafe {
-            crate::driver::pack_lhs_full::<crate::kernel::FloatGemm<T>>(
+            T::pack_lhs_full(
                 buf.as_mut_ptr(),
                 a.data.as_ptr(),
                 a.rs,

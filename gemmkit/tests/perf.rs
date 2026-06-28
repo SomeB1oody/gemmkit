@@ -93,6 +93,84 @@ fn gflops(m: usize, k: usize, n: usize, secs: f64) -> f64 {
     2.0 * m as f64 * k as f64 * n as f64 / secs / 1e9
 }
 
+/// f16 GEMM throughput: gemmkit (f32-accumulate mixed kernel) vs the `gemm` crate
+/// (same f16-in-f32-acc convention). The adopt bar for a new type is "same ballpark
+/// as the `gemm` crate", so this reports the ratio. f16 FLOPs counted like f32.
+fn bench_f16(s: usize, parallel: bool) {
+    use gemmkit::f16;
+    let (m, k, n) = (s, s, s);
+    let to16 = |v: &[f32]| v.iter().map(|&x| f16::from_f32(x)).collect::<Vec<_>>();
+    let a = to16(&fill(m * k, 1));
+    let b = to16(&fill(k * n, 2));
+    let mut c = vec![f16::from_f32(0.0); m * n];
+
+    let par = if parallel {
+        Parallelism::Rayon(0)
+    } else {
+        Parallelism::Serial
+    };
+    let s_kit = measure(m, k, n, || {
+        gemm(
+            f16::from_f32(1.0),
+            MatRef::from_col_major(&a, m, k),
+            MatRef::from_col_major(&b, k, n),
+            f16::from_f32(0.0),
+            MatMut::from_col_major(&mut c, m, n),
+            par,
+        );
+    });
+    let gpar = if parallel {
+        gemm::Parallelism::Rayon(0)
+    } else {
+        gemm::Parallelism::None
+    };
+    let s_gemm = measure(m, k, n, || unsafe {
+        gemm::gemm(
+            m,
+            n,
+            k,
+            c.as_mut_ptr(),
+            m as isize,
+            1,
+            false,
+            a.as_ptr(),
+            m as isize,
+            1,
+            b.as_ptr(),
+            k as isize,
+            1,
+            f16::from_f32(0.0),
+            f16::from_f32(1.0),
+            false,
+            false,
+            false,
+            gpar,
+        );
+    });
+    let mode = if parallel { "par" } else { "ser" };
+    println!(
+        "  n={s:<5} {mode}  gemmkit={:7.1} (±{:>2.0}%)  gemm={:7.1} (±{:>2.0}%)  ({:.0}% of gemm)",
+        s_kit.median,
+        s_kit.spread_pct(),
+        s_gemm.median,
+        s_gemm.spread_pct(),
+        100.0 * s_kit.median / s_gemm.median.max(1e-9)
+    );
+}
+
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture"]
+fn perf_f16() {
+    let _guard = BENCH_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    println!("\nf16 GFLOP/s (column-major) — gemmkit mixed kernel vs gemm crate:");
+    for &s in &[256usize, 512, 1024, 2048] {
+        bench_f16(s, false);
+    }
+    for &s in &[512usize, 1024, 2048] {
+        bench_f16(s, true);
+    }
+}
+
 fn bench_one(s: usize, parallel: bool) {
     let (m, k, n) = (s, s, s);
     let a = fill(m * k, 1);
