@@ -92,10 +92,9 @@ static PARALLEL_OVERSAMPLE: Threshold = Threshold::new("GEMMKIT_PARALLEL_OVERSAM
 
 // Auto worker-count ramp granularity (units of linear problem dimension per
 // worker): the auto `Rayon(0)` path targets `cbrt(m*n*k).div_ceil(this)` workers.
-// Default 64 is calibrated on the Zen5 9950X (16c/32t) so n=512→8, 1024→16,
-// 2048→32. Per-machine — override on other topologies until the value is derived
-// from the core/cache geometry rather than hard-coded.
-static THREAD_DIM_STRIDE: Threshold = Threshold::new("GEMMKIT_THREAD_DIM_STRIDE", 64);
+// `0` (the default) means *auto* — derive the stride from the core count (see
+// [`thread_dim_stride`]); any non-zero env/setter value overrides verbatim.
+static THREAD_DIM_STRIDE: Threshold = Threshold::new("GEMMKIT_THREAD_DIM_STRIDE", 0);
 
 /// Get the serial/parallel work gate (`m*n*k` threshold).
 pub fn parallel_threshold() -> usize {
@@ -156,12 +155,43 @@ pub fn set_parallel_oversample(v: usize) {
 }
 
 /// Get the auto worker-count ramp granularity (units of linear problem dimension
-/// per worker). Always `>= 1` so the `cbrt(mnk).div_ceil(stride)` ramp cannot
-/// divide by zero.
+/// per worker). `0` (the default) derives the stride from the machine's core count
+/// (see [`auto_thread_dim_stride`]); any non-zero env/setter value is used verbatim.
+/// Always `>= 1` so the `cbrt(mnk).div_ceil(stride)` ramp cannot divide by zero.
 pub fn thread_dim_stride() -> usize {
-    THREAD_DIM_STRIDE.get().max(1)
+    match THREAD_DIM_STRIDE.get() {
+        0 => auto_thread_dim_stride(),
+        v => v.max(1),
+    }
 }
-/// Override the auto worker-count ramp granularity.
+/// Override the auto worker-count ramp granularity (`0` restores the core-derived
+/// auto value).
 pub fn set_thread_dim_stride(v: usize) {
     THREAD_DIM_STRIDE.set(v);
+}
+
+/// Core-count-derived auto ramp granularity. The ramp saturates all `cores` workers at
+/// the linear size `cbrt(mnk) == stride * cores`, so the stride sets how fast a problem
+/// ramps to full width. This is an *empirical calibration, not a derivation*: it is fit
+/// to two measured points — a low/mid-core part that benefits from a fast ramp (small
+/// stride) and a higher-core part that wants a slow one (large stride) — as
+/// `stride = clamp(cores²/16, 16, 64)`. The real driver is memory-domain topology
+/// (cross-domain traffic favors a slower ramp), which we can't robustly detect, so core
+/// count is only a proxy and the interpolation between the two anchors is unvalidated.
+/// The `16` floor keeps small machines from ramping *more* aggressively than measured (a
+/// bare `cores²/16` gives `1` at 4 cores); the `64` ceiling keeps large ones no more
+/// aggressive than the legacy default. `available_parallelism` is cheap and `resolve`
+/// already calls it per region, so this is recomputed, not memoized. Override
+/// `GEMMKIT_THREAD_DIM_STRIDE` on any topology this two-point fit misses.
+#[cfg(feature = "std")]
+fn auto_thread_dim_stride() -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8);
+    (cores * cores / 16).clamp(16, 64)
+}
+/// Without `std` there is no `available_parallelism`; keep the legacy constant.
+#[cfg(not(feature = "std"))]
+fn auto_thread_dim_stride() -> usize {
+    64
 }

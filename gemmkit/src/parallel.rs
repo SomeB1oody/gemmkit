@@ -63,8 +63,9 @@ impl Parallelism {
                 // work), not the total work — per-region fork/join + cursor
                 // contention grows with the worker count, so the optimum tracks ~n,
                 // not n³ (Zen5: 512→8, 1024→16, 2048→32). `div_ceil` avoids a dead
-                // band just above the gate and absorbs cbrt truncation. Stride is
-                // per-machine (`GEMMKIT_THREAD_DIM_STRIDE`, default 64).
+                // band just above the gate and absorbs cbrt truncation. The stride
+                // is core-count-derived by default and tunable via
+                // `GEMMKIT_THREAD_DIM_STRIDE` (see `tuning::thread_dim_stride`).
                 let dim = (mnk as f64).cbrt() as usize; // ≈ n for square problems
                 let want = dim.div_ceil(tuning::thread_dim_stride());
                 want.min(auto_threads()).min(n_jobs).max(1)
@@ -121,6 +122,33 @@ pub(crate) fn job_grain(n_jobs: usize, n_threads: usize) -> usize {
     let oversample = crate::tuning::parallel_oversample();
 
     (n_jobs / n_threads.saturating_mul(oversample)).max(1)
+}
+
+/// Job-cursor grain for the **packed-LHS** path, where the natural chunk is a whole
+/// row-block (`n_nt` jobs) so its A panel packs once and is reused across the block's
+/// column tiles. That yields only `n_mc` chunks, so when `n_mc` is a small non-multiple
+/// of `n_threads` the `ceil(n_mc / n_threads)` rounding imbalances the workers — some do
+/// an extra whole block while the rest idle at the join.
+///
+/// We split each block into the fewest power-of-two column sub-chunks needed to exceed
+/// `2 * n_threads` chunks — but **only by a divisor of `n_nt`**, so a chunk never
+/// straddles a row-block boundary. (A non-power-of-two `n_nt` — a tail column panel, or
+/// an L3-derived `nc/nr` — would otherwise leave `n_nt % splits != 0`, and the
+/// demand-driven [`JobCursor`] would hand workers cross-block chunks that re-pack A; the
+/// back-off falls to whole-block grain there rather than straddle.) Each split block is
+/// then packed by up to `splits` workers — a bounded, deliberate trade of pack reuse for
+/// balance. The `2 *` split target is an empirically swept optimum; splitting harder
+/// re-packs too often and regresses.
+#[inline]
+pub(crate) fn packed_block_grain(n_nt: usize, n_mc: usize, n_threads: usize) -> usize {
+    let mut splits = 1usize;
+    while n_mc * splits < 2 * n_threads && n_nt / (splits * 2) >= 1 {
+        splits *= 2;
+    }
+    while splits > 1 && !n_nt.is_multiple_of(splits) {
+        splits /= 2;
+    }
+    (n_nt / splits).max(1)
 }
 
 /// Run `f(tid)` for every worker `tid` in `0..n_threads`, in parallel when the
@@ -226,5 +254,33 @@ mod tests {
         assert_eq!(job_grain(0, 8), 1); // never zero
         let g = job_grain(10_000, 8);
         assert!((1..=10_000).contains(&g));
+    }
+
+    /// `packed_block_grain` must always return a **divisor of `n_nt`** (so cursor chunks
+    /// never straddle a row-block boundary) for *any* `n_nt` — power of two or not — and
+    /// split enough to balance when `n_nt` permits. Guards the straddle/re-pack
+    /// regression on tail panels and non-power-of-two L3 `nc/nr`.
+    #[test]
+    fn packed_block_grain_divides_and_balances() {
+        for &n_nt in &[1usize, 2, 3, 4, 96, 127, 128, 192, 500, 512] {
+            for &n_mc in &[1usize, 7, 14, 16, 32, 100] {
+                for &n_threads in &[2usize, 8, 14, 32] {
+                    let g = packed_block_grain(n_nt, n_mc, n_threads);
+                    assert!(g >= 1 && g <= n_nt, "grain {g} out of (0, {n_nt}]");
+                    // The defining invariant: chunks tile each row-block exactly.
+                    assert_eq!(n_nt % g, 0, "grain {g} does not divide n_nt {n_nt}");
+                    // When `n_nt` has a power-of-two factor large enough, balance to
+                    // > 2*n_threads chunks; powers of two (the common full-panel case)
+                    // always can.
+                    if n_nt.is_power_of_two() && n_nt >= 2 {
+                        let chunks = n_mc * (n_nt / g);
+                        assert!(
+                            chunks >= 2 * n_threads || g == 1,
+                            "n_nt={n_nt} n_mc={n_mc} thr={n_threads}: {chunks} chunks underfills"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
