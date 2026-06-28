@@ -629,6 +629,223 @@ fn prepack_both_tiny_accurate_and_deterministic() {
     }
 }
 
+/// Prepacked-LHS (the mirror of `prepack_equals_gemm`): reusing a prepacked `A`
+/// must be **bit-identical** to a plain `gemm()` for any thread count and any A
+/// layout, with a **row-major-ish C** (the supported no-extra-swap orientation —
+/// the engine drives the prepacked-A product transposed). Packing only rearranges
+/// A's values, so the microkernel does the identical fused FMAs in the identical
+/// order.
+#[test]
+fn prepack_lhs_equals_gemm() {
+    for (m, k, n) in [
+        (200, 130, 175),
+        (384, 96, 320),
+        (256, 257, 129),
+        (65, 64, 64), // just above the tiny shortcut on m
+        (64, 64, 65), // just above on n
+        (300, 1, 256),
+        (40, 200, 300),
+    ] {
+        for &la in &[Layout::Col, Layout::Row] {
+            // A and its packed buffer depend only on the (shape, layout) — hoist the
+            // pack above the alpha/beta loop so it happens once, not per combo.
+            let a = Mat::<f32>::rand(m, k, 0x5A + (m * 7 + n) as u64);
+            let b = Mat::<f32>::rand(k, n, 0x6B + (n * 3 + k) as u64);
+            let c0 = Mat::<f32>::rand(m, n, 0x7C + (k + m) as u64);
+            let (abuf, rsa, csa) = build_view(&a, la);
+            let (bbuf, rsb, csb) = build_view(&b, Layout::Col);
+            // Row-major C is the supported orientation for the packed-LHS path.
+            let (cbase, rsc, csc) = build_view(&c0, Layout::Row);
+            let packed = gemmkit::prepack_lhs(MatRef::new(&abuf, m, k, rsa, csa));
+            assert_eq!(packed.rows(), m);
+            assert_eq!(packed.cols(), k);
+
+            for &(al, be) in &[(1.0f64, 0.0), (0.7, 1.3), (-0.5, 2.0)] {
+                let mut c_ref = cbase.clone();
+                gemm(
+                    al as f32,
+                    MatRef::new(&abuf, m, k, rsa, csa),
+                    MatRef::new(&bbuf, k, n, rsb, csb),
+                    be as f32,
+                    MatMut::new(&mut c_ref, m, n, rsc, csc),
+                    Parallelism::Serial,
+                );
+
+                for par in [
+                    Parallelism::Serial,
+                    Parallelism::Rayon(2),
+                    Parallelism::Rayon(4),
+                    Parallelism::Rayon(8),
+                ] {
+                    let mut c_pk = cbase.clone();
+                    gemmkit::gemm_packed_a(
+                        al as f32,
+                        &packed,
+                        MatRef::new(&bbuf, k, n, rsb, csb),
+                        be as f32,
+                        MatMut::new(&mut c_pk, m, n, rsc, csc),
+                        par,
+                    );
+                    assert_eq!(
+                        c_ref, c_pk,
+                        "prepack_lhs != gemm for {m}x{k}x{n} la={la:?} a={al} b={be} par={par:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// f64 prepacked-LHS path is bit-identical too (exercises the f64 tile + the packed
+/// geometry for a second element type).
+#[test]
+fn prepack_lhs_equals_gemm_f64() {
+    for (m, k, n) in [(160, 96, 208), (96, 65, 65)] {
+        let a = Mat::<f64>::rand(m, k, 0x1234);
+        let b = Mat::<f64>::rand(k, n, 0x5678);
+        let c0 = Mat::<f64>::rand(m, n, 0x9abc);
+        let (abuf, rsa, csa) = build_view(&a, Layout::Col);
+        let (bbuf, rsb, csb) = build_view(&b, Layout::Col);
+        let (cbase, rsc, csc) = build_view(&c0, Layout::Row);
+
+        let mut c_ref = cbase.clone();
+        gemm(
+            0.9,
+            MatRef::new(&abuf, m, k, rsa, csa),
+            MatRef::new(&bbuf, k, n, rsb, csb),
+            -0.3,
+            MatMut::new(&mut c_ref, m, n, rsc, csc),
+            Parallelism::Serial,
+        );
+        let packed = gemmkit::prepack_lhs(MatRef::new(&abuf, m, k, rsa, csa));
+        let mut c_pk = cbase.clone();
+        gemmkit::gemm_packed_a(
+            0.9,
+            &packed,
+            MatRef::new(&bbuf, k, n, rsb, csb),
+            -0.3,
+            MatMut::new(&mut c_pk, m, n, rsc, csc),
+            Parallelism::Rayon(8),
+        );
+        assert_eq!(c_ref, c_pk, "f64 prepack_lhs != gemm for {m}x{k}x{n}");
+    }
+}
+
+/// Both-tiny products (`m <= 64 && n <= 64`) via the prepacked-LHS path: like the
+/// RHS case it uses the buffer's own blocking, so check *accuracy* against the f64
+/// reference rather than bit-identity to plain gemm — and the output must stay
+/// bit-identical across thread counts.
+#[test]
+fn prepack_lhs_both_tiny_accurate_and_deterministic() {
+    for (m, k, n) in [(48, 40, 48), (60, 600, 60), (10, 9, 12)] {
+        let a = Mat::<f32>::rand(m, k, 0x11 + m as u64);
+        let b = Mat::<f32>::rand(k, n, 0x22 + n as u64);
+        let c0 = Mat::<f32>::rand(m, n, 0x33 + k as u64);
+        let (abuf, rsa, csa) = build_view(&a, Layout::Col);
+        let (bbuf, rsb, csb) = build_view(&b, Layout::Col);
+        let (cbase, rsc, csc) = build_view(&c0, Layout::Row);
+        let cref = reference(&a, &b, &c0, 1.0, 0.5);
+
+        let packed = gemmkit::prepack_lhs(MatRef::new(&abuf, m, k, rsa, csa));
+        let mut c_ser = cbase.clone();
+        gemmkit::gemm_packed_a(
+            1.0,
+            &packed,
+            MatRef::new(&bbuf, k, n, rsb, csb),
+            0.5,
+            MatMut::new(&mut c_ser, m, n, rsc, csc),
+            Parallelism::Serial,
+        );
+        assert_accurate(
+            &c_ser,
+            rsc,
+            csc,
+            m,
+            n,
+            &cref,
+            &a,
+            &b,
+            k,
+            "both-tiny prepack_lhs",
+        );
+        for threads in [2usize, 8] {
+            let mut c_par = cbase.clone();
+            gemmkit::gemm_packed_a(
+                1.0,
+                &packed,
+                MatRef::new(&bbuf, k, n, rsb, csb),
+                0.5,
+                MatMut::new(&mut c_par, m, n, rsc, csc),
+                Parallelism::Rayon(threads),
+            );
+            assert_eq!(
+                c_ser, c_par,
+                "both-tiny prepack_lhs serial != parallel({threads}) for {m}x{k}x{n}"
+            );
+        }
+    }
+}
+
+/// gemv shapes (`n == 1` and `m == 1`) through the prepacked-LHS path. Plain `gemm`
+/// routes these to the dedicated gemv kernel, but `gemm_packed_a` runs them through
+/// the general driver (the transpose maps a unit dimension onto a unit *driver*
+/// dimension), so this checks **accuracy** against the f64 reference — and that the
+/// row-major-ish C contract admits the natural vector layouts (a unit column/row is
+/// addressed with `|csc| <= |rsc|`).
+#[test]
+fn prepack_lhs_gemv_accurate() {
+    // (m, k, n, rsc, csc): n==1 column-vector C (rsc=1,csc=1) and m==1 row-vector C
+    // (rsc=n,csc=1), both row-major-ish so the packed-LHS guard accepts them.
+    for &(m, k, n, rsc, csc) in &[
+        (64usize, 40, 1usize, 1isize, 1isize),
+        (255, 129, 1, 1, 1),
+        (1, 40, 64, 64, 1),
+        (1, 100, 255, 255, 1),
+    ] {
+        let a = Mat::<f32>::rand(m, k, 0xAA + (m * 5 + k) as u64);
+        let b = Mat::<f32>::rand(k, n, 0xBB + (n * 7 + k) as u64);
+        let c0 = Mat::<f32>::rand(m, n, 0xCC + (m + n) as u64);
+        let (abuf, rsa, csa) = build_view(&a, Layout::Col);
+        let (bbuf, rsb, csb) = build_view(&b, Layout::Col);
+        let mut cbuf = c0.v.clone(); // row-major m*n vector (rs=csc-major chosen above)
+        let cref = reference(&a, &b, &c0, 1.3, -0.4);
+
+        for par in [Parallelism::Serial, Parallelism::Rayon(4)] {
+            cbuf.copy_from_slice(&c0.v);
+            let packed = gemmkit::prepack_lhs(MatRef::new(&abuf, m, k, rsa, csa));
+            gemmkit::gemm_packed_a(
+                1.3,
+                &packed,
+                MatRef::new(&bbuf, k, n, rsb, csb),
+                -0.4,
+                MatMut::new(&mut cbuf, m, n, rsc, csc),
+                par,
+            );
+            assert_accurate(&cbuf, rsc, csc, m, n, &cref, &a, &b, k, "prepack_lhs gemv");
+        }
+    }
+}
+
+/// A column-major-ish C is unsupported by the prepacked-LHS path (it would keep A
+/// in the genuine LHS role); `gemm_packed_a` must reject it.
+#[test]
+#[should_panic(expected = "row-major-ish C")]
+fn prepack_lhs_col_major_c_panics() {
+    let (m, k, n) = (100, 80, 120);
+    let a = vec![0.0f32; m * k];
+    let b = vec![0.0f32; k * n];
+    let mut c = vec![0.0f32; m * n];
+    let packed = gemmkit::prepack_lhs(MatRef::from_col_major(&a, m, k));
+    gemmkit::gemm_packed_a(
+        1.0,
+        &packed,
+        MatRef::from_col_major(&b, k, n),
+        0.0,
+        MatMut::from_col_major(&mut c, m, n), // column-major C -> reject
+        Parallelism::Serial,
+    );
+}
+
 /// A row-major-ish C is unsupported by the prepacked path (it would swap A/B);
 /// `gemm_packed_b` must reject it instead of silently computing the wrong thing.
 #[test]
@@ -911,6 +1128,35 @@ fn miri_scalar_path() {
             Parallelism::Serial,
         );
         assert_eq!(c_ref, c_pk, "miri: prepack != gemm");
+    }
+    // Prepacked-LHS path on the scalar engine: bit-identical to plain gemm.
+    // Shape is not both-tiny (m > 64), and C is row-major (the supported
+    // orientation), so the prepacked geometry matches plain gemm exactly.
+    {
+        let (m, k, n) = (66usize, 4, 6);
+        let a = rand_vec::<f32>(m * k, 1);
+        let b = rand_vec::<f32>(k * n, 2);
+        let c0 = rand_vec::<f32>(m * n, 3);
+        let mut c_ref = c0.clone();
+        gemm(
+            1.3,
+            MatRef::from_row_major(&a, m, k),
+            MatRef::from_row_major(&b, k, n),
+            0.5,
+            MatMut::from_row_major(&mut c_ref, m, n),
+            Parallelism::Serial,
+        );
+        let packed = gemmkit::prepack_lhs(MatRef::from_row_major(&a, m, k));
+        let mut c_pk = c0.clone();
+        gemmkit::gemm_packed_a(
+            1.3,
+            &packed,
+            MatRef::from_row_major(&b, k, n),
+            0.5,
+            MatMut::from_row_major(&mut c_pk, m, n),
+            Parallelism::Serial,
+        );
+        assert_eq!(c_ref, c_pk, "miri: prepack_lhs != gemm");
     }
 }
 
