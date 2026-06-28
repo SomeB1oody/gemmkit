@@ -16,12 +16,11 @@
 
 #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), not(miri)))]
 mod cpuid;
-// `not(miri)`: the sysctl backend calls the `sysctlbyname` foreign function, which
-// Miri cannot execute — gate it out (like `cpuid` above) so a Miri run on macOS
-// falls through to the calibrated fallback instead of aborting.
+// `not(miri)`: the sysctl backend calls the `sysctlbyname` foreign function
 #[cfg(all(target_os = "macos", not(miri)))]
 mod sysctl;
-#[cfg(target_os = "linux")]
+// `not(miri)`: the sysfs backend reads `/sys` via `std::fs`
+#[cfg(all(target_os = "linux", not(miri)))]
 mod sysfs;
 
 #[cfg(feature = "std")]
@@ -197,11 +196,12 @@ fn detect() -> CacheTopology {
     if let Some(t) = cpuid::detect().filter(plausible) {
         return t;
     }
-    #[cfg(target_os = "linux")]
+    // `not(miri)`: the backend reads `/sys`
+    #[cfg(all(target_os = "linux", not(miri)))]
     if let Some(t) = sysfs::detect().filter(plausible) {
         return t;
     }
-    // `not(miri)`: see the `mod sysctl` gate — `sysctlbyname` is a foreign call.
+    // `not(miri)`: the backend calls `sysctlbyname`
     #[cfg(all(target_os = "macos", not(miri)))]
     if let Some(t) = sysctl::detect().filter(plausible) {
         return t;
