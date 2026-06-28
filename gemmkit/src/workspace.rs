@@ -72,22 +72,24 @@ impl Workspace {
         }
     }
 
-    /// Carve out `n_threads` per-thread LHS regions plus one shared RHS region,
-    /// each 64-byte aligned, sized in elements of `T`. Returns the LHS base, the
-    /// per-thread LHS element stride, and the RHS base.
+    /// Carve out `a_regions` equal LHS regions plus one shared RHS region, each
+    /// 64-byte aligned, sized in elements of `T`. Returns the LHS base, the
+    /// per-region LHS element stride, and the RHS base. The LHS region count is the
+    /// worker count on the per-worker pack path, or the row-block count on the
+    /// shared-A path (B1) — the carving is identical either way.
     ///
     /// # Safety
     /// The returned pointers are valid only while this `&mut self` borrow lives
     /// and only for the requested element counts.
     pub(crate) fn regions<T>(
         &mut self,
-        a_elems_per_thread: usize,
-        n_threads: usize,
+        a_elems_per_region: usize,
+        a_regions: usize,
         b_elems: usize,
     ) -> Regions<T> {
         let esize = core::mem::size_of::<T>().max(1);
-        let a_bytes_per_thread = round_up(a_elems_per_thread * esize, ALIGN);
-        let a_total = a_bytes_per_thread * n_threads.max(1);
+        let a_bytes_per_region = round_up(a_elems_per_region * esize, ALIGN);
+        let a_total = a_bytes_per_region * a_regions.max(1);
         let b_bytes = round_up(b_elems * esize, ALIGN);
         self.ensure(a_total + b_bytes);
 
@@ -96,7 +98,7 @@ impl Workspace {
         let b_base = unsafe { base.add(a_total) };
         Regions {
             a_base: base as *mut T,
-            a_stride: a_bytes_per_thread / esize,
+            a_stride: a_bytes_per_region / esize,
             b_base: b_base as *mut T,
         }
     }
