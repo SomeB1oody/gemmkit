@@ -96,22 +96,21 @@ static PARALLEL_OVERSAMPLE: Threshold = Threshold::new("GEMMKIT_PARALLEL_OVERSAM
 // [`thread_dim_stride`]); any non-zero env/setter value overrides verbatim.
 static THREAD_DIM_STRIDE: Threshold = Threshold::new("GEMMKIT_THREAD_DIM_STRIDE", 0);
 
-// Minimum `m*n*k` for the shared-LHS A-pack to engage on the parallel packed-A
-// path: below it each worker packs its own A block, above it every row-block's A
-// is packed once into a shared region behind a barrier. The pre-pass adds a
-// fork-join per depth slice; it pays only once the *redundancy it removes* (each
-// row-block re-packed by every worker that touches it) outweighs that overhead,
-// so small/mid problems regress and it is gated above the crossover.
+// Minimum `m*n*k` for the shared-LHS A-pack to engage (on top of the runtime
+// `n_mc < n_threads` redundancy guard in the driver). The shared pre-pass removes
+// redundant per-worker packs but adds a fork-join barrier per depth slice; it pays
+// only once the problem is large enough to amortize that barrier, so small/mid
+// sizes regress and it is gated above the crossover.
 //
-// The crossover is architecture-dependent because the redundancy ratio is
-// `workers ÷ row-blocks`, and the row-block count is `ceil(m / MC)`: a smaller MC
-// cap (`MC_REG_PANELS · MR`) means fewer, wider row-blocks re-packed by more
-// workers, so the pre-pass pays from a *much* smaller problem. The default is
-// therefore split by the MC the native tile implies — a small-MC tile (NEON
-// `MR=16` ⇒ `MC=128`) crosses over near `mnk ~ 5e7`, a large-MC tile (AVX-512
-// `MR=32` ⇒ `MC=256`) only near `mnk ~ 8e9`. Calibration points — perf-validate
-// per machine. `=1` forces it on, a huge value forces it off; the
-// `GEMMKIT_SHARED_LHS_MNK` env / setter overrides either default verbatim.
+// The crossover is a **machine** property, not a tile property: the *benefit*
+// (≈ `(n_threads-1)·m·kc` of packs saved) is independent of the tile's MC, while
+// the *cost* is the barrier, which scales with the thread count and the cache
+// hierarchy. Measured crossovers differ ~160× between a few-core / cheap-barrier
+// part (~`5e7`) and a many-core / expensive-barrier part (~`8e9`) — far more than
+// any tile difference. We can't derive that from one machine, so the default is
+// split by a coarse machine-class proxy (`target_arch`) and is meant to be
+// re-validated per machine via `perf_shared_lhs`. `GEMMKIT_SHARED_LHS_MNK`
+// overrides it verbatim (`=1` forces on, a huge value forces off).
 #[cfg(target_arch = "aarch64")]
 const SHARED_LHS_MNK_DEFAULT: usize = 50_000_000;
 #[cfg(not(target_arch = "aarch64"))]
