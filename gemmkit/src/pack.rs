@@ -45,13 +45,12 @@ pub(crate) unsafe fn pack_panels<T: Scalar>(
                     d = d.add(width);
                 }
             } else {
-                // Cache-blocked transpose (B3): walk the source along its
-                // *contiguous* dimension (`depth` — stride 1 for a row-major LHS or
-                // a column-major RHS) in short strips and scatter each strip into
-                // the panel, instead of the naive gather that touches `width` fresh
-                // source cache lines per depth step (a miss per element when `lead`
-                // is large). A pure *reordered* copy — the packed bytes are byte-for-
-                // byte identical — but far cheaper for a strided source.
+                // Cache-blocked transpose: walk the source along its contiguous
+                // dimension (`depth` — stride 1 for a row-major LHS or column-major
+                // RHS) in short strips and scatter each into the panel, rather than
+                // gathering `width` strided elements per depth step (a cache miss
+                // per element when `lead` is large). A pure reordered copy (packed
+                // bytes identical), but far cheaper for a strided source.
                 const TILE: usize = 16;
                 let panel = d;
                 let mut p0 = 0;

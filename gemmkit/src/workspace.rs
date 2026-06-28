@@ -76,7 +76,7 @@ impl Workspace {
     /// 64-byte aligned, sized in elements of `T`. Returns the LHS base, the
     /// per-region LHS element stride, and the RHS base. The LHS region count is the
     /// worker count on the per-worker pack path, or the row-block count on the
-    /// shared-A path (B1) — the carving is identical either way.
+    /// shared-A path — the carving is identical either way.
     ///
     /// # Safety
     /// The returned pointers are valid only while this `&mut self` borrow lives
