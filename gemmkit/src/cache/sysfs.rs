@@ -48,7 +48,7 @@ fn count_cpu_list(s: &str) -> usize {
                 if let (Ok(a), Ok(b)) = (a.trim().parse::<usize>(), b.trim().parse::<usize>())
                     && b >= a
                 {
-                    n += b - a + 1;
+                    n = n.saturating_add((b - a).saturating_add(1));
                 }
             }
             None if part.parse::<usize>().is_ok() => n += 1,
@@ -160,13 +160,15 @@ mod tests {
         assert_eq!(sf.l2.bytes, cp.l2.bytes, "L2 size mismatch");
         assert_eq!(sf.l1d.line, cp.l1d.line, "L1d line mismatch");
         assert_eq!(sf.l2.line, cp.l2.line, "L2 line mismatch");
-        // Derived `shared_by` invariants (independent of the CPUID oracle): L1d
-        // and L3 are always 1; an x86 L2 is private (raw sharing == SMT degree),
-        // so it must derive to 1 as well.
+        // L1d and L3 are hard-set to 1 by the backend.
+        // L2 is *derived* (physical-core L2-sharing degree):
+        // 1 on a private-L2 part (mainstream Core/Zen, Neoverse)
+        // but the cluster size on a shared-L2 part (Intel Atom / E-core modules, Apple),
+        // so it is micro-arch dependent
         assert_eq!(sf.l1d.shared_by, 1, "L1d shared_by must be 1");
-        assert_eq!(
-            sf.l2.shared_by, 1,
-            "x86 private L2 shared_by should derive to 1"
+        assert!(
+            sf.l2.shared_by >= 1,
+            "L2 shared_by must be a positive count"
         );
         if let Some(s3) = sf.l3 {
             assert_eq!(s3.shared_by, 1, "L3 shared_by must be 1");

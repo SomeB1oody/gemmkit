@@ -102,19 +102,15 @@ static THREAD_DIM_STRIDE: Threshold = Threshold::new("GEMMKIT_THREAD_DIM_STRIDE"
 // only once the problem is large enough to amortize that barrier, so small/mid
 // sizes regress and it is gated above the crossover.
 //
-// The crossover is a **machine** property, not a tile property: the *benefit*
-// (≈ `(n_threads-1)·m·kc` of packs saved) is independent of the tile's MC, while
-// the *cost* is the barrier, which scales with the thread count and the cache
-// hierarchy. Measured crossovers differ ~160× between a few-core / cheap-barrier
-// part (~`5e7`) and a many-core / expensive-barrier part (~`8e9`) — far more than
-// any tile difference. We can't derive that from one machine, so the default is
-// split by a coarse machine-class proxy (`target_arch`) and is meant to be
-// re-validated per machine via `perf_shared_lhs`. `GEMMKIT_SHARED_LHS_MNK`
-// overrides it verbatim (`=1` forces on, a huge value forces off).
+// The crossover is a **machine** property, not a tile property
 #[cfg(target_arch = "aarch64")]
 const SHARED_LHS_MNK_DEFAULT: usize = 50_000_000;
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(all(not(target_arch = "aarch64"), target_pointer_width = "64"))]
 const SHARED_LHS_MNK_DEFAULT: usize = 8_000_000_000;
+// On a 32-bit target `usize` 8e9 literal above would not compile
+// So on 32-bit set the default to `usize::MAX` to disable the pre-pass
+#[cfg(all(not(target_arch = "aarch64"), not(target_pointer_width = "64")))]
+const SHARED_LHS_MNK_DEFAULT: usize = usize::MAX;
 static SHARED_LHS_MNK: Threshold = Threshold::new("GEMMKIT_SHARED_LHS_MNK", SHARED_LHS_MNK_DEFAULT);
 
 /// Get the serial/parallel work gate (`m*n*k` threshold).

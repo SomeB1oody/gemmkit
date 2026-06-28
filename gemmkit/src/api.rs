@@ -403,10 +403,10 @@ pub fn prepack_rhs<T: GemmScalar>(b: MatRef<'_, T>) -> PackedRhs<T> {
 /// `C <- alpha·A·B + beta·C` reusing a [`PackedRhs`] (pre-packed `B`), via the
 /// thread-local workspace pool. Skips the per-call RHS repack.
 ///
-/// The result is **bit-identical** to a plain [`gemm`] except for very small
-/// (`m <= 64 && n <= 64`) products, which alone use a small-matrix blocking
-/// shortcut the prepacked path bypasses — those stay correct but may differ in the
-/// last ULP. Output is bit-identical across thread counts regardless.
+/// The result is **bit-identical** to a plain [`gemm`] except in two cases that
+/// stay correct but may differ in the last ULP: very small (`m <= 64 && n <= 64`)
+/// products and gemv-shaped (`m == 1` or `n == 1`) products.
+/// Output is bit-identical across thread counts regardless.
 ///
 /// # Panics
 /// If the dimensions disagree (`A.cols != B.rows`, `A.rows != C.rows`,
