@@ -356,9 +356,11 @@ type PackedFn<T> = unsafe fn(PackedConsume<T>, Parallelism, &mut Workspace);
 /// The memoized dispatch slot for one element type: the standard kernel, the
 /// prepacked-RHS kernel, and the microtile `(mr, nr)` they share. Bundling them
 /// keeps adding an ISA a single `select_*` ladder arm. `mr`/`nr` mirror the tile
-/// constants in the wrappers above; the consume path re-derives `mr` from
-/// `MR_REG·LANES` and asserts the resulting blocking matches, so a stale literal
-/// fails loudly rather than silently.
+/// constants in the wrappers above and are consumed by `prepack_rhs` (via
+/// `rhs_tile`) to resolve the buffer's blocking geometry; the consume path then
+/// reuses that stored geometry verbatim, so pack and consume stay consistent even
+/// if a literal were wrong (the result would be correct but not bit-identical to
+/// plain gemm — caught by `prepack_equals_gemm`).
 #[derive(Copy, Clone)]
 struct Dispatched<T> {
     run: GemmFn<T>,

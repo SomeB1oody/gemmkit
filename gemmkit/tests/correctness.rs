@@ -649,6 +649,52 @@ fn prepack_row_major_c_panics() {
     );
 }
 
+/// B1 shared-LHS A-pack: with the workload gate forced fully open, the shared
+/// pre-pack path (one pack per row-block + indexed read) must stay bit-identical
+/// to the serial per-worker path, for every thread count. These sizes sit below
+/// the default gate, so this is the only coverage of the shared pre-pass; bit-
+/// identity holds whether the gate is on or off, so forcing it cannot disturb
+/// concurrently-running tests. Row-major A (`rsa != 1`) forces the packed path.
+#[test]
+fn shared_lhs_a_bit_identical() {
+    let prev = gemmkit::tuning::shared_lhs_mnk();
+    gemmkit::tuning::set_shared_lhs_mnk(1); // force shared-A on for any parallel run
+    for (m, k, n) in [(200, 130, 175), (384, 96, 320), (256, 64, 200)] {
+        let a = Mat::<f32>::rand(m, k, 0xA1 + m as u64);
+        let b = Mat::<f32>::rand(k, n, 0xB2 + n as u64);
+        let c0 = Mat::<f32>::rand(m, n, 0xC3 + k as u64);
+        let (abuf, rsa, csa) = build_view(&a, Layout::Row); // rsa = k != 1 -> packs A
+        let (bbuf, rsb, csb) = build_view(&b, Layout::Col);
+        let (cbase, rsc, csc) = build_view(&c0, Layout::Col);
+
+        let mut c_ser = cbase.clone();
+        gemm(
+            0.9,
+            MatRef::new(&abuf, m, k, rsa, csa),
+            MatRef::new(&bbuf, k, n, rsb, csb),
+            0.4,
+            MatMut::new(&mut c_ser, m, n, rsc, csc),
+            Parallelism::Serial,
+        );
+        for t in [2usize, 4, 8, 16] {
+            let mut c_par = cbase.clone();
+            gemm(
+                0.9,
+                MatRef::new(&abuf, m, k, rsa, csa),
+                MatRef::new(&bbuf, k, n, rsb, csb),
+                0.4,
+                MatMut::new(&mut c_par, m, n, rsc, csc),
+                Parallelism::Rayon(t),
+            );
+            assert_eq!(
+                c_ser, c_par,
+                "shared-A: serial != parallel({t}) for {m}x{k}x{n}"
+            );
+        }
+    }
+    gemmkit::tuning::set_shared_lhs_mnk(prev);
+}
+
 /// Negative strides via the unchecked API (reversed-row view of A).
 #[test]
 fn negative_strides_unchecked() {
