@@ -1362,6 +1362,25 @@ fn miri_scalar_path() {
         gemmkit::bf16::from_f64(-0.5),
         Parallelism::Serial,
     );
+    // Integer (i8 -> i32) scalar path: widen-load, i32 accumulate, partial-tile
+    // copy-back, and the beta != 0 i32 read of C.
+    {
+        let (m, k, n) = (7usize, 9, 5);
+        let a = rand_i8(m * k, 1);
+        let b = rand_i8(k * n, 2);
+        let c0: Vec<i32> = (0..m * n).map(|x| x as i32 % 4 - 2).collect();
+        let cref = ref_i8(&a, &b, &c0, m, k, n, 3, -2);
+        let mut c = c0.clone();
+        gemmkit::gemm_i8(
+            3,
+            MatRef::from_row_major(&a, m, k),
+            MatRef::from_row_major(&b, k, n),
+            -2,
+            MatMut::from_row_major(&mut c, m, n),
+            Parallelism::Serial,
+        );
+        assert_eq!(c, cref, "miri: i8 mismatch");
+    }
     // gemv shapes.
     run_case::<f32>(
         8,
@@ -1504,9 +1523,9 @@ fn simd_narrow_store_matches_half_avx512() {
         -1.0,
         0.5,
         1.0 / 3.0,
-        65504.0,    // f16 max
-        70000.0,    // overflows f16 -> Inf
-        1.0e-5,     // f16 subnormal-ish
+        65504.0,   // f16 max
+        70000.0,   // overflows f16 -> Inf
+        1.0e-5,    // f16 subnormal-ish
         1.0e-8,    // underflows to 0 in f16
         1.2340001, // rounding
         2.5001,
@@ -1570,6 +1589,177 @@ fn simd_narrow_store_matches_half_avx512() {
                 }
             }
         });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// integer GEMM (i8 -> i32)
+// ---------------------------------------------------------------------------
+
+/// Deterministic i8 fill in [-100, 100] (kept small so the i32 reference never
+/// overflows for the tested k, making the comparison exact).
+fn rand_i8(n: usize, seed: u64) -> Vec<i8> {
+    let mut s = seed.wrapping_add(0x9E3779B97F4A7C15);
+    (0..n)
+        .map(|_| {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            ((s >> 24) as i64 % 201 - 100) as i8
+        })
+        .collect()
+}
+
+/// Exact i32 GEMM reference (row-major), accumulated in i64 then range-checked, so
+/// the integer kernel must match it **bit-for-bit**.
+fn ref_i8(
+    a: &[i8],
+    b: &[i8],
+    c0: &[i32],
+    m: usize,
+    k: usize,
+    n: usize,
+    alpha: i32,
+    beta: i32,
+) -> Vec<i32> {
+    let mut out = vec![0i32; m * n];
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc = 0i64;
+            for p in 0..k {
+                acc += a[i * k + p] as i64 * b[p * n + j] as i64;
+            }
+            let v = beta as i64 * c0[i * n + j] as i64 + alpha as i64 * acc;
+            assert!(
+                (i32::MIN as i64..=i32::MAX as i64).contains(&v),
+                "reference overflow — tighten test sizes"
+            );
+            out[i * n + j] = v as i32;
+        }
+    }
+    out
+}
+
+#[test]
+fn correctness_i8() {
+    use gemmkit::{MatMut, MatRef};
+    for (m, k, n) in [
+        (1, 1, 1),
+        (3, 4, 5),
+        (16, 8, 7),
+        (32, 32, 32),
+        (33, 17, 19),
+        (40, 33, 28),
+        (64, 80, 48),
+        (65, 64, 64),
+        (128, 96, 112),
+    ] {
+        for &(alpha, beta) in &[(1i32, 0i32), (1, 1), (3, -2)] {
+            let a = rand_i8(m * k, 0x100 + (m * 7 + k) as u64);
+            let b = rand_i8(k * n, 0x200 + (n * 3 + k) as u64);
+            let c0: Vec<i32> = (0..m * n).map(|x| (x as i32 % 7) - 3).collect();
+            let cref = ref_i8(&a, &b, &c0, m, k, n, alpha, beta);
+
+            // Row-major A, column-major B, row-major C32.
+            let bcol: Vec<i8> = {
+                let mut v = vec![0i8; k * n];
+                for i in 0..k {
+                    for j in 0..n {
+                        v[j * k + i] = b[i * n + j];
+                    }
+                }
+                v
+            };
+            let mut c = c0.clone();
+            gemmkit::gemm_i8(
+                alpha,
+                MatRef::from_row_major(&a, m, k),
+                MatRef::new(&bcol, k, n, 1, k as isize),
+                beta,
+                MatMut::from_row_major(&mut c, m, n),
+                Parallelism::Serial,
+            );
+            assert_eq!(c, cref, "i8 mismatch {m}x{k}x{n} alpha={alpha} beta={beta}");
+        }
+    }
+}
+
+/// Integer serial == parallel **bit-identity** (integer accumulation is exact, so
+/// any thread count must produce identical i32 output).
+#[test]
+fn parallel_equals_serial_i8() {
+    use gemmkit::{MatMut, MatRef};
+    for (m, k, n) in [(200, 130, 175), (256, 64, 200), (384, 96, 320)] {
+        let a = rand_i8(m * k, 0x300 + m as u64);
+        let b = rand_i8(k * n, 0x400 + n as u64);
+        let c0: Vec<i32> = (0..m * n).map(|x| (x as i32 % 5) - 2).collect();
+        for &(alpha, beta) in &[(1i32, 0i32), (2, 3)] {
+            let mut c_ser = c0.clone();
+            gemmkit::gemm_i8(
+                alpha,
+                MatRef::from_col_major(&a, m, k),
+                MatRef::from_col_major(&b, k, n),
+                beta,
+                MatMut::from_col_major(&mut c_ser, m, n),
+                Parallelism::Serial,
+            );
+            for t in [2usize, 4, 8, 16] {
+                let mut c_par = c0.clone();
+                gemmkit::gemm_i8(
+                    alpha,
+                    MatRef::from_col_major(&a, m, k),
+                    MatRef::from_col_major(&b, k, n),
+                    beta,
+                    MatMut::from_col_major(&mut c_par, m, n),
+                    Parallelism::Rayon(t),
+                );
+                assert_eq!(c_ser, c_par, "i8 serial != parallel({t}) for {m}x{k}x{n}");
+            }
+        }
+    }
+}
+
+/// Negative strides for the integer path via [`gemmkit::gemm_i8_unchecked`] (the
+/// heterogeneous escape hatch — the homogeneous `gemm_unchecked` can't serve
+/// `i8 -> i32`). Reversed-row A, compared to the row-reversed exact reference.
+#[test]
+fn i8_negative_strides_unchecked() {
+    let (m, k, n) = (12usize, 9, 7);
+    let a = rand_i8(m * k, 5); // row-major m×k
+    let b = rand_i8(k * n, 6); // row-major k×n
+    let c0 = vec![0i32; m * n];
+    let cref = ref_i8(&a, &b, &c0, m, k, n, 1, 0);
+
+    let mut c = vec![0i32; m * n];
+    unsafe {
+        let a_last = a.as_ptr().add((m - 1) * k); // base = last row
+        gemmkit::gemm_i8_unchecked(
+            m,
+            k,
+            n,
+            1,
+            a_last,
+            -(k as isize), // reversed rows of A
+            1,
+            b.as_ptr(),
+            n as isize, // row-major B
+            1,
+            0,
+            c.as_mut_ptr(),
+            n as isize, // row-major C
+            1,
+            Parallelism::Serial,
+        );
+    }
+    // Computed C[i,j] = sum_k A[m-1-i,k]·B[k,j]; compare to the reversed reference.
+    for i in 0..m {
+        for j in 0..n {
+            assert_eq!(
+                c[i * n + j],
+                cref[(m - 1 - i) * n + j],
+                "i8 neg stride ({i},{j})"
+            );
+        }
     }
 }
 

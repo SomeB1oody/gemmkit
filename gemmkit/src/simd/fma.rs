@@ -220,3 +220,81 @@ impl KernelSimd<bf16, bf16, f32, bf16> for Fma {
         }
     }
 }
+
+// ---- integer: i8 inputs, i32 accumulator (8-wide __m256i, AVX2 integer ops) ----
+
+impl SimdOps<i32> for Fma {
+    type Reg = __m256i;
+    const LANES: usize = 8;
+    const ALIGN: usize = 32;
+
+    #[inline(always)]
+    unsafe fn zero(self) -> __m256i {
+        unsafe { _mm256_setzero_si256() }
+    }
+    #[inline(always)]
+    unsafe fn splat(self, v: i32) -> __m256i {
+        unsafe { _mm256_set1_epi32(v) }
+    }
+    #[inline(always)]
+    unsafe fn load(self, p: *const i32) -> __m256i {
+        unsafe { _mm256_load_si256(p as *const __m256i) }
+    }
+    #[inline(always)]
+    unsafe fn loadu(self, p: *const i32) -> __m256i {
+        unsafe { _mm256_loadu_si256(p as *const __m256i) }
+    }
+    #[inline(always)]
+    unsafe fn store(self, p: *mut i32, v: __m256i) {
+        unsafe { _mm256_store_si256(p as *mut __m256i, v) }
+    }
+    #[inline(always)]
+    unsafe fn storeu(self, p: *mut i32, v: __m256i) {
+        unsafe { _mm256_storeu_si256(p as *mut __m256i, v) }
+    }
+    #[inline(always)]
+    unsafe fn mul(self, a: __m256i, b: __m256i) -> __m256i {
+        unsafe { _mm256_mullo_epi32(a, b) }
+    }
+    #[inline(always)]
+    unsafe fn add(self, a: __m256i, b: __m256i) -> __m256i {
+        unsafe { _mm256_add_epi32(a, b) }
+    }
+    #[inline(always)]
+    unsafe fn mul_add(self, a: __m256i, b: __m256i, c: __m256i) -> __m256i {
+        unsafe { _mm256_add_epi32(_mm256_mullo_epi32(a, b), c) }
+    }
+    #[inline(always)]
+    unsafe fn reduce_sum(self, v: __m256i) -> i32 {
+        unsafe {
+            let hi = _mm256_extracti128_si256::<1>(v);
+            let lo = _mm256_castsi256_si128(v);
+            let s = _mm_add_epi32(lo, hi); // 4 partials
+            let sh = _mm_shuffle_epi32::<0b01_00_11_10>(s);
+            let s = _mm_add_epi32(s, sh);
+            let sh = _mm_shuffle_epi32::<0b00_00_00_01>(s);
+            _mm_cvtsi128_si32(_mm_add_epi32(s, sh))
+        }
+    }
+}
+
+/// `i8 -> i32`: sign-extend 8 LHS bytes on load, broadcast a sign-extended RHS byte;
+/// `Out == Acc == i32`, so `load_out`/`store_out` are plain `i32` load/store.
+impl KernelSimd<i8, i8, i32, i32> for Fma {
+    #[inline(always)]
+    unsafe fn load_lhs(self, p: *const i8) -> __m256i {
+        unsafe { _mm256_cvtepi8_epi32(_mm_loadl_epi64(p as *const __m128i)) }
+    }
+    #[inline(always)]
+    unsafe fn splat_rhs(self, v: i8) -> __m256i {
+        unsafe { _mm256_set1_epi32(v as i32) }
+    }
+    #[inline(always)]
+    unsafe fn load_out(self, p: *const i32) -> __m256i {
+        unsafe { _mm256_loadu_si256(p as *const __m256i) }
+    }
+    #[inline(always)]
+    unsafe fn store_out(self, p: *mut i32, v: __m256i) {
+        unsafe { _mm256_storeu_si256(p as *mut __m256i, v) }
+    }
+}

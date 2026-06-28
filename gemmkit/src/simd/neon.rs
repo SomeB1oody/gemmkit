@@ -258,3 +258,87 @@ impl KernelSimd<bf16, bf16, f32, bf16> for Neon {
         }
     }
 }
+
+// ---- integer: i8 inputs, i32 accumulator (4-wide int32x4_t) ----
+//
+// The `i32` accumulator ops are native NEON; the `i8 -> i32` widen-load uses a
+// per-lane scalar fallback to avoid loading bytes past a 4-wide panel slot.
+// TODO(neon): vectorize the widen with `vmovl_s8`/`vmovl_s16` over the full `mr`
+// row block at once (where the 8-byte read stays in bounds), and a hardware
+// `i8` dot (`SDOT`) where the `dotprod` extension is present — the NEON analogue of
+// VNNI. Deferred ARM-hardware item.
+
+impl SimdOps<i32> for Neon {
+    type Reg = int32x4_t;
+    const LANES: usize = 4;
+    const ALIGN: usize = 16;
+
+    #[inline(always)]
+    unsafe fn zero(self) -> int32x4_t {
+        unsafe { vdupq_n_s32(0) }
+    }
+    #[inline(always)]
+    unsafe fn splat(self, v: i32) -> int32x4_t {
+        unsafe { vdupq_n_s32(v) }
+    }
+    #[inline(always)]
+    unsafe fn load(self, p: *const i32) -> int32x4_t {
+        unsafe { vld1q_s32(p) }
+    }
+    #[inline(always)]
+    unsafe fn loadu(self, p: *const i32) -> int32x4_t {
+        unsafe { vld1q_s32(p) }
+    }
+    #[inline(always)]
+    unsafe fn store(self, p: *mut i32, v: int32x4_t) {
+        unsafe { vst1q_s32(p, v) }
+    }
+    #[inline(always)]
+    unsafe fn storeu(self, p: *mut i32, v: int32x4_t) {
+        unsafe { vst1q_s32(p, v) }
+    }
+    #[inline(always)]
+    unsafe fn mul(self, a: int32x4_t, b: int32x4_t) -> int32x4_t {
+        unsafe { vmulq_s32(a, b) }
+    }
+    #[inline(always)]
+    unsafe fn add(self, a: int32x4_t, b: int32x4_t) -> int32x4_t {
+        unsafe { vaddq_s32(a, b) }
+    }
+    #[inline(always)]
+    unsafe fn mul_add(self, a: int32x4_t, b: int32x4_t, c: int32x4_t) -> int32x4_t {
+        // `vmlaq_s32(c, a, b)` == a*b + c.
+        unsafe { vmlaq_s32(c, a, b) }
+    }
+    #[inline(always)]
+    unsafe fn reduce_sum(self, v: int32x4_t) -> i32 {
+        unsafe { vaddvq_s32(v) }
+    }
+}
+
+impl KernelSimd<i8, i8, i32, i32> for Neon {
+    #[inline(always)]
+    unsafe fn load_lhs(self, p: *const i8) -> int32x4_t {
+        unsafe {
+            let a = [
+                *p as i32,
+                *p.add(1) as i32,
+                *p.add(2) as i32,
+                *p.add(3) as i32,
+            ];
+            vld1q_s32(a.as_ptr())
+        }
+    }
+    #[inline(always)]
+    unsafe fn splat_rhs(self, v: i8) -> int32x4_t {
+        unsafe { vdupq_n_s32(v as i32) }
+    }
+    #[inline(always)]
+    unsafe fn load_out(self, p: *const i32) -> int32x4_t {
+        unsafe { vld1q_s32(p) }
+    }
+    #[inline(always)]
+    unsafe fn store_out(self, p: *mut i32, v: int32x4_t) {
+        unsafe { vst1q_s32(p, v) }
+    }
+}

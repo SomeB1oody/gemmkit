@@ -99,6 +99,75 @@ impl KernelSimd<f16, f16, f32, f16> for ScalarTok {
     }
 }
 
+// Integer GEMM (scalar fallback): `i32` accumulator ops and the `i8 -> i32`
+// widen-load, one element at a time. Wrapping arithmetic = conventional integer
+// overflow semantics. This is the Miri-checked reference for the integer path.
+impl SimdOps<i32> for ScalarTok {
+    type Reg = i32;
+    const LANES: usize = 1;
+    const ALIGN: usize = core::mem::align_of::<i32>();
+
+    #[inline(always)]
+    unsafe fn zero(self) -> i32 {
+        0
+    }
+    #[inline(always)]
+    unsafe fn splat(self, v: i32) -> i32 {
+        v
+    }
+    #[inline(always)]
+    unsafe fn load(self, p: *const i32) -> i32 {
+        unsafe { *p }
+    }
+    #[inline(always)]
+    unsafe fn loadu(self, p: *const i32) -> i32 {
+        unsafe { *p }
+    }
+    #[inline(always)]
+    unsafe fn store(self, p: *mut i32, v: i32) {
+        unsafe { *p = v }
+    }
+    #[inline(always)]
+    unsafe fn storeu(self, p: *mut i32, v: i32) {
+        unsafe { *p = v }
+    }
+    #[inline(always)]
+    unsafe fn mul(self, a: i32, b: i32) -> i32 {
+        a.wrapping_mul(b)
+    }
+    #[inline(always)]
+    unsafe fn add(self, a: i32, b: i32) -> i32 {
+        a.wrapping_add(b)
+    }
+    #[inline(always)]
+    unsafe fn mul_add(self, a: i32, b: i32, c: i32) -> i32 {
+        a.wrapping_mul(b).wrapping_add(c)
+    }
+    #[inline(always)]
+    unsafe fn reduce_sum(self, v: i32) -> i32 {
+        v
+    }
+}
+
+impl KernelSimd<i8, i8, i32, i32> for ScalarTok {
+    #[inline(always)]
+    unsafe fn load_lhs(self, p: *const i8) -> i32 {
+        unsafe { *p as i32 }
+    }
+    #[inline(always)]
+    unsafe fn splat_rhs(self, v: i8) -> i32 {
+        v as i32
+    }
+    #[inline(always)]
+    unsafe fn load_out(self, p: *const i32) -> i32 {
+        unsafe { *p }
+    }
+    #[inline(always)]
+    unsafe fn store_out(self, p: *mut i32, v: i32) {
+        unsafe { *p = v }
+    }
+}
+
 impl KernelSimd<bf16, bf16, f32, bf16> for ScalarTok {
     #[inline(always)]
     unsafe fn load_lhs(self, p: *const bf16) -> f32 {

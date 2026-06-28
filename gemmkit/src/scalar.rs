@@ -52,6 +52,22 @@ impl Scalar for half::bf16 {
     const ONE: Self = half::bf16::from_bits(0x3F80);
 }
 
+// Integer GEMM element types: `i8` inputs accumulate in `i32` (`Acc = i32`), and
+// `i32` is its own accumulator/output. Like the narrow floats, `i8` is `Scalar` but
+// not `Float` — the integer family widens `i8` to `i32` on load and does exact `i32`
+// arithmetic (wrapping on overflow, the conventional integer-GEMM semantics).
+impl Scalar for i8 {
+    type Acc = i32;
+    const ZERO: Self = 0;
+    const ONE: Self = 1;
+}
+
+impl Scalar for i32 {
+    type Acc = i32;
+    const ZERO: Self = 0;
+    const ONE: Self = 1;
+}
+
 /// A narrow floating-point input type that accumulates in `f32` (`Acc = f32`):
 /// `f16` and `bf16`. It supplies only the **scalar** widen / narrow conversions the
 /// kernel epilogue's strided copy-back path needs; the vectorized hot loop uses the

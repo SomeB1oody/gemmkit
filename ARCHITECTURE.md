@@ -103,10 +103,15 @@ token's `vectorize` is the identity.
 
 The driver is generic over [`KernelFamily`], not over "do an FMA on `T`". A family
 bundles the input/accumulator/output types, the pack layout, the microkernel, and
-the epilogue. It ships two families: `FloatGemm<T>` (homogeneous `f32`/`f64`) and
+the epilogue. It ships three families: `FloatGemm<T>` (homogeneous `f32`/`f64`),
 `MixedGemm<N>` (mixed precision — `f16`/`bf16` in, **`f32` accumulator**, narrow
-out). Complex or integer GEMM would arrive as further *new families* (complex: an
-`fmaddsub` two-step kernel; integer: a VNNI dot kernel with interleaved-K packing
+out), and `IntGemm` (`i8` in, **`i32` accumulator/output** — the first family with
+`Lhs != Out`, reached via the public `gemm_i8` since the homogeneous `gemm<T>`
+surface can't express `Out != Lhs`; it reuses the `KernelSimd` widen seam with an
+`i8 -> i32` sign-extend and exact wrapping `i32` arithmetic, and a denser VNNI
+`vpdpbusd` dot kernel is a deferred increment). A complex family would arrive the
+same way (complex: an `fmaddsub` two-step kernel; the deferred integer VNNI: a dot
+kernel with interleaved-K packing
 and a requantize epilogue) with the driver, packing framework, cache model, and
 parallelism untouched.
 

@@ -193,3 +193,73 @@ impl KernelSimd<bf16, bf16, f32, bf16> for Avx512 {
         }
     }
 }
+
+// ---- integer: i8 inputs, i32 accumulator (16-wide __m512i, AVX-512F integer) ----
+
+impl SimdOps<i32> for Avx512 {
+    type Reg = __m512i;
+    const LANES: usize = 16;
+    const ALIGN: usize = 64;
+
+    #[inline(always)]
+    unsafe fn zero(self) -> __m512i {
+        unsafe { _mm512_setzero_si512() }
+    }
+    #[inline(always)]
+    unsafe fn splat(self, v: i32) -> __m512i {
+        unsafe { _mm512_set1_epi32(v) }
+    }
+    #[inline(always)]
+    unsafe fn load(self, p: *const i32) -> __m512i {
+        unsafe { _mm512_load_si512(p as *const __m512i) }
+    }
+    #[inline(always)]
+    unsafe fn loadu(self, p: *const i32) -> __m512i {
+        unsafe { _mm512_loadu_si512(p as *const __m512i) }
+    }
+    #[inline(always)]
+    unsafe fn store(self, p: *mut i32, v: __m512i) {
+        unsafe { _mm512_store_si512(p as *mut __m512i, v) }
+    }
+    #[inline(always)]
+    unsafe fn storeu(self, p: *mut i32, v: __m512i) {
+        unsafe { _mm512_storeu_si512(p as *mut __m512i, v) }
+    }
+    #[inline(always)]
+    unsafe fn mul(self, a: __m512i, b: __m512i) -> __m512i {
+        unsafe { _mm512_mullo_epi32(a, b) }
+    }
+    #[inline(always)]
+    unsafe fn add(self, a: __m512i, b: __m512i) -> __m512i {
+        unsafe { _mm512_add_epi32(a, b) }
+    }
+    #[inline(always)]
+    unsafe fn mul_add(self, a: __m512i, b: __m512i, c: __m512i) -> __m512i {
+        unsafe { _mm512_add_epi32(_mm512_mullo_epi32(a, b), c) }
+    }
+    #[inline(always)]
+    unsafe fn reduce_sum(self, v: __m512i) -> i32 {
+        unsafe { _mm512_reduce_add_epi32(v) }
+    }
+}
+
+/// `i8 -> i32`: sign-extend 16 LHS bytes on load, broadcast a sign-extended RHS
+/// byte; `Out == Acc == i32`, so `load_out`/`store_out` are plain `i32` load/store.
+impl KernelSimd<i8, i8, i32, i32> for Avx512 {
+    #[inline(always)]
+    unsafe fn load_lhs(self, p: *const i8) -> __m512i {
+        unsafe { _mm512_cvtepi8_epi32(_mm_loadu_si128(p as *const __m128i)) }
+    }
+    #[inline(always)]
+    unsafe fn splat_rhs(self, v: i8) -> __m512i {
+        unsafe { _mm512_set1_epi32(v as i32) }
+    }
+    #[inline(always)]
+    unsafe fn load_out(self, p: *const i32) -> __m512i {
+        unsafe { _mm512_loadu_si512(p as *const __m512i) }
+    }
+    #[inline(always)]
+    unsafe fn store_out(self, p: *mut i32, v: __m512i) {
+        unsafe { _mm512_storeu_si512(p as *mut __m512i, v) }
+    }
+}
