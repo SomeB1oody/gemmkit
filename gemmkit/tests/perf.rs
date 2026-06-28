@@ -593,3 +593,74 @@ fn perf_prepack() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Shared-LHS A-pack gate calibration
+// ---------------------------------------------------------------------------
+
+/// Force the shared-LHS A-pack gate **on vs off back-to-back in one process** (via
+/// the runtime setter, so the same buffers/thread-pool are reused and machine drift
+/// cancels) and report the parallel throughput of each. The gate only changes
+/// behavior on the packed-A path: a row-major A (`rsa != 1`) always packs, so every
+/// size exercises the pre-pass; a column-major A packs only once its K-walk stride
+/// trips the TLB gate (large `m`), so its crossover sits higher. The `on % of off`
+/// column is the signal — above 100% the shared pre-pass wins, below it regresses.
+fn bench_shared_lhs(s: usize, row_major_a: bool) {
+    let (m, k, n) = (s, s, s);
+    let a = fill(m * k, 1);
+    let b = fill(k * n, 2);
+    let mut c = vec![0.0f32; m * n];
+    let (ars, acs) = if row_major_a {
+        (k as isize, 1)
+    } else {
+        (1, m as isize)
+    };
+    let par = Parallelism::Rayon(0);
+
+    let prev = gemmkit::tuning::shared_lhs_mnk();
+    gemmkit::tuning::set_shared_lhs_mnk(1); // force the shared pre-pass on
+    let on = measure(m, k, n, || {
+        gemm(
+            1.0,
+            MatRef::new(&a, m, k, ars, acs),
+            MatRef::from_col_major(&b, k, n),
+            0.0,
+            MatMut::from_col_major(&mut c, m, n),
+            par,
+        );
+    });
+    gemmkit::tuning::set_shared_lhs_mnk(usize::MAX - 1); // force it off
+    let off = measure(m, k, n, || {
+        gemm(
+            1.0,
+            MatRef::new(&a, m, k, ars, acs),
+            MatRef::from_col_major(&b, k, n),
+            0.0,
+            MatMut::from_col_major(&mut c, m, n),
+            par,
+        );
+    });
+    gemmkit::tuning::set_shared_lhs_mnk(prev);
+
+    let layout = if row_major_a { "rowA" } else { "colA" };
+    println!(
+        "  n={s:<5} {layout}  shared-on={:7.1} (±{:>2.0}%)  off={:7.1} (±{:>2.0}%)  (on {:.0}% of off)",
+        on.median,
+        on.spread_pct(),
+        off.median,
+        off.spread_pct(),
+        100.0 * on.median / off.median.max(1e-9)
+    );
+}
+
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture"]
+fn perf_shared_lhs() {
+    let _guard = BENCH_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    println!("\nshared-LHS A-pack gate sweep (parallel, f32 col-major C) — forced on vs off:");
+    for &rma in &[false, true] {
+        for &s in &[128usize, 256, 512, 1024, 2048, 4096] {
+            bench_shared_lhs(s, rma);
+        }
+    }
+}
