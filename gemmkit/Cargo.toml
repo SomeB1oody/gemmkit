@@ -25,7 +25,13 @@ rayon = { version = "1.10", optional = true }
 [target.'cfg(any(target_arch = "x86", target_arch = "x86_64"))'.dependencies]
 raw-cpuid = "11"
 
-[dev-dependencies]
+# Baseline-comparison crates, used only by the perf benches (`tests/perf.rs`,
+# `benches/gemm_bench.rs`) — never by the Miri-checked `tests/correctness.rs`.
+# `gemm` pulls `pulp`, whose released version fails to compile under Miri's
+# nightly on aarch64, so gate the whole set out under `cfg(miri)`: `cargo miri
+# test` then builds gemmkit's scalar path with no manual dependency surgery. The
+# perf/bench targets are themselves `#![cfg(not(miri))]`, so they vanish in lockstep.
+[target.'cfg(not(miri))'.dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 gemm = "0.18"
 matrixmultiply = "0.3"

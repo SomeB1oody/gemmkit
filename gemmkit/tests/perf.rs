@@ -1,6 +1,10 @@
 //! Quick performance comparison vs the `gemm` crate and `matrixmultiply`.
 //! Ignored by default (it is a benchmark, not a correctness gate).
 //!
+//! Built only when *not* under Miri: it depends on `gemm`/`matrixmultiply`, which
+//! are `cfg(not(miri))` dev-dependencies (see `Cargo.toml`). The whole file
+//! compiles away under Miri so `cargo miri test` needs no dependency surgery.
+//!
 //! Each benchmark saturates every core, so the two `#[ignore]` tests
 //! (`perf_sgemm`, `perf_scaling`) must not run concurrently. They take a shared
 //! `BENCH_GUARD` lock, so even the default multi-threaded harness serializes them
@@ -8,6 +12,7 @@
 //!   cargo test -p gemmkit --release --test perf -- --ignored --nocapture
 //! or one at a time:
 //!   cargo test -p gemmkit --release --test perf perf_scaling -- --ignored --nocapture
+#![cfg(not(miri))]
 
 use std::time::Instant;
 
