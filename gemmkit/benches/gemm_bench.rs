@@ -2,6 +2,10 @@
 //! `matrixmultiply` (ndarray's current backend) across a range of square sizes.
 //!
 //! Run: `cargo bench -p gemmkit`. GFLOP/s = 2·m·n·k / median_time.
+//!
+//! Built only when *not* under Miri: `criterion`/`gemm`/`matrixmultiply` are
+//! `cfg(not(miri))` dev-dependencies (see `Cargo.toml`).
+#![cfg(not(miri))]
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
