@@ -61,14 +61,32 @@ hand-written per ISA (and only one tile per ISA was maintainable). Here, *all* t
 primitives are in `SimdOps`, so the microkernel is one generic function and each
 ISA contributes only a set of primitives plus a one-line trampoline.
 
-ISA-specific *fast paths* fit the same seam without forking the kernel: an
-optional `const LANE_FMA` + `fma_bvec` lets a token opt into a lane-indexed FMA
-(NEON `vfmaq_laneq`, broadcasting B multipliers straight from a loaded vector
-lane). The microkernel branches on the const — `false` for every ISA by default,
-so the branch and the (provided) fallback compile away everywhere except where a
-token overrides them. The path is bit-identical to the `splat` path; on the
-benchmarked M-series it is perf-neutral (that kernel is FMA-throughput-bound, not
-B-load-bound), but it keeps the option in the vocabulary rather than the kernel.
+The hot inner loop — the `kc`-deep accumulation of one full `MR_REG × NR` tile —
+is factored behind a single overridable seam, [`SimdOps::accumulate_tile`], so an
+ISA can re-shape *the schedule* without forking the microkernel. The shared
+microkernel calls it directly and carries **no per-ISA branch**; all the variation
+lives in that method's *default implementation*, which holds two schedules: the
+portable per-column `splat` + FMA, and an optional lane-indexed fast path
+(`const LANE_FMA` + `fma_bvec`, NEON `vfmaq_laneq`, broadcasting B multipliers
+straight from a loaded vector lane). The lane path is gated on a `const` that is
+`false` for every ISA by default, so it and its provided `fma_bvec` fallback
+compile away everywhere except the one token (NEON) that overrides them.
+
+On a wide out-of-order core LLVM already lowers the default to the canonical
+register-blocked kernel, so the *whole-seam* override exists only for cores it
+will **not** fix on its own — an in-order / narrow-OoO core that needs explicit
+software pipelining, or a scalable-vector ISA (SVE/RVV) whose length is not a
+compile-time `LANES`. Every path here — the lane fast path and any override — is
+bound by one contract: **bit-identity**. The accumulation must stay a per-element
+fused `a·b + c` in ascending `p`, so a full tile and an edge tile of the same
+matrix round identically (the L4 driver's determinism guarantee); software
+pipelining reorders *loads*, never the arithmetic, so it is legal. The lane path
+is bit-identical to the `splat` path and on the benchmarked M-series perf-neutral
+(that kernel is FMA-throughput-bound, not B-load-bound) — it earns its place as a
+vocabulary option, not a measured win. Instructions that instead *reshape the
+accumulation rounding itself* — matrix/dot widening (`bfmmla`, `sdot`, VNNI,
+bf16) — cannot meet that contract and are **out of scope for this seam**: they
+arrive as a new [`KernelFamily`] (L1), never an `accumulate_tile` override.
 
 ### `#[target_feature]` correctness
 
@@ -99,7 +117,9 @@ The float microkernel is a rank-1 outer-product update: load `MR_REG` LHS vector
 broadcast each of `NR` RHS scalars, FMA into `NR * MR_REG` accumulators that stay
 in registers. The const-bounded `for` loops monomorphize and fully unroll, so the
 optimizer keeps every accumulator in a register without any `seq!`-style macro.
-v1 tiles (register usage in parentheses):
+The full-tile `kc`-loop runs through the overridable [`SimdOps::accumulate_tile`]
+seam (L0); only the partial-column edge tile and the epilogue stay inline in the
+kernel. v1 tiles (register usage in parentheses):
 
 | | f32 | f64 |
 |---|---|---|
@@ -273,6 +293,7 @@ reversed views all work without copying. `dot` is the `.dot()`-style convenience
 [`Simd::vectorize`]: crate::simd::Simd::vectorize
 [`SimdOps`]: crate::simd::SimdOps
 [`SimdOps<T>`]: crate::simd::SimdOps
+[`SimdOps::accumulate_tile`]: crate::simd::SimdOps::accumulate_tile
 [`KernelFamily`]: crate::kernel::KernelFamily
 [`Parallelism`]: crate::Parallelism
 [`gemm`]: crate::gemm
