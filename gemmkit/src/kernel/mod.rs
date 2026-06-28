@@ -17,9 +17,11 @@ use crate::scalar::Scalar;
 use crate::simd::KernelSimd;
 
 pub mod float;
+pub mod int;
 pub mod mixed;
 
 pub use float::FloatGemm;
+pub use int::IntGemm;
 pub use mixed::MixedGemm;
 
 /// State of the `alpha` scale, precomputed once by the driver so the microkernel

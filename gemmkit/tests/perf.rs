@@ -171,6 +171,45 @@ fn perf_f16() {
     }
 }
 
+/// i8 -> i32 GEMM throughput (no `gemm`-crate baseline — it lacks i8 in 0.18). Just
+/// confirms the widen-and-multiply kernel is SIMD-accelerated, not scalar-bound.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture"]
+fn perf_i8() {
+    use gemmkit::{MatMut, MatRef};
+    let _guard = BENCH_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    println!("\ni8->i32 GFLOP/s (column-major) — gemmkit widen+i32 kernel:");
+    for &par in &[false, true] {
+        for &s in &[256usize, 512, 1024, 2048] {
+            let (m, k, n) = (s, s, s);
+            let a: Vec<i8> = (0..m * k).map(|i| (i % 17) as i8 - 8).collect();
+            let b: Vec<i8> = (0..k * n).map(|i| (i % 13) as i8 - 6).collect();
+            let mut c = vec![0i32; m * n];
+            let p = if par {
+                Parallelism::Rayon(0)
+            } else {
+                Parallelism::Serial
+            };
+            let st = measure(m, k, n, || {
+                gemmkit::gemm_i8(
+                    1,
+                    MatRef::from_col_major(&a, m, k),
+                    MatRef::from_col_major(&b, k, n),
+                    0,
+                    MatMut::from_col_major(&mut c, m, n),
+                    p,
+                );
+            });
+            let mode = if par { "par" } else { "ser" };
+            println!(
+                "  n={s:<5} {mode}  gemmkit={:7.1} (±{:>2.0}%)",
+                st.median,
+                st.spread_pct()
+            );
+        }
+    }
+}
+
 fn bench_one(s: usize, parallel: bool) {
     let (m, k, n) = (s, s, s);
     let a = fill(m * k, 1);

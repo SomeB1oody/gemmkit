@@ -158,13 +158,11 @@ fn self_aliases(rows: usize, cols: usize, rs: isize, cs: isize) -> bool {
     }
 }
 
-/// `true` if the byte ranges `[pa, pa+na)` and `[pb, pb+nb)` overlap.
+/// `true` if the byte ranges of two `[T]`-typed views overlap (the same-element-type
+/// case; the heterogeneous integer API uses [`overlaps_bytes`] directly).
 fn overlaps<T>(pa: *const T, na: usize, pb: *const T, nb: usize) -> bool {
-    let a0 = pa as usize;
-    let a1 = a0 + na * core::mem::size_of::<T>();
-    let b0 = pb as usize;
-    let b1 = b0 + nb * core::mem::size_of::<T>();
-    a0 < b1 && b0 < a1
+    let s = core::mem::size_of::<T>();
+    overlaps_bytes(pa as *const u8, na, s, pb as *const u8, nb, s)
 }
 
 /// `C <- alpha·A·B + beta·C` over safe slice views, using the thread-local
@@ -729,6 +727,178 @@ pub fn gemm_packed_a_with<T: GemmScalar>(
             par,
             ws,
         );
+    }
+}
+
+/// `true` if two byte ranges (given as base pointer + element count + element size)
+/// overlap. The heterogeneous analogue of [`overlaps`] for the integer API, where C
+/// (`i32`) and A/B (`i8`) have different element sizes.
+fn overlaps_bytes(
+    pa: *const u8,
+    na: usize,
+    sa: usize,
+    pb: *const u8,
+    nb: usize,
+    sb: usize,
+) -> bool {
+    let a0 = pa as usize;
+    let a1 = a0 + na * sa;
+    let b0 = pb as usize;
+    let b1 = b0 + nb * sb;
+    a0 < b1 && b0 < a1
+}
+
+/// Integer GEMM: `C <- alpha·A·B + beta·C` with **`i8` inputs accumulated into an
+/// `i32` output** (`alpha`/`beta`/`C` are `i32`). Arithmetic wraps on overflow, the
+/// conventional integer-GEMM semantics. Uses the thread-local workspace pool.
+///
+/// This is a separate entry point from [`gemm`] because the input and output types
+/// differ (`i8` vs `i32`), which the homogeneous `gemm<T>` surface cannot express.
+///
+/// # Panics
+/// Same shape / bounds / aliasing conditions as [`gemm`] (`A.cols == B.rows`,
+/// `A.rows == C.rows`, `B.cols == C.cols`; every view in bounds; `C` addresses each
+/// element uniquely and does not overlap `A`/`B`). Negative-stride / raw-pointer
+/// callers use [`gemm_i8_unchecked`] (the homogeneous [`gemm_unchecked`] cannot
+/// serve `i8 -> i32`).
+pub fn gemm_i8(
+    alpha: i32,
+    a: MatRef<'_, i8>,
+    b: MatRef<'_, i8>,
+    beta: i32,
+    c: MatMut<'_, i32>,
+    par: Parallelism,
+) {
+    workspace::with_thread_pool(|ws| gemm_i8_with(ws, alpha, a, b, beta, c, par));
+}
+
+/// Like [`gemm_i8`] but reuses a caller-owned [`Workspace`].
+///
+/// # Panics
+/// Same conditions as [`gemm_i8`].
+pub fn gemm_i8_with(
+    ws: &mut Workspace,
+    alpha: i32,
+    a: MatRef<'_, i8>,
+    b: MatRef<'_, i8>,
+    beta: i32,
+    c: MatMut<'_, i32>,
+    par: Parallelism,
+) {
+    assert_eq!(
+        a.cols, b.rows,
+        "gemmkit: A.cols ({}) != B.rows ({})",
+        a.cols, b.rows
+    );
+    assert_eq!(
+        a.rows, c.rows,
+        "gemmkit: A.rows ({}) != C.rows ({})",
+        a.rows, c.rows
+    );
+    assert_eq!(
+        b.cols, c.cols,
+        "gemmkit: B.cols ({}) != C.cols ({})",
+        b.cols, c.cols
+    );
+
+    check_view(a.data, a.rows, a.cols, a.rs, a.cs, "A");
+    check_view(b.data, b.rows, b.cols, b.rs, b.cs, "B");
+    check_view(c.data, c.rows, c.cols, c.rs, c.cs, "C");
+
+    if self_aliases(c.rows, c.cols, c.rs, c.cs) {
+        panic!(
+            "gemmkit: C view aliases itself (strides {},{} map distinct elements to the same \
+             memory); C must address each (i,j) uniquely",
+            c.rs, c.cs
+        );
+    }
+
+    // C (i32) must not alias A or B (i8) — heterogeneous element sizes.
+    let cp = c.data.as_ptr() as *const u8;
+    let cl = c.data.len();
+    if overlaps_bytes(cp, cl, 4, a.data.as_ptr() as *const u8, a.data.len(), 1)
+        || overlaps_bytes(cp, cl, 4, b.data.as_ptr() as *const u8, b.data.len(), 1)
+    {
+        panic!("gemmkit: C aliases A or B");
+    }
+
+    // SAFETY: validated above — shapes agree, every stride in bounds, C addresses
+    // each (i,j) uniquely and does not overlap A/B.
+    unsafe {
+        dispatch::execute_int(
+            dispatch::IntTask {
+                m: a.rows,
+                k: a.cols,
+                n: b.cols,
+                alpha,
+                a: a.data.as_ptr(),
+                rsa: a.rs,
+                csa: a.cs,
+                b: b.data.as_ptr(),
+                rsb: b.rs,
+                csb: b.cs,
+                beta,
+                c: c.data.as_mut_ptr(),
+                rsc: c.rs,
+                csc: c.cs,
+            },
+            par,
+            ws,
+        );
+    }
+}
+
+/// The raw integer engine: `C(i32) <- alpha·A(i8)·B(i8) + beta·C` over pointers and
+/// `isize` strides, with **no** bounds/alias/shape checks — the heterogeneous
+/// counterpart of [`gemm_unchecked`] (which is typed for the homogeneous surface and
+/// cannot serve `i8 -> i32`). This is the escape hatch the safe [`gemm_i8`] points
+/// negative-stride / advanced callers to. Uses the thread-local workspace pool.
+///
+/// # Safety
+/// The caller guarantees `a`/`b` valid for reads and `c` for read+write over every
+/// `(i,j)` implied by the dimensions and strides; `c` does not alias `a`/`b`; and
+/// when `beta == 0`, `c` need not be initialized.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gemm_i8_unchecked(
+    m: usize,
+    k: usize,
+    n: usize,
+    alpha: i32,
+    a: *const i8,
+    rsa: isize,
+    csa: isize,
+    b: *const i8,
+    rsb: isize,
+    csb: isize,
+    beta: i32,
+    c: *mut i32,
+    rsc: isize,
+    csc: isize,
+    par: Parallelism,
+) {
+    unsafe {
+        workspace::with_thread_pool(|ws| {
+            dispatch::execute_int(
+                dispatch::IntTask {
+                    m,
+                    k,
+                    n,
+                    alpha,
+                    a,
+                    rsa,
+                    csa,
+                    b,
+                    rsb,
+                    csb,
+                    beta,
+                    c,
+                    rsc,
+                    csc,
+                },
+                par,
+                ws,
+            );
+        });
     }
 }
 

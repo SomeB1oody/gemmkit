@@ -26,7 +26,7 @@ use std::sync::OnceLock;
 use half::{bf16, f16};
 
 use crate::driver;
-use crate::kernel::{FloatGemm, MixedGemm};
+use crate::kernel::{FloatGemm, IntGemm, MixedGemm};
 use crate::parallel::Parallelism;
 use crate::scalar::{Float, NarrowFloat, Scalar};
 #[cfg(target_arch = "aarch64")]
@@ -99,6 +99,28 @@ pub struct PackedConsume<T> {
     pub beta: T,
     /// Output base pointer + strides.
     pub c: *mut T,
+    pub rsc: isize,
+    pub csc: isize,
+}
+
+/// A heterogeneous **integer** GEMM problem: `i8` inputs, `i32` accumulator/output
+/// (`C <- alpha·A·B + beta·C`, all of `alpha`/`beta`/`C` in `i32`). The homogeneous
+/// [`Task`] / [`GemmScalar`] machinery assumes `Lhs = Out`, which integer GEMM
+/// breaks (`Out = i32 != Lhs = i8`), so it gets this dedicated task + dispatch.
+#[derive(Copy, Clone)]
+pub(crate) struct IntTask {
+    pub m: usize,
+    pub k: usize,
+    pub n: usize,
+    pub alpha: i32,
+    pub a: *const i8,
+    pub rsa: isize,
+    pub csa: isize,
+    pub b: *const i8,
+    pub rsb: isize,
+    pub csb: isize,
+    pub beta: i32,
+    pub c: *mut i32,
     pub rsc: isize,
     pub csc: isize,
 }
@@ -236,6 +258,27 @@ pub(crate) unsafe fn execute_packed<T: GemmScalar>(
     }
 }
 
+/// Orientation normalization shared by the float / mixed [`Task`] paths: if `C` is
+/// row-major-ish (`|csc| < |rsc|`), compute `Cᵀ = Bᵀ·Aᵀ` instead so the kernel writes
+/// columns contiguously (`rsc == 1`). Swaps `m↔n`, the `A`/`B` pointers and strides,
+/// and `rsc↔csc`. (The integer [`IntTask`] is a distinct struct and inlines the same
+/// swap.)
+#[inline]
+fn orient_transpose<T>(t: &mut Task<T>) {
+    if t.csc.unsigned_abs() < t.rsc.unsigned_abs() {
+        let (oa, orsa, ocsa) = (t.a, t.rsa, t.csa);
+        let (ob, orsb, ocsb) = (t.b, t.rsb, t.csb);
+        core::mem::swap(&mut t.m, &mut t.n);
+        t.a = ob;
+        t.rsa = ocsb;
+        t.csa = orsb;
+        t.b = oa;
+        t.rsb = ocsa;
+        t.csb = orsa;
+        core::mem::swap(&mut t.rsc, &mut t.csc);
+    }
+}
+
 /// `C <- beta·C` for a **homogeneous float** type (`f32`/`f64`): in-place scale,
 /// with `beta == 0` overwriting to zero without reading C. The `GemmScalar::scale_c`
 /// for the float types forwards here; the narrow types use [`scale_c_narrow`].
@@ -306,21 +349,7 @@ unsafe fn run_typed<T, S, const MR_REG: usize, const NR: usize>(
             return;
         }
 
-        // Orientation: if C is row-major-ish (|csc| < |rsc|), compute Cᵀ = Bᵀ·Aᵀ
-        // so the kernel writes columns contiguously (rsc == 1).
-        if t.csc.unsigned_abs() < t.rsc.unsigned_abs() {
-            let (oa, orsa, ocsa) = (t.a, t.rsa, t.csa);
-            let (ob, orsb, ocsb) = (t.b, t.rsb, t.csb);
-            core::mem::swap(&mut t.m, &mut t.n);
-            t.a = ob;
-            t.rsa = ocsb;
-            t.csa = orsb;
-            t.b = oa;
-            t.rsb = ocsa;
-            t.csb = orsa;
-            core::mem::swap(&mut t.rsc, &mut t.csc);
-        }
-
+        orient_transpose(&mut t);
         driver::run::<FloatGemm<T>, S, MR_REG, NR>(
             simd, t.m, t.k, t.n, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb, t.beta, t.c, t.rsc,
             t.csc, par, ws,
@@ -375,18 +404,7 @@ unsafe fn run_typed_mixed<N, S, const MR_REG: usize, const NR: usize>(
     S: KernelSimd<N, N, f32, N>,
 {
     unsafe {
-        if t.csc.unsigned_abs() < t.rsc.unsigned_abs() {
-            let (oa, orsa, ocsa) = (t.a, t.rsa, t.csa);
-            let (ob, orsb, ocsb) = (t.b, t.rsb, t.csb);
-            core::mem::swap(&mut t.m, &mut t.n);
-            t.a = ob;
-            t.rsa = ocsb;
-            t.csa = orsb;
-            t.b = oa;
-            t.rsb = ocsa;
-            t.csb = orsa;
-            core::mem::swap(&mut t.rsc, &mut t.csc);
-        }
+        orient_transpose(&mut t);
         driver::run::<MixedGemm<N>, S, MR_REG, NR>(
             simd,
             t.m,
@@ -1235,5 +1253,183 @@ impl GemmScalar for bf16 {
     fn rhs_tile() -> (usize, usize) {
         let d = dispatched_bf16();
         (d.mr, d.nr)
+    }
+}
+
+// ===========================================================================
+// Integer GEMM (i8 -> i32): a dedicated heterogeneous dispatch path, since the
+// homogeneous `GemmScalar` cannot express `Out != Lhs`.
+// ===========================================================================
+
+/// Top-level integer entry: degenerate cases (`C <- beta·C` when the `A·B` term
+/// vanishes) then the ISA-dispatched integer kernel.
+///
+/// # Safety
+/// `t`'s pointers valid for the implied regions; `c` must not alias `a`/`b`.
+pub(crate) unsafe fn execute_int(t: IntTask, par: Parallelism, ws: &mut Workspace) {
+    unsafe {
+        if t.m == 0 || t.n == 0 {
+            return;
+        }
+        if t.k == 0 || t.alpha == 0 {
+            scale_c_int(t.beta, t.c, t.m, t.n, t.rsc, t.csc);
+            return;
+        }
+        (dispatched_i8().run)(t, par, ws);
+    }
+}
+
+/// `C <- beta·C` for the integer output (wrapping i32; `beta == 0` overwrites to 0).
+unsafe fn scale_c_int(beta: i32, c: *mut i32, m: usize, n: usize, rsc: isize, csc: isize) {
+    unsafe {
+        for j in 0..n {
+            for i in 0..m {
+                let p = c.offset(i as isize * rsc + j as isize * csc);
+                if beta == 0 {
+                    *p = 0;
+                } else if beta != 1 {
+                    *p = beta.wrapping_mul(*p);
+                }
+            }
+        }
+    }
+}
+
+/// Integer driver entry for a concrete `(ISA, tile)`: gemv shapes fall through the
+/// general driver (a dedicated integer gemv is deferred), then the orientation swap
+/// (identical to the float path — only strides move) and `driver::run::<IntGemm>`.
+///
+/// # Safety
+/// As [`execute_int`].
+#[inline]
+unsafe fn run_typed_int<S, const MR_REG: usize, const NR: usize>(
+    simd: S,
+    mut t: IntTask,
+    par: Parallelism,
+    ws: &mut Workspace,
+) where
+    S: KernelSimd<i8, i8, i32, i32>,
+{
+    unsafe {
+        if t.csc.unsigned_abs() < t.rsc.unsigned_abs() {
+            let (oa, orsa, ocsa) = (t.a, t.rsa, t.csa);
+            let (ob, orsb, ocsb) = (t.b, t.rsb, t.csb);
+            core::mem::swap(&mut t.m, &mut t.n);
+            t.a = ob;
+            t.rsa = ocsb;
+            t.csa = orsb;
+            t.b = oa;
+            t.rsb = ocsa;
+            t.csb = orsa;
+            core::mem::swap(&mut t.rsc, &mut t.csc);
+        }
+        driver::run::<IntGemm, S, MR_REG, NR>(
+            simd, t.m, t.k, t.n, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb, t.beta, t.c, t.rsc,
+            t.csc, par, ws,
+        );
+    }
+}
+
+unsafe fn gemm_i8_scalar(t: IntTask, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_typed_int::<ScalarTok, 4, 4>(ScalarTok, t, par, ws) }
+}
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+unsafe fn gemm_i8_fma(t: IntTask, par: Parallelism, ws: &mut Workspace) {
+    // i32 accumulator → MR = 2*8 = 16, NR = 6 (the f32 FMA tile).
+    unsafe { run_typed_int::<Fma, 2, 6>(Fma, t, par, ws) }
+}
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+unsafe fn gemm_i8_avx512(t: IntTask, par: Parallelism, ws: &mut Workspace) {
+    // i32 accumulator → MR = 2*16 = 32, NR = 12 (the f32 AVX-512 tile).
+    unsafe { run_typed_int::<Avx512, 2, 12>(Avx512, t, par, ws) }
+}
+#[cfg(target_arch = "aarch64")]
+unsafe fn gemm_i8_neon(t: IntTask, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_typed_int::<Neon, 4, 4>(Neon, t, par, ws) }
+}
+
+type IntFn = unsafe fn(IntTask, Parallelism, &mut Workspace);
+
+/// Memoized integer dispatch slot (mirror of [`Dispatched`] but a single kernel —
+/// integer prepack is not yet a public API).
+#[derive(Copy, Clone)]
+struct IntDispatched {
+    run: IntFn,
+}
+
+const DISP_I8_SCALAR: IntDispatched = IntDispatched {
+    run: gemm_i8_scalar,
+};
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+const DISP_I8_FMA: IntDispatched = IntDispatched { run: gemm_i8_fma };
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+const DISP_I8_AVX512: IntDispatched = IntDispatched {
+    run: gemm_i8_avx512,
+};
+#[cfg(target_arch = "aarch64")]
+const DISP_I8_NEON: IntDispatched = IntDispatched { run: gemm_i8_neon };
+
+/// `i8` ISA selection. The widen-and-multiply integer kernel uses only AVX2/AVX-512
+/// integer ops (no VNNI), so the gates mirror the `f32` ladder.
+fn select_i8() -> IntDispatched {
+    match forced_isa() {
+        ForcedIsa::Scalar => return DISP_I8_SCALAR,
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        ForcedIsa::Fma => {
+            assert!(
+                is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma"),
+                "GEMMKIT_REQUIRE_ISA=fma, but this CPU/emulator does not report avx2+fma"
+            );
+            return DISP_I8_FMA;
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        ForcedIsa::Avx512 => {
+            assert!(
+                is_x86_feature_detected!("avx512f"),
+                "GEMMKIT_REQUIRE_ISA=avx512, but this CPU/emulator does not report avx512f"
+            );
+            return DISP_I8_AVX512;
+        }
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        ForcedIsa::Fma | ForcedIsa::Avx512 => {
+            panic!("GEMMKIT_REQUIRE_ISA: requested SIMD ISA is unavailable on this target")
+        }
+        #[cfg(target_arch = "aarch64")]
+        ForcedIsa::Neon => return DISP_I8_NEON,
+        #[cfg(not(target_arch = "aarch64"))]
+        ForcedIsa::Neon => panic!("GEMMKIT_REQUIRE_ISA=neon, but this target is not aarch64"),
+        ForcedIsa::Auto => {}
+    }
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if is_x86_feature_detected!("avx512f") {
+            return DISP_I8_AVX512;
+        }
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return DISP_I8_FMA;
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        DISP_I8_NEON
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        DISP_I8_SCALAR
+    }
+}
+
+#[cfg(feature = "std")]
+static GEMM_I8: OnceLock<IntDispatched> = OnceLock::new();
+
+#[inline]
+fn dispatched_i8() -> IntDispatched {
+    #[cfg(feature = "std")]
+    {
+        *GEMM_I8.get_or_init(select_i8)
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        select_i8()
     }
 }
