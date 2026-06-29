@@ -26,12 +26,11 @@ pub struct Fma;
 impl Simd for Fma {
     #[inline(always)]
     unsafe fn vectorize<R>(self, f: impl FnOnce() -> R) -> R {
-        // `f16c` is enabled alongside `avx2,fma`: every AVX2+FMA CPU (Haswell and
-        // later) also has F16C, which the mixed-precision `f16` path needs for its
-        // `vcvtph2ps`/`vcvtps2ph` conversions. The dispatch ladder still checks
-        // `f16c` before selecting this token for an `f16` GEMM (defensive); the
-        // `f32`/`f64`/`bf16` paths emit no F16C instructions, so enabling it is
-        // harmless even on the hypothetical AVX2-without-F16C part.
+        // `f16c` rides along with `avx2,fma`: every AVX2+FMA CPU (Haswell+) also
+        // has F16C, which the `f16` path needs for its `vcvtph2ps`/`vcvtps2ph`
+        // conversions. The dispatcher still checks `f16c` before picking this token
+        // for an `f16` GEMM; the f32/f64/bf16 paths emit no F16C, so enabling it is
+        // harmless if some AVX2-without-F16C part existed.
         #[target_feature(enable = "avx2,fma,f16c")]
         unsafe fn inner<R>(f: impl FnOnce() -> R) -> R {
             f()
@@ -178,8 +177,8 @@ impl KernelSimd<f16, f16, f32, f16> for Fma {
     #[inline(always)]
     unsafe fn store_out(self, p: *mut f16, v: __m256) {
         unsafe {
-            // F16C `vcvtps2ph` takes a 3-bit rounding immediate; round-to-nearest-
-            // even is `_MM_FROUND_TO_NEAREST_INT` (0), matching `half::f16::from_f32`.
+            // `_MM_FROUND_TO_NEAREST_INT` (0) = round-to-nearest-even, matching
+            // `half::f16::from_f32`.
             let h = _mm256_cvtps_ph::<_MM_FROUND_TO_NEAREST_INT>(v);
             _mm_storeu_si128(p as *mut __m128i, h);
         }
@@ -188,8 +187,8 @@ impl KernelSimd<f16, f16, f32, f16> for Fma {
 
 /// `bf16` via integer ops: widen is a 16-bit left shift into `f32`; narrow is the
 /// round-to-nearest-even bias trick (`+ ((bits>>16)&1) + 0x7FFF`, then `>>16`).
-/// **Bit-identical to `half::bf16::from_f32`** including NaN (mapped to
-/// `(bits>>16) | 0x0040`), so the vector and scalar paths never diverge.
+/// Bit-identical to `half::bf16::from_f32`, including NaN (mapped to
+/// `(bits>>16) | 0x0040`), so vector and scalar paths never diverge.
 #[cfg(feature = "half")]
 impl KernelSimd<bf16, bf16, f32, bf16> for Fma {
     #[inline(always)]
@@ -310,9 +309,9 @@ impl KernelSimd<i8, i8, i32, i32> for Fma {
 
 // ---- complex: interleaved (re,im), shuffle + fmaddsub complex multiply ----
 //
-// `Reg` is `__m256`/`__m256d` — the same as `SimdOps<f32>`/`<f64>` — so internal
-// complex multiplies go through these free helpers (a `self.mul` call would be
-// ambiguous between the real and complex `SimdOps`).
+// `Reg` is `__m256`/`__m256d`, same as `SimdOps<f32>`/`<f64>`, so internal complex
+// multiplies use these free helpers (a `self.mul` call would be ambiguous between
+// the real and complex `SimdOps`).
 
 /// Complex multiply of 4 interleaved `f32` complex: `(ar*br - ai*bi, ar*bi + ai*br)`.
 #[cfg(feature = "complex")]
@@ -352,8 +351,8 @@ impl SimdOps<Complex<f32>> for Fma {
     }
     #[inline(always)]
     unsafe fn splat(self, v: Complex<f32>) -> __m256 {
-        // Build the (re,im) pair in a 128-bit lane and broadcast it to both halves —
-        // no `[f32;2]`-reinterpreted-as-f64 misaligned load (which would be UB).
+        // Build (re,im) in a 128-bit lane and broadcast to both halves; avoids a
+        // `[f32;2]`-as-f64 misaligned load (which would be UB).
         unsafe {
             let m = _mm_set_ps(v.im, v.re, v.im, v.re); // [re im re im]
             _mm256_broadcast_ps(&m)

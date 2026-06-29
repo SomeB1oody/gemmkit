@@ -210,21 +210,17 @@ pub unsafe fn pack_rhs_full<Fam: KernelFamily>(
 /// Pack the entire LHS of a fixed `(m, k)` problem into one micropanel-major
 /// buffer, for the prepacked-LHS reuse path ([`crate::gemm_packed_a`]).
 ///
-/// A prepacked **LHS** is, by the engine's A/B symmetry, the prepacked **RHS** of
-/// the *transposed* product `Cᵀ = Bᵀ·Aᵀ` — the orientation the dispatch layer
-/// already takes for a row-major-ish `C`. So the genuine `m × k` LHS is packed in
-/// exactly the same micropanel-major order [`pack_rhs_full`] would lay down for a
-/// `k × m` RHS: the depth is `k` and the leading (column) dimension is the LHS's
-/// `m` rows, so the LHS row stride plays the RHS *column* stride and the LHS column
-/// stride plays the RHS *depth* stride. Delegating to [`pack_rhs_full`] keeps that
-/// single layout the one source of truth — the consuming [`run_packed_rhs`] (driven
-/// transposed) reads back the very bytes written here, so a prepacked-A GEMM is
-/// bit-identical to a plain one (modulo the documented small-matrix / gemv carve-outs).
+/// By the engine's A/B symmetry a prepacked LHS is the prepacked RHS of the
+/// transposed product `Cᵀ = Bᵀ·Aᵀ` (the orientation dispatch already uses for a
+/// row-major-ish `C`), so the `m × k` LHS gets the exact micropanel-major layout
+/// [`pack_rhs_full`] lays down for a `k × m` RHS: depth `k`, leading dim the `m`
+/// rows. Hence the LHS row stride plays the RHS *column* stride and the LHS column
+/// stride the RHS *depth* stride. Delegating keeps one layout as the single source
+/// of truth, so [`run_packed_rhs`] (driven transposed) reads back the same bytes.
 /// `dst` must hold `ceil(m/nr) * nr * k` elements; `(kc, nc)` are the transposed
-/// problem's blocking (depth `kc`, leading `nc` over the `m` rows). The pointers are
-/// `Fam::Rhs`-typed because the LHS is laid down *as the transposed product's RHS*
-/// and read back as such — on the size-homogeneous float family `Lhs == Rhs`, so the
-/// concrete call site passes the LHS buffer with no cast.
+/// problem's blocking (depth `kc`, leading `nc` over the `m` rows). Pointers are
+/// `Fam::Rhs`-typed since the LHS is both written and read as the transposed RHS;
+/// on the size-homogeneous float family `Lhs == Rhs`, so the call site needs no cast.
 ///
 /// # Safety
 /// `a` valid for the `m × k` region at `rsa`/`csa`; `dst` valid for the count above.
@@ -276,10 +272,10 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize>(
     S: KernelSimd<Fam::Lhs, Fam::Rhs, Fam::Acc, Fam::Out>,
 {
     unsafe {
-        // `mr` is in *accumulator* lanes: the microkernel widens the narrow inputs
-        // into `Acc` registers, so a panel row maps to an `Acc` lane. For a
-        // homogeneous float family `Lhs == Acc`, so this is unchanged; for mixed
-        // precision (`f16` in, `f32` acc) it is the `f32` lane count.
+        // `mr` is in *accumulator* lanes: the microkernel widens narrow inputs into
+        // `Acc` registers, so a panel row maps to an `Acc` lane. Homogeneous float
+        // families have `Lhs == Acc`; for mixed precision (`f16` in, `f32` acc) this
+        // is the `f32` lane count.
         let lanes = <S as SimdOps<Fam::Acc>>::LANES;
         let mr = MR_REG * lanes;
         let nr = NR;
@@ -302,10 +298,9 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize>(
             Some((_, pkc, pnc)) => (pkc.max(1), pnc.next_multiple_of(nr).max(nr)),
             None => {
                 // A family whose `Out` is narrower than `Acc` (mixed precision) must
-                // not split K — the running sum would round to `Out` between panels.
-                // Use the whole contraction as one panel so it accumulates in the
-                // `Acc` registers and rounds once. Homogeneous families keep the
-                // cache-model `kc`.
+                // not split K, or the running sum would round to `Out` between panels.
+                // Use the whole contraction as one panel so it accumulates in `Acc`
+                // and rounds once. Homogeneous families keep the cache-model `kc`.
                 let kc = if Fam::OUT_IS_ACC { blk.kc } else { k };
                 (kc.max(1), blk.nc.next_multiple_of(nr).max(nr))
             }

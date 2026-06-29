@@ -1,17 +1,14 @@
 //! The integer GEMM family: `i8` inputs, `i32` accumulator and output.
 //!
-//! The first **non-float** family and the first with `Lhs != Out`. Structurally it
-//! mirrors [`super::mixed::MixedGemm`] — reach inputs through the [`KernelSimd`]
-//! widen seam (here `i8 -> i32` sign-extend on load), accumulate in the wider type
-//! — but the accumulator is `i32` and, because `Out == Acc == i32`, the output is
-//! exact and needs no narrowing (and the driver may block K normally:
-//! `OUT_IS_ACC` keeps its `true` default). Arithmetic wraps on overflow, the
-//! conventional integer-GEMM semantics; no [`crate::scalar::Float`] is involved.
+//! Like [`super::mixed::MixedGemm`], inputs reach the kernel through the
+//! [`KernelSimd`] widen seam (`i8 -> i32` sign-extend on load) and accumulate in
+//! the wider type. Since `Out == Acc == i32` the result is exact, needs no
+//! narrowing, and the driver blocks K normally (`OUT_IS_ACC` stays `true`).
+//! Arithmetic wraps on overflow, the conventional integer-GEMM semantics.
 //!
-//! This is the **widen-and-multiply** kernel (correct and SIMD-accelerated through
-//! the existing seam). The denser VNNI `vpdpbusd` dot kernel — which would need its
-//! own K-interleaved pack layout and `u8 × i8` signedness handling — is a deferred
-//! increment (the `pack.rs` doc anticipates that interleave).
+//! This is the widen-and-multiply kernel. A denser VNNI `vpdpbusd` dot kernel
+//! would need its own K-interleaved pack layout and `u8 × i8` signedness handling
+//! (the `pack.rs` doc anticipates that interleave).
 
 use core::marker::PhantomData;
 
@@ -45,8 +42,8 @@ impl KernelFamily for IntGemm {
         kc: usize,
         mr: usize,
     ) {
-        // Plain micropanel copy of the `i8` inputs (the VNNI K-interleave is the
-        // deferred layout); sign-extension to `i32` happens on load in the kernel.
+        // Plain micropanel copy of the `i8` inputs; sign-extension to `i32`
+        // happens on load in the kernel.
         unsafe {
             pack_panels(
                 dst, src, /*lead*/ rs, /*depth*/ cs, /*n_lead*/ mc, kc, mr,

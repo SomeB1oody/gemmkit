@@ -34,12 +34,10 @@ impl Scalar for f64 {
     const ONE: Self = 1.0;
 }
 
-// f16 / bf16 are the *mixed-precision* element types: they are stored as 16-bit
-// inputs/outputs but **accumulate in `f32`** (`Acc = f32`), so they are `Scalar`
-// but deliberately **not** [`Float`] — they carry no native arithmetic. The kernel
-// widens them to `f32` on load and rounds back on store; the arithmetic happens in
-// `f32` via [`SimdOps`] and the [`NarrowFloat`] scalar conversions below. This is
-// the first place `Acc != Self`, the seam the mixed-precision family relies on.
+// f16 / bf16: 16-bit storage that accumulates in `f32` (`Acc = f32`), so they are
+// `Scalar` but not [`Float`] — they carry no native arithmetic. Widened to `f32` on
+// load and rounded back on store; arithmetic happens in `f32` via `SimdOps` and the
+// [`NarrowFloat`] scalar conversions below. First place `Acc != Self`.
 #[cfg(feature = "half")]
 impl Scalar for half::f16 {
     type Acc = f32;
@@ -54,10 +52,10 @@ impl Scalar for half::bf16 {
     const ONE: Self = half::bf16::from_bits(0x3F80);
 }
 
-// Integer GEMM element types: `i8` inputs accumulate in `i32` (`Acc = i32`), and
-// `i32` is its own accumulator/output. Like the narrow floats, `i8` is `Scalar` but
-// not `Float` — the integer family widens `i8` to `i32` on load and does exact `i32`
-// arithmetic (wrapping on overflow, the conventional integer-GEMM semantics).
+// Integer GEMM: `i8` accumulates in `i32` (`Acc = i32`); `i32` is its own
+// accumulator. Like the narrow floats, `i8` is `Scalar` but not `Float` — widened to
+// `i32` on load, exact `i32` arithmetic (wrapping on overflow, conventional for
+// integer GEMM).
 #[cfg(feature = "int8")]
 impl Scalar for i8 {
     type Acc = i32;
@@ -72,11 +70,10 @@ impl Scalar for i32 {
     const ONE: Self = 1;
 }
 
-// Complex GEMM elements: `Complex<f32>` / `Complex<f64>` are *homogeneous*
-// (`Acc = Self`) and, unlike the narrow / integer types, have native arithmetic
-// (`num-complex` provides Add/Mul/Sub), so they impl [`Float`] and ride the entire
-// float path. The vectorized complex multiply lives in the per-ISA `SimdOps`; conj
-// is a packing-time family variant, not a kernel branch.
+// Complex GEMM: `Complex<f32>` / `Complex<f64>` are homogeneous (`Acc = Self`) and
+// have native arithmetic (`num-complex` provides Add/Mul/Sub), so they impl [`Float`]
+// and ride the float path. The vectorized complex multiply lives in the per-ISA
+// `SimdOps`; conj is applied at pack time, not as a kernel branch.
 #[cfg(feature = "complex")]
 impl Scalar for num_complex::Complex<f32> {
     type Acc = Self;
@@ -95,8 +92,8 @@ impl Scalar for num_complex::Complex<f64> {
 impl Float for num_complex::Complex<f32> {
     #[inline(always)]
     fn mul_add(self, b: Self, c: Self) -> Self {
-        // Plain complex `a*b + c` (num-complex's `*` and `+`); the scalar epilogue
-        // stays reproducible and matches the non-FMA fallback.
+        // Plain complex `a*b + c`; keeps the scalar epilogue reproducible and
+        // matching the non-FMA fallback.
         self * b + c
     }
 }
@@ -109,11 +106,10 @@ impl Float for num_complex::Complex<f64> {
     }
 }
 
-/// Conjugation, the operation that distinguishes the complex GEMM op-family
-/// variants (`conjA` / `conjB`). A complex family applies it **at pack time** —
-/// conjugating the packed `A` or `B` panel — so the hot loop stays a single plain
-/// complex FMA with no per-element conj branch. Implemented only for the complex
-/// types (a real type would just be identity, but no real family needs it).
+/// Conjugation, which distinguishes the complex GEMM variants (`conjA` / `conjB`).
+/// Applied at pack time — conjugating the packed `A` or `B` panel — so the hot loop
+/// stays a single plain complex FMA with no per-element conj branch. Implemented only
+/// for the complex types.
 #[cfg(feature = "complex")]
 pub trait Conjugate: Scalar {
     /// The complex conjugate (`re - im·i`).
@@ -137,11 +133,10 @@ impl Conjugate for num_complex::Complex<f64> {
 }
 
 /// A narrow floating-point input type that accumulates in `f32` (`Acc = f32`):
-/// `f16` and `bf16`. It supplies only the **scalar** widen / narrow conversions the
-/// kernel epilogue's strided copy-back path needs; the vectorized hot loop uses the
-/// SIMD widen-load / narrow-store on [`crate::simd::SimdOps`] instead. Kept separate
-/// from [`Float`] precisely because these types have no native arithmetic — the
-/// point of mixed precision.
+/// `f16` and `bf16`. Supplies only the scalar widen / narrow conversions the kernel
+/// epilogue's strided copy-back path needs; the hot loop uses the SIMD widen-load /
+/// narrow-store on [`crate::simd::SimdOps`] instead. Separate from [`Float`] because
+/// these types have no native arithmetic.
 #[cfg(feature = "half")]
 pub trait NarrowFloat: Scalar<Acc = f32> {
     /// Widen one value to `f32` (exact — `f16`/`bf16` are a subset of `f32`).

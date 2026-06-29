@@ -51,17 +51,15 @@ pub use self::scalar::ScalarTok;
 
 /// The SIMD capability an ISA token must provide to drive a [`crate::kernel::KernelFamily`]
 /// with input types `L`/`R`, accumulator `A`, and output `O`: accumulate in `A`
-/// (the [`SimdOps<A>`] supertrait) and move family inputs/outputs in and out of the
+/// (the [`SimdOps<A>`] supertrait) and move family inputs/outputs into and out of the
 /// `A`-typed registers, **widening on load and narrowing on store** when the element
 /// types are narrower than `A`.
 ///
-/// This is the seam that makes **mixed precision** (`A != L`) work without a per-type
-/// branch in the driver. The homogeneous case (`L = R = A = O`, every float family
-/// today) is covered by a single blanket impl that forwards to plain
-/// [`SimdOps`] load/splat/store; a narrow family (`f16`/`bf16` inputs, `f32`
-/// accumulator) adds an ISA impl whose `load_*` widens and `store_out` narrows. The
-/// all-equal blanket and a mixed impl (which has `L != A`) can never overlap, so the
-/// two coexist cleanly.
+/// This seam makes **mixed precision** (`A != L`) work without a per-type branch in
+/// the driver. The homogeneous case (`L = R = A = O`) is covered by a blanket impl
+/// forwarding to plain [`SimdOps`] load/splat/store; a narrow family (`f16`/`bf16`
+/// inputs, `f32` accumulator) adds an ISA impl whose `load_*` widens and `store_out`
+/// narrows. The all-equal blanket and a mixed impl (`L != A`) can never overlap.
 pub trait KernelSimd<L: Scalar, R: Scalar, A: Scalar, O: Scalar>: SimdOps<A> {
     /// Load `LANES` LHS values and widen to one `A` register (plain load if `L == A`).
     ///
@@ -88,8 +86,8 @@ pub trait KernelSimd<L: Scalar, R: Scalar, A: Scalar, O: Scalar>: SimdOps<A> {
 }
 
 /// Homogeneous blanket: when every family type is the accumulator type, the
-/// widen/narrow ops are plain [`SimdOps`] load/splat/store. Covers `FloatGemm<f32>`
-/// / `FloatGemm<f64>` (and any external homogeneous family) with zero per-ISA code.
+/// widen/narrow ops are plain [`SimdOps`] load/splat/store, so any homogeneous
+/// family (e.g. `FloatGemm<f32>`/`FloatGemm<f64>`) needs zero per-ISA code.
 impl<A: Scalar, S: SimdOps<A>> KernelSimd<A, A, A, A> for S {
     #[inline(always)]
     unsafe fn load_lhs(self, p: *const A) -> <S as SimdOps<A>>::Reg {

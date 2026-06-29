@@ -305,10 +305,7 @@ fn correctness_f64_layouts() {
     }
 }
 
-/// Mixed-precision accuracy: `f16`/`bf16` inputs, `f32` accumulator, narrow output,
-/// across shapes / layouts / alpha-beta — checked against the (f64) reference at the
-/// 16-bit tolerance (the kernel's f32 accumulation is far tighter than the final
-/// round, so the gate is dominated by `T::EPS`).
+/// Shapes for the mixed-precision (`f16`/`bf16`) accuracy and bit-identity tests.
 #[cfg(feature = "half")]
 fn mixed_dims() -> [(usize, usize, usize); 9] {
     [
@@ -750,10 +747,9 @@ fn prepack_equals_gemm() {
 }
 
 /// Mixed-precision prepacked-RHS must be **bit-identical** to plain `gemm()` for
-/// the narrow types too — the prepack now blocks with the accumulator size and the
-/// same `kc = k` (mixed) the driver uses, so packed and unpacked never diverge.
-/// Includes a `k > 512` case (the cross-panel regime the blocking-size mismatch
-/// would have broken).
+/// the narrow types too: the prepack blocks with the accumulator size and the same
+/// `kc = k` the driver uses, so packed and unpacked never diverge. Includes a
+/// `k > 512` cross-panel case.
 #[cfg(feature = "half")]
 #[test]
 fn prepack_equals_gemm_mixed() {
@@ -842,9 +838,8 @@ fn prepack_equals_gemm_f64() {
 /// uses the buffer's own blocking (which may round differently from plain gemm's
 /// small-matrix shortcut), so we check *accuracy* against the f64 reference rather
 /// than bit-identity to plain gemm — and the output must stay bit-identical across
-/// thread counts. `(60, 600, 60)` is the case whose general/tiny blocking actually
-/// diverges (`k > 512`), which the old recompute-and-assert design would have
-/// rejected; here it must compute correctly instead.
+/// thread counts. `(60, 600, 60)` exercises the `k > 512` case where the
+/// general/tiny blocking diverges.
 #[test]
 fn prepack_both_tiny_accurate_and_deterministic() {
     for (m, k, n) in [(48, 40, 48), (60, 600, 60), (10, 9, 12)] {
@@ -1542,7 +1537,7 @@ fn isa_neon() {
 /// The SIMD narrow-store (`KernelSimd::store_out`) must be **bit-identical** to the
 /// scalar `NarrowFloat::narrow` (= `half::from_f32`) across edge values — normals,
 /// subnormals, ±0, ±Inf, and NaN — so the full-tile vector path and the partial-tile
-/// scalar path never disagree (and the bf16 NaN fix is real). AVX-512, 16-wide.
+/// scalar path never disagree. AVX-512, 16-wide.
 #[test]
 #[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
 #[cfg_attr(miri, ignore = "Miri cannot execute AVX intrinsics")]
@@ -2157,8 +2152,7 @@ fn gemv_shapes() {
 #[test]
 fn cache_topology_is_plausible() {
     let t = gemmkit::topology();
-    // Sane bounds (true on any real CPU; on the 9950X these read close to the
-    // Zen5 values L1d≈48K, L2≈1M, L3≈32M).
+    // Sane bounds (true on any real CPU).
     assert!(
         t.l1d.bytes >= 8 * 1024 && t.l1d.bytes <= 256 * 1024,
         "L1d={}",

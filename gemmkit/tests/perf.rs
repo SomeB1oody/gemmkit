@@ -46,9 +46,8 @@ fn fill(n: usize, seed: u64) -> Vec<f32> {
 const REPS: usize = 9;
 const BATCH_SECS: f64 = 0.07;
 
-/// A throughput sample: median GFLOP/s plus the min/max so run-to-run spread
-/// (this box swings ~15-20% on quick benches) is *visible* and tuning decisions
-/// are not made on noise.
+/// A throughput sample: median GFLOP/s plus the min/max so run-to-run spread is
+/// *visible* and tuning decisions are not made on noise.
 struct Stat {
     median: f64,
     min: f64,
@@ -94,8 +93,7 @@ fn gflops(m: usize, k: usize, n: usize, secs: f64) -> f64 {
 }
 
 /// f16 GEMM throughput: gemmkit (f32-accumulate mixed kernel) vs the `gemm` crate
-/// (same f16-in-f32-acc convention). The adopt bar for a new type is "same ballpark
-/// as the `gemm` crate", so this reports the ratio. f16 FLOPs counted like f32.
+/// (same f16-in-f32-acc convention), reported as a ratio. f16 FLOPs counted like f32.
 #[cfg(feature = "half")]
 fn bench_f16(s: usize, parallel: bool) {
     use gemmkit::f16;
@@ -808,14 +806,12 @@ fn perf_prepack() {
 }
 
 /// Per-call throughput of a reused prepacked A (`gemm_packed_a`) vs plain `gemm`
-/// (which re-reads / re-packs A every call) for a fixed `(m, k)` operator A and a
-/// varying `n` (the batch width of the streamed B). The packed-LHS path drives the
-/// product transposed, so C is row-major here (its supported orientation) and `A`
-/// plays the transposed RHS. `a_col_major` is the strided case: after the transpose
-/// a column-major A is read by the driver with a large K-stride (`= m`) each call
-/// and, below the pack gate (transposed `m = n > 2048`), never packed — so the
-/// contiguous prepacked panel should win per call. Row-major A is the contiguous
-/// control. The win is the per-call speedup (the one-time pack amortizes away).
+/// (which re-packs A every call) for a fixed `(m, k)` A and varying `n`. The
+/// packed-LHS path drives the product transposed, so C is row-major (its supported
+/// orientation) and A plays the transposed RHS. `a_col_major` is the strided case:
+/// after the transpose the driver reads A with a large K-stride (`= m`) and, below
+/// the pack gate (transposed `m = n > 2048`), never packs it — so the contiguous
+/// prepacked panel should win per call. Row-major A is the contiguous control.
 fn bench_prepack_lhs(m: usize, k: usize, n: usize, a_col_major: bool, par: Parallelism) {
     let a = fill(m * k, 1);
     let b = fill(k * n, 2);

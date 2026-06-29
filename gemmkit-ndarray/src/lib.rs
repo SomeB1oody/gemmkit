@@ -14,13 +14,12 @@
 //! assert_eq!(c, array![[19.0, 22.0], [43.0, 50.0]]);
 //! ```
 //!
-//! The generic [`gemm`]/[`gemm_with`]/[`dot`] are over [`gemmkit::GemmScalar`], so
-//! `f32`/`f64` work out of the box and `f16`/`bf16` work once the `half` feature
-//! (forwarded to `gemmkit/half`) is enabled. **Complex** (`Complex<f32>`/`Complex<f64>`,
-//! with optional conjugation) is served by the dedicated [`gemm_cplx`]/[`gemm_cplx_with`]
-//! /[`dot_cplx`] under the `complex` feature — it can't ride the homogeneous surface
-//! because it carries conj flags. gemmkit's integer (`i8 -> i32`) path is heterogeneous
-//! and has no adapter yet.
+//! [`gemm`]/[`gemm_with`]/[`dot`] are generic over [`gemmkit::GemmScalar`]: `f32`/`f64`
+//! always, plus `f16`/`bf16` under the `half` feature. Complex
+//! (`Complex<f32>`/`Complex<f64>`, with optional conjugation) needs the separate
+//! [`gemm_cplx`]/[`gemm_cplx_with`]/[`dot_cplx`] under the `complex` feature, since the
+//! conj flags don't fit the homogeneous surface. The integer (`i8 -> i32`) path has no
+//! adapter yet.
 
 #[cfg(feature = "complex")]
 use gemmkit::{ComplexScalar, gemm_cplx_unchecked, gemm_cplx_unchecked_with};
@@ -149,10 +148,10 @@ where
     c
 }
 
-/// Complex `C <- alpha·op(A)·op(B) + beta·C`, where `op(A) = A̅` if `conj_a` (resp.
-/// `B̅` if `conj_b`). `T` is `Complex<f32>`/`Complex<f64>`. Requires the `complex`
-/// feature. Like [`gemm`], it reads the pointer/strides straight out of the arrays, so
-/// transposed / F-order / negative-stride views work without copying.
+/// Complex `C <- alpha·op(A)·op(B) + beta·C`, with `op(A) = A̅` when `conj_a` (resp.
+/// `B̅` when `conj_b`). `T` is `Complex<f32>`/`Complex<f64>`; needs the `complex`
+/// feature. Like [`gemm`], it reads pointer/strides directly, so transposed, F-order,
+/// and negative-stride views work without copying.
 ///
 /// # Panics
 /// If the inner dimensions disagree.
@@ -264,7 +263,7 @@ pub fn gemm_cplx_with<T, S1, S2, SC>(
 }
 
 /// Non-conjugated complex `A·B` into a fresh row-major [`Array2`] — the complex
-/// analogue of [`dot`]. For conjugated products use [`gemm_cplx`]. Requires the
+/// analogue of [`dot`]. For conjugated products use [`gemm_cplx`]. Needs the
 /// `complex` feature.
 #[cfg(feature = "complex")]
 pub fn dot_cplx<T, S1, S2>(a: &ArrayBase<S1, Ix2>, b: &ArrayBase<S2, Ix2>) -> Array2<T>

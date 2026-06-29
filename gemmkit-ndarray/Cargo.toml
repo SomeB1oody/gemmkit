@@ -14,17 +14,14 @@ readme = "README.md"
 [features]
 default = ["parallel"]
 parallel = ["gemmkit/parallel"]
-# Forward gemmkit's `half` feature so the generic adapter (`gemm`/`gemm_with`/`dot`)
-# also serves `f16`/`bf16` — they are `GemmScalar` (mixed-precision, f32-accumulate),
-# so the existing generic surface covers them once the family is compiled in. (gemmkit's
-# `complex`/`int8` are *not* forwarded: complex needs the conj entry and i8 is i8->i32
-# heterogeneous, neither of which the homogeneous `gemm<T: GemmScalar>` surface can
-# express — they would need dedicated adapter functions, not a passthrough.)
+# Forward gemmkit's `half`: `f16`/`bf16` are `GemmScalar` (f32-accumulate), so the
+# generic adapter (`gemm`/`gemm_with`/`dot`) serves them as-is. (gemmkit's `complex`/
+# `int8` are not forwarded here — they aren't `GemmScalar` and need dedicated adapter
+# fns, not a passthrough.)
 half = ["gemmkit/half"]
-# Complex GEMM over `Complex<f32>`/`Complex<f64>`, with optional conjugation. Unlike
-# `half`, this needs dedicated adapter fns (`dot_cplx` / `gemm_cplx[_with]`) — complex
-# is not `GemmScalar` and the conj flags don't fit the homogeneous surface — so it
-# forwards `gemmkit/complex` *and* compiles those fns in.
+# Complex GEMM over `Complex<f32>`/`Complex<f64>` with optional conjugation. Not
+# `GemmScalar`, so it needs dedicated adapter fns (`dot_cplx` / `gemm_cplx[_with]`),
+# which this feature compiles in alongside forwarding `gemmkit/complex`.
 complex = ["gemmkit/complex"]
 
 [dependencies]

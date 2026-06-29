@@ -105,14 +105,14 @@ where
 
             if nr_eff == NR {
                 // Full tile: the hot kc-loop, routed through the overridable
-                // [`SimdOps::accumulate_tile`] seam (roadmap §2). The default impl
-                // is the former lane / splat hot paths verbatim, which the
-                // optimizer already turns into the canonical register-blocked
-                // kernel on wide OoO x86 cores; a load-bound ISA (e.g. AArch64
-                // NEON, where the FMA pipes stall on operand delivery at kc-loop
-                // boundaries) can override just this loop with a software-pipelined
-                // schedule, leaving the driver, packing, epilogue, and every other
-                // (type, ISA) cell untouched. Bit-identical across the override.
+                // [`SimdOps::accumulate_tile`] seam. The default impl is a
+                // lane/splat loop the optimizer turns into the canonical
+                // register-blocked kernel on wide OoO cores; a load-bound ISA
+                // (e.g. AArch64 NEON, where the FMA pipes stall on operand
+                // delivery at kc-loop boundaries) can override just this loop
+                // with a software-pipelined schedule, leaving the driver,
+                // packing, and epilogue untouched. Bit-identical across the
+                // override.
                 simd.accumulate_tile::<MR_REG, NR>(kc, a, a_cs, b, b_rs, b_cs, &mut acc);
             } else {
                 // Edge column tile (`nr_eff < NR`): read exactly `nr_eff` columns

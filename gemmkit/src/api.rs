@@ -160,8 +160,8 @@ fn self_aliases(rows: usize, cols: usize, rs: isize, cs: isize) -> bool {
     }
 }
 
-/// `true` if the byte ranges of two `[T]`-typed views overlap (the same-element-type
-/// case; the heterogeneous integer API uses [`overlaps_bytes`] directly).
+/// `true` if the byte ranges of two `[T]`-typed views overlap (same element type;
+/// the heterogeneous integer API uses [`overlaps_bytes`] directly).
 fn overlaps<T>(pa: *const T, na: usize, pb: *const T, nb: usize) -> bool {
     let s = core::mem::size_of::<T>();
     overlaps_bytes(pa as *const u8, na, s, pb as *const u8, nb, s)
@@ -365,10 +365,9 @@ pub fn prepack_rhs<T: GemmScalar>(b: MatRef<'_, T>) -> PackedRhs<T> {
     let (k, n) = (b.rows, b.cols);
     // Resolve the panel geometry through the same ISA tile the consuming call will
     // use; the `m = 65` sentinel dodges the tiny-matrix branch so the geometry is
-    // `m`-independent (the consume reads it back verbatim).
-    // Block with the **accumulator** element size (what the driver uses), and pick
-    // the same `kc`: a mixed-precision type accumulates the whole `k` in one panel
-    // (`kc = k`), so the prepacked buffer blocks exactly as `gemm()` would.
+    // `m`-independent (the consume reads it back verbatim). Block with the
+    // accumulator element size (what the driver uses); a mixed-precision type
+    // accumulates the whole `k` in one panel (`kc = k`), matching `gemm()`.
     let (mr, nr) = <T as GemmScalar>::rhs_tile();
     let acc_size = core::mem::size_of::<<T as crate::Scalar>::Acc>().max(1);
     let blk = crate::cache::topology().blocking(mr, nr, acc_size, 65, n, k);
@@ -384,8 +383,7 @@ pub fn prepack_rhs<T: GemmScalar>(b: MatRef<'_, T>) -> PackedRhs<T> {
     if total > 0 {
         // SAFETY: `buf` holds `ceil(n/nr)*nr*k` elements (the exact layout size);
         // `b` is validated in-bounds above; `pack_rhs_full` writes only that range.
-        // The type's `GemmScalar::pack_rhs_full` selects the right kernel family
-        // (`FloatGemm` for f32/f64, `MixedGemm` for the narrow types).
+        // `GemmScalar::pack_rhs_full` selects the right kernel family per type.
         unsafe {
             T::pack_rhs_full(
                 buf.as_mut_ptr(),
@@ -523,16 +521,15 @@ pub fn gemm_packed_b_with<T: GemmScalar>(
 
 /// A left-hand-side matrix pre-packed once into gemmkit's internal
 /// micropanel-major layout, for reuse across many products that share the same
-/// `A` (the inference pattern mirrored for a fixed *operator*: one weight matrix
-/// `A`, a stream of differently-shaped right operands `B`). Produced by
-/// [`prepack_lhs`] and consumed by [`gemm_packed_a`] / [`gemm_packed_a_with`],
-/// which skip the per-call LHS repack.
+/// `A` (a fixed weight matrix `A` against a stream of differently-shaped right
+/// operands `B`). Produced by [`prepack_lhs`] and consumed by [`gemm_packed_a`] /
+/// [`gemm_packed_a_with`], which skip the per-call LHS repack.
 ///
-/// A prepacked LHS is, by the engine's A/B symmetry, the prepacked RHS of the
-/// transposed product `Cᵀ = Bᵀ·Aᵀ`; the buffer therefore records that transposed
-/// problem's blocking geometry and the consuming call (which the engine drives
-/// transposed) reads it back verbatim. It is read-only during the GEMM, so it is
-/// shared across worker threads with no synchronization.
+/// By the engine's A/B symmetry, a prepacked LHS is the prepacked RHS of the
+/// transposed product `Cᵀ = Bᵀ·Aᵀ`; the buffer records that transposed problem's
+/// blocking geometry, which the consuming call (driven transposed) reads back
+/// verbatim. Read-only during the GEMM, so it is shared across worker threads with
+/// no synchronization.
 pub struct PackedLhs<T> {
     buf: Vec<T>,
     m: usize,
@@ -565,11 +562,10 @@ impl<T> PackedLhs<T> {
 pub fn prepack_lhs<T: GemmScalar>(a: MatRef<'_, T>) -> PackedLhs<T> {
     check_view(a.data, a.rows, a.cols, a.rs, a.cs, "A");
     let (m, k) = (a.rows, a.cols);
-    // Resolve the panel geometry through the same ISA tile the consuming call will
-    // use, for the *transposed* problem (whose RHS is this A): its `N` is the LHS's
-    // `m` rows and its `K` is `k`. The `m = 65` sentinel for the transposed `M`
-    // (the genuine, unknown-here `n`) dodges the tiny-matrix branch so the geometry
-    // is `n`-independent (the consume reads it back verbatim).
+    // Resolve the panel geometry through the consuming call's ISA tile, for the
+    // *transposed* problem (whose RHS is this A): its `N` is the LHS's `m` rows, its
+    // `K` is `k`. The `m = 65` sentinel for the transposed `M` (the unknown-here `n`)
+    // dodges the tiny-matrix branch so the geometry is `n`-independent.
     let (mr, nr) = <T as GemmScalar>::rhs_tile();
     let acc_size = core::mem::size_of::<<T as crate::Scalar>::Acc>().max(1);
     let blk = crate::cache::topology().blocking(mr, nr, acc_size, 65, m, k);
@@ -584,8 +580,8 @@ pub fn prepack_lhs<T: GemmScalar>(a: MatRef<'_, T>) -> PackedLhs<T> {
     let mut buf = vec![T::ZERO; total];
     if total > 0 {
         // SAFETY: `buf` holds `ceil(m/nr)*nr*k` elements (the exact layout size);
-        // `a` is validated in-bounds above; `pack_lhs_full` writes only that range.
-        // `GemmScalar::pack_lhs_full` selects the right kernel family per type.
+        // `a` is validated in-bounds above; `pack_lhs_full` writes only that range
+        // and selects the right kernel family per type.
         unsafe {
             T::pack_lhs_full(
                 buf.as_mut_ptr(),
@@ -696,12 +692,11 @@ pub fn gemm_packed_a_with<T: GemmScalar>(
 
     // Reframe as the transposed product `Cᵀ = Bᵀ·(prepacked Aᵀ)` and reuse the
     // existing prepacked-*RHS* engine — a prepacked LHS *is* the prepacked RHS of
-    // that transpose (the symmetry `pack_lhs_full` packed for). So the genuine `B`
-    // becomes the in-place LHS (`a`) with its strides swapped (Bᵀ row/col = B
-    // col/row), the prepacked `A` stays the `packed` RHS, the dims swap (`m↔n`), and
-    // `C`'s strides swap so the driver writes Cᵀ down contiguous columns. The
-    // required row-major-ish C makes that transposed Cᵀ column-major-ish — exactly
-    // the no-extra-swap orientation `execute_packed`/`run_packed_typed` expect, so
+    // that transpose. So the genuine `B` becomes the in-place LHS (`a`) with its
+    // strides swapped (Bᵀ row/col = B col/row), the prepacked `A` stays the `packed`
+    // RHS, the dims swap (`m↔n`), and `C`'s strides swap so the driver writes Cᵀ down
+    // contiguous columns. The required row-major-ish C makes that transposed Cᵀ
+    // column-major-ish — the no-extra-swap orientation `execute_packed` expects, so
     // no new dispatch path is needed.
     //
     // SAFETY: validated above — shapes agree, B/C strides are in bounds, C does not
@@ -732,9 +727,9 @@ pub fn gemm_packed_a_with<T: GemmScalar>(
     }
 }
 
-/// `true` if two byte ranges (given as base pointer + element count + element size)
-/// overlap. The heterogeneous analogue of [`overlaps`] for the integer API, where C
-/// (`i32`) and A/B (`i8`) have different element sizes.
+/// `true` if two byte ranges (base pointer + element count + element size) overlap.
+/// The heterogeneous analogue of [`overlaps`] for the integer API, where C (`i32`)
+/// and A/B (`i8`) have different element sizes.
 fn overlaps_bytes(
     pa: *const u8,
     na: usize,
@@ -754,8 +749,8 @@ fn overlaps_bytes(
 /// `i32` output** (`alpha`/`beta`/`C` are `i32`). Arithmetic wraps on overflow, the
 /// conventional integer-GEMM semantics. Uses the thread-local workspace pool.
 ///
-/// This is a separate entry point from [`gemm`] because the input and output types
-/// differ (`i8` vs `i32`), which the homogeneous `gemm<T>` surface cannot express.
+/// A separate entry point from [`gemm`] because input and output types differ
+/// (`i8` vs `i32`), which the homogeneous `gemm<T>` surface cannot express.
 ///
 /// # Panics
 /// Same shape / bounds / aliasing conditions as [`gemm`] (`A.cols == B.rows`,
@@ -857,9 +852,9 @@ pub fn gemm_i8_with(
 /// `Complex<f64>` (re-exported as [`crate::c32`] / [`crate::c64`]). Uses the
 /// thread-local workspace pool.
 ///
-/// Complex is homogeneous, so this could ride [`gemm`] for the non-conjugated case,
-/// but the conj op-family gets its own entry; `conj_a = conj_b = false` is the plain
-/// product `A·B`.
+/// Complex is homogeneous, so the non-conjugated case could ride [`gemm`], but the
+/// conj op-family gets its own entry; `conj_a = conj_b = false` is the plain product
+/// `A·B`.
 ///
 /// # Panics
 /// Same shape / bounds / aliasing conditions as [`gemm`].
@@ -958,9 +953,9 @@ pub fn gemm_cplx_with<T: ComplexScalar>(
 
 /// The raw complex engine: `C <- alpha·op(A)·op(B) + beta·C` over pointers and
 /// `isize` strides, with **no** bounds/alias/shape checks — the complex counterpart
-/// of [`gemm_unchecked`] (`op` conjugates that operand when its `conj_*` flag is set).
-/// This is the raw path the ndarray adapter and other advanced callers use to express
-/// arbitrary (transposed / negative) strides. Uses the thread-local workspace pool.
+/// of [`gemm_unchecked`] (`op` conjugates the operand when its `conj_*` flag is set).
+/// The raw path advanced callers (e.g. the ndarray adapter) use to express arbitrary
+/// (transposed / negative) strides. Uses the thread-local workspace pool.
 ///
 /// # Safety
 /// The caller guarantees `a`/`b` valid for reads and `c` for read+write over every
@@ -1052,8 +1047,8 @@ pub unsafe fn gemm_cplx_unchecked_with<T: ComplexScalar>(
 /// The raw integer engine: `C(i32) <- alpha·A(i8)·B(i8) + beta·C` over pointers and
 /// `isize` strides, with **no** bounds/alias/shape checks — the heterogeneous
 /// counterpart of [`gemm_unchecked`] (which is typed for the homogeneous surface and
-/// cannot serve `i8 -> i32`). This is the escape hatch the safe [`gemm_i8`] points
-/// negative-stride / advanced callers to. Uses the thread-local workspace pool.
+/// cannot serve `i8 -> i32`). The escape hatch [`gemm_i8`] points negative-stride /
+/// advanced callers to. Uses the thread-local workspace pool.
 ///
 /// # Safety
 /// The caller guarantees `a`/`b` valid for reads and `c` for read+write over every

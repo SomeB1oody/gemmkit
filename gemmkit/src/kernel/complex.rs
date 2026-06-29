@@ -1,17 +1,16 @@
 //! The complex GEMM family: `Complex<f32>` / `Complex<f64>`, with optional
 //! conjugation of `A` and/or `B`.
 //!
-//! Complex is *homogeneous* (`Lhs = Rhs = Acc = Out`) and has native arithmetic, so
-//! it rides the entire float path: the per-ISA `SimdOps<Complex<_>>` make `mul` /
-//! `mul_add` the **vectorized complex multiply** (interleaved re/im, shuffle +
-//! `fmaddsub`), and `ComplexGemm`'s microkernel simply **delegates to
-//! [`super::float::FloatGemm`]'s** — one kernel serves both.
+//! Complex is homogeneous (`Lhs = Rhs = Acc = Out`) with native arithmetic, so it
+//! rides the float path: the per-ISA `SimdOps<Complex<_>>` make `mul` / `mul_add`
+//! the vectorized complex multiply (interleaved re/im, shuffle + `fmaddsub`), and
+//! `ComplexGemm`'s microkernel delegates to [`super::float::FloatGemm`]'s.
 //!
-//! **Conjugation is on the pack seam, not the hot loop.** `conjA` / `conjB` are
+//! Conjugation lives on the pack seam, not the hot loop. `conjA` / `conjB` are
 //! `const` parameters: when set, the packed `A` (resp. `B`) panel is conjugated
-//! *during packing*, so `A̅·B` / `A·B̅` fall out of the same plain complex FMA. There
-//! is no per-element conj branch in the microkernel, exactly as the op-family seam
-//! intends. `conjC` (a final output conjugation) is a deferred increment.
+//! during packing, so `A̅·B` / `A·B̅` fall out of the same plain complex FMA — no
+//! per-element conj branch in the microkernel. `conjC` (output conjugation) is not
+//! yet implemented.
 
 use core::marker::PhantomData;
 
@@ -74,8 +73,8 @@ where
                 dst, src, /*lead*/ rs, /*depth*/ cs, /*n_lead*/ mc, kc, mr,
             );
             if CONJ_A {
-                // Conjugate the whole packed panel (live rows + zero pad; conj of 0
-                // is 0, so the pad is unaffected). Count = ceil(mc/mr)*mr*kc.
+                // Conjugate the whole packed panel including zero pad (conj of 0 is
+                // 0, so the pad is unaffected). Count = ceil(mc/mr)*mr*kc.
                 conjugate_panel(dst, mc.div_ceil(mr) * mr * kc);
             }
         }
@@ -124,9 +123,9 @@ where
     ) where
         S: KernelSimd<T, T, T, T>,
     {
-        // The conj is already baked into the packed A/B, so the arithmetic is the
-        // plain complex GEMM — reuse FloatGemm's microkernel verbatim (its `mul_add`
-        // is the vectorized complex FMA via `SimdOps<Complex<_>>`).
+        // Conj is already baked into the packed A/B, so the arithmetic is plain
+        // complex GEMM — reuse FloatGemm's microkernel (its `mul_add` is the
+        // vectorized complex FMA via `SimdOps<Complex<_>>`).
         unsafe {
             <FloatGemm<T> as KernelFamily>::microkernel::<S, MR_REG, NR>(
                 simd,
