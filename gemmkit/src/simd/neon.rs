@@ -382,31 +382,24 @@ impl KernelSimd<i8, i8, i32, i32> for Neon {
 // Complex (NEON): real `Reg`; `LANES` is the real lane count (4 / 2). Complex GEMM
 // routes through the shared SoA `soa_microkernel`, so the **inner loop is already
 // vectorized** on NEON for free — `mul_add` lowers to `vfmaq_f32`/`vfmaq_f64` and `fnma`
-// to `vfmsq_f32`/`vfmsq_f64` through the real `SimdOps<f32>`/`<f64>` above. What remains
-// is per-ISA *tuning*, which could not be benchmarked here (x86 host):
+// to `vfmsq_f32`/`vfmsq_f64` through the real `SimdOps<f32>`/`<f64>` above. The on-device
+// SoA tuning is complete:
 //
-// TODO(neon): finish the on-device SoA tuning.
-//   1. De-interleave pack: `pack_planar` (kernel/complex.rs) currently gathers re/im one
-//      scalar at a time. For a contiguous source, replace the per-depth-step copy with
-//      `vld2q_f32`/`vld2q_f64` (load+de-interleave in one) into the re/im planes, and the
-//      strided case with a `vld2q` over short K-strips (mirror `pack_panels`'s blocked
-//      transpose). Bit-identical to the scalar pack, so only speed changes.
-//   2. C epilogue: `soa_microkernel` re-interleaves C scalar-by-scalar. Replace the
-//      full-tile, unit-`rsc` store with `vst2q_f32`/`vst2q_f64` (interleave+store) and the
-//      `beta != 0` read with `vld2q`; keep the scalar drain for edge/strided tiles.
-//   3. Tile sweep: the dispatch tile is MR_REG=2, NR=6 (acc = 24, the isolated-best from
-//      the SoA data); sweep MR_REG ∈ {1,2,3}, NR ∈ {4,6,8} on-device against the 32-vreg
-//      budget (acc = 2·MR_REG·NR, + 2·MR_REG A-plane regs).
-//   4. Keep/drop decision: run `cargo test -p gemmkit --release --features complex
-//      perf_complex -- --ignored --nocapture` on the NEON box. Target: beat the ~49
-//      GFLOP/s `gemm` baseline and the ~16.7 of the old AoS kernel (SoA hit 127.9 isolated
-//      on M4 Max). Like every gemmkit override, keep it only if measured (`Keep only
-//      measured wins`); the generic path is the correct floor if a hand-tune does not pay.
-//      Do NOT use ARMv8.3 `FCMLA`/`FCADD`: they are nightly-gated on stable Rust (the very
-//      reason this SoA path exists), and they fold the complex cross-terms into a single
-//      rounding step — a different accumulation structure than the four separate real FMAs
-//      here — so they cannot interleave with this kernel without breaking the full-vs-edge
-//      rounding identity (the analogue of why `sdot`/`bfmmla` are out of scope).
+//   * Tile: the dispatch tile (see `dispatch.rs`) is MR_REG=2, NR=5, chosen by sweeping
+//     MR_REG/NR against the 32-vreg budget (acc = 2·MR_REG·NR, + 2·MR_REG A-plane regs,
+//     + 2 splats). MR_REG=2 halves the splat:FMA ratio of a 1-register-row tile, and NR is
+//     capped at 5 so the accumulators stay in registers; a fuller tile overflows the file
+//     (once the in-flight load/lane temporaries are counted) and spills to the stack.
+//   * De-interleave stays **scalar**: profiling the tuned kernel puts the pack
+//     (`pack_planar`) and the C re-interleave epilogue (`soa_microkernel`) at a small
+//     fraction of runtime — the inner loop dominates — so a `vld2q`/`vst2q` per-ISA seam
+//     was measured to not pay and dropped. The generic scalar path is the correct floor.
+//
+// Do NOT use ARMv8.3 `FCMLA`/`FCADD`: they are nightly-gated on stable Rust (the very
+// reason this SoA path exists), and they fold the complex cross-terms into a single
+// rounding step — a different accumulation structure than the four separate real FMAs
+// here — so they cannot interleave with this kernel without breaking the full-vs-edge
+// rounding identity (the analogue of why `sdot`/`bfmmla` are out of scope).
 #[cfg(feature = "complex")]
 impl_complex_simd!(Neon, f32, float32x4_t, 4, 16);
 #[cfg(feature = "complex")]
