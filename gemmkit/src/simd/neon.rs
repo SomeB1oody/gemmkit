@@ -201,9 +201,8 @@ impl SimdOps<f64> for Neon {
 //
 // * `bf16`: a vectorized widen is *possible* (bf16 is the top half of an f32, so
 //   the widen is an exact `vshll` left-shift by 16, bit-identical to `to_f32`) but
-//   not *worth it*: implemented and benchmarked against this scalar form, it showed
-//   no throughput gain (~36/51/49 GFLOP/s either way at n=256/512/1024) — the wide
-//   OoO core already hides the per-lane widen among the FMAs, exactly as the
+//   not *worth it*: measured against this scalar form it showed no throughput gain —
+//   the out-of-order core already hides the per-lane widen among the FMAs, as the
 //   `SimdOps::accumulate_tile` doc notes. "Keep only measured wins", so it was
 //   dropped in favor of the simpler scalar code.
 // * `f16`: the native conversion (`vcvt_f32_f16` over `float16x4_t`) needs the
@@ -249,10 +248,8 @@ impl KernelSimd<f16, f16, f32, f16> for Neon {
     }
 }
 
-/// `bf16` mixed precision (scalar fallback), mirror of the `f16` impl. (A
-/// vectorized `vshll` widen was implemented and measured but showed no throughput
-/// gain over this — the wide OoO core already hides the per-lane widen among the
-/// FMAs — so the simpler scalar form is kept; see the note above.)
+/// `bf16` mixed precision (scalar fallback), mirror of the `f16` impl. (A vectorized
+/// `vshll` widen showed no measured gain over this — see the note above.)
 #[cfg(feature = "half")]
 impl KernelSimd<bf16, bf16, f32, bf16> for Neon {
     #[inline(always)]
@@ -381,19 +378,12 @@ impl KernelSimd<i8, i8, i32, i32> for Neon {
 
 // Complex (NEON): real `Reg`; `LANES` is the real lane count (4 / 2). Complex GEMM
 // routes through the shared SoA `soa_microkernel`, so the **inner loop is already
-// vectorized** on NEON for free — `mul_add` lowers to `vfmaq_f32`/`vfmaq_f64` and `fnma`
-// to `vfmsq_f32`/`vfmsq_f64` through the real `SimdOps<f32>`/`<f64>` above. The on-device
-// SoA tuning is complete:
-//
-//   * Tile: the dispatch tile (see `dispatch.rs`) is MR_REG=2, NR=5, chosen by sweeping
-//     MR_REG/NR against the 32-vreg budget (acc = 2·MR_REG·NR, + 2·MR_REG A-plane regs,
-//     + 2 splats). MR_REG=2 halves the splat:FMA ratio of a 1-register-row tile, and NR is
-//     capped at 5 so the accumulators stay in registers; a fuller tile overflows the file
-//     (once the in-flight load/lane temporaries are counted) and spills to the stack.
-//   * De-interleave stays **scalar**: profiling the tuned kernel puts the pack
-//     (`pack_planar`) and the C re-interleave epilogue (`soa_microkernel`) at a small
-//     fraction of runtime — the inner loop dominates — so a `vld2q`/`vst2q` per-ISA seam
-//     was measured to not pay and dropped. The generic scalar path is the correct floor.
+// vectorized** for free — `mul_add` lowers to `vfmaq_f32`/`vfmaq_f64` and `fnma` to
+// `vfmsq_f32`/`vfmsq_f64` through the real `SimdOps<f32>`/`<f64>` above. The tile is
+// MR_REG=2, NR=5 (see `dispatch.rs` for the register-budget rationale). The de-interleave
+// pack (`pack_planar`) and C re-interleave epilogue stay **scalar**: they are a small
+// fraction of runtime (the inner loop dominates), so a `vld2q`/`vst2q` seam does not pay
+// and the generic scalar path is the floor.
 //
 // Do NOT use ARMv8.3 `FCMLA`/`FCADD`: they are nightly-gated on stable Rust (the very
 // reason this SoA path exists), and they fold the complex cross-terms into a single
