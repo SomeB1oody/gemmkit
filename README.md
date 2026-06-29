@@ -9,7 +9,9 @@ for Rust, in two crates:
   AArch64 (NEON).
 - [**`gemmkit-ndarray`**](/gemmkit-ndarray/README.md) — a thin [`ndarray`] 0.17 adapter.
 
-It computes `C ← α·A·B + β·C` for `f32` and `f64`.
+It computes `C ← α·A·B + β·C` for `f32`/`f64`, plus optional `f16`/`bf16`
+(mixed-precision, f32 accumulate), `i8 → i32` integer, and `c32`/`c64` complex
+families behind Cargo features.
 
 ```rust
 use gemmkit::{gemm, MatRef, MatMut, Parallelism};
@@ -57,8 +59,9 @@ untouched. See [`ARCHITECTURE.md`](ARCHITECTURE.md).
 ## Status
 
 v1 ships f32/f64 over scalar + AVX2/FMA + AVX-512 on x86-64 and NEON on AArch64
-(Apple Silicon, with `sysctl` cache detection). f16/bf16, complex, and integer
-families are designed-for but not yet implemented. The AArch64 kernel uses a
+(Apple Silicon, with `sysctl` cache detection). The `half` (f16/bf16,
+mixed-precision), `int8` (i8 → i32), and `complex` (c32/c64, with conjA/conjB)
+families ship on top of that core as opt-in Cargo features. The AArch64 kernel uses a
 lane-indexed FMA fast path (`vfmaq_laneq`, packed RHS) on top of the portable
 `splat`+`vfmaq` path; single-threaded it runs at **~90–103% of the `gemm` crate**
 (parity) on an M-series core. The microtile is a 4×4 (16-accumulator) tile,

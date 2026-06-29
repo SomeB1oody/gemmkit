@@ -365,12 +365,12 @@ pub fn prepack_rhs<T: GemmScalar>(b: MatRef<'_, T>) -> PackedRhs<T> {
     let (k, n) = (b.rows, b.cols);
     // Resolve the panel geometry through the same ISA tile the consuming call will
     // use; the `m = 65` sentinel dodges the tiny-matrix branch so the geometry is
-    // `m`-independent (the consume reads it back verbatim). Block with the
-    // accumulator element size (what the driver uses); a mixed-precision type
-    // accumulates the whole `k` in one panel (`kc = k`), matching `gemm()`.
+    // `m`-independent (the consume reads it back verbatim). Block with the packed
+    // input (`Lhs` == `Rhs`) element size — the unit the panels are stored in, same
+    // as the driver
     let (mr, nr) = <T as GemmScalar>::rhs_tile();
-    let acc_size = core::mem::size_of::<<T as crate::Scalar>::Acc>().max(1);
-    let blk = crate::cache::topology().blocking(mr, nr, acc_size, 65, n, k);
+    let lhs_size = core::mem::size_of::<T>().max(1);
+    let blk = crate::cache::topology().blocking(mr, nr, lhs_size, 65, n, k);
     let kc = if T::OUT_IS_ACC {
         blk.kc.max(1)
     } else {
@@ -567,8 +567,10 @@ pub fn prepack_lhs<T: GemmScalar>(a: MatRef<'_, T>) -> PackedLhs<T> {
     // `K` is `k`. The `m = 65` sentinel for the transposed `M` (the unknown-here `n`)
     // dodges the tiny-matrix branch so the geometry is `n`-independent.
     let (mr, nr) = <T as GemmScalar>::rhs_tile();
-    let acc_size = core::mem::size_of::<<T as crate::Scalar>::Acc>().max(1);
-    let blk = crate::cache::topology().blocking(mr, nr, acc_size, 65, m, k);
+    // Packed input (`Lhs` == `Rhs`) element size — the unit the panels are stored in,
+    // matching the driver (the prepacked buffer below is `T`-typed).
+    let lhs_size = core::mem::size_of::<T>().max(1);
+    let blk = crate::cache::topology().blocking(mr, nr, lhs_size, 65, m, k);
     let kc = if T::OUT_IS_ACC {
         blk.kc.max(1)
     } else {
