@@ -13,36 +13,24 @@ readme = "README.md"
 
 [features]
 default = ["std", "parallel"]
-# `std` enables runtime cache/feature detection and the thread-local workspace pool.
-std = []
-# `parallel` enables rayon-backed multithreading. With it off, everything still
-# compiles and runs single-threaded (`Parallelism::Serial`).
+# `dep:raw-cpuid` is x86-only (target-gated below); the activation is a no-op on
+# other targets, and on x86 it is pulled only when `std` is on — matching the
+# `cfg(all(feature = "std", x86))`-gated cpuid detection module that is its sole user.
+std = ["dep:raw-cpuid"]
 parallel = ["std", "dep:rayon"]
-# Optional element-type families. Each gates a self-contained dispatch path
-# (kernel family + per-ISA SimdOps + dispatch ladder + public entry). Off by
-# default so a plain `f32`/`f64` build pays for none of their monomorphizations
-# or deps. (`int8` is pure i8->i32 codegen, so it needs no dep.)
+# Optional element-type
 complex = ["dep:num-complex"] # c32/c64 GEMM with conjA/conjB (`gemm_cplx`)
 half = ["dep:half"] # f16/bf16 mixed-precision GEMM (f32 accumulate)
 int8 = [] # i8 -> i32 integer GEMM (`gemm_i8`)
 
 [dependencies]
 rayon = { version = "1.10", optional = true }
-# `half` (f16 / bf16): ecosystem-standard element type for interop.
-# `default-features = false` keeps it `core`-only so the no_std build stays clean.
 half = { version = "2", default-features = false, optional = true }
-# `num-complex` (c32/c64): ecosystem-standard complex type.
-# `default-features = false` keeps it `core`-only for the no_std build.
 num-complex = { version = "0.4", default-features = false, optional = true }
 
 [target.'cfg(any(target_arch = "x86", target_arch = "x86_64"))'.dependencies]
-raw-cpuid = "11"
+raw-cpuid = { version = "11", optional = true }
 
-# Baseline-comparison crates, used only by the perf benches (`tests/perf.rs`,
-# `benches/gemm_bench.rs`) — never by the Miri-checked `tests/correctness.rs`.
-# `gemm` pulls `pulp`, which fails to compile under Miri's nightly on aarch64, so
-# gate the whole set out under `cfg(miri)` to keep `cargo miri test` building only
-# gemmkit's scalar path. The perf/bench targets are themselves `#![cfg(not(miri))]`.
 [target.'cfg(not(miri))'.dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 gemm = "0.18"

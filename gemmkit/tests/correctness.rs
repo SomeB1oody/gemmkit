@@ -358,7 +358,7 @@ fn mixed_dims() -> [(usize, usize, usize); 9] {
 fn correctness_f16_layouts() {
     for (m, k, n) in mixed_dims() {
         for &lc in &[Layout::Row, Layout::Col] {
-            for &(al, be) in &[(1.0f64, 0.0), (1.0, 1.0), (0.75, -0.5)] {
+            for &(al, be) in &[(1.0f64, 0.0), (1.0, 1.0), (0.75, -0.5), (0.0, 2.5)] {
                 run_case::<gemmkit::f16>(
                     m,
                     k,
@@ -380,7 +380,7 @@ fn correctness_f16_layouts() {
 fn correctness_bf16_layouts() {
     for (m, k, n) in mixed_dims() {
         for &lc in &[Layout::Row, Layout::Col] {
-            for &(al, be) in &[(1.0f64, 0.0), (1.0, 1.0), (0.75, -0.5)] {
+            for &(al, be) in &[(1.0f64, 0.0), (1.0, 1.0), (0.75, -0.5), (0.0, 2.5)] {
                 run_case::<gemmkit::bf16>(
                     m,
                     k,
@@ -455,9 +455,12 @@ fn parallel_equals_serial_mixed() {
 #[test]
 #[cfg(all(not(miri), feature = "half"))]
 fn mixed_f16_matches_gemm_crate() {
-    // Includes a large-k case (k > the f32 kc blocking ≈ 512) to exercise the
-    // cross-depth-panel accumulation, where the running sum round-trips through the
-    // narrow C between kc panels.
+    // Includes a large-k case (k = 2048 > the f32 kc blocking ≈ 512) to exercise the
+    // mixed-precision single-panel rule: because `Out` (f16) is narrower than `Acc`
+    // (f32), the driver forces `kc = k` (`OUT_IS_ACC = false`), so the whole
+    // contraction accumulates in f32 and rounds to f16 exactly ONCE at writeback —
+    // never between kc panels. (A homogeneous f32 kernel would instead split this k.)
+    // This is what keeps gemmkit matching `gemm`'s whole-k f32 accumulation.
     for (m, k, n) in [(64, 48, 40), (96, 65, 72), (33, 17, 19), (64, 2048, 64)] {
         let a = Mat::<gemmkit::f16>::rand(m, k, 0x16A + m as u64);
         let b = Mat::<gemmkit::f16>::rand(k, n, 0x16B + n as u64);
@@ -592,35 +595,191 @@ fn correctness_alpha_beta() {
     }
 }
 
-/// beta==0 must not read C — prove it by seeding C with NaN.
+/// beta==0 must not read C — prove it by seeding C with NaN. Each kernel family has
+/// its own `BetaStatus::Zero` branch (float / mixed / int / complex), so cover every
+/// real element type, not just f32: a family that load-then-stored C would propagate
+/// the NaN (`0 * NaN == NaN`) and fail the finite check in `assert_accurate`. Sizes
+/// hit both the small-matrix branch (40×33×28) and a real tile with partial edges
+/// (64×16×96, exercising the strided copy-back `Zero` branch).
 #[test]
 fn beta_zero_does_not_read_c() {
-    let (m, k, n) = (40, 33, 28);
-    let a = Mat::<f32>::rand(m, k, 7);
-    let b = Mat::<f32>::rand(k, n, 9);
-    let cref = reference(
-        &a,
-        &b,
-        &Mat {
-            v: vec![0.0; m * n],
-            rows: m,
-            cols: n,
-        },
-        1.0,
-        0.0,
-    );
-    let (abuf, rsa, csa) = build_view(&a, Layout::Col);
-    let (bbuf, rsb, csb) = build_view(&b, Layout::Col);
-    let mut cbuf = vec![f32::NAN; m * n];
-    gemm(
-        1.0,
-        MatRef::new(&abuf, m, k, rsa, csa),
-        MatRef::new(&bbuf, k, n, rsb, csb),
-        0.0,
-        MatMut::from_col_major(&mut cbuf, m, n),
-        Parallelism::Serial,
-    );
-    assert_accurate(&cbuf, 1, m as isize, m, n, &cref, &a, &b, k, "beta=0 NaN C");
+    fn check<T: Elem>() {
+        for (m, k, n) in [(40usize, 33, 28), (64, 16, 96)] {
+            let a = Mat::<T>::rand(m, k, 7 + m as u64);
+            let b = Mat::<T>::rand(k, n, 9 + n as u64);
+            let cref = reference(
+                &a,
+                &b,
+                &Mat {
+                    v: vec![T::from_f64(0.0); m * n],
+                    rows: m,
+                    cols: n,
+                },
+                1.0,
+                0.0,
+            );
+            let (abuf, rsa, csa) = build_view(&a, Layout::Col);
+            let (bbuf, rsb, csb) = build_view(&b, Layout::Col);
+            let mut cbuf = vec![T::from_f64(f64::NAN); m * n];
+            gemm(
+                T::from_f64(1.0),
+                MatRef::new(&abuf, m, k, rsa, csa),
+                MatRef::new(&bbuf, k, n, rsb, csb),
+                T::from_f64(0.0),
+                MatMut::from_col_major(&mut cbuf, m, n),
+                Parallelism::Serial,
+            );
+            assert_accurate(&cbuf, 1, m as isize, m, n, &cref, &a, &b, k, "beta=0 NaN C");
+        }
+    }
+    check::<f32>();
+    check::<f64>();
+    #[cfg(feature = "half")]
+    {
+        check::<gemmkit::f16>();
+        check::<gemmkit::bf16>();
+    }
+}
+
+/// Complex counterpart of [`beta_zero_does_not_read_c`]: the SoA complex kernel's
+/// `Zero` branch must overwrite C without reading it. `ref_cplx` has no beta==0 guard
+/// (it always multiplies `beta * C0`), so the reference is built from a *zeroed* C
+/// while the kernel is fed a NaN-seeded C — a spurious read would surface as a
+/// non-finite output.
+#[cfg(feature = "complex")]
+#[test]
+fn beta_zero_does_not_read_c_complex() {
+    fn check<T: CElem>() {
+        for (m, k, n) in [(40usize, 33, 28), (64, 16, 96)] {
+            let a = rand_cplx::<T>(m * k, 0x5E + m as u64);
+            let b = rand_cplx::<T>(k * n, 0x5F + n as u64);
+            let zero_c0 = vec![T::of(0.0, 0.0); m * n];
+            let (alpha, beta) = (T::of(1.0, 0.0), T::of(0.0, 0.0));
+            let cref = ref_cplx(&a, &b, &zero_c0, m, k, n, alpha, beta, false, false);
+            let mut c = vec![T::of(f64::NAN, f64::NAN); m * n];
+            gemmkit::gemm_cplx(
+                alpha,
+                MatRef::from_col_major(&a, m, k),
+                false,
+                MatRef::from_col_major(&b, k, n),
+                false,
+                beta,
+                MatMut::from_col_major(&mut c, m, n),
+                Parallelism::Serial,
+            );
+            assert_cplx_accurate(
+                &c,
+                m,
+                n,
+                &cref,
+                k,
+                &format!("cplx beta=0 NaN C {m}x{k}x{n}"),
+            );
+        }
+    }
+    check::<gemmkit::c32>();
+    check::<gemmkit::c64>();
+}
+
+/// The workspace-reuse entry `gemm_with` must match the pool-allocating `gemm`
+/// numerically (it otherwise has only a zero-alloc test). Reuse one `Workspace` across
+/// two calls to also cover the warm (no-alloc) path.
+#[test]
+fn workspace_reuse_matches_allocating() {
+    fn check<T: Elem>() {
+        let (m, k, n) = (96, 65, 72);
+        let a = Mat::<T>::rand(m, k, 0x7A + m as u64);
+        let b = Mat::<T>::rand(k, n, 0x7B + n as u64);
+        let c0 = Mat::<T>::rand(m, n, 0x7C + k as u64);
+        let (abuf, rsa, csa) = build_view(&a, Layout::Col);
+        let (bbuf, rsb, csb) = build_view(&b, Layout::Col);
+        let (cbase, rsc, csc) = build_view(&c0, Layout::Col);
+        let (al, be) = (T::from_f64(0.5), T::from_f64(0.25));
+
+        let mut c_ref = cbase.clone();
+        gemm(
+            al,
+            MatRef::new(&abuf, m, k, rsa, csa),
+            MatRef::new(&bbuf, k, n, rsb, csb),
+            be,
+            MatMut::new(&mut c_ref, m, n, rsc, csc),
+            Parallelism::Serial,
+        );
+        let mut ws = Workspace::new();
+        for _ in 0..2 {
+            let mut c_ws = cbase.clone();
+            gemmkit::gemm_with(
+                &mut ws,
+                al,
+                MatRef::new(&abuf, m, k, rsa, csa),
+                MatRef::new(&bbuf, k, n, rsb, csb),
+                be,
+                MatMut::new(&mut c_ws, m, n, rsc, csc),
+                Parallelism::Serial,
+            );
+            assert!(
+                c_ref
+                    .iter()
+                    .zip(&c_ws)
+                    .all(|(x, y)| x.to_f64().to_bits() == y.to_f64().to_bits()),
+                "gemm_with != gemm"
+            );
+        }
+    }
+    check::<f32>();
+    check::<f64>();
+}
+
+/// Complex counterpart: `gemm_cplx_with` (the only complex workspace-reuse entry) had
+/// no test at all. Must match `gemm_cplx` bit-for-bit, including conjugated cases.
+#[cfg(feature = "complex")]
+#[test]
+fn workspace_reuse_matches_allocating_complex() {
+    fn check<T: CElem>() {
+        let (m, k, n) = (96, 65, 72);
+        let a = rand_cplx::<T>(m * k, 0x8A + m as u64);
+        let b = rand_cplx::<T>(k * n, 0x8B + n as u64);
+        let c0 = rand_cplx::<T>(m * n, 0x8C + k as u64);
+        let (alpha, beta) = (T::of(1.1, -0.3), T::of(0.5, 0.7));
+        for &(ca, cb) in &[(false, false), (true, false), (true, true)] {
+            let mut c_ref = c0.clone();
+            gemmkit::gemm_cplx(
+                alpha,
+                MatRef::from_col_major(&a, m, k),
+                ca,
+                MatRef::from_col_major(&b, k, n),
+                cb,
+                beta,
+                MatMut::from_col_major(&mut c_ref, m, n),
+                Parallelism::Serial,
+            );
+            let mut ws = Workspace::new();
+            for _ in 0..2 {
+                let mut c_ws = c0.clone();
+                gemmkit::gemm_cplx_with(
+                    &mut ws,
+                    alpha,
+                    MatRef::from_col_major(&a, m, k),
+                    ca,
+                    MatRef::from_col_major(&b, k, n),
+                    cb,
+                    beta,
+                    MatMut::from_col_major(&mut c_ws, m, n),
+                    Parallelism::Serial,
+                );
+                for idx in 0..m * n {
+                    let (rr, ri) = c_ref[idx].parts();
+                    let (wr, wi) = c_ws[idx].parts();
+                    assert!(
+                        rr.to_bits() == wr.to_bits() && ri.to_bits() == wi.to_bits(),
+                        "gemm_cplx_with != gemm_cplx at {idx} ca={ca} cb={cb}"
+                    );
+                }
+            }
+        }
+    }
+    check::<gemmkit::c32>();
+    check::<gemmkit::c64>();
 }
 
 /// Serial and parallel runs must be bit-identical.
@@ -779,9 +938,9 @@ fn prepack_equals_gemm() {
 }
 
 /// Mixed-precision prepacked-RHS must be **bit-identical** to plain `gemm()` for
-/// the narrow types too: the prepack blocks with the accumulator size and the same
-/// `kc = k` the driver uses, so packed and unpacked never diverge. Includes a
-/// `k > 512` cross-panel case.
+/// the narrow types too: the prepack blocks with the packed-input (`Lhs`) size and
+/// the same `kc = k` the driver uses, so packed and unpacked never diverge. Includes
+/// a `k > 512` cross-panel case.
 #[cfg(feature = "half")]
 #[test]
 fn prepack_equals_gemm_mixed() {
@@ -1023,6 +1182,66 @@ fn prepack_lhs_equals_gemm_f64() {
         );
         assert_eq!(c_ref, c_pk, "f64 prepack_lhs != gemm for {m}x{k}x{n}");
     }
+}
+
+/// Mixed-precision prepacked-**LHS** must be bit-identical to plain `gemm()` for the
+/// narrow types — the LHS transpose-pack path at `Acc != Lhs` sizes. This is the only
+/// path that simultaneously hits a narrow type, the transpose/packing framework, and
+/// the `kc = k` single-panel rule (`prepack_equals_gemm_mixed` covers the RHS pack;
+/// `prepack_lhs_equals_gemm` covers the transpose at `Acc == Lhs`). Mirrors the RHS
+/// mixed test on the `gemm_packed_a` side, with both A layouts and a `k > 512` case.
+#[cfg(feature = "half")]
+#[test]
+fn prepack_lhs_equals_gemm_mixed() {
+    fn check<T: Elem>() {
+        for (m, k, n) in [(200, 130, 175), (96, 65, 72), (65, 64, 64), (96, 1024, 72)] {
+            for &la in &[Layout::Col, Layout::Row] {
+                let a = Mat::<T>::rand(m, k, 0x4A + (m * 7 + n) as u64);
+                let b = Mat::<T>::rand(k, n, 0x4B + (n * 3 + k) as u64);
+                let c0 = Mat::<T>::rand(m, n, 0x4C + (k + m) as u64);
+                let (abuf, rsa, csa) = build_view(&a, la);
+                let (bbuf, rsb, csb) = build_view(&b, Layout::Col);
+                // Row-major C is the supported orientation for the packed-LHS path.
+                let (cbase, rsc, csc) = build_view(&c0, Layout::Row);
+                let packed = gemmkit::prepack_lhs(MatRef::new(&abuf, m, k, rsa, csa));
+                assert_eq!(packed.rows(), m);
+                assert_eq!(packed.cols(), k);
+
+                for &(al, be) in &[(1.0f64, 0.0), (0.7, 1.3)] {
+                    let (al, be) = (T::from_f64(al), T::from_f64(be));
+                    let mut c_ref = cbase.clone();
+                    gemm(
+                        al,
+                        MatRef::new(&abuf, m, k, rsa, csa),
+                        MatRef::new(&bbuf, k, n, rsb, csb),
+                        be,
+                        MatMut::new(&mut c_ref, m, n, rsc, csc),
+                        Parallelism::Serial,
+                    );
+                    for par in [Parallelism::Serial, Parallelism::Rayon(4)] {
+                        let mut c_pk = cbase.clone();
+                        gemmkit::gemm_packed_a(
+                            al,
+                            &packed,
+                            MatRef::new(&bbuf, k, n, rsb, csb),
+                            be,
+                            MatMut::new(&mut c_pk, m, n, rsc, csc),
+                            par,
+                        );
+                        assert!(
+                            c_ref
+                                .iter()
+                                .zip(&c_pk)
+                                .all(|(x, y)| x.to_f64().to_bits() == y.to_f64().to_bits()),
+                            "mixed prepack_lhs != gemm for {m}x{k}x{n} la={la:?} par={par:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    check::<gemmkit::f16>();
+    check::<gemmkit::bf16>();
 }
 
 /// Both-tiny products (`m <= 64 && n <= 64`) via the prepacked-LHS path: like the
@@ -1723,7 +1942,7 @@ fn correctness_i8() {
         (65, 64, 64),
         (128, 96, 112),
     ] {
-        for &(alpha, beta) in &[(1i32, 0i32), (1, 1), (3, -2)] {
+        for &(alpha, beta) in &[(1i32, 0i32), (1, 1), (3, -2), (0, 3)] {
             let a = rand_i8(m * k, 0x100 + (m * 7 + k) as u64);
             let b = rand_i8(k * n, 0x200 + (n * 3 + k) as u64);
             let c0: Vec<i32> = (0..m * n).map(|x| (x as i32 % 7) - 3).collect();
@@ -1751,6 +1970,46 @@ fn correctness_i8() {
             assert_eq!(c, cref, "i8 mismatch {m}x{k}x{n} alpha={alpha} beta={beta}");
         }
     }
+}
+
+/// The documented i8 contract is *wrapping* i32 arithmetic on overflow. Every other
+/// i8 test keeps values in range so the wrap never fires; force it here with a large
+/// `alpha` and check against a wrapping-i32 reference (not the range-checked `ref_i8`).
+#[cfg(feature = "int8")]
+#[test]
+fn i8_wraps_on_overflow() {
+    use gemmkit::{MatMut, MatRef};
+    // 2×2×2, all 127s: each dot = 127*127 + 127*127 = 32258 (fits i32). A large `alpha`
+    // then overflows the i32 epilogue; 2×2 stays on the general kernel drain (not the
+    // gemv path), exercising the scalar `wrapping_mul`/`wrapping_add`.
+    let a = [127i8; 4];
+    let b = [127i8; 4];
+    let c0 = [1_000_000i32, -2_000_000, 3_000_000, -4_000_000];
+    let (alpha, beta) = (100_000i32, 1i32);
+    let acc: i32 = 127 * 127 + 127 * 127;
+    assert!(
+        (alpha as i64) * (acc as i64) > i32::MAX as i64,
+        "test setup must actually overflow i32"
+    );
+    let scaled = alpha.wrapping_mul(acc);
+    let want: Vec<i32> = c0
+        .iter()
+        .map(|&c| beta.wrapping_mul(c).wrapping_add(scaled))
+        .collect();
+    let mut c = c0;
+    gemmkit::gemm_i8(
+        alpha,
+        MatRef::from_row_major(&a, 2, 2),
+        MatRef::from_row_major(&b, 2, 2),
+        beta,
+        MatMut::from_row_major(&mut c, 2, 2),
+        Parallelism::Serial,
+    );
+    assert_eq!(
+        c.to_vec(),
+        want,
+        "i8 must wrap (two's complement) on i32 overflow per the documented contract"
+    );
 }
 
 /// Integer serial == parallel **bit-identity** (integer accumulation is exact, so
@@ -1978,6 +2237,37 @@ fn correctness_complex() {
                 );
                 assert_cplx_accurate(&c, m, n, &cref, k, &format!("{m}x{k}x{n} ca={ca} cb={cb}"));
             }
+        }
+    }
+    check::<gemmkit::c32>();
+    check::<gemmkit::c64>();
+}
+
+/// `alpha == 0` is the scale-only path: `C <- beta·C0`, with `A·B` (and any conj)
+/// skipped. It is the only way to reach the complex `scale_c_float` monomorphization,
+/// previously unexercised. `conj_a = true` is set on purpose and must be ignored.
+#[cfg(feature = "complex")]
+#[test]
+fn correctness_complex_alpha_zero() {
+    fn check<T: CElem>() {
+        for (m, k, n) in [(3, 4, 5), (40, 33, 28), (64, 80, 48)] {
+            let a = rand_cplx::<T>(m * k, 0xA0 + (m * 7 + k) as u64);
+            let b = rand_cplx::<T>(k * n, 0xA1 + (n * 3 + k) as u64);
+            let c0 = rand_cplx::<T>(m * n, 0xA2 + (m + n) as u64);
+            let (alpha, beta) = (T::of(0.0, 0.0), T::of(0.5, 0.7));
+            let cref = ref_cplx(&a, &b, &c0, m, k, n, alpha, beta, false, false);
+            let mut c = c0.clone();
+            gemmkit::gemm_cplx(
+                alpha,
+                MatRef::from_col_major(&a, m, k),
+                true, // conj A on purpose: alpha==0 skips A·B, so it must have no effect
+                MatRef::from_col_major(&b, k, n),
+                false,
+                beta,
+                MatMut::from_col_major(&mut c, m, n),
+                Parallelism::Serial,
+            );
+            assert_cplx_accurate(&c, m, n, &cref, k, &format!("cplx alpha=0 {m}x{k}x{n}"));
         }
     }
     check::<gemmkit::c32>();
@@ -2287,5 +2577,57 @@ fn panic_c_aliases_a() {
             MatMut::from_row_major(c_slice, 2, 2),
             Parallelism::Serial,
         );
+    }
+}
+
+/// Exact conjugation check. On small-integer inputs every product and sum is exactly
+/// representable in `f32`, so the FMA kernel and a scalar `num_complex` reference must
+/// agree *exactly* (value equality, not the L2 tolerance the other complex tests use)
+#[cfg(feature = "complex")]
+#[test]
+fn correctness_complex_conj_bit_exact() {
+    use gemmkit::Complex;
+    // Deterministic small integers in [-3, 3] (exactly representable; exact arithmetic).
+    let cval = |seed: u64, i: usize| -> Complex<f32> {
+        let r = (seed.wrapping_mul(2654435761).wrapping_add(i as u64) % 7) as i64 - 3;
+        let m = (seed.wrapping_mul(40503).wrapping_add(i as u64 * 3) % 7) as i64 - 3;
+        Complex::new(r as f32, m as f32)
+    };
+    let conj = |z: Complex<f32>, c: bool| if c { z.conj() } else { z };
+    for (m, k, n) in [(2usize, 3usize, 2usize), (4, 5, 3)] {
+        let a: Vec<Complex<f32>> = (0..m * k).map(|i| cval(0x11, i)).collect();
+        let b: Vec<Complex<f32>> = (0..k * n).map(|i| cval(0x22, i)).collect();
+        let c0: Vec<Complex<f32>> = (0..m * n).map(|i| cval(0x33, i)).collect();
+        let (alpha, beta) = (Complex::new(2.0f32, 1.0), Complex::new(1.0f32, -1.0));
+        for &(ca, cb) in &[(false, false), (true, false), (false, true), (true, true)] {
+            // Column-major scalar reference, exact in f32.
+            let mut expect = c0.clone();
+            for i in 0..m {
+                for j in 0..n {
+                    let mut acc = Complex::new(0.0f32, 0.0);
+                    for p in 0..k {
+                        acc += conj(a[p * m + i], ca) * conj(b[j * k + p], cb);
+                    }
+                    expect[j * m + i] = beta * c0[j * m + i] + alpha * acc;
+                }
+            }
+            let mut c = c0.clone();
+            gemmkit::gemm_cplx(
+                alpha,
+                MatRef::from_col_major(&a, m, k),
+                ca,
+                MatRef::from_col_major(&b, k, n),
+                cb,
+                beta,
+                MatMut::from_col_major(&mut c, m, n),
+                Parallelism::Serial,
+            );
+            for idx in 0..m * n {
+                assert_eq!(
+                    c[idx], expect[idx],
+                    "conj mismatch at {idx} ca={ca} cb={cb} ({m}x{k}x{n})"
+                );
+            }
+        }
     }
 }

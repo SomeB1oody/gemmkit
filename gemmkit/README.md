@@ -1,7 +1,8 @@
 # gemmkit
 
 The core GEMM engine — **zero ndarray dependency**. Computes `C ← α·A·B + β·C` for
-`f32` and `f64` over a data-type-agnostic `&[T]` + stride API, selecting the best
+`f32`/`f64` — plus optional `f16`/`bf16`, `i8`, and `c32`/`c64` families behind Cargo
+features — over a data-type-agnostic `&[T]` + stride API, selecting the best
 instruction set at runtime: x86 (scalar / AVX2+FMA / AVX-512) and AArch64 (NEON,
 baseline on the architecture).
 
@@ -62,6 +63,9 @@ for _ in 0..1000 {
 - `std` (default) — runtime cache/feature detection and the thread-local pool.
 - `parallel` (default) — rayon multithreading. With it off, everything still
   compiles and runs single-threaded.
+- `half` — `f16`/`bf16` mixed-precision GEMM with f32 accumulation.
+- `int8` — `i8 → i32` integer GEMM (`gemm_i8`); arithmetic wraps on overflow.
+- `complex` — `c32`/`c64` complex GEMM with optional conjugation of A/B (`gemm_cplx`).
 
 ## Tuning
 

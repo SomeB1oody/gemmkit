@@ -287,8 +287,12 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize>(
             core::mem::size_of::<Fam::Rhs>()
         );
 
-        let sizeof_acc = core::mem::size_of::<Fam::Acc>().max(1);
-        let blk = cache::topology().blocking(mr, nr, sizeof_acc, m, n, k);
+        // Block on the *packed input* element size: `blocking()` sizes the A/B
+        // panels, which are stored in `Lhs` (== `Rhs`) units, not the accumulator.
+        // For homogeneous families (`Acc == Lhs`) this is unchanged; it only affects
+        // narrow packed types (i8: 1 vs 4 bytes; f16/bf16: 2 vs 4).
+        let sizeof_lhs = core::mem::size_of::<Fam::Lhs>().max(1);
+        let blk = cache::topology().blocking(mr, nr, sizeof_lhs, m, n, k);
         let mc = blk.mc.next_multiple_of(mr).max(mr);
         // Depth/column panel sizes: from the cache model normally, but taken
         // verbatim from the prepacked buffer's recorded geometry on the prepacked

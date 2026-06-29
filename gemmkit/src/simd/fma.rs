@@ -186,7 +186,9 @@ impl KernelSimd<f16, f16, f32, f16> for Fma {
     unsafe fn store_out(self, p: *mut f16, v: __m256) {
         unsafe {
             // `_MM_FROUND_TO_NEAREST_INT` (0) = round-to-nearest-even, matching
-            // `half::f16::from_f32`.
+            // `half::f16::from_f32`. NOT OR in `_MM_FROUND_NO_EXC`:
+            // 256-bit F16C `vcvtps2ph` has no suppress-all-exceptions field (that is EVEX-only)
+            // and the intrinsic rejects the bit at compile time.
             let h = _mm256_cvtps_ph::<_MM_FROUND_TO_NEAREST_INT>(v);
             _mm_storeu_si128(p as *mut __m128i, h);
         }

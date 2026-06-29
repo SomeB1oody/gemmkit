@@ -264,7 +264,7 @@ impl CacheTopology {
     /// geometry and problem size.
     ///
     /// * `mr`/`nr`: microkernel tile (in elements).
-    /// * `sizeof`: size of one accumulator element in bytes.
+    /// * `sizeof`: size in bytes of one *packed input* element
     ///
     /// The result is independent of the thread count, so serial and parallel
     /// runs use identical blocking (a prerequisite for bit-identical output).
@@ -297,7 +297,11 @@ impl CacheTopology {
         // Small-matrix shortcut: skip the full model, just keep panels in L2.
         if m <= 64 && n <= 64 {
             let kc = k.clamp(1, 512);
-            let mc = ((l2 / sizeof / kc) / mr * mr).max(mr);
+            // Cap by the actual row count: there are only `m` rows, so a larger `mc`
+            // never splits fewer blocks (`n_mc` stays 1)
+            let mc = ((l2 / sizeof / kc) / mr * mr)
+                .min(m.next_multiple_of(mr))
+                .max(mr);
             let nc = n.next_multiple_of(nr).max(nr);
             return Blocking { mc, kc, nc };
         }
