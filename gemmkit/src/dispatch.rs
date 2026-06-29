@@ -25,6 +25,10 @@ use std::sync::OnceLock;
 
 use half::{bf16, f16};
 
+/// `c32` / `c64` element-type aliases (the complex-GEMM dispatch types).
+type C32 = num_complex::Complex<f32>;
+type C64 = num_complex::Complex<f64>;
+
 use crate::driver;
 use crate::kernel::{FloatGemm, IntGemm, MixedGemm};
 use crate::parallel::Parallelism;
@@ -1431,5 +1435,298 @@ fn dispatched_i8() -> IntDispatched {
     #[cfg(not(feature = "std"))]
     {
         select_i8()
+    }
+}
+
+// ===========================================================================
+// Complex GEMM (c32 / c64, with optional conjA / conjB).
+// ===========================================================================
+
+/// Run a complex GEMM for a concrete `(complex type, ISA, tile)`: do the
+/// orientation swap (which also **swaps the conj flags**, since
+/// `(A̅·B)ᵀ = Bᵀ·A̅ᵀ` puts old-A's conj on the new RHS), then dispatch the now-fixed
+/// `(conj_a, conj_b)` to the matching const-generic `ComplexGemm` variant — the
+/// runtime→compile-time conj branch lives here, never in the hot loop.
+///
+/// # Safety
+/// `t`'s pointers valid; `c` not aliasing `a`/`b`. Run after the degenerate check.
+#[inline]
+unsafe fn run_complex<T, S, const MR_REG: usize, const NR: usize>(
+    simd: S,
+    conj_a: bool,
+    conj_b: bool,
+    mut t: Task<T>,
+    par: Parallelism,
+    ws: &mut Workspace,
+) where
+    T: Float<Acc = T> + crate::scalar::Conjugate,
+    S: KernelSimd<T, T, T, T>,
+{
+    use crate::kernel::ComplexGemm;
+    unsafe {
+        let (mut ca, mut cb) = (conj_a, conj_b);
+        if t.csc.unsigned_abs() < t.rsc.unsigned_abs() {
+            orient_transpose(&mut t);
+            core::mem::swap(&mut ca, &mut cb);
+        }
+        match (ca, cb) {
+            (false, false) => driver::run::<ComplexGemm<T, false, false>, S, MR_REG, NR>(
+                simd, t.m, t.k, t.n, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb, t.beta, t.c,
+                t.rsc, t.csc, par, ws,
+            ),
+            (true, false) => driver::run::<ComplexGemm<T, true, false>, S, MR_REG, NR>(
+                simd, t.m, t.k, t.n, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb, t.beta, t.c,
+                t.rsc, t.csc, par, ws,
+            ),
+            (false, true) => driver::run::<ComplexGemm<T, false, true>, S, MR_REG, NR>(
+                simd, t.m, t.k, t.n, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb, t.beta, t.c,
+                t.rsc, t.csc, par, ws,
+            ),
+            (true, true) => driver::run::<ComplexGemm<T, true, true>, S, MR_REG, NR>(
+                simd, t.m, t.k, t.n, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb, t.beta, t.c,
+                t.rsc, t.csc, par, ws,
+            ),
+        }
+    }
+}
+
+/// Complex element types gemmkit can dispatch (`Complex<f32>` / `Complex<f64>`).
+/// Separate from [`GemmScalar`] because complex carries the conj op-family.
+pub trait ComplexScalar: Float<Acc = Self> + crate::scalar::Conjugate {
+    /// Dispatch a complex GEMM (with conj flags) to the best ISA.
+    ///
+    /// # Safety
+    /// `t`'s pointers valid; `c` not aliasing `a`/`b`.
+    #[doc(hidden)]
+    unsafe fn dispatch_complex(
+        conj_a: bool,
+        conj_b: bool,
+        t: Task<Self>,
+        par: Parallelism,
+        ws: &mut Workspace,
+    );
+}
+
+/// Top-level complex entry: degenerate cases (`C <- beta·C`) then the ISA dispatch.
+///
+/// # Safety
+/// `t`'s pointers valid for the implied regions; `c` not aliasing `a`/`b`.
+pub(crate) unsafe fn execute_complex<T: ComplexScalar>(
+    conj_a: bool,
+    conj_b: bool,
+    t: Task<T>,
+    par: Parallelism,
+    ws: &mut Workspace,
+) {
+    unsafe {
+        if t.m == 0 || t.n == 0 {
+            return;
+        }
+        if t.k == 0 || t.alpha == T::ZERO {
+            scale_c_float(t.beta, t.c, t.m, t.n, t.rsc, t.csc);
+            return;
+        }
+        T::dispatch_complex(conj_a, conj_b, t, par, ws);
+    }
+}
+
+type CplxFn<T> = unsafe fn(bool, bool, Task<T>, Parallelism, &mut Workspace);
+
+#[derive(Copy, Clone)]
+struct CplxDispatched<T> {
+    run: CplxFn<T>,
+}
+
+unsafe fn gemm_c32_scalar(ca: bool, cb: bool, t: Task<C32>, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_complex::<C32, ScalarTok, 4, 4>(ScalarTok, ca, cb, t, par, ws) }
+}
+unsafe fn gemm_c64_scalar(ca: bool, cb: bool, t: Task<C64>, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_complex::<C64, ScalarTok, 4, 4>(ScalarTok, ca, cb, t, par, ws) }
+}
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+unsafe fn gemm_c32_fma(ca: bool, cb: bool, t: Task<C32>, par: Parallelism, ws: &mut Workspace) {
+    // complex<f32> FMA: LANES = 4, MR = 2*4 = 8, NR = 4.
+    unsafe { run_complex::<C32, Fma, 2, 4>(Fma, ca, cb, t, par, ws) }
+}
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+unsafe fn gemm_c64_fma(ca: bool, cb: bool, t: Task<C64>, par: Parallelism, ws: &mut Workspace) {
+    // complex<f64> FMA: LANES = 2, MR = 2*2 = 4, NR = 4.
+    unsafe { run_complex::<C64, Fma, 2, 4>(Fma, ca, cb, t, par, ws) }
+}
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+unsafe fn gemm_c32_avx512(ca: bool, cb: bool, t: Task<C32>, par: Parallelism, ws: &mut Workspace) {
+    // complex<f32> AVX-512: LANES = 8, MR = 2*8 = 16, NR = 6.
+    unsafe { run_complex::<C32, Avx512, 2, 6>(Avx512, ca, cb, t, par, ws) }
+}
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+unsafe fn gemm_c64_avx512(ca: bool, cb: bool, t: Task<C64>, par: Parallelism, ws: &mut Workspace) {
+    // complex<f64> AVX-512: LANES = 4, MR = 2*4 = 8, NR = 6.
+    unsafe { run_complex::<C64, Avx512, 2, 6>(Avx512, ca, cb, t, par, ws) }
+}
+#[cfg(target_arch = "aarch64")]
+unsafe fn gemm_c32_neon(ca: bool, cb: bool, t: Task<C32>, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_complex::<C32, Neon, 4, 4>(Neon, ca, cb, t, par, ws) }
+}
+#[cfg(target_arch = "aarch64")]
+unsafe fn gemm_c64_neon(ca: bool, cb: bool, t: Task<C64>, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_complex::<C64, Neon, 4, 4>(Neon, ca, cb, t, par, ws) }
+}
+
+const CDISP_C32_SCALAR: CplxDispatched<C32> = CplxDispatched {
+    run: gemm_c32_scalar,
+};
+const CDISP_C64_SCALAR: CplxDispatched<C64> = CplxDispatched {
+    run: gemm_c64_scalar,
+};
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+const CDISP_C32_FMA: CplxDispatched<C32> = CplxDispatched { run: gemm_c32_fma };
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+const CDISP_C64_FMA: CplxDispatched<C64> = CplxDispatched { run: gemm_c64_fma };
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+const CDISP_C32_AVX512: CplxDispatched<C32> = CplxDispatched {
+    run: gemm_c32_avx512,
+};
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+const CDISP_C64_AVX512: CplxDispatched<C64> = CplxDispatched {
+    run: gemm_c64_avx512,
+};
+#[cfg(target_arch = "aarch64")]
+const CDISP_C32_NEON: CplxDispatched<C32> = CplxDispatched { run: gemm_c32_neon };
+#[cfg(target_arch = "aarch64")]
+const CDISP_C64_NEON: CplxDispatched<C64> = CplxDispatched { run: gemm_c64_neon };
+
+/// `c32` ISA selection (the complex multiply uses only AVX2/AVX-512 float ops).
+fn select_c32() -> CplxDispatched<C32> {
+    match forced_isa() {
+        ForcedIsa::Scalar => return CDISP_C32_SCALAR,
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        ForcedIsa::Fma => {
+            assert!(
+                is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma"),
+                "GEMMKIT_REQUIRE_ISA=fma, but this CPU/emulator does not report avx2+fma"
+            );
+            return CDISP_C32_FMA;
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        ForcedIsa::Avx512 => {
+            assert!(
+                is_x86_feature_detected!("avx512f"),
+                "GEMMKIT_REQUIRE_ISA=avx512, but this CPU/emulator does not report avx512f"
+            );
+            return CDISP_C32_AVX512;
+        }
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        ForcedIsa::Fma | ForcedIsa::Avx512 => {
+            panic!("GEMMKIT_REQUIRE_ISA: requested SIMD ISA is unavailable on this target")
+        }
+        #[cfg(target_arch = "aarch64")]
+        ForcedIsa::Neon => return CDISP_C32_NEON,
+        #[cfg(not(target_arch = "aarch64"))]
+        ForcedIsa::Neon => panic!("GEMMKIT_REQUIRE_ISA=neon, but this target is not aarch64"),
+        ForcedIsa::Auto => {}
+    }
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if is_x86_feature_detected!("avx512f") {
+            return CDISP_C32_AVX512;
+        }
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return CDISP_C32_FMA;
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        CDISP_C32_NEON
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        CDISP_C32_SCALAR
+    }
+}
+
+/// `c64` ISA selection.
+fn select_c64() -> CplxDispatched<C64> {
+    match forced_isa() {
+        ForcedIsa::Scalar => return CDISP_C64_SCALAR,
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        ForcedIsa::Fma => {
+            assert!(
+                is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma"),
+                "GEMMKIT_REQUIRE_ISA=fma, but this CPU/emulator does not report avx2+fma"
+            );
+            return CDISP_C64_FMA;
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        ForcedIsa::Avx512 => {
+            assert!(
+                is_x86_feature_detected!("avx512f"),
+                "GEMMKIT_REQUIRE_ISA=avx512, but this CPU/emulator does not report avx512f"
+            );
+            return CDISP_C64_AVX512;
+        }
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        ForcedIsa::Fma | ForcedIsa::Avx512 => {
+            panic!("GEMMKIT_REQUIRE_ISA: requested SIMD ISA is unavailable on this target")
+        }
+        #[cfg(target_arch = "aarch64")]
+        ForcedIsa::Neon => return CDISP_C64_NEON,
+        #[cfg(not(target_arch = "aarch64"))]
+        ForcedIsa::Neon => panic!("GEMMKIT_REQUIRE_ISA=neon, but this target is not aarch64"),
+        ForcedIsa::Auto => {}
+    }
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if is_x86_feature_detected!("avx512f") {
+            return CDISP_C64_AVX512;
+        }
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return CDISP_C64_FMA;
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        CDISP_C64_NEON
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        CDISP_C64_SCALAR
+    }
+}
+
+#[cfg(feature = "std")]
+static GEMM_C32: OnceLock<CplxDispatched<C32>> = OnceLock::new();
+#[cfg(feature = "std")]
+static GEMM_C64: OnceLock<CplxDispatched<C64>> = OnceLock::new();
+
+impl ComplexScalar for C32 {
+    #[inline]
+    unsafe fn dispatch_complex(
+        ca: bool,
+        cb: bool,
+        t: Task<C32>,
+        par: Parallelism,
+        ws: &mut Workspace,
+    ) {
+        #[cfg(feature = "std")]
+        let d = *GEMM_C32.get_or_init(select_c32);
+        #[cfg(not(feature = "std"))]
+        let d = select_c32();
+        unsafe { (d.run)(ca, cb, t, par, ws) }
+    }
+}
+impl ComplexScalar for C64 {
+    #[inline]
+    unsafe fn dispatch_complex(
+        ca: bool,
+        cb: bool,
+        t: Task<C64>,
+        par: Parallelism,
+        ws: &mut Workspace,
+    ) {
+        #[cfg(feature = "std")]
+        let d = *GEMM_C64.get_or_init(select_c64);
+        #[cfg(not(feature = "std"))]
+        let d = select_c64();
+        unsafe { (d.run)(ca, cb, t, par, ws) }
     }
 }

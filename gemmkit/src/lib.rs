@@ -58,13 +58,13 @@ mod special;
 mod workspace;
 
 pub use api::{
-    MatMut, MatRef, PackedLhs, PackedRhs, gemm, gemm_i8, gemm_i8_unchecked, gemm_i8_with,
-    gemm_packed_a, gemm_packed_a_with, gemm_packed_b, gemm_packed_b_with, gemm_unchecked,
-    gemm_unchecked_with, gemm_with, prepack_lhs, prepack_rhs,
+    MatMut, MatRef, PackedLhs, PackedRhs, gemm, gemm_cplx, gemm_cplx_with, gemm_i8,
+    gemm_i8_unchecked, gemm_i8_with, gemm_packed_a, gemm_packed_a_with, gemm_packed_b,
+    gemm_packed_b_with, gemm_unchecked, gemm_unchecked_with, gemm_with, prepack_lhs, prepack_rhs,
 };
-pub use dispatch::GemmScalar;
+pub use dispatch::{ComplexScalar, GemmScalar};
 pub use parallel::Parallelism;
-pub use scalar::{Float, NarrowFloat, Scalar};
+pub use scalar::{Conjugate, Float, NarrowFloat, Scalar};
 pub use workspace::Workspace;
 
 #[doc(no_inline)]
@@ -75,3 +75,14 @@ pub use cache::{CacheTopology, Machine, topology};
 /// `f32` (their [`Scalar::Acc`]).
 #[doc(no_inline)]
 pub use half::{bf16, f16};
+
+/// Re-exported [`num_complex::Complex`] (and the `c32`/`c64` aliases), so callers can
+/// run a complex GEMM (via [`gemm_cplx`]) without depending on `num-complex` directly.
+#[doc(no_inline)]
+pub use num_complex::Complex;
+/// `Complex<f32>` — the single-precision complex element type.
+#[allow(non_camel_case_types)]
+pub type c32 = num_complex::Complex<f32>;
+/// `Complex<f64>` — the double-precision complex element type.
+#[allow(non_camel_case_types)]
+pub type c64 = num_complex::Complex<f64>;
