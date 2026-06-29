@@ -89,9 +89,8 @@ fn accumulate_with_beta() {
     assert_relative_eq!(c, exp, max_relative = 1e-10);
 }
 
-/// The `half` feature forwards `gemmkit/half`, so the *same generic* `dot`/`gemm`
-/// serve `f16` (a `GemmScalar`) with no adapter-specific code — proven here against
-/// the `f64` reference at a 16-bit tolerance.
+/// `f16` (a `GemmScalar`) flows through the same generic `dot`/`gemm` with no
+/// adapter-specific code; checked against the `f64` reference at 16-bit tolerance.
 #[cfg(feature = "half")]
 #[test]
 fn dot_f16_matches_reference() {
@@ -113,10 +112,9 @@ fn dot_f16_matches_reference() {
     }
 }
 
-/// The `complex` feature's dedicated adapters: `dot_cplx` (plain `A·B`) and `gemm_cplx`
-/// (with conj + accumulate), checked against a naive complex reference — including a
-/// transposed (F-order) conjugated A view, the case the raw `gemm_cplx_unchecked` path
-/// exists for.
+/// Complex adapters `dot_cplx` (plain `A·B`) and `gemm_cplx` (conj + accumulate),
+/// checked against a naive reference — including a transposed (F-order) conjugated
+/// A view, the case the raw `gemm_cplx_unchecked` path exists for.
 #[cfg(feature = "complex")]
 #[test]
 fn cplx_dot_and_conj_matches_reference() {
@@ -125,8 +123,8 @@ fn cplx_dot_and_conj_matches_reference() {
     use ndarray::Array2;
 
     type C = Complex<f64>;
-    // gemmkit pulls num-complex `no_std`, so `Complex::norm` (needs `sqrt`) isn't in
-    // scope on its re-export; compute the magnitude with `f64::hypot` instead.
+    // `Complex::norm` needs `sqrt`, unavailable via the `no_std` num-complex re-export;
+    // compute the magnitude with `f64::hypot` instead.
     let cabs = |z: C| z.re.hypot(z.im);
     let crand = |r: usize, c: usize, s: u64| -> Array2<C> {
         let re = rand2(r, c, s);

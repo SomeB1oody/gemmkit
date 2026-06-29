@@ -1,9 +1,7 @@
 //! AVX-512 ISA token (x86 / x86-64).
 //!
 //! `f32` → 512-bit registers (16 lanes), `f64` → 512-bit (8 lanes). Requires the
-//! stable AVX-512 intrinsics (Rust 1.89+). Adding this entire instruction set on
-//! top of the FMA token cost exactly this file plus one dispatch line — the
-//! concrete demonstration of the `SimdOps` abstraction's leverage.
+//! stable AVX-512 intrinsics (Rust 1.89+).
 
 #[cfg(target_arch = "x86")]
 use core::arch::x86::*;
@@ -168,14 +166,13 @@ impl KernelSimd<f16, f16, f32, f16> for Avx512 {
     }
     #[inline(always)]
     unsafe fn splat_rhs(self, v: f16) -> __m512 {
-        // Broadcast the f16 bits to all 16 lanes, then widen with the AVX-512
-        // `vcvtph2ps` (zmm) — pure AVX-512F, so this path needs no separate F16C
-        // feature (unlike the FMA token's 256-bit conversion).
+        // Broadcast the f16 bits to all 16 lanes, then widen via `vcvtph2ps`
+        // (zmm) — pure AVX-512F, so no separate F16C feature is needed.
         unsafe { _mm512_cvtph_ps(_mm256_set1_epi16(v.to_bits() as i16)) }
     }
     #[inline(always)]
     unsafe fn load_out(self, p: *const f16) -> __m512 {
-        // C (== Out == Lhs == f16) is widened exactly like an A panel.
+        // C (== Out == Lhs == f16) widens exactly like an A panel.
         unsafe { self.load_lhs(p) }
     }
     #[inline(always)]
@@ -188,9 +185,9 @@ impl KernelSimd<f16, f16, f32, f16> for Avx512 {
 }
 
 /// `bf16` via integer ops (all AVX-512F): widen = 16-bit left shift into `f32`;
-/// narrow = round-to-nearest-even bias trick then truncate. **Bit-identical to
-/// `half::bf16::from_f32`** including NaN (which half maps to `(bits>>16) | 0x0040`,
-/// not the bias trick's garbage), so the vector and scalar paths never diverge.
+/// narrow = round-to-nearest-even bias trick then truncate. Bit-identical to
+/// `half::bf16::from_f32`, including NaN (which half forces to `(bits>>16) | 0x0040`
+/// rather than the bias trick's result), so vector and scalar paths never diverge.
 #[cfg(feature = "half")]
 impl KernelSimd<bf16, bf16, f32, bf16> for Avx512 {
     #[inline(always)]

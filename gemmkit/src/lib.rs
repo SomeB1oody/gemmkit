@@ -44,8 +44,8 @@
 //! * `half` — `f16`/`bf16` mixed-precision GEMM (`f32` accumulate); pulls in `half`.
 //! * `int8` — `i8 -> i32` integer GEMM ([`gemm_i8`]); no extra dependency.
 //!
-//! The three element-type families are **off by default** — a plain `f32`/`f64`
-//! build pays for none of their codegen or dependencies. Enable the ones you need.
+//! These three element-type families are off by default, so a plain `f32`/`f64`
+//! build pays for none of their codegen or dependencies.
 
 #![warn(missing_docs)]
 #![allow(clippy::missing_safety_doc)] // safety documented at the module / contract level
@@ -86,16 +86,14 @@ pub use workspace::Workspace;
 #[doc(no_inline)]
 pub use cache::{CacheTopology, Machine, topology};
 
-/// Re-exported [`half`] narrow float types (`f16`, `bf16`), so callers can run a
-/// mixed-precision GEMM without depending on `half` directly. They accumulate in
-/// `f32` (their [`Scalar::Acc`]). Requires the `half` feature.
+/// Re-exported [`half`] narrow float types (`f16`, `bf16`), so callers need not
+/// depend on `half` directly. They accumulate in `f32` (their [`Scalar::Acc`]).
 #[cfg(feature = "half")]
 #[doc(no_inline)]
 pub use half::{bf16, f16};
 
-/// Re-exported [`num_complex::Complex`] (and the `c32`/`c64` aliases), so callers can
-/// run a complex GEMM (via [`gemm_cplx`]) without depending on `num-complex` directly.
-/// Requires the `complex` feature.
+/// Re-exported [`num_complex::Complex`] (and the `c32`/`c64` aliases), so callers
+/// need not depend on `num-complex` directly. Used by [`gemm_cplx`].
 #[cfg(feature = "complex")]
 #[doc(no_inline)]
 pub use num_complex::Complex;

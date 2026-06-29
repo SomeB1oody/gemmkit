@@ -15,9 +15,9 @@ use super::{Simd, SimdOps};
 #[cfg(feature = "half")]
 use crate::scalar::NarrowFloat;
 
-// Complex (scalar fallback): the `Reg` is one `Complex`, arithmetic is num-complex's
-// (the complex multiply / FMA the SIMD tokens vectorize). The Miri-checked reference
-// for the complex path.
+// Complex (scalar fallback): one `Complex` per `Reg`, using num-complex's
+// arithmetic (the complex multiply / FMA the SIMD tokens vectorize). Miri-checked
+// reference for the complex path.
 #[cfg(feature = "complex")]
 macro_rules! impl_scalar_complex {
     ($t:ty) => {
@@ -143,8 +143,8 @@ impl_scalar_ops!(f32);
 impl_scalar_ops!(f64);
 
 // Mixed-precision (scalar fallback): `f16`/`bf16` widen to `f32` on load and round
-// back on store, one element at a time (LANES == 1, so the `Reg` is a bare `f32`).
-// This is the portability floor and the Miri-checked reference for the narrow types.
+// back on store, one element at a time (`Reg` is a bare `f32`). Miri-checked
+// reference for the narrow types.
 #[cfg(feature = "half")]
 impl KernelSimd<f16, f16, f32, f16> for ScalarTok {
     #[inline(always)]
@@ -166,8 +166,8 @@ impl KernelSimd<f16, f16, f32, f16> for ScalarTok {
 }
 
 // Integer GEMM (scalar fallback): `i32` accumulator ops and the `i8 -> i32`
-// widen-load, one element at a time. Wrapping arithmetic = conventional integer
-// overflow semantics. This is the Miri-checked reference for the integer path.
+// widen-load, one element at a time. Wrapping arithmetic gives conventional
+// integer overflow semantics. Miri-checked reference for the integer path.
 #[cfg(feature = "int8")]
 impl SimdOps<i32> for ScalarTok {
     type Reg = i32;

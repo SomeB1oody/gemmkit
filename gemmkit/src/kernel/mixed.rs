@@ -1,12 +1,12 @@
 //! The mixed-precision GEMM family: narrow (`f16`/`bf16`) inputs and output,
 //! `f32` accumulator. The first family where `Acc != Lhs`.
 //!
-//! It mirrors [`super::float::FloatGemm`] structurally but reaches every input
-//! through the [`KernelSimd`] widen-load / narrow-store seam: A and B are widened
-//! to `f32` registers on load, the dot products accumulate in `f32`, and the
-//! epilogue rounds back to the narrow output (reading a narrow `C` widened for the
-//! `beta != 0` term). No instruction variation leaks into the driver — the widening
-//! lives entirely behind `KernelSimd`, so the same five-loop nest drives it.
+//! Structurally mirrors [`super::float::FloatGemm`] but reaches every input
+//! through the [`KernelSimd`] widen-load / narrow-store seam: A and B widen to
+//! `f32` on load, dot products accumulate in `f32`, and the epilogue rounds back
+//! to the narrow output (widening a narrow `C` for the `beta != 0` term). The
+//! widening lives entirely behind `KernelSimd`, so the same five-loop nest drives
+//! it with no instruction variation in the driver.
 
 use core::marker::PhantomData;
 
@@ -35,9 +35,9 @@ where
     type Acc = f32;
     type Out = N;
 
-    // `Out` (f16/bf16) is narrower than `Acc` (f32), so the running sum must NOT
-    // round-trip through C between depth panels — the driver uses `kc = k` and the
-    // whole contraction accumulates in f32 registers, rounding to N once.
+    // `Out` is narrower than `Acc`, so the running sum must NOT round-trip through C
+    // between depth panels: the driver uses `kc = k` and the whole contraction
+    // accumulates in f32 registers, rounding to N once.
     const OUT_IS_ACC: bool = false;
 
     #[inline]
@@ -50,8 +50,8 @@ where
         kc: usize,
         mr: usize,
     ) {
-        // The packed layout is the plain micropanel copy (narrow elements stored as
-        // is); widening happens later, on load in the microkernel.
+        // Plain micropanel copy of the narrow elements; widening happens later, on
+        // load in the microkernel.
         unsafe {
             pack_panels(
                 dst, src, /*lead*/ rs, /*depth*/ cs, /*n_lead*/ mc, kc, mr,
@@ -106,9 +106,8 @@ where
             // --- accumulate in f32: widen-load A, widen-broadcast B, fused FMA ---
             let mut acc: [[<S as SimdOps<f32>>::Reg; MR_REG]; NR] = [[simd.zero(); MR_REG]; NR];
             if nr_eff == NR {
-                // Full tile: the const-`NR` column loop fully unrolls, so every
-                // accumulator stays in a register (the same discipline FloatGemm's
-                // hot loop relies on). A runtime `nr_eff` bound here would collapse it.
+                // Full tile: the const-`NR` column loop fully unrolls, keeping every
+                // accumulator in a register. A runtime `nr_eff` bound would collapse it.
                 for p in 0..kc {
                     let pa = a.offset(p as isize * a_cs);
                     let a_regs: [<S as SimdOps<f32>>::Reg; MR_REG] =
@@ -122,8 +121,8 @@ where
                     }
                 }
             } else {
-                // Edge column tile (`nr_eff < NR`): read exactly `nr_eff` columns so
-                // an unpacked B is never read past its last real column. `acc[nr_eff..]`
+                // Edge column tile (`nr_eff < NR`): read exactly `nr_eff` columns so an
+                // unpacked B is never read past its last real column. `acc[nr_eff..]`
                 // stay zero and are ignored by the scratch epilogue.
                 for p in 0..kc {
                     let pa = a.offset(p as isize * a_cs);
@@ -183,7 +182,7 @@ where
                     }
                 }
             } else {
-                // General / partial path: drain f32 acc to f32 scratch, then strided
+                // General / partial path: drain f32 acc to scratch, then strided
                 // copy-back with a per-element widen (read C) / narrow (write C).
                 for j in 0..NR {
                     for i in 0..MR_REG {

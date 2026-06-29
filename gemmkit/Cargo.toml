@@ -19,26 +19,20 @@ std = []
 # compiles and runs single-threaded (`Parallelism::Serial`).
 parallel = ["std", "dep:rayon"]
 # Optional element-type families. Each gates a self-contained dispatch path
-# (kernel family + per-ISA SimdOps + dispatch ladder + public entry) plus, for the
-# two that need an external numeric type, a light no_std dependency. They are
-# **off by default** so a plain `f32`/`f64` build pays for none of them — neither
-# the extra monomorphizations nor the `half`/`num-complex` deps. Opt in with e.g.
-# `features = ["half"]`. (`int8` is pure i8->i32 codegen, so it needs no dep.)
+# (kernel family + per-ISA SimdOps + dispatch ladder + public entry). Off by
+# default so a plain `f32`/`f64` build pays for none of their monomorphizations
+# or deps. (`int8` is pure i8->i32 codegen, so it needs no dep.)
 complex = ["dep:num-complex"] # c32/c64 GEMM with conjA/conjB (`gemm_cplx`)
 half = ["dep:half"] # f16/bf16 mixed-precision GEMM (f32 accumulate)
 int8 = [] # i8 -> i32 integer GEMM (`gemm_i8`)
 
 [dependencies]
 rayon = { version = "1.10", optional = true }
-# `half` (f16 / bf16) is a light, no_std, ecosystem-standard element type callers
-# expect for interop; `default-features = false` keeps it `core`-only so gemmkit's
-# no_std build stays clean (the `gemm` dev-dep re-enables std in bench builds via
-# feature unification, which is fine — it never reaches the lib). Optional: pulled
-# in only by the `half` feature.
+# `half` (f16 / bf16): ecosystem-standard element type for interop.
+# `default-features = false` keeps it `core`-only so the no_std build stays clean.
 half = { version = "2", default-features = false, optional = true }
-# `num-complex` (c32/c64) is the light, no_std, ecosystem-standard complex type;
-# `default-features = false` keeps it `core`-only for the no_std build. Optional:
-# pulled in only by the `complex` feature.
+# `num-complex` (c32/c64): ecosystem-standard complex type.
+# `default-features = false` keeps it `core`-only for the no_std build.
 num-complex = { version = "0.4", default-features = false, optional = true }
 
 [target.'cfg(any(target_arch = "x86", target_arch = "x86_64"))'.dependencies]
@@ -46,10 +40,9 @@ raw-cpuid = "11"
 
 # Baseline-comparison crates, used only by the perf benches (`tests/perf.rs`,
 # `benches/gemm_bench.rs`) — never by the Miri-checked `tests/correctness.rs`.
-# `gemm` pulls `pulp`, whose released version fails to compile under Miri's
-# nightly on aarch64, so gate the whole set out under `cfg(miri)`: `cargo miri
-# test` then builds gemmkit's scalar path with no manual dependency surgery. The
-# perf/bench targets are themselves `#![cfg(not(miri))]`, so they vanish in lockstep.
+# `gemm` pulls `pulp`, which fails to compile under Miri's nightly on aarch64, so
+# gate the whole set out under `cfg(miri)` to keep `cargo miri test` building only
+# gemmkit's scalar path. The perf/bench targets are themselves `#![cfg(not(miri))]`.
 [target.'cfg(not(miri))'.dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 gemm = "0.18"

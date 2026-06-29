@@ -193,11 +193,10 @@ impl SimdOps<f64> for Neon {
 // fp16 path — `vcvt_f32_f16` (widen `float16x4_t` -> `float32x4_t`) and
 // `vcvt_f16_f32` (narrow), behind the `fp16`/`neon` features — and a hardware
 // `bf16` path (`bfcvt` / shift) where the `bf16` extension is present. The scalar
-// fallback here is correct and keeps `aarch64` type-checking, but is unvectorized;
-// this is a deferred ARM-hardware item (cannot be perf-validated on the x86 host).
+// fallback is correct but unvectorized.
 
-/// `f16` mixed precision (scalar fallback). Loads/stores 4 lanes one at a time
-/// through [`NarrowFloat`]; byte-identical to the scalar engine's `f16` path.
+/// `f16` mixed precision (scalar fallback): widens/narrows 4 lanes one at a time
+/// through [`NarrowFloat`], matching the scalar engine's `f16` path.
 #[cfg(feature = "half")]
 impl KernelSimd<f16, f16, f32, f16> for Neon {
     #[inline(always)]
@@ -274,7 +273,7 @@ impl KernelSimd<bf16, bf16, f32, bf16> for Neon {
 // TODO(neon): vectorize the widen with `vmovl_s8`/`vmovl_s16` over the full `mr`
 // row block at once (where the 8-byte read stays in bounds), and a hardware
 // `i8` dot (`SDOT`) where the `dotprod` extension is present — the NEON analogue of
-// VNNI. Deferred ARM-hardware item.
+// VNNI.
 
 #[cfg(feature = "int8")]
 impl SimdOps<i32> for Neon {
@@ -357,8 +356,7 @@ impl KernelSimd<i8, i8, i32, i32> for Neon {
 //
 // TODO(neon): use the ARMv8.3 `FCMLA`/`FCADD` complex-multiply-accumulate
 // instructions (behind the `fcma` feature) instead of the per-element scalar
-// arithmetic below. Correct and keeps aarch64 compiling, but unvectorized; a
-// deferred ARM-hardware item.
+// arithmetic below. Correct but unvectorized.
 
 #[cfg(feature = "complex")]
 impl SimdOps<Complex<f32>> for Neon {
