@@ -12,8 +12,6 @@ use core::arch::x86_64::*;
 
 #[cfg(feature = "half")]
 use half::{bf16, f16};
-#[cfg(feature = "complex")]
-use num_complex::Complex;
 
 #[cfg(any(feature = "half", feature = "int8"))]
 use super::KernelSimd;
@@ -84,6 +82,11 @@ impl SimdOps<f32> for Fma {
         unsafe { _mm256_fmadd_ps(a, b, c) }
     }
     #[inline(always)]
+    unsafe fn fnma(self, a: Self::Reg, b: Self::Reg, c: Self::Reg) -> Self::Reg {
+        // `_mm256_fnmadd_ps(a, b, c)` == `c - a*b`.
+        unsafe { _mm256_fnmadd_ps(a, b, c) }
+    }
+    #[inline(always)]
     unsafe fn reduce_sum(self, v: Self::Reg) -> f32 {
         unsafe {
             let hi = _mm256_extractf128_ps(v, 1);
@@ -138,6 +141,11 @@ impl SimdOps<f64> for Fma {
     #[inline(always)]
     unsafe fn mul_add(self, a: Self::Reg, b: Self::Reg, c: Self::Reg) -> Self::Reg {
         unsafe { _mm256_fmadd_pd(a, b, c) }
+    }
+    #[inline(always)]
+    unsafe fn fnma(self, a: Self::Reg, b: Self::Reg, c: Self::Reg) -> Self::Reg {
+        // `_mm256_fnmadd_pd(a, b, c)` == `c - a*b`.
+        unsafe { _mm256_fnmadd_pd(a, b, c) }
     }
     #[inline(always)]
     unsafe fn reduce_sum(self, v: Self::Reg) -> f64 {
@@ -272,6 +280,12 @@ impl SimdOps<i32> for Fma {
         unsafe { _mm256_add_epi32(_mm256_mullo_epi32(a, b), c) }
     }
     #[inline(always)]
+    unsafe fn fnma(self, a: __m256i, b: __m256i, c: __m256i) -> __m256i {
+        // `c - a*b` (wrapping i32). Present only to satisfy the trait; the integer
+        // kernel never calls it.
+        unsafe { _mm256_sub_epi32(c, _mm256_mullo_epi32(a, b)) }
+    }
+    #[inline(always)]
     unsafe fn reduce_sum(self, v: __m256i) -> i32 {
         unsafe {
             let hi = _mm256_extracti128_si256::<1>(v);
@@ -307,154 +321,9 @@ impl KernelSimd<i8, i8, i32, i32> for Fma {
     }
 }
 
-// ---- complex: interleaved (re,im), shuffle + fmaddsub complex multiply ----
-//
-// `Reg` is `__m256`/`__m256d`, same as `SimdOps<f32>`/`<f64>`, so internal complex
-// multiplies use these free helpers (a `self.mul` call would be ambiguous between
-// the real and complex `SimdOps`).
-
-/// Complex multiply of 4 interleaved `f32` complex: `(ar*br - ai*bi, ar*bi + ai*br)`.
+// Complex (AVX2): real `Reg` is the f32/f64 register; `LANES` is the real lane count
+// (8 / 4). Complex GEMM routes through the shared SoA `soa_microkernel`.
 #[cfg(feature = "complex")]
-#[inline(always)]
-unsafe fn cmul_ps(a: __m256, b: __m256) -> __m256 {
-    unsafe {
-        let b_re = _mm256_moveldup_ps(b); // [br br ...] (dup real)
-        let b_im = _mm256_movehdup_ps(b); // [bi bi ...] (dup imag)
-        let a_sw = _mm256_permute_ps::<0xB1>(a); // [ai ar ...] (swap each pair)
-        let t = _mm256_mul_ps(a_sw, b_im); // [ai*bi  ar*bi ...]
-        _mm256_fmaddsub_ps(a, b_re, t) // even: a*b_re - t, odd: + t
-    }
-}
-
-/// Complex multiply of 2 interleaved `f64` complex.
+impl_complex_simd!(Fma, f32, __m256, 8, 32);
 #[cfg(feature = "complex")]
-#[inline(always)]
-unsafe fn cmul_pd(a: __m256d, b: __m256d) -> __m256d {
-    unsafe {
-        let b_re = _mm256_movedup_pd(b);
-        let b_im = _mm256_permute_pd::<0b1111>(b);
-        let a_sw = _mm256_permute_pd::<0b0101>(a);
-        let t = _mm256_mul_pd(a_sw, b_im);
-        _mm256_fmaddsub_pd(a, b_re, t)
-    }
-}
-
-#[cfg(feature = "complex")]
-impl SimdOps<Complex<f32>> for Fma {
-    type Reg = __m256; // 4 complex = 8 f32, interleaved [r0 i0 r1 i1 r2 i2 r3 i3]
-    const LANES: usize = 4;
-    const ALIGN: usize = 32;
-
-    #[inline(always)]
-    unsafe fn zero(self) -> __m256 {
-        unsafe { _mm256_setzero_ps() }
-    }
-    #[inline(always)]
-    unsafe fn splat(self, v: Complex<f32>) -> __m256 {
-        // Build (re,im) in a 128-bit lane and broadcast to both halves; avoids a
-        // `[f32;2]`-as-f64 misaligned load (which would be UB).
-        unsafe {
-            let m = _mm_set_ps(v.im, v.re, v.im, v.re); // [re im re im]
-            _mm256_broadcast_ps(&m)
-        }
-    }
-    #[inline(always)]
-    unsafe fn load(self, p: *const Complex<f32>) -> __m256 {
-        unsafe { _mm256_load_ps(p as *const f32) }
-    }
-    #[inline(always)]
-    unsafe fn loadu(self, p: *const Complex<f32>) -> __m256 {
-        unsafe { _mm256_loadu_ps(p as *const f32) }
-    }
-    #[inline(always)]
-    unsafe fn store(self, p: *mut Complex<f32>, v: __m256) {
-        unsafe { _mm256_store_ps(p as *mut f32, v) }
-    }
-    #[inline(always)]
-    unsafe fn storeu(self, p: *mut Complex<f32>, v: __m256) {
-        unsafe { _mm256_storeu_ps(p as *mut f32, v) }
-    }
-    #[inline(always)]
-    unsafe fn mul(self, a: __m256, b: __m256) -> __m256 {
-        unsafe { cmul_ps(a, b) }
-    }
-    #[inline(always)]
-    unsafe fn add(self, a: __m256, b: __m256) -> __m256 {
-        unsafe { _mm256_add_ps(a, b) }
-    }
-    #[inline(always)]
-    unsafe fn mul_add(self, a: __m256, b: __m256, c: __m256) -> __m256 {
-        unsafe { _mm256_add_ps(cmul_ps(a, b), c) }
-    }
-    #[inline(always)]
-    unsafe fn reduce_sum(self, v: __m256) -> Complex<f32> {
-        // gemv-only and perf-noncritical: sum even (re) / odd (im) lanes via a store.
-        unsafe {
-            let mut t = [0.0f32; 8];
-            _mm256_storeu_ps(t.as_mut_ptr(), v);
-            let (mut re, mut im) = (0.0f32, 0.0f32);
-            for c in 0..4 {
-                re += t[2 * c];
-                im += t[2 * c + 1];
-            }
-            Complex::new(re, im)
-        }
-    }
-}
-
-#[cfg(feature = "complex")]
-impl SimdOps<Complex<f64>> for Fma {
-    type Reg = __m256d; // 2 complex = 4 f64
-    const LANES: usize = 2;
-    const ALIGN: usize = 32;
-
-    #[inline(always)]
-    unsafe fn zero(self) -> __m256d {
-        unsafe { _mm256_setzero_pd() }
-    }
-    #[inline(always)]
-    unsafe fn splat(self, v: Complex<f64>) -> __m256d {
-        // Build (re,im) in a 128-bit lane and broadcast to both complex lanes (no
-        // misaligned `[f64;2]`-as-`__m128d` load).
-        unsafe {
-            let m = _mm_set_pd(v.im, v.re); // [re im]
-            _mm256_broadcast_pd(&m)
-        }
-    }
-    #[inline(always)]
-    unsafe fn load(self, p: *const Complex<f64>) -> __m256d {
-        unsafe { _mm256_load_pd(p as *const f64) }
-    }
-    #[inline(always)]
-    unsafe fn loadu(self, p: *const Complex<f64>) -> __m256d {
-        unsafe { _mm256_loadu_pd(p as *const f64) }
-    }
-    #[inline(always)]
-    unsafe fn store(self, p: *mut Complex<f64>, v: __m256d) {
-        unsafe { _mm256_store_pd(p as *mut f64, v) }
-    }
-    #[inline(always)]
-    unsafe fn storeu(self, p: *mut Complex<f64>, v: __m256d) {
-        unsafe { _mm256_storeu_pd(p as *mut f64, v) }
-    }
-    #[inline(always)]
-    unsafe fn mul(self, a: __m256d, b: __m256d) -> __m256d {
-        unsafe { cmul_pd(a, b) }
-    }
-    #[inline(always)]
-    unsafe fn add(self, a: __m256d, b: __m256d) -> __m256d {
-        unsafe { _mm256_add_pd(a, b) }
-    }
-    #[inline(always)]
-    unsafe fn mul_add(self, a: __m256d, b: __m256d, c: __m256d) -> __m256d {
-        unsafe { _mm256_add_pd(cmul_pd(a, b), c) }
-    }
-    #[inline(always)]
-    unsafe fn reduce_sum(self, v: __m256d) -> Complex<f64> {
-        unsafe {
-            let mut t = [0.0f64; 4];
-            _mm256_storeu_pd(t.as_mut_ptr(), v);
-            Complex::new(t[0] + t[2], t[1] + t[3])
-        }
-    }
-}
+impl_complex_simd!(Fma, f64, __m256d, 4, 32);

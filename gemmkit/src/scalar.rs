@@ -70,10 +70,11 @@ impl Scalar for i32 {
     const ONE: Self = 1;
 }
 
-// Complex GEMM: `Complex<f32>` / `Complex<f64>` are homogeneous (`Acc = Self`) and
-// have native arithmetic (`num-complex` provides Add/Mul/Sub), so they impl [`Float`]
-// and ride the float path. The vectorized complex multiply lives in the per-ISA
-// `SimdOps`; conj is applied at pack time, not as a kernel branch.
+// Complex GEMM: `Complex<f32>` / `Complex<f64>` have native arithmetic (`num-complex`
+// provides Add/Mul/Sub), so they impl [`Float`] — used by the degenerate `C <- beta·C`
+// scale and the complex `alpha`/`beta` epilogue. Their GEMM rides the dedicated split
+// (SoA) complex kernel ([`ComplexFloat`] + [`crate::kernel::ComplexGemm`]), which
+// accumulates in the real component type, not via a vectorized complex multiply.
 #[cfg(feature = "complex")]
 impl Scalar for num_complex::Complex<f32> {
     type Acc = Self;
@@ -106,29 +107,54 @@ impl Float for num_complex::Complex<f64> {
     }
 }
 
-/// Conjugation, which distinguishes the complex GEMM variants (`conjA` / `conjB`).
-/// Applied at pack time — conjugating the packed `A` or `B` panel — so the hot loop
-/// stays a single plain complex FMA with no per-element conj branch. Implemented only
-/// for the complex types.
+/// A complex element type (`Complex<f32>` / `Complex<f64>`) viewed as a pair of real
+/// components, for the split-accumulator (SoA) complex kernel. It exposes the real
+/// component type [`ComplexFloat::Real`] and the re/im accessors and constructor the
+/// de-interleaving pack and the kernel epilogue need; conjugation is a plain negate of
+/// the imaginary part, so it needs no separate trait.
 #[cfg(feature = "complex")]
-pub trait Conjugate: Scalar {
-    /// The complex conjugate (`re - im·i`).
-    fn conjugate(self) -> Self;
+pub trait ComplexFloat: Float<Acc = Self> {
+    /// The real component type (`f32` for `Complex<f32>`, `f64` for `Complex<f64>`).
+    type Real: Float<Acc = Self::Real>;
+    /// The real part.
+    fn re(self) -> Self::Real;
+    /// The imaginary part.
+    fn im(self) -> Self::Real;
+    /// Assemble a complex value from its real and imaginary parts.
+    fn new(re: Self::Real, im: Self::Real) -> Self;
 }
 
 #[cfg(feature = "complex")]
-impl Conjugate for num_complex::Complex<f32> {
+impl ComplexFloat for num_complex::Complex<f32> {
+    type Real = f32;
     #[inline(always)]
-    fn conjugate(self) -> Self {
-        self.conj()
+    fn re(self) -> f32 {
+        self.re
+    }
+    #[inline(always)]
+    fn im(self) -> f32 {
+        self.im
+    }
+    #[inline(always)]
+    fn new(re: f32, im: f32) -> Self {
+        num_complex::Complex::new(re, im)
     }
 }
 
 #[cfg(feature = "complex")]
-impl Conjugate for num_complex::Complex<f64> {
+impl ComplexFloat for num_complex::Complex<f64> {
+    type Real = f64;
     #[inline(always)]
-    fn conjugate(self) -> Self {
-        self.conj()
+    fn re(self) -> f64 {
+        self.re
+    }
+    #[inline(always)]
+    fn im(self) -> f64 {
+        self.im
+    }
+    #[inline(always)]
+    fn new(re: f64, im: f64) -> Self {
+        num_complex::Complex::new(re, im)
     }
 }
 
@@ -181,6 +207,7 @@ pub trait Float:
     + core::ops::Add<Output = Self>
     + core::ops::Mul<Output = Self>
     + core::ops::Sub<Output = Self>
+    + core::ops::Neg<Output = Self>
 {
     /// Fused (or emulated) `self * b + c`, used in scalar epilogues.
     fn mul_add(self, b: Self, c: Self) -> Self;

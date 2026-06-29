@@ -1494,7 +1494,7 @@ unsafe fn run_complex<T, S, const MR_REG: usize, const NR: usize>(
     par: Parallelism,
     ws: &mut Workspace,
 ) where
-    T: Float<Acc = T> + crate::scalar::Conjugate,
+    T: crate::scalar::ComplexFloat,
     S: KernelSimd<T, T, T, T>,
 {
     use crate::kernel::ComplexGemm;
@@ -1526,9 +1526,11 @@ unsafe fn run_complex<T, S, const MR_REG: usize, const NR: usize>(
 }
 
 /// Complex element types gemmkit can dispatch (`Complex<f32>` / `Complex<f64>`).
-/// Separate from [`GemmScalar`] because complex carries the conj op-family.
+/// Separate from [`GemmScalar`] because complex carries the conj op-family. The
+/// [`crate::scalar::ComplexFloat`] supertrait supplies the real component type and the
+/// re/im split the SoA kernel and its epilogue need.
 #[cfg(feature = "complex")]
-pub trait ComplexScalar: Float<Acc = Self> + crate::scalar::Conjugate {
+pub trait ComplexScalar: crate::scalar::ComplexFloat {
     /// Dispatch a complex GEMM (with conj flags) to the best ISA.
     ///
     /// # Safety
@@ -1584,33 +1586,41 @@ unsafe fn gemm_c32_scalar(ca: bool, cb: bool, t: Task<C32>, par: Parallelism, ws
 unsafe fn gemm_c64_scalar(ca: bool, cb: bool, t: Task<C64>, par: Parallelism, ws: &mut Workspace) {
     unsafe { run_complex::<C64, ScalarTok, 4, 4>(ScalarTok, ca, cb, t, par, ws) }
 }
+// SoA tiles use *real*-lane geometry: `LANES = SimdOps<real>::LANES` (real lanes =
+// complex rows), and the kernel needs `2·MR_REG·NR` accumulator registers (re + im
+// banks) plus `2·MR_REG` A-plane regs — so the tiles are smaller than the old AoS ones.
 #[cfg(all(feature = "complex", any(target_arch = "x86", target_arch = "x86_64")))]
 unsafe fn gemm_c32_fma(ca: bool, cb: bool, t: Task<C32>, par: Parallelism, ws: &mut Workspace) {
-    // complex<f32> FMA: LANES = 4, MR = 2*4 = 8, NR = 4.
-    unsafe { run_complex::<C32, Fma, 2, 4>(Fma, ca, cb, t, par, ws) }
+    // c32 FMA: real LANES = 8, MR = 1*8 = 8 complex rows, NR = 5 → 10 acc + 2 A + 2 B
+    // splat = 14 of 16 YMM. The 2 spare matter: a full 16/16 tile (NR = 6) spilled
+    // accumulators and ran at ~half the throughput (measured ~38 → ~83 GFLOP/s, Zen5 AVX2).
+    unsafe { run_complex::<C32, Fma, 1, 5>(Fma, ca, cb, t, par, ws) }
 }
 #[cfg(all(feature = "complex", any(target_arch = "x86", target_arch = "x86_64")))]
 unsafe fn gemm_c64_fma(ca: bool, cb: bool, t: Task<C64>, par: Parallelism, ws: &mut Workspace) {
-    // complex<f64> FMA: LANES = 2, MR = 2*2 = 4, NR = 4.
-    unsafe { run_complex::<C64, Fma, 2, 4>(Fma, ca, cb, t, par, ws) }
+    // c64 FMA: real LANES = 4, MR = 1*4 = 4 complex rows, NR = 5 (same 14-YMM budget).
+    unsafe { run_complex::<C64, Fma, 1, 5>(Fma, ca, cb, t, par, ws) }
 }
 #[cfg(all(feature = "complex", any(target_arch = "x86", target_arch = "x86_64")))]
 unsafe fn gemm_c32_avx512(ca: bool, cb: bool, t: Task<C32>, par: Parallelism, ws: &mut Workspace) {
-    // complex<f32> AVX-512: LANES = 8, MR = 2*8 = 16, NR = 6.
+    // c32 AVX-512: real LANES = 16, MR = 2*16 = 32, NR = 6 → 24 acc + 4 A + 2 B = 30 ZMM.
     unsafe { run_complex::<C32, Avx512, 2, 6>(Avx512, ca, cb, t, par, ws) }
 }
 #[cfg(all(feature = "complex", any(target_arch = "x86", target_arch = "x86_64")))]
 unsafe fn gemm_c64_avx512(ca: bool, cb: bool, t: Task<C64>, par: Parallelism, ws: &mut Workspace) {
-    // complex<f64> AVX-512: LANES = 4, MR = 2*4 = 8, NR = 6.
+    // c64 AVX-512: real LANES = 8, MR = 2*8 = 16, NR = 6 (same 30-ZMM budget).
     unsafe { run_complex::<C64, Avx512, 2, 6>(Avx512, ca, cb, t, par, ws) }
 }
 #[cfg(all(feature = "complex", target_arch = "aarch64"))]
 unsafe fn gemm_c32_neon(ca: bool, cb: bool, t: Task<C32>, par: Parallelism, ws: &mut Workspace) {
-    unsafe { run_complex::<C32, Neon, 4, 4>(Neon, ca, cb, t, par, ws) }
+    // c32 NEON: real LANES = 4, MR = 2*4 = 8, NR = 6 → 24 acc + 4 A + 2 B = 30 of 32
+    // vregs (the isolated-best SoA tile from the data; on-device tile sweep is TODO).
+    unsafe { run_complex::<C32, Neon, 2, 6>(Neon, ca, cb, t, par, ws) }
 }
 #[cfg(all(feature = "complex", target_arch = "aarch64"))]
 unsafe fn gemm_c64_neon(ca: bool, cb: bool, t: Task<C64>, par: Parallelism, ws: &mut Workspace) {
-    unsafe { run_complex::<C64, Neon, 4, 4>(Neon, ca, cb, t, par, ws) }
+    // c64 NEON: real LANES = 2, MR = 2*2 = 4, NR = 6 (same 30-vreg budget).
+    unsafe { run_complex::<C64, Neon, 2, 6>(Neon, ca, cb, t, par, ws) }
 }
 
 #[cfg(feature = "complex")]
