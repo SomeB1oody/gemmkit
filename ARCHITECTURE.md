@@ -122,8 +122,11 @@ build pays for none of their codegen or dependencies.
 
 **Complex (op-family seam).** Complex is homogeneous, so the per-ISA
 `SimdOps<Complex<_>>` make `mul`/`mul_add` the **vectorized complex multiply**
-(interleaved re/im, shuffle + `fmaddsub`), and `ComplexGemm`'s microkernel just
-delegates to `FloatGemm`'s — one kernel. **Conjugation is on the pack seam, not the
+(interleaved re/im: x86 shuffles + the fused `fmaddsub`; NEON shuffles
+(`vtrn`/`vrev`) + **unfused** `vmul`/`vsub`/`vadd` with a lane blend — NEON's fused
+`FCMLA` is deliberately avoided, since fusing the multiply-add into one rounding step
+would diverge from the unfused scalar reference the NEON path is kept bit-identical
+to), and `ComplexGemm`'s microkernel just delegates to `FloatGemm`'s — one kernel. **Conjugation is on the pack seam, not the
 hot loop:** `CONJ_A`/`CONJ_B` are `const` params, and a set flag conjugates that
 operand *during packing* (so `A̅·B` falls out of the same plain complex FMA). Because
 a conjugated operand must therefore always be packed, the family sets the

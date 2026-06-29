@@ -12,6 +12,9 @@ const UNSET: usize = usize::MAX;
 
 struct Threshold {
     value: AtomicUsize,
+    // Read only by the `std` `resolve_env` below; the no-`std` build never looks
+    // at an env var, so the name is stored but unread there.
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
     env: &'static str,
     default: usize,
 }
