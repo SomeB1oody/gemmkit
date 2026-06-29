@@ -14,13 +14,20 @@
 //! a static default calibrated on the Ryzen 9950X (Zen5). Detection runs once
 //! and is memoized.
 
-#[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), not(miri)))]
+// Every backend is consumed only by the `std`-gated `detect()` below (the no-`std`
+// path uses the static fallback in `Machine::current`), so each is gated on `std`
+// too — otherwise the module compiles but goes uncalled, tripping `dead_code`.
+#[cfg(all(
+    feature = "std",
+    any(target_arch = "x86", target_arch = "x86_64"),
+    not(miri)
+))]
 mod cpuid;
 // `not(miri)`: the sysctl backend calls the `sysctlbyname` foreign function
-#[cfg(all(target_os = "macos", not(miri)))]
+#[cfg(all(feature = "std", target_os = "macos", not(miri)))]
 mod sysctl;
 // `not(miri)`: the sysfs backend reads `/sys` via `std::fs`
-#[cfg(all(target_os = "linux", not(miri)))]
+#[cfg(all(feature = "std", target_os = "linux", not(miri)))]
 mod sysfs;
 
 #[cfg(feature = "std")]

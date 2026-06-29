@@ -764,6 +764,12 @@ const DISP_BF16_NEON: Dispatched<bf16> = Dispatched {
 };
 
 /// An explicitly requested kernel, parsed from `GEMMKIT_REQUIRE_ISA`.
+///
+/// The non-`Auto` variants are constructed only by the `std` `forced_isa` (env-var
+/// parsing); the no-`std` `forced_isa` always yields `Auto`. The `select_*` ladders
+/// still match on every variant, so they must remain in the type — hence the
+/// `dead_code` allowance for the no-`std` build rather than `#[cfg]`-ing them out.
+#[cfg_attr(not(feature = "std"), allow(dead_code))]
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum ForcedIsa {
     /// No override: auto-select the best available ISA (the default).
