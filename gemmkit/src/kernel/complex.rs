@@ -26,8 +26,9 @@
 //! `KernelSimd<T, T, T, T>` only yields `SimdOps<T>` (complex), not the real ops, so the
 //! microkernel below forwards to [`crate::simd::SimdOps::cplx_microkernel`] — the L0 seam
 //! (the complex analogue of `accumulate_tile`) whose per-ISA override has the real
-//! `SimdOps<T::Real>` and runs the one shared SoA kernel. (Per-ISA tuning of the
-//! de-interleave pack / C epilogue with `vld2`/`vst2` is the remaining NEON work; see
+//! `SimdOps<T::Real>` and runs the one shared SoA kernel. (The de-interleave pack and C
+//! epilogue stay scalar: a vectorized `vld2`/`vst2` per-ISA seam was measured on NEON and
+//! did not pay — the inner loop dominates — so the generic scalar path is the floor; see
 //! `simd/neon.rs`.)
 
 use core::marker::PhantomData;

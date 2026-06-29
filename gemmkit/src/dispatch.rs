@@ -1613,14 +1613,20 @@ unsafe fn gemm_c64_avx512(ca: bool, cb: bool, t: Task<C64>, par: Parallelism, ws
 }
 #[cfg(all(feature = "complex", target_arch = "aarch64"))]
 unsafe fn gemm_c32_neon(ca: bool, cb: bool, t: Task<C32>, par: Parallelism, ws: &mut Workspace) {
-    // c32 NEON: real LANES = 4, MR = 2*4 = 8, NR = 6 → 24 acc + 4 A + 2 B = 30 of 32
-    // vregs (the isolated-best SoA tile from the data; on-device tile sweep is TODO).
-    unsafe { run_complex::<C32, Neon, 2, 6>(Neon, ca, cb, t, par, ws) }
+    // c32 NEON: real LANES = 4, MR = 2*4 = 8 complex rows, NR = 5 → 20 acc + 4 A + 2 B
+    // splat = 26 of the 32 v0–v31, leaving room for the in-flight load/lane temporaries.
+    // On-device sweep best on two counts: MR_REG = 2 broadcasts each RHS scalar across 8
+    // rows, halving the splat:FMA ratio of a 1-register-row tile; and NR is capped at 5 so
+    // every accumulator stays in a register. A fuller tile (NR = 6 is 30 *named* vregs, yet
+    // more once temporaries are counted) overflows the 32-register file and spills
+    // accumulators to the stack on every k-step, regressing sharply.
+    unsafe { run_complex::<C32, Neon, 2, 5>(Neon, ca, cb, t, par, ws) }
 }
 #[cfg(all(feature = "complex", target_arch = "aarch64"))]
 unsafe fn gemm_c64_neon(ca: bool, cb: bool, t: Task<C64>, par: Parallelism, ws: &mut Workspace) {
-    // c64 NEON: real LANES = 2, MR = 2*2 = 4, NR = 6 (same 30-vreg budget).
-    unsafe { run_complex::<C64, Neon, 2, 6>(Neon, ca, cb, t, par, ws) }
+    // c64 NEON: real LANES = 2, MR = 2*2 = 4 complex rows, NR = 5 (same 26-vreg budget and
+    // the same MR_REG=2 / NR=5 rationale as c32 above).
+    unsafe { run_complex::<C64, Neon, 2, 5>(Neon, ca, cb, t, par, ws) }
 }
 
 #[cfg(feature = "complex")]
