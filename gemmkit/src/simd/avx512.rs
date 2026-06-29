@@ -10,12 +10,17 @@ use core::arch::x86::*;
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 
+#[cfg(feature = "half")]
 use half::{bf16, f16};
+#[cfg(feature = "complex")]
 use num_complex::Complex;
 
-use super::{KernelSimd, Simd, SimdOps};
+#[cfg(any(feature = "half", feature = "int8"))]
+use super::KernelSimd;
+use super::{Simd, SimdOps};
 
 /// Complex multiply of 16 interleaved `f32` complex (8 complex per 512-bit reg).
+#[cfg(feature = "complex")]
 #[inline(always)]
 unsafe fn cmul_ps_512(a: __m512, b: __m512) -> __m512 {
     unsafe {
@@ -28,6 +33,7 @@ unsafe fn cmul_ps_512(a: __m512, b: __m512) -> __m512 {
 }
 
 /// Complex multiply of 4 interleaved `f64` complex.
+#[cfg(feature = "complex")]
 #[inline(always)]
 unsafe fn cmul_pd_512(a: __m512d, b: __m512d) -> __m512d {
     unsafe {
@@ -154,6 +160,7 @@ impl SimdOps<f64> for Avx512 {
 
 /// `f16` via AVX-512 `vcvtph2ps` / `vcvtps2ph` (round-to-nearest-even on store,
 /// matching `half::f16::from_f32`).
+#[cfg(feature = "half")]
 impl KernelSimd<f16, f16, f32, f16> for Avx512 {
     #[inline(always)]
     unsafe fn load_lhs(self, p: *const f16) -> __m512 {
@@ -184,6 +191,7 @@ impl KernelSimd<f16, f16, f32, f16> for Avx512 {
 /// narrow = round-to-nearest-even bias trick then truncate. **Bit-identical to
 /// `half::bf16::from_f32`** including NaN (which half maps to `(bits>>16) | 0x0040`,
 /// not the bias trick's garbage), so the vector and scalar paths never diverge.
+#[cfg(feature = "half")]
 impl KernelSimd<bf16, bf16, f32, bf16> for Avx512 {
     #[inline(always)]
     unsafe fn load_lhs(self, p: *const bf16) -> __m512 {
@@ -221,6 +229,7 @@ impl KernelSimd<bf16, bf16, f32, bf16> for Avx512 {
 
 // ---- integer: i8 inputs, i32 accumulator (16-wide __m512i, AVX-512F integer) ----
 
+#[cfg(feature = "int8")]
 impl SimdOps<i32> for Avx512 {
     type Reg = __m512i;
     const LANES: usize = 16;
@@ -270,6 +279,7 @@ impl SimdOps<i32> for Avx512 {
 
 /// `i8 -> i32`: sign-extend 16 LHS bytes on load, broadcast a sign-extended RHS
 /// byte; `Out == Acc == i32`, so `load_out`/`store_out` are plain `i32` load/store.
+#[cfg(feature = "int8")]
 impl KernelSimd<i8, i8, i32, i32> for Avx512 {
     #[inline(always)]
     unsafe fn load_lhs(self, p: *const i8) -> __m512i {
@@ -291,6 +301,7 @@ impl KernelSimd<i8, i8, i32, i32> for Avx512 {
 
 // ---- complex: interleaved (re,im), shuffle + fmaddsub complex multiply ----
 
+#[cfg(feature = "complex")]
 impl SimdOps<Complex<f32>> for Avx512 {
     type Reg = __m512; // 8 complex = 16 f32
     const LANES: usize = 8;
@@ -349,6 +360,7 @@ impl SimdOps<Complex<f32>> for Avx512 {
     }
 }
 
+#[cfg(feature = "complex")]
 impl SimdOps<Complex<f64>> for Avx512 {
     type Reg = __m512d; // 4 complex = 8 f64
     const LANES: usize = 4;

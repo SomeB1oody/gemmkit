@@ -13,10 +13,15 @@
 
 use core::arch::aarch64::*;
 
+#[cfg(feature = "half")]
 use half::{bf16, f16};
+#[cfg(feature = "complex")]
 use num_complex::Complex;
 
-use super::{KernelSimd, Simd, SimdOps};
+#[cfg(any(feature = "half", feature = "int8"))]
+use super::KernelSimd;
+use super::{Simd, SimdOps};
+#[cfg(feature = "half")]
 use crate::scalar::NarrowFloat;
 
 /// AArch64 NEON ISA token.
@@ -193,6 +198,7 @@ impl SimdOps<f64> for Neon {
 
 /// `f16` mixed precision (scalar fallback). Loads/stores 4 lanes one at a time
 /// through [`NarrowFloat`]; byte-identical to the scalar engine's `f16` path.
+#[cfg(feature = "half")]
 impl KernelSimd<f16, f16, f32, f16> for Neon {
     #[inline(always)]
     unsafe fn load_lhs(self, p: *const f16) -> float32x4_t {
@@ -227,6 +233,7 @@ impl KernelSimd<f16, f16, f32, f16> for Neon {
 }
 
 /// `bf16` mixed precision (scalar fallback), mirror of the `f16` impl.
+#[cfg(feature = "half")]
 impl KernelSimd<bf16, bf16, f32, bf16> for Neon {
     #[inline(always)]
     unsafe fn load_lhs(self, p: *const bf16) -> float32x4_t {
@@ -269,6 +276,7 @@ impl KernelSimd<bf16, bf16, f32, bf16> for Neon {
 // `i8` dot (`SDOT`) where the `dotprod` extension is present — the NEON analogue of
 // VNNI. Deferred ARM-hardware item.
 
+#[cfg(feature = "int8")]
 impl SimdOps<i32> for Neon {
     type Reg = int32x4_t;
     const LANES: usize = 4;
@@ -317,6 +325,7 @@ impl SimdOps<i32> for Neon {
     }
 }
 
+#[cfg(feature = "int8")]
 impl KernelSimd<i8, i8, i32, i32> for Neon {
     #[inline(always)]
     unsafe fn load_lhs(self, p: *const i8) -> int32x4_t {
@@ -351,6 +360,7 @@ impl KernelSimd<i8, i8, i32, i32> for Neon {
 // arithmetic below. Correct and keeps aarch64 compiling, but unvectorized; a
 // deferred ARM-hardware item.
 
+#[cfg(feature = "complex")]
 impl SimdOps<Complex<f32>> for Neon {
     type Reg = float32x4_t; // 2 complex = 4 f32, interleaved
     const LANES: usize = 2;
@@ -425,6 +435,7 @@ impl SimdOps<Complex<f32>> for Neon {
     }
 }
 
+#[cfg(feature = "complex")]
 impl SimdOps<Complex<f64>> for Neon {
     type Reg = float64x2_t; // 1 complex = 2 f64
     const LANES: usize = 1;

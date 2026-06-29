@@ -23,21 +23,32 @@
 #[cfg(feature = "std")]
 use std::sync::OnceLock;
 
+#[cfg(feature = "half")]
 use half::{bf16, f16};
 
 /// `c32` / `c64` element-type aliases (the complex-GEMM dispatch types).
+#[cfg(feature = "complex")]
 type C32 = num_complex::Complex<f32>;
+#[cfg(feature = "complex")]
 type C64 = num_complex::Complex<f64>;
 
 use crate::driver;
-use crate::kernel::{FloatGemm, IntGemm, MixedGemm};
+use crate::kernel::FloatGemm;
+#[cfg(feature = "int8")]
+use crate::kernel::IntGemm;
+#[cfg(feature = "half")]
+use crate::kernel::MixedGemm;
 use crate::parallel::Parallelism;
-use crate::scalar::{Float, NarrowFloat, Scalar};
+#[cfg(feature = "half")]
+use crate::scalar::NarrowFloat;
+use crate::scalar::{Float, Scalar};
+#[cfg(any(feature = "half", feature = "int8", feature = "complex"))]
+use crate::simd::KernelSimd;
 #[cfg(target_arch = "aarch64")]
 use crate::simd::Neon;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use crate::simd::{Avx512, Fma};
-use crate::simd::{KernelSimd, ScalarTok, SimdOps};
+use crate::simd::{ScalarTok, SimdOps};
 use crate::special::gemv;
 use crate::tuning;
 use crate::workspace::Workspace;
@@ -111,6 +122,7 @@ pub struct PackedConsume<T> {
 /// (`C <- alpha·A·B + beta·C`, all of `alpha`/`beta`/`C` in `i32`). The homogeneous
 /// [`Task`] / [`GemmScalar`] machinery assumes `Lhs = Out`, which integer GEMM
 /// breaks (`Out = i32 != Lhs = i8`), so it gets this dedicated task + dispatch.
+#[cfg(feature = "int8")]
 #[derive(Copy, Clone)]
 pub(crate) struct IntTask {
     pub m: usize,
@@ -303,6 +315,7 @@ unsafe fn scale_c_float<T: Float>(beta: T, c: *mut T, m: usize, n: usize, rsc: i
 
 /// `C <- beta·C` for a **narrow** type (`f16`/`bf16`): widen each element to `f32`,
 /// scale, and round back. Matches the mixed kernel's epilogue precision.
+#[cfg(feature = "half")]
 unsafe fn scale_c_narrow<N: NarrowFloat>(
     beta: N,
     c: *mut N,
@@ -397,6 +410,7 @@ unsafe fn run_packed_typed<T, S, const MR_REG: usize, const NR: usize>(
 ///
 /// # Safety
 /// As [`run_typed`].
+#[cfg(feature = "half")]
 #[inline]
 unsafe fn run_typed_mixed<N, S, const MR_REG: usize, const NR: usize>(
     simd: S,
@@ -436,6 +450,7 @@ unsafe fn run_typed_mixed<N, S, const MR_REG: usize, const NR: usize>(
 ///
 /// # Safety
 /// As [`run_packed_typed`].
+#[cfg(feature = "half")]
 #[inline]
 unsafe fn run_packed_typed_mixed<N, S, const MR_REG: usize, const NR: usize>(
     simd: S,
@@ -555,65 +570,69 @@ unsafe fn gemm_f64_neon_packed(r: PackedConsume<f64>, par: Parallelism, ws: &mut
 // ---- mixed-precision (f16 / bf16) entry points: same tiles as f32 (the
 // accumulator is f32, so the register budget matches) ----
 
+#[cfg(feature = "half")]
 unsafe fn gemm_f16_scalar(t: Task<f16>, par: Parallelism, ws: &mut Workspace) {
     unsafe { run_typed_mixed::<f16, ScalarTok, 4, 4>(ScalarTok, t, par, ws) }
 }
+#[cfg(feature = "half")]
 unsafe fn gemm_bf16_scalar(t: Task<bf16>, par: Parallelism, ws: &mut Workspace) {
     unsafe { run_typed_mixed::<bf16, ScalarTok, 4, 4>(ScalarTok, t, par, ws) }
 }
+#[cfg(feature = "half")]
 unsafe fn gemm_f16_scalar_packed(r: PackedConsume<f16>, par: Parallelism, ws: &mut Workspace) {
     unsafe { run_packed_typed_mixed::<f16, ScalarTok, 4, 4>(ScalarTok, r, par, ws) }
 }
+#[cfg(feature = "half")]
 unsafe fn gemm_bf16_scalar_packed(r: PackedConsume<bf16>, par: Parallelism, ws: &mut Workspace) {
     unsafe { run_packed_typed_mixed::<bf16, ScalarTok, 4, 4>(ScalarTok, r, par, ws) }
 }
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
 unsafe fn gemm_f16_fma(t: Task<f16>, par: Parallelism, ws: &mut Workspace) {
     // f32 accumulator → MR = 2*8 = 16, NR = 6 (the f32 FMA tile).
     unsafe { run_typed_mixed::<f16, Fma, 2, 6>(Fma, t, par, ws) }
 }
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
 unsafe fn gemm_bf16_fma(t: Task<bf16>, par: Parallelism, ws: &mut Workspace) {
     unsafe { run_typed_mixed::<bf16, Fma, 2, 6>(Fma, t, par, ws) }
 }
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
 unsafe fn gemm_f16_fma_packed(r: PackedConsume<f16>, par: Parallelism, ws: &mut Workspace) {
     unsafe { run_packed_typed_mixed::<f16, Fma, 2, 6>(Fma, r, par, ws) }
 }
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
 unsafe fn gemm_bf16_fma_packed(r: PackedConsume<bf16>, par: Parallelism, ws: &mut Workspace) {
     unsafe { run_packed_typed_mixed::<bf16, Fma, 2, 6>(Fma, r, par, ws) }
 }
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
 unsafe fn gemm_f16_avx512(t: Task<f16>, par: Parallelism, ws: &mut Workspace) {
     // f32 accumulator → MR = 2*16 = 32, NR = 12 (the f32 AVX-512 tile).
     unsafe { run_typed_mixed::<f16, Avx512, 2, 12>(Avx512, t, par, ws) }
 }
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
 unsafe fn gemm_bf16_avx512(t: Task<bf16>, par: Parallelism, ws: &mut Workspace) {
     unsafe { run_typed_mixed::<bf16, Avx512, 2, 12>(Avx512, t, par, ws) }
 }
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
 unsafe fn gemm_f16_avx512_packed(r: PackedConsume<f16>, par: Parallelism, ws: &mut Workspace) {
     unsafe { run_packed_typed_mixed::<f16, Avx512, 2, 12>(Avx512, r, par, ws) }
 }
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
 unsafe fn gemm_bf16_avx512_packed(r: PackedConsume<bf16>, par: Parallelism, ws: &mut Workspace) {
     unsafe { run_packed_typed_mixed::<bf16, Avx512, 2, 12>(Avx512, r, par, ws) }
 }
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(feature = "half", target_arch = "aarch64"))]
 unsafe fn gemm_f16_neon(t: Task<f16>, par: Parallelism, ws: &mut Workspace) {
     unsafe { run_typed_mixed::<f16, Neon, 4, 4>(Neon, t, par, ws) }
 }
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(feature = "half", target_arch = "aarch64"))]
 unsafe fn gemm_bf16_neon(t: Task<bf16>, par: Parallelism, ws: &mut Workspace) {
     unsafe { run_typed_mixed::<bf16, Neon, 4, 4>(Neon, t, par, ws) }
 }
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(feature = "half", target_arch = "aarch64"))]
 unsafe fn gemm_f16_neon_packed(r: PackedConsume<f16>, par: Parallelism, ws: &mut Workspace) {
     unsafe { run_packed_typed_mixed::<f16, Neon, 4, 4>(Neon, r, par, ws) }
 }
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(feature = "half", target_arch = "aarch64"))]
 unsafe fn gemm_bf16_neon_packed(r: PackedConsume<bf16>, par: Parallelism, ws: &mut Workspace) {
     unsafe { run_packed_typed_mixed::<bf16, Neon, 4, 4>(Neon, r, par, ws) }
 }
@@ -694,54 +713,56 @@ const DISP_F64_NEON: Dispatched<f64> = Dispatched {
 
 // Mixed-precision descriptors. `mr = MR_REG · f32-LANES` (the accumulator width):
 // scalar 4×4, FMA 16×6, AVX-512 32×12, NEON 16×4 — the same tiles as f32.
+#[cfg(feature = "half")]
 const DISP_F16_SCALAR: Dispatched<f16> = Dispatched {
     run: gemm_f16_scalar,
     run_packed: gemm_f16_scalar_packed,
     mr: 4,
     nr: 4,
 };
+#[cfg(feature = "half")]
 const DISP_BF16_SCALAR: Dispatched<bf16> = Dispatched {
     run: gemm_bf16_scalar,
     run_packed: gemm_bf16_scalar_packed,
     mr: 4,
     nr: 4,
 };
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
 const DISP_F16_FMA: Dispatched<f16> = Dispatched {
     run: gemm_f16_fma,
     run_packed: gemm_f16_fma_packed,
     mr: 16,
     nr: 6,
 };
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
 const DISP_BF16_FMA: Dispatched<bf16> = Dispatched {
     run: gemm_bf16_fma,
     run_packed: gemm_bf16_fma_packed,
     mr: 16,
     nr: 6,
 };
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
 const DISP_F16_AVX512: Dispatched<f16> = Dispatched {
     run: gemm_f16_avx512,
     run_packed: gemm_f16_avx512_packed,
     mr: 32,
     nr: 12,
 };
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
 const DISP_BF16_AVX512: Dispatched<bf16> = Dispatched {
     run: gemm_bf16_avx512,
     run_packed: gemm_bf16_avx512_packed,
     mr: 32,
     nr: 12,
 };
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(feature = "half", target_arch = "aarch64"))]
 const DISP_F16_NEON: Dispatched<f16> = Dispatched {
     run: gemm_f16_neon,
     run_packed: gemm_f16_neon_packed,
     mr: 16,
     nr: 4,
 };
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(feature = "half", target_arch = "aarch64"))]
 const DISP_BF16_NEON: Dispatched<bf16> = Dispatched {
     run: gemm_bf16_neon,
     run_packed: gemm_bf16_neon_packed,
@@ -900,6 +921,7 @@ fn select_f64() -> Dispatched<f64> {
 /// (`vcvtph2ps`/`vcvtps2ph`) — universal on AVX2+FMA hardware but checked here so a
 /// forced or auto FMA selection on a (hypothetical) F16C-less part falls back rather
 /// than faulting. AVX-512 covers `f16` within `avx512f`.
+#[cfg(feature = "half")]
 fn select_f16() -> Dispatched<f16> {
     match forced_isa() {
         ForcedIsa::Scalar => return DISP_F16_SCALAR,
@@ -955,6 +977,7 @@ fn select_f16() -> Dispatched<f16> {
 
 /// `bf16` ISA selection. The FMA path uses only AVX2 integer ops (shift / pack), so
 /// no F16C is required; AVX-512 covers `bf16` within `avx512f`.
+#[cfg(feature = "half")]
 fn select_bf16() -> Dispatched<bf16> {
     match forced_isa() {
         ForcedIsa::Scalar => return DISP_BF16_SCALAR,
@@ -1007,9 +1030,9 @@ fn select_bf16() -> Dispatched<bf16> {
 static GEMM_F32: OnceLock<Dispatched<f32>> = OnceLock::new();
 #[cfg(feature = "std")]
 static GEMM_F64: OnceLock<Dispatched<f64>> = OnceLock::new();
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", feature = "half"))]
 static GEMM_F16: OnceLock<Dispatched<f16>> = OnceLock::new();
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", feature = "half"))]
 static GEMM_BF16: OnceLock<Dispatched<bf16>> = OnceLock::new();
 
 /// The memoized dispatch descriptor for `f32` (selection runs once).
@@ -1039,6 +1062,7 @@ fn dispatched_f64() -> Dispatched<f64> {
 }
 
 /// The memoized dispatch descriptor for `f16` (selection runs once).
+#[cfg(feature = "half")]
 #[inline]
 fn dispatched_f16() -> Dispatched<f16> {
     #[cfg(feature = "std")]
@@ -1052,6 +1076,7 @@ fn dispatched_f16() -> Dispatched<f16> {
 }
 
 /// The memoized dispatch descriptor for `bf16` (selection runs once).
+#[cfg(feature = "half")]
 #[inline]
 fn dispatched_bf16() -> Dispatched<bf16> {
     #[cfg(feature = "std")]
@@ -1162,6 +1187,7 @@ impl GemmScalar for f64 {
     }
 }
 
+#[cfg(feature = "half")]
 impl GemmScalar for f16 {
     const OUT_IS_ACC: bool = false;
     #[inline]
@@ -1211,6 +1237,7 @@ impl GemmScalar for f16 {
     }
 }
 
+#[cfg(feature = "half")]
 impl GemmScalar for bf16 {
     const OUT_IS_ACC: bool = false;
     #[inline]
@@ -1270,6 +1297,7 @@ impl GemmScalar for bf16 {
 ///
 /// # Safety
 /// `t`'s pointers valid for the implied regions; `c` must not alias `a`/`b`.
+#[cfg(feature = "int8")]
 pub(crate) unsafe fn execute_int(t: IntTask, par: Parallelism, ws: &mut Workspace) {
     unsafe {
         if t.m == 0 || t.n == 0 {
@@ -1284,6 +1312,7 @@ pub(crate) unsafe fn execute_int(t: IntTask, par: Parallelism, ws: &mut Workspac
 }
 
 /// `C <- beta·C` for the integer output (wrapping i32; `beta == 0` overwrites to 0).
+#[cfg(feature = "int8")]
 unsafe fn scale_c_int(beta: i32, c: *mut i32, m: usize, n: usize, rsc: isize, csc: isize) {
     unsafe {
         for j in 0..n {
@@ -1305,6 +1334,7 @@ unsafe fn scale_c_int(beta: i32, c: *mut i32, m: usize, n: usize, rsc: isize, cs
 ///
 /// # Safety
 /// As [`execute_int`].
+#[cfg(feature = "int8")]
 #[inline]
 unsafe fn run_typed_int<S, const MR_REG: usize, const NR: usize>(
     simd: S,
@@ -1334,47 +1364,52 @@ unsafe fn run_typed_int<S, const MR_REG: usize, const NR: usize>(
     }
 }
 
+#[cfg(feature = "int8")]
 unsafe fn gemm_i8_scalar(t: IntTask, par: Parallelism, ws: &mut Workspace) {
     unsafe { run_typed_int::<ScalarTok, 4, 4>(ScalarTok, t, par, ws) }
 }
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(feature = "int8", any(target_arch = "x86", target_arch = "x86_64")))]
 unsafe fn gemm_i8_fma(t: IntTask, par: Parallelism, ws: &mut Workspace) {
     // i32 accumulator → MR = 2*8 = 16, NR = 6 (the f32 FMA tile).
     unsafe { run_typed_int::<Fma, 2, 6>(Fma, t, par, ws) }
 }
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(feature = "int8", any(target_arch = "x86", target_arch = "x86_64")))]
 unsafe fn gemm_i8_avx512(t: IntTask, par: Parallelism, ws: &mut Workspace) {
     // i32 accumulator → MR = 2*16 = 32, NR = 12 (the f32 AVX-512 tile).
     unsafe { run_typed_int::<Avx512, 2, 12>(Avx512, t, par, ws) }
 }
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(feature = "int8", target_arch = "aarch64"))]
 unsafe fn gemm_i8_neon(t: IntTask, par: Parallelism, ws: &mut Workspace) {
     unsafe { run_typed_int::<Neon, 4, 4>(Neon, t, par, ws) }
 }
 
+#[cfg(feature = "int8")]
 type IntFn = unsafe fn(IntTask, Parallelism, &mut Workspace);
 
 /// Memoized integer dispatch slot (mirror of [`Dispatched`] but a single kernel —
 /// integer prepack is not yet a public API).
+#[cfg(feature = "int8")]
 #[derive(Copy, Clone)]
 struct IntDispatched {
     run: IntFn,
 }
 
+#[cfg(feature = "int8")]
 const DISP_I8_SCALAR: IntDispatched = IntDispatched {
     run: gemm_i8_scalar,
 };
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(feature = "int8", any(target_arch = "x86", target_arch = "x86_64")))]
 const DISP_I8_FMA: IntDispatched = IntDispatched { run: gemm_i8_fma };
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(feature = "int8", any(target_arch = "x86", target_arch = "x86_64")))]
 const DISP_I8_AVX512: IntDispatched = IntDispatched {
     run: gemm_i8_avx512,
 };
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(feature = "int8", target_arch = "aarch64"))]
 const DISP_I8_NEON: IntDispatched = IntDispatched { run: gemm_i8_neon };
 
 /// `i8` ISA selection. The widen-and-multiply integer kernel uses only AVX2/AVX-512
 /// integer ops (no VNNI), so the gates mirror the `f32` ladder.
+#[cfg(feature = "int8")]
 fn select_i8() -> IntDispatched {
     match forced_isa() {
         ForcedIsa::Scalar => return DISP_I8_SCALAR,
@@ -1423,9 +1458,10 @@ fn select_i8() -> IntDispatched {
     }
 }
 
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", feature = "int8"))]
 static GEMM_I8: OnceLock<IntDispatched> = OnceLock::new();
 
+#[cfg(feature = "int8")]
 #[inline]
 fn dispatched_i8() -> IntDispatched {
     #[cfg(feature = "std")]
@@ -1450,6 +1486,7 @@ fn dispatched_i8() -> IntDispatched {
 ///
 /// # Safety
 /// `t`'s pointers valid; `c` not aliasing `a`/`b`. Run after the degenerate check.
+#[cfg(feature = "complex")]
 #[inline]
 unsafe fn run_complex<T, S, const MR_REG: usize, const NR: usize>(
     simd: S,
@@ -1492,6 +1529,7 @@ unsafe fn run_complex<T, S, const MR_REG: usize, const NR: usize>(
 
 /// Complex element types gemmkit can dispatch (`Complex<f32>` / `Complex<f64>`).
 /// Separate from [`GemmScalar`] because complex carries the conj op-family.
+#[cfg(feature = "complex")]
 pub trait ComplexScalar: Float<Acc = Self> + crate::scalar::Conjugate {
     /// Dispatch a complex GEMM (with conj flags) to the best ISA.
     ///
@@ -1511,6 +1549,7 @@ pub trait ComplexScalar: Float<Acc = Self> + crate::scalar::Conjugate {
 ///
 /// # Safety
 /// `t`'s pointers valid for the implied regions; `c` not aliasing `a`/`b`.
+#[cfg(feature = "complex")]
 pub(crate) unsafe fn execute_complex<T: ComplexScalar>(
     conj_a: bool,
     conj_b: bool,
@@ -1530,72 +1569,79 @@ pub(crate) unsafe fn execute_complex<T: ComplexScalar>(
     }
 }
 
+#[cfg(feature = "complex")]
 type CplxFn<T> = unsafe fn(bool, bool, Task<T>, Parallelism, &mut Workspace);
 
+#[cfg(feature = "complex")]
 #[derive(Copy, Clone)]
 struct CplxDispatched<T> {
     run: CplxFn<T>,
 }
 
+#[cfg(feature = "complex")]
 unsafe fn gemm_c32_scalar(ca: bool, cb: bool, t: Task<C32>, par: Parallelism, ws: &mut Workspace) {
     unsafe { run_complex::<C32, ScalarTok, 4, 4>(ScalarTok, ca, cb, t, par, ws) }
 }
+#[cfg(feature = "complex")]
 unsafe fn gemm_c64_scalar(ca: bool, cb: bool, t: Task<C64>, par: Parallelism, ws: &mut Workspace) {
     unsafe { run_complex::<C64, ScalarTok, 4, 4>(ScalarTok, ca, cb, t, par, ws) }
 }
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(feature = "complex", any(target_arch = "x86", target_arch = "x86_64")))]
 unsafe fn gemm_c32_fma(ca: bool, cb: bool, t: Task<C32>, par: Parallelism, ws: &mut Workspace) {
     // complex<f32> FMA: LANES = 4, MR = 2*4 = 8, NR = 4.
     unsafe { run_complex::<C32, Fma, 2, 4>(Fma, ca, cb, t, par, ws) }
 }
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(feature = "complex", any(target_arch = "x86", target_arch = "x86_64")))]
 unsafe fn gemm_c64_fma(ca: bool, cb: bool, t: Task<C64>, par: Parallelism, ws: &mut Workspace) {
     // complex<f64> FMA: LANES = 2, MR = 2*2 = 4, NR = 4.
     unsafe { run_complex::<C64, Fma, 2, 4>(Fma, ca, cb, t, par, ws) }
 }
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(feature = "complex", any(target_arch = "x86", target_arch = "x86_64")))]
 unsafe fn gemm_c32_avx512(ca: bool, cb: bool, t: Task<C32>, par: Parallelism, ws: &mut Workspace) {
     // complex<f32> AVX-512: LANES = 8, MR = 2*8 = 16, NR = 6.
     unsafe { run_complex::<C32, Avx512, 2, 6>(Avx512, ca, cb, t, par, ws) }
 }
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(feature = "complex", any(target_arch = "x86", target_arch = "x86_64")))]
 unsafe fn gemm_c64_avx512(ca: bool, cb: bool, t: Task<C64>, par: Parallelism, ws: &mut Workspace) {
     // complex<f64> AVX-512: LANES = 4, MR = 2*4 = 8, NR = 6.
     unsafe { run_complex::<C64, Avx512, 2, 6>(Avx512, ca, cb, t, par, ws) }
 }
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(feature = "complex", target_arch = "aarch64"))]
 unsafe fn gemm_c32_neon(ca: bool, cb: bool, t: Task<C32>, par: Parallelism, ws: &mut Workspace) {
     unsafe { run_complex::<C32, Neon, 4, 4>(Neon, ca, cb, t, par, ws) }
 }
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(feature = "complex", target_arch = "aarch64"))]
 unsafe fn gemm_c64_neon(ca: bool, cb: bool, t: Task<C64>, par: Parallelism, ws: &mut Workspace) {
     unsafe { run_complex::<C64, Neon, 4, 4>(Neon, ca, cb, t, par, ws) }
 }
 
+#[cfg(feature = "complex")]
 const CDISP_C32_SCALAR: CplxDispatched<C32> = CplxDispatched {
     run: gemm_c32_scalar,
 };
+#[cfg(feature = "complex")]
 const CDISP_C64_SCALAR: CplxDispatched<C64> = CplxDispatched {
     run: gemm_c64_scalar,
 };
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(feature = "complex", any(target_arch = "x86", target_arch = "x86_64")))]
 const CDISP_C32_FMA: CplxDispatched<C32> = CplxDispatched { run: gemm_c32_fma };
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(feature = "complex", any(target_arch = "x86", target_arch = "x86_64")))]
 const CDISP_C64_FMA: CplxDispatched<C64> = CplxDispatched { run: gemm_c64_fma };
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(feature = "complex", any(target_arch = "x86", target_arch = "x86_64")))]
 const CDISP_C32_AVX512: CplxDispatched<C32> = CplxDispatched {
     run: gemm_c32_avx512,
 };
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(feature = "complex", any(target_arch = "x86", target_arch = "x86_64")))]
 const CDISP_C64_AVX512: CplxDispatched<C64> = CplxDispatched {
     run: gemm_c64_avx512,
 };
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(feature = "complex", target_arch = "aarch64"))]
 const CDISP_C32_NEON: CplxDispatched<C32> = CplxDispatched { run: gemm_c32_neon };
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(feature = "complex", target_arch = "aarch64"))]
 const CDISP_C64_NEON: CplxDispatched<C64> = CplxDispatched { run: gemm_c64_neon };
 
 /// `c32` ISA selection (the complex multiply uses only AVX2/AVX-512 float ops).
+#[cfg(feature = "complex")]
 fn select_c32() -> CplxDispatched<C32> {
     match forced_isa() {
         ForcedIsa::Scalar => return CDISP_C32_SCALAR,
@@ -1645,6 +1691,7 @@ fn select_c32() -> CplxDispatched<C32> {
 }
 
 /// `c64` ISA selection.
+#[cfg(feature = "complex")]
 fn select_c64() -> CplxDispatched<C64> {
     match forced_isa() {
         ForcedIsa::Scalar => return CDISP_C64_SCALAR,
@@ -1693,11 +1740,12 @@ fn select_c64() -> CplxDispatched<C64> {
     }
 }
 
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", feature = "complex"))]
 static GEMM_C32: OnceLock<CplxDispatched<C32>> = OnceLock::new();
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", feature = "complex"))]
 static GEMM_C64: OnceLock<CplxDispatched<C64>> = OnceLock::new();
 
+#[cfg(feature = "complex")]
 impl ComplexScalar for C32 {
     #[inline]
     unsafe fn dispatch_complex(
@@ -1714,6 +1762,7 @@ impl ComplexScalar for C32 {
         unsafe { (d.run)(ca, cb, t, par, ws) }
     }
 }
+#[cfg(feature = "complex")]
 impl ComplexScalar for C64 {
     #[inline]
     unsafe fn dispatch_complex(

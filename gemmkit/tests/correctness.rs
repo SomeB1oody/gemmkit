@@ -44,6 +44,7 @@ impl Elem for f64 {
 // Narrow types accumulate in f32 and round outputs to 16 bits, so their `EPS` is the
 // 16-bit machine epsilon (f16 ≈ 9.8e-4, bf16 ≈ 7.8e-3) — the dominant error is the
 // final round, the f32 accumulation being far more accurate.
+#[cfg(feature = "half")]
 impl Elem for gemmkit::f16 {
     const EPS: f64 = 9.765625e-4; // 2^-10
     fn to_f64(self) -> f64 {
@@ -53,6 +54,7 @@ impl Elem for gemmkit::f16 {
         gemmkit::f16::from_f64(x)
     }
 }
+#[cfg(feature = "half")]
 impl Elem for gemmkit::bf16 {
     const EPS: f64 = 7.8125e-3; // 2^-7
     fn to_f64(self) -> f64 {
@@ -307,6 +309,7 @@ fn correctness_f64_layouts() {
 /// across shapes / layouts / alpha-beta — checked against the (f64) reference at the
 /// 16-bit tolerance (the kernel's f32 accumulation is far tighter than the final
 /// round, so the gate is dominated by `T::EPS`).
+#[cfg(feature = "half")]
 fn mixed_dims() -> [(usize, usize, usize); 9] {
     [
         (1, 1, 1),
@@ -321,6 +324,7 @@ fn mixed_dims() -> [(usize, usize, usize); 9] {
     ]
 }
 
+#[cfg(feature = "half")]
 #[test]
 fn correctness_f16_layouts() {
     for (m, k, n) in mixed_dims() {
@@ -342,6 +346,7 @@ fn correctness_f16_layouts() {
     }
 }
 
+#[cfg(feature = "half")]
 #[test]
 fn correctness_bf16_layouts() {
     for (m, k, n) in mixed_dims() {
@@ -366,6 +371,7 @@ fn correctness_bf16_layouts() {
 /// Mixed-precision serial == parallel **bit-identity** across thread counts (the
 /// hard determinism invariant must hold for the new types too — narrowing is a pure
 /// per-position function of the f32 result, and the blocking is thread-independent).
+#[cfg(feature = "half")]
 #[test]
 fn parallel_equals_serial_mixed() {
     fn check<T: Elem>(la: Layout) {
@@ -418,7 +424,7 @@ fn parallel_equals_serial_mixed() {
 /// `gemm`'s `f16` *is* `half::f16` *is* `gemmkit::f16`, so the comparison is direct.
 /// Gated out of Miri (the `gemm` dev-dep is `cfg(not(miri))`).
 #[test]
-#[cfg(not(miri))]
+#[cfg(all(not(miri), feature = "half"))]
 fn mixed_f16_matches_gemm_crate() {
     // Includes a large-k case (k > the f32 kc blocking ≈ 512) to exercise the
     // cross-depth-panel accumulation, where the running sum round-trips through the
@@ -748,6 +754,7 @@ fn prepack_equals_gemm() {
 /// same `kc = k` (mixed) the driver uses, so packed and unpacked never diverge.
 /// Includes a `k > 512` case (the cross-panel regime the blocking-size mismatch
 /// would have broken).
+#[cfg(feature = "half")]
 #[test]
 fn prepack_equals_gemm_mixed() {
     fn check<T: Elem>() {
@@ -1340,30 +1347,34 @@ fn miri_scalar_path() {
     );
     // Mixed-precision (f16 / bf16) scalar path: widen-load, f32 accumulate, narrow
     // store, plus the strided copy-back epilogue and beta != 0 read of narrow C.
-    run_case::<gemmkit::f16>(
-        7,
-        9,
-        5,
-        Layout::Row,
-        Layout::Col,
-        Layout::Row,
-        gemmkit::f16::from_f64(1.0),
-        gemmkit::f16::from_f64(0.5),
-        Parallelism::Serial,
-    );
-    run_case::<gemmkit::bf16>(
-        6,
-        6,
-        6,
-        Layout::Col,
-        Layout::Row,
-        Layout::Col,
-        gemmkit::bf16::from_f64(0.75),
-        gemmkit::bf16::from_f64(-0.5),
-        Parallelism::Serial,
-    );
+    #[cfg(feature = "half")]
+    {
+        run_case::<gemmkit::f16>(
+            7,
+            9,
+            5,
+            Layout::Row,
+            Layout::Col,
+            Layout::Row,
+            gemmkit::f16::from_f64(1.0),
+            gemmkit::f16::from_f64(0.5),
+            Parallelism::Serial,
+        );
+        run_case::<gemmkit::bf16>(
+            6,
+            6,
+            6,
+            Layout::Col,
+            Layout::Row,
+            Layout::Col,
+            gemmkit::bf16::from_f64(0.75),
+            gemmkit::bf16::from_f64(-0.5),
+            Parallelism::Serial,
+        );
+    }
     // Complex (c32) scalar path with conj-A: the conjugate-on-pack variant + the
     // scalar complex multiply and epilogue.
+    #[cfg(feature = "complex")]
     {
         let (m, k, n) = (5usize, 4, 6);
         let a = rand_cplx::<gemmkit::c32>(m * k, 11);
@@ -1389,6 +1400,7 @@ fn miri_scalar_path() {
     }
     // Integer (i8 -> i32) scalar path: widen-load, i32 accumulate, partial-tile
     // copy-back, and the beta != 0 i32 read of C.
+    #[cfg(feature = "int8")]
     {
         let (m, k, n) = (7usize, 9, 5);
         let a = rand_i8(m * k, 1);
@@ -1532,7 +1544,7 @@ fn isa_neon() {
 /// subnormals, ±0, ±Inf, and NaN — so the full-tile vector path and the partial-tile
 /// scalar path never disagree (and the bf16 NaN fix is real). AVX-512, 16-wide.
 #[test]
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
 #[cfg_attr(miri, ignore = "Miri cannot execute AVX intrinsics")]
 fn simd_narrow_store_matches_half_avx512() {
     use gemmkit::simd::{Avx512, KernelSimd, Simd, SimdOps};
@@ -1623,6 +1635,7 @@ fn simd_narrow_store_matches_half_avx512() {
 
 /// Deterministic i8 fill in [-100, 100] (kept small so the i32 reference never
 /// overflows for the tested k, making the comparison exact).
+#[cfg(feature = "int8")]
 fn rand_i8(n: usize, seed: u64) -> Vec<i8> {
     let mut s = seed.wrapping_add(0x9E3779B97F4A7C15);
     (0..n)
@@ -1637,6 +1650,7 @@ fn rand_i8(n: usize, seed: u64) -> Vec<i8> {
 
 /// Exact i32 GEMM reference (row-major), accumulated in i64 then range-checked, so
 /// the integer kernel must match it **bit-for-bit**.
+#[cfg(feature = "int8")]
 fn ref_i8(
     a: &[i8],
     b: &[i8],
@@ -1665,6 +1679,7 @@ fn ref_i8(
     out
 }
 
+#[cfg(feature = "int8")]
 #[test]
 fn correctness_i8() {
     use gemmkit::{MatMut, MatRef};
@@ -1711,6 +1726,7 @@ fn correctness_i8() {
 
 /// Integer serial == parallel **bit-identity** (integer accumulation is exact, so
 /// any thread count must produce identical i32 output).
+#[cfg(feature = "int8")]
 #[test]
 fn parallel_equals_serial_i8() {
     use gemmkit::{MatMut, MatRef};
@@ -1747,6 +1763,7 @@ fn parallel_equals_serial_i8() {
 /// Negative strides for the integer path via [`gemmkit::gemm_i8_unchecked`] (the
 /// heterogeneous escape hatch — the homogeneous `gemm_unchecked` can't serve
 /// `i8 -> i32`). Reversed-row A, compared to the row-reversed exact reference.
+#[cfg(feature = "int8")]
 #[test]
 fn i8_negative_strides_unchecked() {
     let (m, k, n) = (12usize, 9, 7);
@@ -1793,11 +1810,13 @@ fn i8_negative_strides_unchecked() {
 // ---------------------------------------------------------------------------
 
 /// A complex element type the complex test harness is generic over.
+#[cfg(feature = "complex")]
 trait CElem: gemmkit::ComplexScalar {
     const EPS: f64;
     fn of(re: f64, im: f64) -> Self;
     fn parts(self) -> (f64, f64);
 }
+#[cfg(feature = "complex")]
 impl CElem for gemmkit::c32 {
     const EPS: f64 = f32::EPSILON as f64;
     fn of(re: f64, im: f64) -> Self {
@@ -1807,6 +1826,7 @@ impl CElem for gemmkit::c32 {
         (self.re as f64, self.im as f64)
     }
 }
+#[cfg(feature = "complex")]
 impl CElem for gemmkit::c64 {
     const EPS: f64 = f64::EPSILON;
     fn of(re: f64, im: f64) -> Self {
@@ -1817,6 +1837,7 @@ impl CElem for gemmkit::c64 {
     }
 }
 
+#[cfg(feature = "complex")]
 fn rand_cplx<T: CElem>(n: usize, seed: u64) -> Vec<T> {
     let mut s = seed.wrapping_add(0x9E3779B97F4A7C15);
     let mut next = || {
@@ -1829,6 +1850,7 @@ fn rand_cplx<T: CElem>(n: usize, seed: u64) -> Vec<T> {
 }
 
 /// f64 complex reference (column-major), with conj of A / B as selected.
+#[cfg(feature = "complex")]
 fn ref_cplx<T: CElem>(
     a: &[T],
     b: &[T],
@@ -1867,6 +1889,7 @@ fn ref_cplx<T: CElem>(
     out
 }
 
+#[cfg(feature = "complex")]
 fn assert_cplx_accurate<T: CElem>(
     got: &[T],
     m: usize,
@@ -1895,6 +1918,7 @@ fn assert_cplx_accurate<T: CElem>(
     assert!(rel <= tol, "{ctx}: rel err {rel:.3e} > tol {tol:.3e}");
 }
 
+#[cfg(feature = "complex")]
 #[test]
 fn correctness_complex() {
     fn check<T: CElem>() {
@@ -1932,6 +1956,7 @@ fn correctness_complex() {
 }
 
 /// Complex serial == parallel bit-identity across thread counts.
+#[cfg(feature = "complex")]
 #[test]
 fn parallel_equals_serial_complex() {
     for (m, k, n) in [(200, 130, 175), (256, 64, 200)] {
@@ -1977,11 +2002,69 @@ fn parallel_equals_serial_complex() {
     }
 }
 
+/// The raw `gemm_cplx_unchecked` entry (added for the ndarray adapter): exercise it
+/// with a **negative-row-stride** A view + conj, against the row-reversed reference.
+/// The safe `MatRef` surface can't express reversed strides, so this raw path is what
+/// arbitrary-stride callers (the ndarray adapter) rely on.
+#[cfg(feature = "complex")]
+#[test]
+fn cplx_unchecked_negative_strides() {
+    let (m, k, n) = (12, 9, 7);
+    for &(ca, cb) in &[(false, false), (true, false), (true, true)] {
+        let a = rand_cplx::<gemmkit::c32>(m * k, 0xF0 + (m + k) as u64);
+        let b = rand_cplx::<gemmkit::c32>(k * n, 0xF1 + (n + k) as u64);
+        let c0 = rand_cplx::<gemmkit::c32>(m * n, 0xF2 + (m + n) as u64);
+        let (alpha, beta) = (
+            gemmkit::Complex::new(1.1f32, -0.3),
+            gemmkit::Complex::new(0.5f32, 0.7),
+        );
+        // Row-reversed copy of the (column-major) A, for the reference.
+        let mut a_rev = a.clone();
+        for p in 0..k {
+            for i in 0..m {
+                a_rev[p * m + i] = a[p * m + (m - 1 - i)];
+            }
+        }
+        let cref = ref_cplx(&a_rev, &b, &c0, m, k, n, alpha, beta, ca, cb);
+        let mut c = c0.clone();
+        // A: base at physical row m-1, row stride -1 (col-major col stride m); B/C col-major.
+        unsafe {
+            gemmkit::gemm_cplx_unchecked(
+                m,
+                k,
+                n,
+                alpha,
+                a.as_ptr().add(m - 1),
+                -1,
+                m as isize,
+                ca,
+                b.as_ptr(),
+                1,
+                k as isize,
+                cb,
+                beta,
+                c.as_mut_ptr(),
+                1,
+                m as isize,
+                Parallelism::Serial,
+            );
+        }
+        assert_cplx_accurate(
+            &c,
+            m,
+            n,
+            &cref,
+            k,
+            &format!("unchecked neg-stride ca={ca} cb={cb}"),
+        );
+    }
+}
+
 /// Cross-check complex (c32) against the `gemm` crate (which has native c32 and
 /// `conj_lhs`/`conj_rhs` flags); `gemm::c32 == num_complex::Complex32 == gemmkit::c32`,
 /// so the comparison is direct. Gated out of Miri.
 #[test]
-#[cfg(not(miri))]
+#[cfg(all(not(miri), feature = "complex"))]
 fn complex_matches_gemm_crate() {
     for (m, k, n) in [(64, 48, 40), (96, 65, 72), (33, 17, 19)] {
         for &(ca, cb) in &[(false, false), (true, false), (false, true), (true, true)] {

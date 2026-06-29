@@ -10,10 +10,14 @@ use core::arch::x86::*;
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 
+#[cfg(feature = "half")]
 use half::{bf16, f16};
+#[cfg(feature = "complex")]
 use num_complex::Complex;
 
-use super::{KernelSimd, Simd, SimdOps};
+#[cfg(any(feature = "half", feature = "int8"))]
+use super::KernelSimd;
+use super::{Simd, SimdOps};
 
 /// AVX2 + FMA ISA token.
 #[derive(Copy, Clone, Default)]
@@ -153,6 +157,7 @@ impl SimdOps<f64> for Fma {
 
 /// `f16` via F16C: 8 lanes widen with `vcvtph2ps`, narrow with `vcvtps2ph`
 /// (round-to-nearest-even, matching `half::f16::from_f32`).
+#[cfg(feature = "half")]
 impl KernelSimd<f16, f16, f32, f16> for Fma {
     #[inline(always)]
     unsafe fn load_lhs(self, p: *const f16) -> __m256 {
@@ -185,6 +190,7 @@ impl KernelSimd<f16, f16, f32, f16> for Fma {
 /// round-to-nearest-even bias trick (`+ ((bits>>16)&1) + 0x7FFF`, then `>>16`).
 /// **Bit-identical to `half::bf16::from_f32`** including NaN (mapped to
 /// `(bits>>16) | 0x0040`), so the vector and scalar paths never diverge.
+#[cfg(feature = "half")]
 impl KernelSimd<bf16, bf16, f32, bf16> for Fma {
     #[inline(always)]
     unsafe fn load_lhs(self, p: *const bf16) -> __m256 {
@@ -224,6 +230,7 @@ impl KernelSimd<bf16, bf16, f32, bf16> for Fma {
 
 // ---- integer: i8 inputs, i32 accumulator (8-wide __m256i, AVX2 integer ops) ----
 
+#[cfg(feature = "int8")]
 impl SimdOps<i32> for Fma {
     type Reg = __m256i;
     const LANES: usize = 8;
@@ -281,6 +288,7 @@ impl SimdOps<i32> for Fma {
 
 /// `i8 -> i32`: sign-extend 8 LHS bytes on load, broadcast a sign-extended RHS byte;
 /// `Out == Acc == i32`, so `load_out`/`store_out` are plain `i32` load/store.
+#[cfg(feature = "int8")]
 impl KernelSimd<i8, i8, i32, i32> for Fma {
     #[inline(always)]
     unsafe fn load_lhs(self, p: *const i8) -> __m256i {
@@ -307,6 +315,7 @@ impl KernelSimd<i8, i8, i32, i32> for Fma {
 // ambiguous between the real and complex `SimdOps`).
 
 /// Complex multiply of 4 interleaved `f32` complex: `(ar*br - ai*bi, ar*bi + ai*br)`.
+#[cfg(feature = "complex")]
 #[inline(always)]
 unsafe fn cmul_ps(a: __m256, b: __m256) -> __m256 {
     unsafe {
@@ -319,6 +328,7 @@ unsafe fn cmul_ps(a: __m256, b: __m256) -> __m256 {
 }
 
 /// Complex multiply of 2 interleaved `f64` complex.
+#[cfg(feature = "complex")]
 #[inline(always)]
 unsafe fn cmul_pd(a: __m256d, b: __m256d) -> __m256d {
     unsafe {
@@ -330,6 +340,7 @@ unsafe fn cmul_pd(a: __m256d, b: __m256d) -> __m256d {
     }
 }
 
+#[cfg(feature = "complex")]
 impl SimdOps<Complex<f32>> for Fma {
     type Reg = __m256; // 4 complex = 8 f32, interleaved [r0 i0 r1 i1 r2 i2 r3 i3]
     const LANES: usize = 4;
@@ -392,6 +403,7 @@ impl SimdOps<Complex<f32>> for Fma {
     }
 }
 
+#[cfg(feature = "complex")]
 impl SimdOps<Complex<f64>> for Fma {
     type Reg = __m256d; // 2 complex = 4 f64
     const LANES: usize = 2;
