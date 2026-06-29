@@ -12,7 +12,7 @@
 //! through strides (a transposed view swaps `rs`/`cs`, no copy). When `beta == 0`
 //! the output C is **not read**, so it may be uninitialized.
 
-use crate::dispatch::{self, GemmScalar, PackedConsume, Task};
+use crate::dispatch::{self, ComplexScalar, GemmScalar, PackedConsume, Task};
 use crate::parallel::Parallelism;
 use crate::workspace::{self, Workspace};
 
@@ -827,6 +827,108 @@ pub fn gemm_i8_with(
     unsafe {
         dispatch::execute_int(
             dispatch::IntTask {
+                m: a.rows,
+                k: a.cols,
+                n: b.cols,
+                alpha,
+                a: a.data.as_ptr(),
+                rsa: a.rs,
+                csa: a.cs,
+                b: b.data.as_ptr(),
+                rsb: b.rs,
+                csb: b.cs,
+                beta,
+                c: c.data.as_mut_ptr(),
+                rsc: c.rs,
+                csc: c.cs,
+            },
+            par,
+            ws,
+        );
+    }
+}
+
+/// Complex GEMM with optional conjugation: `C <- alpha·op(A)·op(B) + beta·C` where
+/// `op(A) = A̅` if `conj_a` (resp. `B̅` if `conj_b`). `T` is `Complex<f32>` or
+/// `Complex<f64>` (re-exported as [`crate::c32`] / [`crate::c64`]). Uses the
+/// thread-local workspace pool.
+///
+/// Complex is homogeneous, so this could ride [`gemm`] for the non-conjugated case,
+/// but the conj op-family gets its own entry; `conj_a = conj_b = false` is the plain
+/// product `A·B`.
+///
+/// # Panics
+/// Same shape / bounds / aliasing conditions as [`gemm`].
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_cplx<T: ComplexScalar>(
+    alpha: T,
+    a: MatRef<'_, T>,
+    conj_a: bool,
+    b: MatRef<'_, T>,
+    conj_b: bool,
+    beta: T,
+    c: MatMut<'_, T>,
+    par: Parallelism,
+) {
+    workspace::with_thread_pool(|ws| gemm_cplx_with(ws, alpha, a, conj_a, b, conj_b, beta, c, par));
+}
+
+/// Like [`gemm_cplx`] but reuses a caller-owned [`Workspace`].
+///
+/// # Panics
+/// Same conditions as [`gemm_cplx`].
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_cplx_with<T: ComplexScalar>(
+    ws: &mut Workspace,
+    alpha: T,
+    a: MatRef<'_, T>,
+    conj_a: bool,
+    b: MatRef<'_, T>,
+    conj_b: bool,
+    beta: T,
+    c: MatMut<'_, T>,
+    par: Parallelism,
+) {
+    assert_eq!(
+        a.cols, b.rows,
+        "gemmkit: A.cols ({}) != B.rows ({})",
+        a.cols, b.rows
+    );
+    assert_eq!(
+        a.rows, c.rows,
+        "gemmkit: A.rows ({}) != C.rows ({})",
+        a.rows, c.rows
+    );
+    assert_eq!(
+        b.cols, c.cols,
+        "gemmkit: B.cols ({}) != C.cols ({})",
+        b.cols, c.cols
+    );
+    check_view(a.data, a.rows, a.cols, a.rs, a.cs, "A");
+    check_view(b.data, b.rows, b.cols, b.rs, b.cs, "B");
+    check_view(c.data, c.rows, c.cols, c.rs, c.cs, "C");
+    if self_aliases(c.rows, c.cols, c.rs, c.cs) {
+        panic!(
+            "gemmkit: C view aliases itself (strides {},{} map distinct elements to the same \
+             memory); C must address each (i,j) uniquely",
+            c.rs, c.cs
+        );
+    }
+    let cp = c.data.as_ptr();
+    let cl = c.data.len();
+    if overlaps(cp, cl, a.data.as_ptr(), a.data.len())
+        || overlaps(cp, cl, b.data.as_ptr(), b.data.len())
+    {
+        panic!("gemmkit: C aliases A or B");
+    }
+
+    // SAFETY: validated above — shapes agree, strides in bounds, C unique and not
+    // aliasing A/B.
+    unsafe {
+        dispatch::execute_complex(
+            conj_a,
+            conj_b,
+            Task {
                 m: a.rows,
                 k: a.cols,
                 n: b.cols,

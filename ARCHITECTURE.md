@@ -103,17 +103,28 @@ token's `vectorize` is the identity.
 
 The driver is generic over [`KernelFamily`], not over "do an FMA on `T`". A family
 bundles the input/accumulator/output types, the pack layout, the microkernel, and
-the epilogue. It ships three families: `FloatGemm<T>` (homogeneous `f32`/`f64`),
+the epilogue. It ships four families: `FloatGemm<T>` (homogeneous `f32`/`f64`),
 `MixedGemm<N>` (mixed precision — `f16`/`bf16` in, **`f32` accumulator**, narrow
-out), and `IntGemm` (`i8` in, **`i32` accumulator/output** — the first family with
+out), `IntGemm` (`i8` in, **`i32` accumulator/output** — the first family with
 `Lhs != Out`, reached via the public `gemm_i8` since the homogeneous `gemm<T>`
 surface can't express `Out != Lhs`; it reuses the `KernelSimd` widen seam with an
 `i8 -> i32` sign-extend and exact wrapping `i32` arithmetic, and a denser VNNI
-`vpdpbusd` dot kernel is a deferred increment). A complex family would arrive the
-same way (complex: an `fmaddsub` two-step kernel; the deferred integer VNNI: a dot
-kernel with interleaved-K packing
-and a requantize epilogue) with the driver, packing framework, cache model, and
-parallelism untouched.
+`vpdpbusd` dot kernel is a deferred increment), and `ComplexGemm<T, CONJ_A, CONJ_B>`
+(`Complex<f32>`/`Complex<f64>`, via the public `gemm_cplx`).
+
+**Complex (op-family seam).** Complex is homogeneous, so the per-ISA
+`SimdOps<Complex<_>>` make `mul`/`mul_add` the **vectorized complex multiply**
+(interleaved re/im, shuffle + `fmaddsub`), and `ComplexGemm`'s microkernel just
+delegates to `FloatGemm`'s — one kernel. **Conjugation is on the pack seam, not the
+hot loop:** `CONJ_A`/`CONJ_B` are `const` params, and a set flag conjugates that
+operand *during packing* (so `A̅·B` falls out of the same plain complex FMA). Because
+a conjugated operand must therefore always be packed, the family sets the
+`KernelFamily::FORCE_PACK_LHS`/`FORCE_PACK_RHS` consts, which the driver ORs into its
+pack decisions. Dispatch maps the runtime conj flags to the const-generic variant
+(and the orientation swap swaps the flags too, since `(A̅·B)ᵀ = Bᵀ·A̅ᵀ`); `conjC` is
+deferred. The deferred integer VNNI (a dot kernel with interleaved-K packing and a
+requantize epilogue) would arrive the same way, with the driver, packing framework,
+cache model, and parallelism untouched.
 
 **Mixed precision (`Acc != Lhs`).** `MixedGemm<N>` is the seam's first asymmetric
 family: it packs narrow `N` panels (plain micropanels, like the float pack),

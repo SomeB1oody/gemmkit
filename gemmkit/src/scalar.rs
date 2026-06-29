@@ -68,6 +68,63 @@ impl Scalar for i32 {
     const ONE: Self = 1;
 }
 
+// Complex GEMM elements: `Complex<f32>` / `Complex<f64>` are *homogeneous*
+// (`Acc = Self`) and, unlike the narrow / integer types, have native arithmetic
+// (`num-complex` provides Add/Mul/Sub), so they impl [`Float`] and ride the entire
+// float path. The vectorized complex multiply lives in the per-ISA `SimdOps`; conj
+// is a packing-time family variant, not a kernel branch.
+impl Scalar for num_complex::Complex<f32> {
+    type Acc = Self;
+    const ZERO: Self = num_complex::Complex::new(0.0, 0.0);
+    const ONE: Self = num_complex::Complex::new(1.0, 0.0);
+}
+
+impl Scalar for num_complex::Complex<f64> {
+    type Acc = Self;
+    const ZERO: Self = num_complex::Complex::new(0.0, 0.0);
+    const ONE: Self = num_complex::Complex::new(1.0, 0.0);
+}
+
+impl Float for num_complex::Complex<f32> {
+    #[inline(always)]
+    fn mul_add(self, b: Self, c: Self) -> Self {
+        // Plain complex `a*b + c` (num-complex's `*` and `+`); the scalar epilogue
+        // stays reproducible and matches the non-FMA fallback.
+        self * b + c
+    }
+}
+
+impl Float for num_complex::Complex<f64> {
+    #[inline(always)]
+    fn mul_add(self, b: Self, c: Self) -> Self {
+        self * b + c
+    }
+}
+
+/// Conjugation, the operation that distinguishes the complex GEMM op-family
+/// variants (`conjA` / `conjB`). A complex family applies it **at pack time** —
+/// conjugating the packed `A` or `B` panel — so the hot loop stays a single plain
+/// complex FMA with no per-element conj branch. Implemented only for the complex
+/// types (a real type would just be identity, but no real family needs it).
+pub trait Conjugate: Scalar {
+    /// The complex conjugate (`re - im·i`).
+    fn conjugate(self) -> Self;
+}
+
+impl Conjugate for num_complex::Complex<f32> {
+    #[inline(always)]
+    fn conjugate(self) -> Self {
+        self.conj()
+    }
+}
+
+impl Conjugate for num_complex::Complex<f64> {
+    #[inline(always)]
+    fn conjugate(self) -> Self {
+        self.conj()
+    }
+}
+
 /// A narrow floating-point input type that accumulates in `f32` (`Acc = f32`):
 /// `f16` and `bf16`. It supplies only the **scalar** widen / narrow conversions the
 /// kernel epilogue's strided copy-back path needs; the vectorized hot loop uses the

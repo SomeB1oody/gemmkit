@@ -16,10 +16,12 @@
 use crate::scalar::Scalar;
 use crate::simd::KernelSimd;
 
+pub mod complex;
 pub mod float;
 pub mod int;
 pub mod mixed;
 
+pub use complex::ComplexGemm;
 pub use float::FloatGemm;
 pub use int::IntGemm;
 pub use mixed::MixedGemm;
@@ -82,6 +84,15 @@ pub trait KernelFamily: Copy + Send + Sync + 'static {
     /// sets this `false` and the driver then uses `kc = k` (one panel — the whole
     /// contraction accumulates in the `f32` registers and rounds to `Out` once).
     const OUT_IS_ACC: bool = true;
+
+    /// Force the driver to **always pack** the LHS / RHS, overriding the cost-based
+    /// pack decision. A family whose pack does more than a plain copy — the complex
+    /// conj variants conjugate the operand *during packing* — must set this so the
+    /// transform always runs (otherwise the driver might read an operand in place,
+    /// unconjugated). Default `false` (the cost model decides).
+    const FORCE_PACK_LHS: bool = false;
+    /// See [`KernelFamily::FORCE_PACK_LHS`].
+    const FORCE_PACK_RHS: bool = false;
 
     /// Pack an `mc × kc` LHS block into micropanel-major layout: a sequence of
     /// panels each `mr` rows tall, every panel stored column-by-column with `mr`

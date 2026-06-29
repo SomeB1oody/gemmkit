@@ -210,6 +210,93 @@ fn perf_i8() {
     }
 }
 
+/// Complex (c32) GEMM throughput: gemmkit (`gemm_cplx`, no conj) vs the `gemm` crate
+/// (native c32). Complex FLOPs counted as 4× the real count (a complex mul-add is
+/// ~4 real mul + 4 real add), the convention both report.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture"]
+fn perf_complex() {
+    use gemmkit::Complex;
+    let _guard = BENCH_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    println!("\nc32 GFLOP/s (column-major, 4 flop/mul-add) — gemmkit vs gemm crate:");
+    for &par in &[false, true] {
+        for &s in &[256usize, 512, 1024] {
+            let (m, k, n) = (s, s, s);
+            let mk = |seed: u64, n: usize| {
+                let mut z = seed | 1;
+                (0..n)
+                    .map(|_| {
+                        z ^= z << 13;
+                        z ^= z >> 7;
+                        z ^= z << 17;
+                        Complex::new((z >> 40) as f32 / (1u64 << 24) as f32 - 0.5, 0.25)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let a = mk(1, m * k);
+            let b = mk(2, k * n);
+            let mut c = vec![Complex::new(0.0f32, 0.0); m * n];
+            let p = if par {
+                Parallelism::Rayon(0)
+            } else {
+                Parallelism::Serial
+            };
+            let gp = if par {
+                gemm::Parallelism::Rayon(0)
+            } else {
+                gemm::Parallelism::None
+            };
+            // 4x for the complex flop convention.
+            let cflop = |secs: f64| 4.0 * 2.0 * (m * k * n) as f64 / secs / 1e9;
+            let sk = measure(m, k, n, || {
+                gemmkit::gemm_cplx(
+                    Complex::new(1.0f32, 0.0),
+                    MatRef::from_col_major(&a, m, k),
+                    false,
+                    MatRef::from_col_major(&b, k, n),
+                    false,
+                    Complex::new(0.0f32, 0.0),
+                    MatMut::from_col_major(&mut c, m, n),
+                    p,
+                );
+            });
+            let sg = measure(m, k, n, || unsafe {
+                gemm::gemm(
+                    m,
+                    n,
+                    k,
+                    c.as_mut_ptr(),
+                    m as isize,
+                    1,
+                    false,
+                    a.as_ptr(),
+                    m as isize,
+                    1,
+                    b.as_ptr(),
+                    k as isize,
+                    1,
+                    Complex::new(0.0f32, 0.0),
+                    Complex::new(1.0f32, 0.0),
+                    false,
+                    false,
+                    false,
+                    gp,
+                );
+            });
+            // `measure` already divides by 2*m*n*k; rescale to the complex flop count.
+            let (kit, gem) = (sk.median * 2.0, sg.median * 2.0);
+            let mode = if par { "par" } else { "ser" };
+            println!(
+                "  n={s:<5} {mode}  gemmkit={:7.1}  gemm={:7.1}  ({:.0}% of gemm)",
+                kit,
+                gem,
+                100.0 * kit / gem.max(1e-9)
+            );
+            let _ = cflop;
+        }
+    }
+}
+
 fn bench_one(s: usize, parallel: bool) {
     let (m, k, n) = (s, s, s);
     let a = fill(m * k, 1);

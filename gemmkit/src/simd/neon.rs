@@ -14,6 +14,7 @@
 use core::arch::aarch64::*;
 
 use half::{bf16, f16};
+use num_complex::Complex;
 
 use super::{KernelSimd, Simd, SimdOps};
 use crate::scalar::NarrowFloat;
@@ -340,5 +341,156 @@ impl KernelSimd<i8, i8, i32, i32> for Neon {
     #[inline(always)]
     unsafe fn store_out(self, p: *mut i32, v: int32x4_t) {
         unsafe { vst1q_s32(p, v) }
+    }
+}
+
+// ---- complex (scalar-fallback stub) ----
+//
+// TODO(neon): use the ARMv8.3 `FCMLA`/`FCADD` complex-multiply-accumulate
+// instructions (behind the `fcma` feature) instead of the per-element scalar
+// arithmetic below. Correct and keeps aarch64 compiling, but unvectorized; a
+// deferred ARM-hardware item.
+
+impl SimdOps<Complex<f32>> for Neon {
+    type Reg = float32x4_t; // 2 complex = 4 f32, interleaved
+    const LANES: usize = 2;
+    const ALIGN: usize = 16;
+
+    #[inline(always)]
+    unsafe fn zero(self) -> float32x4_t {
+        unsafe { vdupq_n_f32(0.0) }
+    }
+    #[inline(always)]
+    unsafe fn splat(self, v: Complex<f32>) -> float32x4_t {
+        unsafe {
+            let t = [v.re, v.im, v.re, v.im];
+            vld1q_f32(t.as_ptr())
+        }
+    }
+    #[inline(always)]
+    unsafe fn load(self, p: *const Complex<f32>) -> float32x4_t {
+        unsafe { vld1q_f32(p as *const f32) }
+    }
+    #[inline(always)]
+    unsafe fn loadu(self, p: *const Complex<f32>) -> float32x4_t {
+        unsafe { vld1q_f32(p as *const f32) }
+    }
+    #[inline(always)]
+    unsafe fn store(self, p: *mut Complex<f32>, v: float32x4_t) {
+        unsafe { vst1q_f32(p as *mut f32, v) }
+    }
+    #[inline(always)]
+    unsafe fn storeu(self, p: *mut Complex<f32>, v: float32x4_t) {
+        unsafe { vst1q_f32(p as *mut f32, v) }
+    }
+    #[inline(always)]
+    unsafe fn mul(self, a: float32x4_t, b: float32x4_t) -> float32x4_t {
+        unsafe {
+            let (mut ta, mut tb) = ([0.0f32; 4], [0.0f32; 4]);
+            vst1q_f32(ta.as_mut_ptr(), a);
+            vst1q_f32(tb.as_mut_ptr(), b);
+            let c0 = Complex::new(ta[0], ta[1]) * Complex::new(tb[0], tb[1]);
+            let c1 = Complex::new(ta[2], ta[3]) * Complex::new(tb[2], tb[3]);
+            let r = [c0.re, c0.im, c1.re, c1.im];
+            vld1q_f32(r.as_ptr())
+        }
+    }
+    #[inline(always)]
+    unsafe fn add(self, a: float32x4_t, b: float32x4_t) -> float32x4_t {
+        unsafe { vaddq_f32(a, b) }
+    }
+    #[inline(always)]
+    unsafe fn mul_add(self, a: float32x4_t, b: float32x4_t, c: float32x4_t) -> float32x4_t {
+        // Inlined (a `self.mul` call is ambiguous with the real `SimdOps<f32>`).
+        unsafe {
+            let (mut ta, mut tb, mut tc) = ([0.0f32; 4], [0.0f32; 4], [0.0f32; 4]);
+            vst1q_f32(ta.as_mut_ptr(), a);
+            vst1q_f32(tb.as_mut_ptr(), b);
+            vst1q_f32(tc.as_mut_ptr(), c);
+            let r0 = Complex::new(ta[0], ta[1]) * Complex::new(tb[0], tb[1])
+                + Complex::new(tc[0], tc[1]);
+            let r1 = Complex::new(ta[2], ta[3]) * Complex::new(tb[2], tb[3])
+                + Complex::new(tc[2], tc[3]);
+            let r = [r0.re, r0.im, r1.re, r1.im];
+            vld1q_f32(r.as_ptr())
+        }
+    }
+    #[inline(always)]
+    unsafe fn reduce_sum(self, v: float32x4_t) -> Complex<f32> {
+        unsafe {
+            let mut t = [0.0f32; 4];
+            vst1q_f32(t.as_mut_ptr(), v);
+            Complex::new(t[0] + t[2], t[1] + t[3])
+        }
+    }
+}
+
+impl SimdOps<Complex<f64>> for Neon {
+    type Reg = float64x2_t; // 1 complex = 2 f64
+    const LANES: usize = 1;
+    const ALIGN: usize = 16;
+
+    #[inline(always)]
+    unsafe fn zero(self) -> float64x2_t {
+        unsafe { vdupq_n_f64(0.0) }
+    }
+    #[inline(always)]
+    unsafe fn splat(self, v: Complex<f64>) -> float64x2_t {
+        unsafe {
+            let t = [v.re, v.im];
+            vld1q_f64(t.as_ptr())
+        }
+    }
+    #[inline(always)]
+    unsafe fn load(self, p: *const Complex<f64>) -> float64x2_t {
+        unsafe { vld1q_f64(p as *const f64) }
+    }
+    #[inline(always)]
+    unsafe fn loadu(self, p: *const Complex<f64>) -> float64x2_t {
+        unsafe { vld1q_f64(p as *const f64) }
+    }
+    #[inline(always)]
+    unsafe fn store(self, p: *mut Complex<f64>, v: float64x2_t) {
+        unsafe { vst1q_f64(p as *mut f64, v) }
+    }
+    #[inline(always)]
+    unsafe fn storeu(self, p: *mut Complex<f64>, v: float64x2_t) {
+        unsafe { vst1q_f64(p as *mut f64, v) }
+    }
+    #[inline(always)]
+    unsafe fn mul(self, a: float64x2_t, b: float64x2_t) -> float64x2_t {
+        unsafe {
+            let (mut ta, mut tb) = ([0.0f64; 2], [0.0f64; 2]);
+            vst1q_f64(ta.as_mut_ptr(), a);
+            vst1q_f64(tb.as_mut_ptr(), b);
+            let c = Complex::new(ta[0], ta[1]) * Complex::new(tb[0], tb[1]);
+            let r = [c.re, c.im];
+            vld1q_f64(r.as_ptr())
+        }
+    }
+    #[inline(always)]
+    unsafe fn add(self, a: float64x2_t, b: float64x2_t) -> float64x2_t {
+        unsafe { vaddq_f64(a, b) }
+    }
+    #[inline(always)]
+    unsafe fn mul_add(self, a: float64x2_t, b: float64x2_t, c: float64x2_t) -> float64x2_t {
+        unsafe {
+            let (mut ta, mut tb, mut tc) = ([0.0f64; 2], [0.0f64; 2], [0.0f64; 2]);
+            vst1q_f64(ta.as_mut_ptr(), a);
+            vst1q_f64(tb.as_mut_ptr(), b);
+            vst1q_f64(tc.as_mut_ptr(), c);
+            let r = Complex::new(ta[0], ta[1]) * Complex::new(tb[0], tb[1])
+                + Complex::new(tc[0], tc[1]);
+            let o = [r.re, r.im];
+            vld1q_f64(o.as_ptr())
+        }
+    }
+    #[inline(always)]
+    unsafe fn reduce_sum(self, v: float64x2_t) -> Complex<f64> {
+        unsafe {
+            let mut t = [0.0f64; 2];
+            vst1q_f64(t.as_mut_ptr(), v);
+            Complex::new(t[0], t[1])
+        }
     }
 }

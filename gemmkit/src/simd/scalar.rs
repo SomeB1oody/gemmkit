@@ -5,9 +5,66 @@
 //! kernel that drives AVX-512 drives this token with a one-element "register".
 
 use half::{bf16, f16};
+use num_complex::Complex;
 
 use super::{KernelSimd, Simd, SimdOps};
 use crate::scalar::NarrowFloat;
+
+// Complex (scalar fallback): the `Reg` is one `Complex`, arithmetic is num-complex's
+// (the complex multiply / FMA the SIMD tokens vectorize). The Miri-checked reference
+// for the complex path.
+macro_rules! impl_scalar_complex {
+    ($t:ty) => {
+        impl SimdOps<Complex<$t>> for ScalarTok {
+            type Reg = Complex<$t>;
+            const LANES: usize = 1;
+            const ALIGN: usize = core::mem::align_of::<Complex<$t>>();
+
+            #[inline(always)]
+            unsafe fn zero(self) -> Self::Reg {
+                Complex::new(0.0, 0.0)
+            }
+            #[inline(always)]
+            unsafe fn splat(self, v: Complex<$t>) -> Self::Reg {
+                v
+            }
+            #[inline(always)]
+            unsafe fn load(self, p: *const Complex<$t>) -> Self::Reg {
+                unsafe { *p }
+            }
+            #[inline(always)]
+            unsafe fn loadu(self, p: *const Complex<$t>) -> Self::Reg {
+                unsafe { *p }
+            }
+            #[inline(always)]
+            unsafe fn store(self, p: *mut Complex<$t>, v: Self::Reg) {
+                unsafe { *p = v }
+            }
+            #[inline(always)]
+            unsafe fn storeu(self, p: *mut Complex<$t>, v: Self::Reg) {
+                unsafe { *p = v }
+            }
+            #[inline(always)]
+            unsafe fn mul(self, a: Self::Reg, b: Self::Reg) -> Self::Reg {
+                a * b
+            }
+            #[inline(always)]
+            unsafe fn add(self, a: Self::Reg, b: Self::Reg) -> Self::Reg {
+                a + b
+            }
+            #[inline(always)]
+            unsafe fn mul_add(self, a: Self::Reg, b: Self::Reg, c: Self::Reg) -> Self::Reg {
+                a * b + c
+            }
+            #[inline(always)]
+            unsafe fn reduce_sum(self, v: Self::Reg) -> Complex<$t> {
+                v
+            }
+        }
+    };
+}
+impl_scalar_complex!(f32);
+impl_scalar_complex!(f64);
 
 /// The scalar (1-lane) ISA token. Always available.
 #[derive(Copy, Clone, Default)]

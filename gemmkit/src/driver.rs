@@ -331,7 +331,8 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize>(
                 .unsigned_abs()
                 .saturating_mul(core::mem::size_of::<Fam::Lhs>())
                 >= pack_stride;
-        let want_pack_lhs = reuse_cols > tuning::lhs_pack_threshold() || strided_lhs;
+        let want_pack_lhs =
+            reuse_cols > tuning::lhs_pack_threshold() || strided_lhs || Fam::FORCE_PACK_LHS;
 
         // Shared-LHS pre-pack: on the parallel packed-A path, pack each row-block's
         // A panel once into a shared region (below) instead of every worker that
@@ -352,7 +353,7 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize>(
         // unpacked) is packed once and reused across all `n_mc` row blocks. The
         // copy amortizes only when that reuse is high (large `m`); otherwise B is
         // read in place. Never packed here when the RHS is already prepacked.
-        let pack_b = !prepacked && m > tuning::rhs_pack_threshold();
+        let pack_b = !prepacked && (m > tuning::rhs_pack_threshold() || Fam::FORCE_PACK_RHS);
 
         // One packing allocation. The LHS region count is `n_mc` when shared (one
         // slot per row-block, written once by the pre-pass) or `n_threads` when

@@ -11,8 +11,33 @@ use core::arch::x86::*;
 use core::arch::x86_64::*;
 
 use half::{bf16, f16};
+use num_complex::Complex;
 
 use super::{KernelSimd, Simd, SimdOps};
+
+/// Complex multiply of 16 interleaved `f32` complex (8 complex per 512-bit reg).
+#[inline(always)]
+unsafe fn cmul_ps_512(a: __m512, b: __m512) -> __m512 {
+    unsafe {
+        let b_re = _mm512_moveldup_ps(b);
+        let b_im = _mm512_movehdup_ps(b);
+        let a_sw = _mm512_permute_ps::<0xB1>(a);
+        let t = _mm512_mul_ps(a_sw, b_im);
+        _mm512_fmaddsub_ps(a, b_re, t)
+    }
+}
+
+/// Complex multiply of 4 interleaved `f64` complex.
+#[inline(always)]
+unsafe fn cmul_pd_512(a: __m512d, b: __m512d) -> __m512d {
+    unsafe {
+        let b_re = _mm512_movedup_pd(b);
+        let b_im = _mm512_permute_pd::<0b11111111>(b);
+        let a_sw = _mm512_permute_pd::<0b01010101>(a);
+        let t = _mm512_mul_pd(a_sw, b_im);
+        _mm512_fmaddsub_pd(a, b_re, t)
+    }
+}
 
 /// AVX-512 (foundation) ISA token.
 #[derive(Copy, Clone, Default)]
@@ -261,5 +286,117 @@ impl KernelSimd<i8, i8, i32, i32> for Avx512 {
     #[inline(always)]
     unsafe fn store_out(self, p: *mut i32, v: __m512i) {
         unsafe { _mm512_storeu_si512(p as *mut __m512i, v) }
+    }
+}
+
+// ---- complex: interleaved (re,im), shuffle + fmaddsub complex multiply ----
+
+impl SimdOps<Complex<f32>> for Avx512 {
+    type Reg = __m512; // 8 complex = 16 f32
+    const LANES: usize = 8;
+    const ALIGN: usize = 64;
+
+    #[inline(always)]
+    unsafe fn zero(self) -> __m512 {
+        unsafe { _mm512_setzero_ps() }
+    }
+    #[inline(always)]
+    unsafe fn splat(self, v: Complex<f32>) -> __m512 {
+        // Build (re,im) in a 128-bit lane and broadcast it to all 4 lanes (no
+        // misaligned `[f32;2]`-as-f64 load, which would be UB).
+        unsafe { _mm512_broadcast_f32x4(_mm_set_ps(v.im, v.re, v.im, v.re)) }
+    }
+    #[inline(always)]
+    unsafe fn load(self, p: *const Complex<f32>) -> __m512 {
+        unsafe { _mm512_load_ps(p as *const f32) }
+    }
+    #[inline(always)]
+    unsafe fn loadu(self, p: *const Complex<f32>) -> __m512 {
+        unsafe { _mm512_loadu_ps(p as *const f32) }
+    }
+    #[inline(always)]
+    unsafe fn store(self, p: *mut Complex<f32>, v: __m512) {
+        unsafe { _mm512_store_ps(p as *mut f32, v) }
+    }
+    #[inline(always)]
+    unsafe fn storeu(self, p: *mut Complex<f32>, v: __m512) {
+        unsafe { _mm512_storeu_ps(p as *mut f32, v) }
+    }
+    #[inline(always)]
+    unsafe fn mul(self, a: __m512, b: __m512) -> __m512 {
+        unsafe { cmul_ps_512(a, b) }
+    }
+    #[inline(always)]
+    unsafe fn add(self, a: __m512, b: __m512) -> __m512 {
+        unsafe { _mm512_add_ps(a, b) }
+    }
+    #[inline(always)]
+    unsafe fn mul_add(self, a: __m512, b: __m512, c: __m512) -> __m512 {
+        unsafe { _mm512_add_ps(cmul_ps_512(a, b), c) }
+    }
+    #[inline(always)]
+    unsafe fn reduce_sum(self, v: __m512) -> Complex<f32> {
+        unsafe {
+            let mut t = [0.0f32; 16];
+            _mm512_storeu_ps(t.as_mut_ptr(), v);
+            let (mut re, mut im) = (0.0f32, 0.0f32);
+            for c in 0..8 {
+                re += t[2 * c];
+                im += t[2 * c + 1];
+            }
+            Complex::new(re, im)
+        }
+    }
+}
+
+impl SimdOps<Complex<f64>> for Avx512 {
+    type Reg = __m512d; // 4 complex = 8 f64
+    const LANES: usize = 4;
+    const ALIGN: usize = 64;
+
+    #[inline(always)]
+    unsafe fn zero(self) -> __m512d {
+        unsafe { _mm512_setzero_pd() }
+    }
+    #[inline(always)]
+    unsafe fn splat(self, v: Complex<f64>) -> __m512d {
+        // Broadcast the (re,im) pair to all 4 complex lanes (AVX-512F `setr`).
+        unsafe { _mm512_setr_pd(v.re, v.im, v.re, v.im, v.re, v.im, v.re, v.im) }
+    }
+    #[inline(always)]
+    unsafe fn load(self, p: *const Complex<f64>) -> __m512d {
+        unsafe { _mm512_load_pd(p as *const f64) }
+    }
+    #[inline(always)]
+    unsafe fn loadu(self, p: *const Complex<f64>) -> __m512d {
+        unsafe { _mm512_loadu_pd(p as *const f64) }
+    }
+    #[inline(always)]
+    unsafe fn store(self, p: *mut Complex<f64>, v: __m512d) {
+        unsafe { _mm512_store_pd(p as *mut f64, v) }
+    }
+    #[inline(always)]
+    unsafe fn storeu(self, p: *mut Complex<f64>, v: __m512d) {
+        unsafe { _mm512_storeu_pd(p as *mut f64, v) }
+    }
+    #[inline(always)]
+    unsafe fn mul(self, a: __m512d, b: __m512d) -> __m512d {
+        unsafe { cmul_pd_512(a, b) }
+    }
+    #[inline(always)]
+    unsafe fn add(self, a: __m512d, b: __m512d) -> __m512d {
+        unsafe { _mm512_add_pd(a, b) }
+    }
+    #[inline(always)]
+    unsafe fn mul_add(self, a: __m512d, b: __m512d, c: __m512d) -> __m512d {
+        unsafe { _mm512_add_pd(cmul_pd_512(a, b), c) }
+    }
+    #[inline(always)]
+    unsafe fn reduce_sum(self, v: __m512d) -> Complex<f64> {
+        unsafe {
+            let mut t = [0.0f64; 8];
+            _mm512_storeu_pd(t.as_mut_ptr(), v);
+            Complex::new(t[0] + t[2] + t[4] + t[6], t[1] + t[3] + t[5] + t[7])
+        }
     }
 }

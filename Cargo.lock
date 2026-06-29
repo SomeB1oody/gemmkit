@@ -392,6 +392,7 @@ dependencies = [
  "gemm",
  "half",
  "matrixmultiply",
+ "num-complex",
  "raw-cpuid",
  "rayon",
 ]

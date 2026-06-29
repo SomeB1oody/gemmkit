@@ -1362,6 +1362,31 @@ fn miri_scalar_path() {
         gemmkit::bf16::from_f64(-0.5),
         Parallelism::Serial,
     );
+    // Complex (c32) scalar path with conj-A: the conjugate-on-pack variant + the
+    // scalar complex multiply and epilogue.
+    {
+        let (m, k, n) = (5usize, 4, 6);
+        let a = rand_cplx::<gemmkit::c32>(m * k, 11);
+        let b = rand_cplx::<gemmkit::c32>(k * n, 12);
+        let c0 = rand_cplx::<gemmkit::c32>(m * n, 13);
+        let (alpha, beta) = (
+            gemmkit::Complex::new(1.0f32, 0.0),
+            gemmkit::Complex::new(0.5f32, -0.25),
+        );
+        let cref = ref_cplx(&a, &b, &c0, m, k, n, alpha, beta, true, false);
+        let mut c = c0.clone();
+        gemmkit::gemm_cplx(
+            alpha,
+            MatRef::from_col_major(&a, m, k),
+            true,
+            MatRef::from_col_major(&b, k, n),
+            false,
+            beta,
+            MatMut::from_col_major(&mut c, m, n),
+            Parallelism::Serial,
+        );
+        assert_cplx_accurate(&c, m, n, &cref, k, "miri complex conjA");
+    }
     // Integer (i8 -> i32) scalar path: widen-load, i32 accumulate, partial-tile
     // copy-back, and the beta != 0 i32 read of C.
     {
@@ -1758,6 +1783,262 @@ fn i8_negative_strides_unchecked() {
                 c[i * n + j],
                 cref[(m - 1 - i) * n + j],
                 "i8 neg stride ({i},{j})"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// complex GEMM (c32 / c64, conj variants)
+// ---------------------------------------------------------------------------
+
+/// A complex element type the complex test harness is generic over.
+trait CElem: gemmkit::ComplexScalar {
+    const EPS: f64;
+    fn of(re: f64, im: f64) -> Self;
+    fn parts(self) -> (f64, f64);
+}
+impl CElem for gemmkit::c32 {
+    const EPS: f64 = f32::EPSILON as f64;
+    fn of(re: f64, im: f64) -> Self {
+        gemmkit::Complex::new(re as f32, im as f32)
+    }
+    fn parts(self) -> (f64, f64) {
+        (self.re as f64, self.im as f64)
+    }
+}
+impl CElem for gemmkit::c64 {
+    const EPS: f64 = f64::EPSILON;
+    fn of(re: f64, im: f64) -> Self {
+        gemmkit::Complex::new(re, im)
+    }
+    fn parts(self) -> (f64, f64) {
+        (self.re, self.im)
+    }
+}
+
+fn rand_cplx<T: CElem>(n: usize, seed: u64) -> Vec<T> {
+    let mut s = seed.wrapping_add(0x9E3779B97F4A7C15);
+    let mut next = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        2.0 * ((s >> 11) as f64 / (1u64 << 53) as f64) - 1.0
+    };
+    (0..n).map(|_| T::of(next(), next())).collect()
+}
+
+/// f64 complex reference (column-major), with conj of A / B as selected.
+fn ref_cplx<T: CElem>(
+    a: &[T],
+    b: &[T],
+    c0: &[T],
+    m: usize,
+    k: usize,
+    n: usize,
+    alpha: T,
+    beta: T,
+    conj_a: bool,
+    conj_b: bool,
+) -> Vec<(f64, f64)> {
+    let cmul = |x: (f64, f64), y: (f64, f64)| (x.0 * y.0 - x.1 * y.1, x.0 * y.1 + x.1 * y.0);
+    let (al, be) = (alpha.parts(), beta.parts());
+    let mut out = vec![(0.0, 0.0); m * n];
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc = (0.0f64, 0.0f64);
+            for p in 0..k {
+                let mut av = a[p * m + i].parts(); // column-major A
+                let mut bv = b[j * k + p].parts(); // column-major B
+                if conj_a {
+                    av.1 = -av.1;
+                }
+                if conj_b {
+                    bv.1 = -bv.1;
+                }
+                let pr = cmul(av, bv);
+                acc = (acc.0 + pr.0, acc.1 + pr.1);
+            }
+            let term = cmul(al, acc);
+            let bc = cmul(be, c0[j * m + i].parts());
+            out[i * n + j] = (bc.0 + term.0, bc.1 + term.1);
+        }
+    }
+    out
+}
+
+fn assert_cplx_accurate<T: CElem>(
+    got: &[T],
+    m: usize,
+    n: usize,
+    cref: &[(f64, f64)],
+    k: usize,
+    ctx: &str,
+) {
+    // Relative error over the whole matrix (column-major `got`).
+    let mut diff2 = 0.0;
+    let mut ref2 = 0.0;
+    for i in 0..m {
+        for j in 0..n {
+            let (gr, gi) = got[j * m + i].parts();
+            let (rr, ri) = cref[i * n + j];
+            assert!(
+                gr.is_finite() && gi.is_finite(),
+                "{ctx}: non-finite ({i},{j})"
+            );
+            diff2 += (gr - rr).powi(2) + (gi - ri).powi(2);
+            ref2 += rr * rr + ri * ri;
+        }
+    }
+    let rel = diff2.sqrt() / (ref2.sqrt() + 1e-30);
+    let tol = 16.0 * (k.max(1) as f64) * T::EPS;
+    assert!(rel <= tol, "{ctx}: rel err {rel:.3e} > tol {tol:.3e}");
+}
+
+#[test]
+fn correctness_complex() {
+    fn check<T: CElem>() {
+        for (m, k, n) in [
+            (1, 1, 1),
+            (3, 4, 5),
+            (32, 32, 32),
+            (33, 17, 19),
+            (64, 80, 48),
+        ] {
+            for &(ca, cb) in &[(false, false), (true, false), (false, true), (true, true)] {
+                let a = rand_cplx::<T>(m * k, 0xC0 + (m * 7 + k) as u64);
+                let b = rand_cplx::<T>(k * n, 0xC1 + (n * 3 + k) as u64);
+                let c0 = rand_cplx::<T>(m * n, 0xC2 + (m + n) as u64);
+                let (alpha, beta) = (T::of(1.1, -0.3), T::of(0.5, 0.7));
+                let cref = ref_cplx(&a, &b, &c0, m, k, n, alpha, beta, ca, cb);
+                let mut c = c0.clone();
+                // All column-major.
+                gemmkit::gemm_cplx(
+                    alpha,
+                    MatRef::from_col_major(&a, m, k),
+                    ca,
+                    MatRef::from_col_major(&b, k, n),
+                    cb,
+                    beta,
+                    MatMut::from_col_major(&mut c, m, n),
+                    Parallelism::Serial,
+                );
+                assert_cplx_accurate(&c, m, n, &cref, k, &format!("{m}x{k}x{n} ca={ca} cb={cb}"));
+            }
+        }
+    }
+    check::<gemmkit::c32>();
+    check::<gemmkit::c64>();
+}
+
+/// Complex serial == parallel bit-identity across thread counts.
+#[test]
+fn parallel_equals_serial_complex() {
+    for (m, k, n) in [(200, 130, 175), (256, 64, 200)] {
+        for &(ca, cb) in &[(false, false), (true, true)] {
+            let a = rand_cplx::<gemmkit::c32>(m * k, 0xD0 + m as u64);
+            let b = rand_cplx::<gemmkit::c32>(k * n, 0xD1 + n as u64);
+            let c0 = rand_cplx::<gemmkit::c32>(m * n, 0xD2 + k as u64);
+            let (alpha, beta) = (
+                gemmkit::Complex::new(0.7f32, 0.2),
+                gemmkit::Complex::new(1.3f32, -0.4),
+            );
+            let mut c_ser = c0.clone();
+            gemmkit::gemm_cplx(
+                alpha,
+                MatRef::from_col_major(&a, m, k),
+                ca,
+                MatRef::from_col_major(&b, k, n),
+                cb,
+                beta,
+                MatMut::from_col_major(&mut c_ser, m, n),
+                Parallelism::Serial,
+            );
+            for t in [2usize, 4, 8, 16] {
+                let mut c_par = c0.clone();
+                gemmkit::gemm_cplx(
+                    alpha,
+                    MatRef::from_col_major(&a, m, k),
+                    ca,
+                    MatRef::from_col_major(&b, k, n),
+                    cb,
+                    beta,
+                    MatMut::from_col_major(&mut c_par, m, n),
+                    Parallelism::Rayon(t),
+                );
+                let bits = |v: &[gemmkit::c32]| {
+                    v.iter()
+                        .flat_map(|z| [z.re.to_bits(), z.im.to_bits()])
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(bits(&c_ser), bits(&c_par), "complex serial != par({t})");
+            }
+        }
+    }
+}
+
+/// Cross-check complex (c32) against the `gemm` crate (which has native c32 and
+/// `conj_lhs`/`conj_rhs` flags); `gemm::c32 == num_complex::Complex32 == gemmkit::c32`,
+/// so the comparison is direct. Gated out of Miri.
+#[test]
+#[cfg(not(miri))]
+fn complex_matches_gemm_crate() {
+    for (m, k, n) in [(64, 48, 40), (96, 65, 72), (33, 17, 19)] {
+        for &(ca, cb) in &[(false, false), (true, false), (false, true), (true, true)] {
+            let a = rand_cplx::<gemmkit::c32>(m * k, 0xE0 + (m + k) as u64);
+            let b = rand_cplx::<gemmkit::c32>(k * n, 0xE1 + (n + k) as u64);
+            let mut c_kit = vec![gemmkit::Complex::new(0.0f32, 0.0); m * n];
+            let mut c_gemm = c_kit.clone();
+
+            gemmkit::gemm_cplx(
+                gemmkit::Complex::new(1.0f32, 0.0),
+                MatRef::from_col_major(&a, m, k),
+                ca,
+                MatRef::from_col_major(&b, k, n),
+                cb,
+                gemmkit::Complex::new(0.0f32, 0.0),
+                MatMut::from_col_major(&mut c_kit, m, n),
+                Parallelism::Serial,
+            );
+            // gemm crate: dst = alpha*dst + beta*op(lhs)*op(rhs); alpha=0, beta=1.
+            unsafe {
+                gemm::gemm(
+                    m,
+                    n,
+                    k,
+                    c_gemm.as_mut_ptr(),
+                    m as isize,
+                    1,
+                    false,
+                    a.as_ptr(),
+                    m as isize,
+                    1,
+                    b.as_ptr(),
+                    k as isize,
+                    1,
+                    gemmkit::Complex::new(0.0f32, 0.0),
+                    gemmkit::Complex::new(1.0f32, 0.0),
+                    false, // conj_dst
+                    ca,    // conj_lhs
+                    cb,    // conj_rhs
+                    gemm::Parallelism::None,
+                );
+            }
+            // Both column-major; build a row-major (f64,f64) reference from c_gemm.
+            let mut cref = vec![(0.0f64, 0.0f64); m * n];
+            for i in 0..m {
+                for j in 0..n {
+                    let z = c_gemm[j * m + i];
+                    cref[i * n + j] = (z.re as f64, z.im as f64);
+                }
+            }
+            assert_cplx_accurate(
+                &c_kit,
+                m,
+                n,
+                &cref,
+                k,
+                &format!("c32 vs gemm {m}x{k}x{n} ca={ca} cb={cb}"),
             );
         }
     }
