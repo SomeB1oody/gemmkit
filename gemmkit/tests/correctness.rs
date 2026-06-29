@@ -44,24 +44,56 @@ impl Elem for f64 {
 // Narrow types accumulate in f32 and round outputs to 16 bits, so their `EPS` is the
 // 16-bit machine epsilon (f16 ≈ 9.8e-4, bf16 ≈ 7.8e-3) — the dominant error is the
 // final round, the f32 accumulation being far more accurate.
+// `half`'s hardware `to_f64`/`from_f64` are inline asm on aarch64 (Miri can't interpret
+// it), so under `cfg(miri)` the harness routes through `half`'s pure-software `*_const`
+// conversions — bit-equivalent, keeping the mixed-precision scalar path exercisable under
+// Miri (the gemmkit-internal conversions are handled the same way in src/scalar.rs).
 #[cfg(feature = "half")]
 impl Elem for gemmkit::f16 {
     const EPS: f64 = 9.765625e-4; // 2^-10
     fn to_f64(self) -> f64 {
-        self.to_f64()
+        #[cfg(not(miri))]
+        {
+            self.to_f64()
+        }
+        #[cfg(miri)]
+        {
+            self.to_f64_const()
+        }
     }
     fn from_f64(x: f64) -> Self {
-        gemmkit::f16::from_f64(x)
+        #[cfg(not(miri))]
+        {
+            gemmkit::f16::from_f64(x)
+        }
+        #[cfg(miri)]
+        {
+            gemmkit::f16::from_f64_const(x)
+        }
     }
 }
 #[cfg(feature = "half")]
 impl Elem for gemmkit::bf16 {
     const EPS: f64 = 7.8125e-3; // 2^-7
     fn to_f64(self) -> f64 {
-        self.to_f64()
+        #[cfg(not(miri))]
+        {
+            self.to_f64()
+        }
+        #[cfg(miri)]
+        {
+            self.to_f64_const()
+        }
     }
     fn from_f64(x: f64) -> Self {
-        gemmkit::bf16::from_f64(x)
+        #[cfg(not(miri))]
+        {
+            gemmkit::bf16::from_f64(x)
+        }
+        #[cfg(miri)]
+        {
+            gemmkit::bf16::from_f64_const(x)
+        }
     }
 }
 
@@ -1351,8 +1383,10 @@ fn miri_scalar_path() {
             Layout::Row,
             Layout::Col,
             Layout::Row,
-            gemmkit::f16::from_f64(1.0),
-            gemmkit::f16::from_f64(0.5),
+            // via `Elem::from_f64` so the alpha/beta build is Miri-safe too (routes to the
+            // `*_const` software conversion under `cfg(miri)`; see the `Elem` impls above).
+            Elem::from_f64(1.0),
+            Elem::from_f64(0.5),
             Parallelism::Serial,
         );
         run_case::<gemmkit::bf16>(
@@ -1362,8 +1396,8 @@ fn miri_scalar_path() {
             Layout::Col,
             Layout::Row,
             Layout::Col,
-            gemmkit::bf16::from_f64(0.75),
-            gemmkit::bf16::from_f64(-0.5),
+            Elem::from_f64(0.75),
+            Elem::from_f64(-0.5),
             Parallelism::Serial,
         );
     }

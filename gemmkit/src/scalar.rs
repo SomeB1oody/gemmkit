@@ -171,15 +171,35 @@ pub trait NarrowFloat: Scalar<Acc = f32> {
     fn narrow(x: f32) -> Self;
 }
 
+// `half`'s default `to_f32`/`from_f32` dispatch to a hardware conversion that, on
+// aarch64, is inline `asm!` (see `half`'s `binary16/arch/aarch64.rs`). Miri cannot
+// interpret inline asm, so under `cfg(miri)` these route to `half`'s own pure-software
+// `*_const` conversions instead — bit-equivalent (the same IEEE round-to-nearest-even),
+// keeping gemmkit's mixed-precision scalar pack/accumulate/epilogue exercisable under
+// Miri. Real builds are unchanged: `not(miri)` keeps the fast hardware path.
 #[cfg(feature = "half")]
 impl NarrowFloat for half::f16 {
     #[inline(always)]
     fn widen(self) -> f32 {
-        self.to_f32()
+        #[cfg(not(miri))]
+        {
+            self.to_f32()
+        }
+        #[cfg(miri)]
+        {
+            self.to_f32_const()
+        }
     }
     #[inline(always)]
     fn narrow(x: f32) -> Self {
-        half::f16::from_f32(x)
+        #[cfg(not(miri))]
+        {
+            half::f16::from_f32(x)
+        }
+        #[cfg(miri)]
+        {
+            half::f16::from_f32_const(x)
+        }
     }
 }
 
@@ -187,11 +207,25 @@ impl NarrowFloat for half::f16 {
 impl NarrowFloat for half::bf16 {
     #[inline(always)]
     fn widen(self) -> f32 {
-        self.to_f32()
+        #[cfg(not(miri))]
+        {
+            self.to_f32()
+        }
+        #[cfg(miri)]
+        {
+            self.to_f32_const()
+        }
     }
     #[inline(always)]
     fn narrow(x: f32) -> Self {
-        half::bf16::from_f32(x)
+        #[cfg(not(miri))]
+        {
+            half::bf16::from_f32(x)
+        }
+        #[cfg(miri)]
+        {
+            half::bf16::from_f32_const(x)
+        }
     }
 }
 
