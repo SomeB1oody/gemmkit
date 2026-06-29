@@ -16,14 +16,20 @@
 use crate::scalar::Scalar;
 use crate::simd::KernelSimd;
 
+#[cfg(feature = "complex")]
 pub mod complex;
 pub mod float;
+#[cfg(feature = "int8")]
 pub mod int;
+#[cfg(feature = "half")]
 pub mod mixed;
 
+#[cfg(feature = "complex")]
 pub use complex::ComplexGemm;
 pub use float::FloatGemm;
+#[cfg(feature = "int8")]
 pub use int::IntGemm;
+#[cfg(feature = "half")]
 pub use mixed::MixedGemm;
 
 /// State of the `alpha` scale, precomputed once by the driver so the microkernel

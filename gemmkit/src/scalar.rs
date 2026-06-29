@@ -40,12 +40,14 @@ impl Scalar for f64 {
 // widens them to `f32` on load and rounds back on store; the arithmetic happens in
 // `f32` via [`SimdOps`] and the [`NarrowFloat`] scalar conversions below. This is
 // the first place `Acc != Self`, the seam the mixed-precision family relies on.
+#[cfg(feature = "half")]
 impl Scalar for half::f16 {
     type Acc = f32;
     const ZERO: Self = half::f16::from_bits(0x0000);
     const ONE: Self = half::f16::from_bits(0x3C00);
 }
 
+#[cfg(feature = "half")]
 impl Scalar for half::bf16 {
     type Acc = f32;
     const ZERO: Self = half::bf16::from_bits(0x0000);
@@ -56,12 +58,14 @@ impl Scalar for half::bf16 {
 // `i32` is its own accumulator/output. Like the narrow floats, `i8` is `Scalar` but
 // not `Float` — the integer family widens `i8` to `i32` on load and does exact `i32`
 // arithmetic (wrapping on overflow, the conventional integer-GEMM semantics).
+#[cfg(feature = "int8")]
 impl Scalar for i8 {
     type Acc = i32;
     const ZERO: Self = 0;
     const ONE: Self = 1;
 }
 
+#[cfg(feature = "int8")]
 impl Scalar for i32 {
     type Acc = i32;
     const ZERO: Self = 0;
@@ -73,18 +77,21 @@ impl Scalar for i32 {
 // (`num-complex` provides Add/Mul/Sub), so they impl [`Float`] and ride the entire
 // float path. The vectorized complex multiply lives in the per-ISA `SimdOps`; conj
 // is a packing-time family variant, not a kernel branch.
+#[cfg(feature = "complex")]
 impl Scalar for num_complex::Complex<f32> {
     type Acc = Self;
     const ZERO: Self = num_complex::Complex::new(0.0, 0.0);
     const ONE: Self = num_complex::Complex::new(1.0, 0.0);
 }
 
+#[cfg(feature = "complex")]
 impl Scalar for num_complex::Complex<f64> {
     type Acc = Self;
     const ZERO: Self = num_complex::Complex::new(0.0, 0.0);
     const ONE: Self = num_complex::Complex::new(1.0, 0.0);
 }
 
+#[cfg(feature = "complex")]
 impl Float for num_complex::Complex<f32> {
     #[inline(always)]
     fn mul_add(self, b: Self, c: Self) -> Self {
@@ -94,6 +101,7 @@ impl Float for num_complex::Complex<f32> {
     }
 }
 
+#[cfg(feature = "complex")]
 impl Float for num_complex::Complex<f64> {
     #[inline(always)]
     fn mul_add(self, b: Self, c: Self) -> Self {
@@ -106,11 +114,13 @@ impl Float for num_complex::Complex<f64> {
 /// conjugating the packed `A` or `B` panel — so the hot loop stays a single plain
 /// complex FMA with no per-element conj branch. Implemented only for the complex
 /// types (a real type would just be identity, but no real family needs it).
+#[cfg(feature = "complex")]
 pub trait Conjugate: Scalar {
     /// The complex conjugate (`re - im·i`).
     fn conjugate(self) -> Self;
 }
 
+#[cfg(feature = "complex")]
 impl Conjugate for num_complex::Complex<f32> {
     #[inline(always)]
     fn conjugate(self) -> Self {
@@ -118,6 +128,7 @@ impl Conjugate for num_complex::Complex<f32> {
     }
 }
 
+#[cfg(feature = "complex")]
 impl Conjugate for num_complex::Complex<f64> {
     #[inline(always)]
     fn conjugate(self) -> Self {
@@ -131,6 +142,7 @@ impl Conjugate for num_complex::Complex<f64> {
 /// SIMD widen-load / narrow-store on [`crate::simd::SimdOps`] instead. Kept separate
 /// from [`Float`] precisely because these types have no native arithmetic — the
 /// point of mixed precision.
+#[cfg(feature = "half")]
 pub trait NarrowFloat: Scalar<Acc = f32> {
     /// Widen one value to `f32` (exact — `f16`/`bf16` are a subset of `f32`).
     fn widen(self) -> f32;
@@ -138,6 +150,7 @@ pub trait NarrowFloat: Scalar<Acc = f32> {
     fn narrow(x: f32) -> Self;
 }
 
+#[cfg(feature = "half")]
 impl NarrowFloat for half::f16 {
     #[inline(always)]
     fn widen(self) -> f32 {
@@ -149,6 +162,7 @@ impl NarrowFloat for half::f16 {
     }
 }
 
+#[cfg(feature = "half")]
 impl NarrowFloat for half::bf16 {
     #[inline(always)]
     fn widen(self) -> f32 {

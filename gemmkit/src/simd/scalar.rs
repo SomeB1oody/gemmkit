@@ -4,15 +4,21 @@
 //! also what makes the `SimdOps` abstraction honest: the exact same generic
 //! kernel that drives AVX-512 drives this token with a one-element "register".
 
+#[cfg(feature = "half")]
 use half::{bf16, f16};
+#[cfg(feature = "complex")]
 use num_complex::Complex;
 
-use super::{KernelSimd, Simd, SimdOps};
+#[cfg(any(feature = "half", feature = "int8"))]
+use super::KernelSimd;
+use super::{Simd, SimdOps};
+#[cfg(feature = "half")]
 use crate::scalar::NarrowFloat;
 
 // Complex (scalar fallback): the `Reg` is one `Complex`, arithmetic is num-complex's
 // (the complex multiply / FMA the SIMD tokens vectorize). The Miri-checked reference
 // for the complex path.
+#[cfg(feature = "complex")]
 macro_rules! impl_scalar_complex {
     ($t:ty) => {
         impl SimdOps<Complex<$t>> for ScalarTok {
@@ -63,7 +69,9 @@ macro_rules! impl_scalar_complex {
         }
     };
 }
+#[cfg(feature = "complex")]
 impl_scalar_complex!(f32);
+#[cfg(feature = "complex")]
 impl_scalar_complex!(f64);
 
 /// The scalar (1-lane) ISA token. Always available.
@@ -137,6 +145,7 @@ impl_scalar_ops!(f64);
 // Mixed-precision (scalar fallback): `f16`/`bf16` widen to `f32` on load and round
 // back on store, one element at a time (LANES == 1, so the `Reg` is a bare `f32`).
 // This is the portability floor and the Miri-checked reference for the narrow types.
+#[cfg(feature = "half")]
 impl KernelSimd<f16, f16, f32, f16> for ScalarTok {
     #[inline(always)]
     unsafe fn load_lhs(self, p: *const f16) -> f32 {
@@ -159,6 +168,7 @@ impl KernelSimd<f16, f16, f32, f16> for ScalarTok {
 // Integer GEMM (scalar fallback): `i32` accumulator ops and the `i8 -> i32`
 // widen-load, one element at a time. Wrapping arithmetic = conventional integer
 // overflow semantics. This is the Miri-checked reference for the integer path.
+#[cfg(feature = "int8")]
 impl SimdOps<i32> for ScalarTok {
     type Reg = i32;
     const LANES: usize = 1;
@@ -206,6 +216,7 @@ impl SimdOps<i32> for ScalarTok {
     }
 }
 
+#[cfg(feature = "int8")]
 impl KernelSimd<i8, i8, i32, i32> for ScalarTok {
     #[inline(always)]
     unsafe fn load_lhs(self, p: *const i8) -> i32 {
@@ -225,6 +236,7 @@ impl KernelSimd<i8, i8, i32, i32> for ScalarTok {
     }
 }
 
+#[cfg(feature = "half")]
 impl KernelSimd<bf16, bf16, f32, bf16> for ScalarTok {
     #[inline(always)]
     unsafe fn load_lhs(self, p: *const bf16) -> f32 {

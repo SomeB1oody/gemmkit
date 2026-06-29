@@ -39,6 +39,13 @@
 //!   workspace pool.
 //! * `parallel` (default) — rayon multithreading. With it off everything still
 //!   compiles and runs single-threaded.
+//! * `complex` — complex GEMM over `c32`/`c64` with optional conjugation
+//!   ([`gemm_cplx`]); pulls in `num-complex`.
+//! * `half` — `f16`/`bf16` mixed-precision GEMM (`f32` accumulate); pulls in `half`.
+//! * `int8` — `i8 -> i32` integer GEMM ([`gemm_i8`]); no extra dependency.
+//!
+//! The three element-type families are **off by default** — a plain `f32`/`f64`
+//! build pays for none of their codegen or dependencies. Enable the ones you need.
 
 #![warn(missing_docs)]
 #![allow(clippy::missing_safety_doc)] // safety documented at the module / contract level
@@ -58,13 +65,22 @@ mod special;
 mod workspace;
 
 pub use api::{
-    MatMut, MatRef, PackedLhs, PackedRhs, gemm, gemm_cplx, gemm_cplx_with, gemm_i8,
-    gemm_i8_unchecked, gemm_i8_with, gemm_packed_a, gemm_packed_a_with, gemm_packed_b,
+    MatMut, MatRef, PackedLhs, PackedRhs, gemm, gemm_packed_a, gemm_packed_a_with, gemm_packed_b,
     gemm_packed_b_with, gemm_unchecked, gemm_unchecked_with, gemm_with, prepack_lhs, prepack_rhs,
 };
-pub use dispatch::{ComplexScalar, GemmScalar};
+#[cfg(feature = "complex")]
+pub use api::{gemm_cplx, gemm_cplx_unchecked, gemm_cplx_unchecked_with, gemm_cplx_with};
+#[cfg(feature = "int8")]
+pub use api::{gemm_i8, gemm_i8_unchecked, gemm_i8_with};
+#[cfg(feature = "complex")]
+pub use dispatch::ComplexScalar;
+pub use dispatch::GemmScalar;
 pub use parallel::Parallelism;
-pub use scalar::{Conjugate, Float, NarrowFloat, Scalar};
+#[cfg(feature = "complex")]
+pub use scalar::Conjugate;
+#[cfg(feature = "half")]
+pub use scalar::NarrowFloat;
+pub use scalar::{Float, Scalar};
 pub use workspace::Workspace;
 
 #[doc(no_inline)]
@@ -72,17 +88,22 @@ pub use cache::{CacheTopology, Machine, topology};
 
 /// Re-exported [`half`] narrow float types (`f16`, `bf16`), so callers can run a
 /// mixed-precision GEMM without depending on `half` directly. They accumulate in
-/// `f32` (their [`Scalar::Acc`]).
+/// `f32` (their [`Scalar::Acc`]). Requires the `half` feature.
+#[cfg(feature = "half")]
 #[doc(no_inline)]
 pub use half::{bf16, f16};
 
 /// Re-exported [`num_complex::Complex`] (and the `c32`/`c64` aliases), so callers can
 /// run a complex GEMM (via [`gemm_cplx`]) without depending on `num-complex` directly.
+/// Requires the `complex` feature.
+#[cfg(feature = "complex")]
 #[doc(no_inline)]
 pub use num_complex::Complex;
 /// `Complex<f32>` — the single-precision complex element type.
+#[cfg(feature = "complex")]
 #[allow(non_camel_case_types)]
 pub type c32 = num_complex::Complex<f32>;
 /// `Complex<f64>` — the double-precision complex element type.
+#[cfg(feature = "complex")]
 #[allow(non_camel_case_types)]
 pub type c64 = num_complex::Complex<f64>;

@@ -12,7 +12,9 @@
 //! through strides (a transposed view swaps `rs`/`cs`, no copy). When `beta == 0`
 //! the output C is **not read**, so it may be uninitialized.
 
-use crate::dispatch::{self, ComplexScalar, GemmScalar, PackedConsume, Task};
+#[cfg(feature = "complex")]
+use crate::dispatch::ComplexScalar;
+use crate::dispatch::{self, GemmScalar, PackedConsume, Task};
 use crate::parallel::Parallelism;
 use crate::workspace::{self, Workspace};
 
@@ -761,6 +763,7 @@ fn overlaps_bytes(
 /// element uniquely and does not overlap `A`/`B`). Negative-stride / raw-pointer
 /// callers use [`gemm_i8_unchecked`] (the homogeneous [`gemm_unchecked`] cannot
 /// serve `i8 -> i32`).
+#[cfg(feature = "int8")]
 pub fn gemm_i8(
     alpha: i32,
     a: MatRef<'_, i8>,
@@ -776,6 +779,7 @@ pub fn gemm_i8(
 ///
 /// # Panics
 /// Same conditions as [`gemm_i8`].
+#[cfg(feature = "int8")]
 pub fn gemm_i8_with(
     ws: &mut Workspace,
     alpha: i32,
@@ -859,6 +863,7 @@ pub fn gemm_i8_with(
 ///
 /// # Panics
 /// Same shape / bounds / aliasing conditions as [`gemm`].
+#[cfg(feature = "complex")]
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_cplx<T: ComplexScalar>(
     alpha: T,
@@ -877,6 +882,7 @@ pub fn gemm_cplx<T: ComplexScalar>(
 ///
 /// # Panics
 /// Same conditions as [`gemm_cplx`].
+#[cfg(feature = "complex")]
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_cplx_with<T: ComplexScalar>(
     ws: &mut Workspace,
@@ -950,6 +956,99 @@ pub fn gemm_cplx_with<T: ComplexScalar>(
     }
 }
 
+/// The raw complex engine: `C <- alpha·op(A)·op(B) + beta·C` over pointers and
+/// `isize` strides, with **no** bounds/alias/shape checks — the complex counterpart
+/// of [`gemm_unchecked`] (`op` conjugates that operand when its `conj_*` flag is set).
+/// This is the raw path the ndarray adapter and other advanced callers use to express
+/// arbitrary (transposed / negative) strides. Uses the thread-local workspace pool.
+///
+/// # Safety
+/// The caller guarantees `a`/`b` valid for reads and `c` for read+write over every
+/// `(i,j)` implied by the dimensions and strides; `c` does not alias `a`/`b`; and
+/// when `beta == 0`, `c` need not be initialized.
+#[cfg(feature = "complex")]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gemm_cplx_unchecked<T: ComplexScalar>(
+    m: usize,
+    k: usize,
+    n: usize,
+    alpha: T,
+    a: *const T,
+    rsa: isize,
+    csa: isize,
+    conj_a: bool,
+    b: *const T,
+    rsb: isize,
+    csb: isize,
+    conj_b: bool,
+    beta: T,
+    c: *mut T,
+    rsc: isize,
+    csc: isize,
+    par: Parallelism,
+) {
+    unsafe {
+        workspace::with_thread_pool(|ws| {
+            gemm_cplx_unchecked_with(
+                ws, m, k, n, alpha, a, rsa, csa, conj_a, b, rsb, csb, conj_b, beta, c, rsc, csc,
+                par,
+            );
+        });
+    }
+}
+
+/// As [`gemm_cplx_unchecked`] but with a caller-owned [`Workspace`].
+///
+/// # Safety
+/// See [`gemm_cplx_unchecked`].
+#[cfg(feature = "complex")]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gemm_cplx_unchecked_with<T: ComplexScalar>(
+    ws: &mut Workspace,
+    m: usize,
+    k: usize,
+    n: usize,
+    alpha: T,
+    a: *const T,
+    rsa: isize,
+    csa: isize,
+    conj_a: bool,
+    b: *const T,
+    rsb: isize,
+    csb: isize,
+    conj_b: bool,
+    beta: T,
+    c: *mut T,
+    rsc: isize,
+    csc: isize,
+    par: Parallelism,
+) {
+    unsafe {
+        dispatch::execute_complex(
+            conj_a,
+            conj_b,
+            Task {
+                m,
+                k,
+                n,
+                alpha,
+                a,
+                rsa,
+                csa,
+                b,
+                rsb,
+                csb,
+                beta,
+                c,
+                rsc,
+                csc,
+            },
+            par,
+            ws,
+        );
+    }
+}
+
 /// The raw integer engine: `C(i32) <- alpha·A(i8)·B(i8) + beta·C` over pointers and
 /// `isize` strides, with **no** bounds/alias/shape checks — the heterogeneous
 /// counterpart of [`gemm_unchecked`] (which is typed for the homogeneous surface and
@@ -960,6 +1059,7 @@ pub fn gemm_cplx_with<T: ComplexScalar>(
 /// The caller guarantees `a`/`b` valid for reads and `c` for read+write over every
 /// `(i,j)` implied by the dimensions and strides; `c` does not alias `a`/`b`; and
 /// when `beta == 0`, `c` need not be initialized.
+#[cfg(feature = "int8")]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn gemm_i8_unchecked(
     m: usize,

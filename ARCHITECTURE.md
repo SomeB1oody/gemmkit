@@ -112,6 +112,14 @@ surface can't express `Out != Lhs`; it reuses the `KernelSimd` widen seam with a
 `vpdpbusd` dot kernel is a deferred increment), and `ComplexGemm<T, CONJ_A, CONJ_B>`
 (`Complex<f32>`/`Complex<f64>`, via the public `gemm_cplx`).
 
+`FloatGemm` is always built; the other three families are **optional, off-by-default
+Cargo features** — `half` (`MixedGemm`, pulls `half`), `int8` (`IntGemm`, no extra
+dep), and `complex` (`ComplexGemm`, pulls `num-complex`). Gating is purely additive
+and orthogonal to the seam: each feature toggles a family's kernel, its per-ISA
+`SimdOps`/`KernelSimd` impls, its dispatch ladder, and its public entry — the driver,
+packing framework, cache model, and parallelism are untouched, so a plain `f32`/`f64`
+build pays for none of their codegen or dependencies.
+
 **Complex (op-family seam).** Complex is homogeneous, so the per-ISA
 `SimdOps<Complex<_>>` make `mul`/`mul_add` the **vectorized complex multiply**
 (interleaved re/im, shuffle + `fmaddsub`), and `ComplexGemm`'s microkernel just

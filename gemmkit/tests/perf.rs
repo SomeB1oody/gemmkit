@@ -96,6 +96,7 @@ fn gflops(m: usize, k: usize, n: usize, secs: f64) -> f64 {
 /// f16 GEMM throughput: gemmkit (f32-accumulate mixed kernel) vs the `gemm` crate
 /// (same f16-in-f32-acc convention). The adopt bar for a new type is "same ballpark
 /// as the `gemm` crate", so this reports the ratio. f16 FLOPs counted like f32.
+#[cfg(feature = "half")]
 fn bench_f16(s: usize, parallel: bool) {
     use gemmkit::f16;
     let (m, k, n) = (s, s, s);
@@ -158,6 +159,7 @@ fn bench_f16(s: usize, parallel: bool) {
     );
 }
 
+#[cfg(feature = "half")]
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
 fn perf_f16() {
@@ -173,6 +175,7 @@ fn perf_f16() {
 
 /// i8 -> i32 GEMM throughput (no `gemm`-crate baseline — it lacks i8 in 0.18). Just
 /// confirms the widen-and-multiply kernel is SIMD-accelerated, not scalar-bound.
+#[cfg(feature = "int8")]
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
 fn perf_i8() {
@@ -213,6 +216,7 @@ fn perf_i8() {
 /// Complex (c32) GEMM throughput: gemmkit (`gemm_cplx`, no conj) vs the `gemm` crate
 /// (native c32). Complex FLOPs counted as 4× the real count (a complex mul-add is
 /// ~4 real mul + 4 real add), the convention both report.
+#[cfg(feature = "complex")]
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
 fn perf_complex() {
