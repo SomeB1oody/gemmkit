@@ -77,7 +77,7 @@ pub use dispatch::ComplexScalar;
 pub use dispatch::GemmScalar;
 pub use parallel::Parallelism;
 #[cfg(feature = "complex")]
-pub use scalar::Conjugate;
+pub use scalar::ComplexFloat;
 #[cfg(feature = "half")]
 pub use scalar::NarrowFloat;
 pub use scalar::{Float, Scalar};

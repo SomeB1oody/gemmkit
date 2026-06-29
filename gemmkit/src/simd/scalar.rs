@@ -6,73 +6,12 @@
 
 #[cfg(feature = "half")]
 use half::{bf16, f16};
-#[cfg(feature = "complex")]
-use num_complex::Complex;
 
 #[cfg(any(feature = "half", feature = "int8"))]
 use super::KernelSimd;
 use super::{Simd, SimdOps};
 #[cfg(feature = "half")]
 use crate::scalar::NarrowFloat;
-
-// Complex (scalar fallback): one `Complex` per `Reg`, using num-complex's
-// arithmetic (the complex multiply / FMA the SIMD tokens vectorize). Miri-checked
-// reference for the complex path.
-#[cfg(feature = "complex")]
-macro_rules! impl_scalar_complex {
-    ($t:ty) => {
-        impl SimdOps<Complex<$t>> for ScalarTok {
-            type Reg = Complex<$t>;
-            const LANES: usize = 1;
-            const ALIGN: usize = core::mem::align_of::<Complex<$t>>();
-
-            #[inline(always)]
-            unsafe fn zero(self) -> Self::Reg {
-                Complex::new(0.0, 0.0)
-            }
-            #[inline(always)]
-            unsafe fn splat(self, v: Complex<$t>) -> Self::Reg {
-                v
-            }
-            #[inline(always)]
-            unsafe fn load(self, p: *const Complex<$t>) -> Self::Reg {
-                unsafe { *p }
-            }
-            #[inline(always)]
-            unsafe fn loadu(self, p: *const Complex<$t>) -> Self::Reg {
-                unsafe { *p }
-            }
-            #[inline(always)]
-            unsafe fn store(self, p: *mut Complex<$t>, v: Self::Reg) {
-                unsafe { *p = v }
-            }
-            #[inline(always)]
-            unsafe fn storeu(self, p: *mut Complex<$t>, v: Self::Reg) {
-                unsafe { *p = v }
-            }
-            #[inline(always)]
-            unsafe fn mul(self, a: Self::Reg, b: Self::Reg) -> Self::Reg {
-                a * b
-            }
-            #[inline(always)]
-            unsafe fn add(self, a: Self::Reg, b: Self::Reg) -> Self::Reg {
-                a + b
-            }
-            #[inline(always)]
-            unsafe fn mul_add(self, a: Self::Reg, b: Self::Reg, c: Self::Reg) -> Self::Reg {
-                a * b + c
-            }
-            #[inline(always)]
-            unsafe fn reduce_sum(self, v: Self::Reg) -> Complex<$t> {
-                v
-            }
-        }
-    };
-}
-#[cfg(feature = "complex")]
-impl_scalar_complex!(f32);
-#[cfg(feature = "complex")]
-impl_scalar_complex!(f64);
 
 /// The scalar (1-lane) ISA token. Always available.
 #[derive(Copy, Clone, Default)]
@@ -130,6 +69,12 @@ macro_rules! impl_scalar_ops {
                 // Plain `a*b + c` keeps the scalar path bit-reproducible and in
                 // agreement with `Float::mul_add` used by the epilogue.
                 a * b + c
+            }
+            #[inline(always)]
+            unsafe fn fnma(self, a: Self::Reg, b: Self::Reg, c: Self::Reg) -> Self::Reg {
+                // Plain `c - a*b` (the scalar reference for the SoA complex kernel's
+                // `acc_re -= a_im·b_im` step).
+                c - a * b
             }
             #[inline(always)]
             unsafe fn reduce_sum(self, v: Self::Reg) -> $t {
@@ -211,6 +156,10 @@ impl SimdOps<i32> for ScalarTok {
         a.wrapping_mul(b).wrapping_add(c)
     }
     #[inline(always)]
+    unsafe fn fnma(self, a: i32, b: i32, c: i32) -> i32 {
+        c.wrapping_sub(a.wrapping_mul(b))
+    }
+    #[inline(always)]
     unsafe fn reduce_sum(self, v: i32) -> i32 {
         v
     }
@@ -255,3 +204,10 @@ impl KernelSimd<bf16, bf16, f32, bf16> for ScalarTok {
         unsafe { *p = bf16::narrow(v) }
     }
 }
+
+// Complex (scalar fallback): the Miri-checked SoA reference. `LANES = 1`, the real `Reg`
+// is the scalar itself; complex GEMM routes through the shared `soa_microkernel`.
+#[cfg(feature = "complex")]
+impl_complex_simd!(ScalarTok, f32, f32, 1, core::mem::align_of::<f32>());
+#[cfg(feature = "complex")]
+impl_complex_simd!(ScalarTok, f64, f64, 1, core::mem::align_of::<f64>());

@@ -9,8 +9,9 @@ and **no `transmute`**.
 ## Design principles
 
 1. **The algorithm is written once.** Blocking, packing, parallelism, and cache
-   modelling are all generic. There is exactly one five-loop driver and exactly
-   one floating-point microkernel.
+   modelling are all generic. There is exactly one five-loop driver, and each family's
+   microkernel is a single generic function across all ISAs and tiles (the real
+   `FloatGemm` one; the shared split-layout complex one).
 2. **Variation points collapse onto traits.** ISA → [`SimdOps`]; element type →
    [`Scalar`]; operation family → [`KernelFamily`]. Tile geometry is a pair of
    const generics chosen at the dispatch site.
@@ -50,10 +51,10 @@ No arithmetic lives on it, so adding an element type does not grow the trait.
 
 [`SimdOps<T>`] is the **load-bearing wall**. It is *thick*: it exposes every
 primitive the whole microkernel needs — `zero`, `splat`, `load`/`loadu`,
-`store`/`storeu`, `mul`, `add`, `mul_add`, `reduce_sum` — plus `LANES` and
-`ALIGN`. Because the ISA *token* and the element *type* are decoupled, `LANES`
-varies with the `(ISA, T)` pair (f32@FMA = 8, f32@AVX-512 = 16, f32@NEON = 4, f64
-halved).
+`store`/`storeu`, `mul`, `add`, `mul_add`, `fnma` (fused `c - a·b`, for the complex
+kernel's `acc_re -= ai·bi`), `reduce_sum` — plus `LANES` and `ALIGN`. Because the ISA
+*token* and the element *type* are decoupled, `LANES` varies with the `(ISA, T)` pair
+(f32@FMA = 8, f32@AVX-512 = 16, f32@NEON = 4, f64 halved).
 
 This is the direct answer to matrixmultiply's thin-trait trap. matrixmultiply's
 kernel trait abstracts only the multiply-add, so the entire microkernel had to be
@@ -120,22 +121,39 @@ and orthogonal to the seam: each feature toggles a family's kernel, its per-ISA
 packing framework, cache model, and parallelism are untouched, so a plain `f32`/`f64`
 build pays for none of their codegen or dependencies.
 
-**Complex (op-family seam).** Complex is homogeneous, so the per-ISA
-`SimdOps<Complex<_>>` make `mul`/`mul_add` the **vectorized complex multiply**
-(interleaved re/im: x86 shuffles + the fused `fmaddsub`; NEON shuffles
-(`vtrn`/`vrev`) + **unfused** `vmul`/`vsub`/`vadd` with a lane blend — NEON's fused
-`FCMLA` is deliberately avoided, since fusing the multiply-add into one rounding step
-would diverge from the unfused scalar reference the NEON path is kept bit-identical
-to), and `ComplexGemm`'s microkernel just delegates to `FloatGemm`'s — one kernel. **Conjugation is on the pack seam, not the
-hot loop:** `CONJ_A`/`CONJ_B` are `const` params, and a set flag conjugates that
-operand *during packing* (so `A̅·B` falls out of the same plain complex FMA). Because
-a conjugated operand must therefore always be packed, the family sets the
-`KernelFamily::FORCE_PACK_LHS`/`FORCE_PACK_RHS` consts, which the driver ORs into its
-pack decisions. Dispatch maps the runtime conj flags to the const-generic variant
-(and the orientation swap swaps the flags too, since `(A̅·B)ᵀ = Bᵀ·A̅ᵀ`); `conjC` is
-deferred. The deferred integer VNNI (a dot kernel with interleaved-K packing and a
-requantize epilogue) would arrive the same way, with the driver, packing framework,
-cache model, and parallelism untouched.
+**Complex (op-family seam) — a dedicated split (SoA) kernel.** `ComplexGemm` does
+**not** ride `FloatGemm`. The product runs in the **structure-of-arrays** layout: real
+and imaginary planes in **separate accumulator registers**, so one complex
+multiply-accumulate is four fused *real* FMAs into two banks — `acc_re += ar·br`,
+`acc_re -= ai·bi`, `acc_im += ar·bi`, `acc_im += ai·br` — with no in-loop shuffle or
+`fmaddsub` (that `-=` step is the only new L0 primitive, `SimdOps::fnma`, x86 `fnmadd` /
+NEON `vfms`). The de-interleave moves *out* of the `kc` loop into the pack: each
+micropanel is laid down **planar** (per depth step, the `mr`/`nr` reals then the imags),
+amortized `O(MK+KN)` instead of `O(MNK)`, so the kernel loads a register of reals and a
+register of imags with plain contiguous loads. Because the kernel only consumes that
+layout, both operands are **always** packed (`FORCE_PACK_LHS = FORCE_PACK_RHS = true`).
+The epilogue de-interleaves `C`, folds the complex `alpha`/`beta`, and re-interleaves on
+store. This is the only path to NEON's full FMA throughput on **stable** Rust (the fused
+`FCMLA` is nightly-gated and would also break determinism) and it raises x86 throughput
+over the old interleaved-`fmaddsub` kernel.
+
+The family stays homogeneous (`Acc = T`, so the complex `alpha`/`beta` thread through the
+unchanged driver), but the hot loop runs on the *real* component, which the
+`KernelSimd<T, T, T, T>` bound — yielding only `SimdOps<Complex>` — cannot name. The
+bridge is `SimdOps::cplx_microkernel`, the **complex analogue of `accumulate_tile`**: an
+L0 seam whose default is unreachable and whose per-ISA `SimdOps<Complex<_>>` override has
+the real `SimdOps<f32>`/`<f64>` concretely and forwards to one shared, ISA-generic SoA
+kernel. The thin `SimdOps<Complex<_>>` glue exists only so the driver can read `LANES`
+(set to the **real** lane count: real lanes = complex rows the tile spans) and the
+homogeneous `KernelSimd` blanket applies; complex GEMM never calls its element ops.
+
+**Conjugation is a sign flip on the packed imaginary plane:** `CONJ_A`/`CONJ_B` are
+`const` params, and a set flag negates the imag plane *during packing*, so `A̅·B` falls
+out of the same real-FMA loop — no per-element conj branch. Dispatch maps the runtime
+conj flags to the const-generic variant (and the orientation swap swaps the flags too,
+since `(A̅·B)ᵀ = Bᵀ·A̅ᵀ`); `conjC` is deferred. The deferred integer VNNI (a dot kernel
+with interleaved-K packing and a requantize epilogue) would arrive the same way, with the
+driver, packing framework, cache model, and parallelism untouched.
 
 **Mixed precision (`Acc != Lhs`).** `MixedGemm<N>` is the seam's first asymmetric
 family: it packs narrow `N` panels (plain micropanels, like the float pack),
@@ -318,9 +336,10 @@ reversed views all work without copying. `dot` is the `.dot()`-style convenience
 
 ## How this maps to the rigor criteria
 
-- **No macro-generated kernels** — the microkernel is the single generic function;
-  the only `macro_rules!` in the crate generates the *scalar* `SimdOps` impl
-  boilerplate, not kernel bodies.
+- **No macro-generated kernels** — each microkernel is a single generic function (the
+  real one; the one shared SoA complex one); the only `macro_rules!` in the crate
+  generate `SimdOps` *impl boilerplate* — the scalar token's element ops and the thin
+  complex glue — never kernel bodies.
 - **One kernel, all ISAs** — adding an ISA is a `SimdOps` impl + one `vectorize`
   trampoline + a few dispatch lines, with the driver, packing, blocking,
   parallelism, API, and microkernel all untouched. The AArch64 NEON token is the

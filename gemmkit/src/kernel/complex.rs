@@ -1,23 +1,39 @@
 //! The complex GEMM family: `Complex<f32>` / `Complex<f64>`, with optional
 //! conjugation of `A` and/or `B`.
 //!
-//! Complex is homogeneous (`Lhs = Rhs = Acc = Out`) with native arithmetic, so it
-//! rides the float path: the per-ISA `SimdOps<Complex<_>>` make `mul` / `mul_add`
-//! the vectorized complex multiply (interleaved re/im, shuffle + `fmaddsub`), and
-//! `ComplexGemm`'s microkernel delegates to [`super::float::FloatGemm`]'s.
+//! Unlike the other families, complex does **not** ride [`super::float::FloatGemm`].
+//! It is a *dedicated* kernel built on the **split (structure-of-arrays) layout**: the
+//! real and imaginary planes live in separate accumulator registers, so the hot loop is
+//! pure real FMAs (`vfmadd`/`vfnmadd`, no in-loop shuffles or `fmaddsub`). One complex
+//! multiply-accumulate is four fused real steps into two running accumulators:
+//! `acc_re += ar·br`, `acc_re -= ai·bi`, `acc_im += ar·bi`, `acc_im += ai·br`.
 //!
-//! Conjugation lives on the pack seam, not the hot loop. `conjA` / `conjB` are
-//! `const` parameters: when set, the packed `A` (resp. `B`) panel is conjugated
-//! during packing, so `A̅·B` / `A·B̅` fall out of the same plain complex FMA — no
-//! per-element conj branch in the microkernel. `conjC` (output conjugation) is not
-//! yet implemented.
+//! The de-interleave moves *out* of the `kc` inner loop into the pack (amortized
+//! `O(MK+KN)` instead of `O(MNK)`): [`ComplexGemm::pack_lhs`]/[`ComplexGemm::pack_rhs`]
+//! lay each micropanel down **planar** — for every depth step, the `mr` (resp. `nr`)
+//! reals followed by the `mr` (resp. `nr`) imags — so the kernel loads a register of
+//! reals and a register of imags with plain contiguous loads. Because the kernel can
+//! only consume that planar layout, both operands are **always** packed
+//! (`FORCE_PACK_LHS = FORCE_PACK_RHS = true`).
+//!
+//! Conjugation is a sign flip on the packed imaginary plane: `conjA` / `conjB` are
+//! `const` parameters, and a set flag negates the imag plane during packing, so `A̅·B` /
+//! `A·B̅` fall out of the same real-FMA loop — no per-element conj branch. `conjC`
+//! (output conjugation) is not yet implemented.
+//!
+//! The family stays homogeneous (`Acc = T`, so complex `alpha`/`beta` thread through the
+//! driver unchanged), but the hot loop runs on the *real* component. The driver bound
+//! `KernelSimd<T, T, T, T>` only yields `SimdOps<T>` (complex), not the real ops, so the
+//! microkernel below forwards to [`crate::simd::SimdOps::cplx_microkernel`] — the L0 seam
+//! (the complex analogue of `accumulate_tile`) whose per-ISA override has the real
+//! `SimdOps<T::Real>` and runs the one shared SoA kernel. (Per-ISA tuning of the
+//! de-interleave pack / C epilogue with `vld2`/`vst2` is the remaining NEON work; see
+//! `simd/neon.rs`.)
 
 use core::marker::PhantomData;
 
-use super::float::FloatGemm;
 use super::{AlphaStatus, BetaStatus, KernelFamily};
-use crate::pack::pack_panels;
-use crate::scalar::{Conjugate, Float};
+use crate::scalar::{ComplexFloat, Scalar};
 use crate::simd::KernelSimd;
 
 /// The complex GEMM family. `T` is `Complex<f32>` or `Complex<f64>`; `CONJ_A` /
@@ -31,32 +47,105 @@ impl<T, const CONJ_A: bool, const CONJ_B: bool> Clone for ComplexGemm<T, CONJ_A,
 }
 impl<T, const CONJ_A: bool, const CONJ_B: bool> Copy for ComplexGemm<T, CONJ_A, CONJ_B> {}
 
-/// Conjugate every element of a just-packed panel in place.
+/// Pack one `n_lead × depth_len` block into **planar** micropanels: `ceil(n_lead/width)`
+/// panels, each storing — for every depth step — `width` real parts immediately followed
+/// by `width` imaginary parts (`conj` negates the imags). Tail leading positions past
+/// `n_lead` are zero-filled. This is the de-interleaved analogue of [`crate::pack`]'s
+/// interleaved micropanel copy; LHS sets `lead = rows` / `depth = cols`, RHS swaps them.
+/// It mirrors that helper's two paths — a contiguous-leading walk and a cache-blocked
+/// transpose for a strided source — so a row-major operand packs without a cache miss per
+/// element. The two paths write byte-identical panels (only the write order differs).
 ///
 /// # Safety
-/// `dst` valid for `count` reads+writes.
+/// `src` must cover the `n_lead × depth_len` region addressed by `lead`/`depth`; `dst`
+/// must hold `ceil(n_lead/width) * width * depth_len` complex elements (i.e. twice that
+/// many `T::Real`).
+#[allow(clippy::too_many_arguments)]
 #[inline]
-unsafe fn conjugate_panel<T: Conjugate>(dst: *mut T, count: usize) {
+unsafe fn pack_planar<T: ComplexFloat>(
+    dst: *mut T,
+    src: *const T,
+    lead: isize,
+    depth: isize,
+    n_lead: usize,
+    depth_len: usize,
+    width: usize,
+    conj: bool,
+) {
     unsafe {
-        for i in 0..count {
-            *dst.add(i) = (*dst.add(i)).conjugate();
+        let zero = <T::Real as Scalar>::ZERO;
+        // conj = negate the imaginary plane (true `-im`, so `+0.0` maps to `-0.0`,
+        // matching `num_complex`'s `.conj()`); else copy it through.
+        let pack_im = |im: T::Real| if conj { -im } else { im };
+        // Each panel occupies `depth_len * 2 * width` reals (re plane + im plane per
+        // depth step). Write through a real-typed cursor.
+        let mut panel = dst as *mut T::Real;
+        let mut base = 0usize;
+        while base < n_lead {
+            let live = core::cmp::min(width, n_lead - base);
+            if lead == 1 {
+                // Contiguous leading dimension: each depth step's `width` complex are
+                // adjacent, so walk them in order and de-interleave.
+                for p in 0..depth_len {
+                    let re_off = p * 2 * width;
+                    let s = src.offset(base as isize + p as isize * depth);
+                    for i in 0..width {
+                        if i < live {
+                            let z = *s.add(i);
+                            *panel.add(re_off + i) = z.re();
+                            *panel.add(re_off + width + i) = pack_im(z.im());
+                        } else {
+                            *panel.add(re_off + i) = zero;
+                            *panel.add(re_off + width + i) = zero;
+                        }
+                    }
+                }
+            } else {
+                // Cache-blocked transpose: walk the source along its contiguous `depth`
+                // dimension (stride 1 for a row-major LHS / column-major RHS) in short
+                // strips per leading row, scattering into the planar panel — rather than
+                // gathering `width` strided elements per depth step (a cache miss each).
+                const TILE: usize = 16;
+                let mut p0 = 0;
+                while p0 < depth_len {
+                    let pe = core::cmp::min(p0 + TILE, depth_len);
+                    for i in 0..width {
+                        if i < live {
+                            let row = src.offset((base + i) as isize * lead);
+                            for p in p0..pe {
+                                let z = *row.offset(p as isize * depth);
+                                *panel.add(p * 2 * width + i) = z.re();
+                                *panel.add(p * 2 * width + width + i) = pack_im(z.im());
+                            }
+                        } else {
+                            for p in p0..pe {
+                                *panel.add(p * 2 * width + i) = zero;
+                                *panel.add(p * 2 * width + width + i) = zero;
+                            }
+                        }
+                    }
+                    p0 = pe;
+                }
+            }
+            panel = panel.add(depth_len * 2 * width);
+            base += width;
         }
     }
 }
 
 impl<T, const CONJ_A: bool, const CONJ_B: bool> KernelFamily for ComplexGemm<T, CONJ_A, CONJ_B>
 where
-    T: Float<Acc = T> + Conjugate,
+    T: ComplexFloat,
 {
     type Lhs = T;
     type Rhs = T;
     type Acc = T;
     type Out = T;
 
-    // Conjugation happens at pack time, so a conjugated operand must always be
-    // packed — otherwise the driver could read it in place, unconjugated.
-    const FORCE_PACK_LHS: bool = CONJ_A;
-    const FORCE_PACK_RHS: bool = CONJ_B;
+    // The SoA kernel can only consume the planar (de-interleaved) layout, so both
+    // operands must always be packed — never read in place.
+    const FORCE_PACK_LHS: bool = true;
+    const FORCE_PACK_RHS: bool = true;
 
     #[inline]
     unsafe fn pack_lhs(
@@ -68,15 +157,11 @@ where
         kc: usize,
         mr: usize,
     ) {
+        // LHS: leading dimension is rows (stride `rs`), depth is columns (stride `cs`).
         unsafe {
-            pack_panels(
-                dst, src, /*lead*/ rs, /*depth*/ cs, /*n_lead*/ mc, kc, mr,
+            pack_planar(
+                dst, src, /*lead*/ rs, /*depth*/ cs, mc, kc, mr, CONJ_A,
             );
-            if CONJ_A {
-                // Conjugate the whole packed panel including zero pad (conj of 0 is
-                // 0, so the pad is unaffected). Count = ceil(mc/mr)*mr*kc.
-                conjugate_panel(dst, mc.div_ceil(mr) * mr * kc);
-            }
         }
     }
 
@@ -90,13 +175,11 @@ where
         nc: usize,
         nr: usize,
     ) {
+        // RHS: leading dimension is columns (stride `cs`), depth is rows (stride `rs`).
         unsafe {
-            pack_panels(
-                dst, src, /*lead*/ cs, /*depth*/ rs, /*n_lead*/ nc, kc, nr,
+            pack_planar(
+                dst, src, /*lead*/ cs, /*depth*/ rs, nc, kc, nr, CONJ_B,
             );
-            if CONJ_B {
-                conjugate_panel(dst, nc.div_ceil(nr) * nr * kc);
-            }
         }
     }
 
@@ -113,7 +196,7 @@ where
         a_cs: isize,
         b: *const T,
         b_rs: isize,
-        b_cs: isize,
+        _b_cs: isize,
         c: *mut T,
         rsc: isize,
         csc: isize,
@@ -123,22 +206,21 @@ where
     ) where
         S: KernelSimd<T, T, T, T>,
     {
-        // Conj is already baked into the packed A/B, so the arithmetic is plain
-        // complex GEMM — reuse FloatGemm's microkernel (its `mul_add` is the
-        // vectorized complex FMA via `SimdOps<Complex<_>>`).
+        // Forward to the L0 SoA seam, translating the alpha/beta state to plain bools
+        // (the L0 method must not depend on the L1 status enums). `b_cs` is unused: a
+        // packed RHS is contiguous (`b_cs == 1`).
         unsafe {
-            <FloatGemm<T> as KernelFamily>::microkernel::<S, MR_REG, NR>(
-                simd,
+            simd.cplx_microkernel::<MR_REG, NR>(
                 kc,
                 alpha,
                 beta,
-                alpha_status,
-                beta_status,
+                alpha_status == AlphaStatus::One,
+                beta_status == BetaStatus::Zero,
+                beta_status == BetaStatus::One,
                 a,
                 a_cs,
                 b,
                 b_rs,
-                b_cs,
                 c,
                 rsc,
                 csc,

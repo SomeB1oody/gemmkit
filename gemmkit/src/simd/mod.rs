@@ -33,6 +33,11 @@
 
 use crate::scalar::Scalar;
 
+// `complex` is declared first and `#[macro_use]` so its `impl_complex_simd!` glue macro
+// is in scope for the ISA token modules below (they invoke it for their complex types).
+#[cfg(feature = "complex")]
+#[macro_use]
+mod complex;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod avx512;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -189,6 +194,15 @@ pub trait SimdOps<T: Scalar>: Simd {
     /// # Safety
     /// See the trait-level note.
     unsafe fn mul_add(self, a: Self::Reg, b: Self::Reg, c: Self::Reg) -> Self::Reg;
+    /// Lane-wise fused negative-multiply-add `c - a * b` (true FMA where available:
+    /// x86 `fnmadd`, NEON `vfms`). This is the subtractive partner of [`Self::mul_add`]
+    /// that the split (SoA) complex kernel needs for the `acc_re -= a_im · b_im` term;
+    /// it rounds the fused `c - a·b` in one step, matching the `mul_add` accumulation
+    /// step's single rounding so the two interleave consistently.
+    ///
+    /// # Safety
+    /// See the trait-level note.
+    unsafe fn fnma(self, a: Self::Reg, b: Self::Reg, c: Self::Reg) -> Self::Reg;
     /// Horizontal sum of all lanes (used by gemv / dot epilogues).
     ///
     /// # Safety
@@ -326,5 +340,46 @@ pub trait SimdOps<T: Scalar>: Simd {
                 }
             }
         }
+    }
+
+    /// Compute one `MR × NR` **complex** tile in the split (structure-of-arrays) layout
+    /// and apply the complex `alpha`/`beta` epilogue. This is the complex analogue of
+    /// [`Self::accumulate_tile`]: a per-ISA hot loop that lives on the L0 seam because it
+    /// needs the *real* intrinsics (`SimdOps<T::Real>`) the generic
+    /// [`crate::kernel::ComplexGemm`] microkernel cannot name through its
+    /// `KernelSimd<T, T, T, T>` bound. The default is unreachable — only the complex
+    /// `SimdOps<Complex<_>>` impls override it (each forwards to the shared, ISA-generic
+    /// [`complex::soa_microkernel`], which has the real ops concretely). The alpha/beta
+    /// state arrives as plain bools (the L1 `AlphaStatus`/`BetaStatus` would be an upward
+    /// dependency from this L0 seam).
+    ///
+    /// * `a`/`b`: planar packed panels (re plane then im plane per depth step);
+    ///   `a_cs`/`b_rs` their depth strides in complex elements (`mr`/`NR`).
+    /// * `c`/`rsc`/`csc`: interleaved output tile; `scratch`: at least `2*mr*NR` reals.
+    ///
+    /// # Safety
+    /// As [`crate::kernel::KernelFamily::microkernel`]; run inside [`Simd::vectorize`].
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    unsafe fn cplx_microkernel<const MR_REG: usize, const NR: usize>(
+        self,
+        _kc: usize,
+        _alpha: T,
+        _beta: T,
+        _alpha_is_one: bool,
+        _beta_is_zero: bool,
+        _beta_is_one: bool,
+        _a: *const T,
+        _a_cs: isize,
+        _b: *const T,
+        _b_rs: isize,
+        _c: *mut T,
+        _rsc: isize,
+        _csc: isize,
+        _mr_eff: usize,
+        _nr_eff: usize,
+        _scratch: *mut T,
+    ) {
+        unreachable!("cplx_microkernel is provided only by the complex `SimdOps` impls")
     }
 }
