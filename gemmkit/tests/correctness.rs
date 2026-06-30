@@ -1,5 +1,5 @@
 //! Correctness suite: numerical accuracy, full shape / layout / alpha-beta
-//! coverage, parallel==serial bit-identity, per-ISA kernels, gemv, and the safe
+//! coverage, parallel/serial reproducibility, per-ISA kernels, gemv, and the safe
 //! API's panic guarantees.
 
 #![allow(clippy::too_many_arguments)]
@@ -397,9 +397,12 @@ fn correctness_bf16_layouts() {
     }
 }
 
-/// Mixed-precision serial == parallel **bit-identity** across thread counts (the
-/// hard determinism invariant must hold for the new types too — narrowing is a pure
-/// per-position function of the f32 result, and the blocking is thread-independent).
+/// Mixed-precision (`f16`/`bf16`) serial == parallel bit-identity across thread counts —
+/// same caveat as `parallel_equals_serial_bit_identical`: it holds because narrowing is a
+/// pure per-position function of the f32 result *and* blocking is thread-independent, an
+/// implementation property, not a promised contract. (`bf16` here is the **dot** kernel,
+/// whose serial and parallel paths share one kernel + layout, so they coincide bitwise
+/// even though dot ≠ widen.) Pins current behavior; relax with split-K, as noted there.
 #[cfg(feature = "half")]
 #[test]
 fn parallel_equals_serial_mixed() {
@@ -782,7 +785,15 @@ fn workspace_reuse_matches_allocating_complex() {
     check::<gemmkit::c64>();
 }
 
-/// Serial and parallel runs must be bit-identical.
+/// Serial and parallel runs are bit-identical **under the current thread-independent
+/// blocking** — float add isn't associative, so this holds only because every thread
+/// count reduces in the same order, not because the library promises it. The *contract*
+/// is weaker: reproducible under a fixed config, not bitwise serial-vs-parallel (see the
+/// consistency docs and the `accumulate_tile` contract). The exact check is kept as the
+/// strongest net against an *accidental* reduction-order divergence (a race, a
+/// thread-count-dependent tail bug); relax it to determinism + tolerance only if blocking
+/// is ever made parallelism-dependent on purpose (e.g. split-K). (Canonical caveat; the
+/// other float `parallel_equals_serial_*` tests share it.)
 #[test]
 fn parallel_equals_serial_bit_identical() {
     for (m, k, n) in [
@@ -828,7 +839,8 @@ fn parallel_equals_serial_bit_identical() {
     }
 }
 
-/// Bit-identity with a **row-major A** (`rsa != 1`), which forces per-row-block LHS
+/// Serial == parallel bit-identity (same thread-independent-blocking caveat as
+/// `parallel_equals_serial_bit_identical`) with a **row-major A** (`rsa != 1`), which forces per-row-block LHS
 /// packing and so exercises the dynamic scheduler's whole-row-block ("packed")
 /// grain path under multiple threads — distinct from the column-major case above.
 /// Sizes are chosen so the row-block count straddles the thread count (so both the
@@ -2013,7 +2025,10 @@ fn i8_wraps_on_overflow() {
 }
 
 /// Integer serial == parallel **bit-identity** (integer accumulation is exact, so
-/// any thread count must produce identical i32 output).
+/// any thread count must produce identical i32 output). Unlike the float
+/// `parallel_equals_serial_*` tests, this is *order-independent* — wrapping i32 add is
+/// associative — so it stays a hard guarantee even if blocking ever becomes
+/// parallelism-dependent; it does not carry their thread-independent-blocking caveat.
 #[cfg(feature = "int8")]
 #[test]
 fn parallel_equals_serial_i8() {
@@ -2274,7 +2289,9 @@ fn correctness_complex_alpha_zero() {
     check::<gemmkit::c64>();
 }
 
-/// Complex serial == parallel bit-identity across thread counts.
+/// Complex serial == parallel bit-identity across thread counts — complex add isn't
+/// associative either, so the same thread-independent-blocking caveat as
+/// `parallel_equals_serial_bit_identical` applies.
 #[cfg(feature = "complex")]
 #[test]
 fn parallel_equals_serial_complex() {

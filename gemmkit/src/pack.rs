@@ -98,6 +98,7 @@ pub(crate) unsafe fn pack_panels<T: Scalar>(
 /// # Safety
 /// `src` must cover the `n_lead × depth_len` region addressed by `lead`/`depth`; `dst`
 /// must hold `ceil(n_lead/width) * width * depth_len.next_multiple_of(Q)` elements.
+#[cfg(any(feature = "int8", feature = "half"))]
 #[allow(clippy::too_many_arguments)]
 #[inline]
 pub(crate) unsafe fn pack_kgroup_panels<T: Scalar, const Q: usize, F: Fn(T) -> T>(

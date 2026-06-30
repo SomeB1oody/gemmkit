@@ -93,18 +93,17 @@ pub trait KernelSimd<L: Scalar, R: Scalar, A: Scalar, O: Scalar>: SimdOps<A> {
     /// `p` valid for `LANES` writes; run inside [`Simd::vectorize`].
     unsafe fn store_out(self, p: *mut O, v: <Self as SimdOps<A>>::Reg);
 
-    /// Accumulate one full `MR_REG × NR` microtile from **dot-product**-packed panels
-    /// into the register-resident `acc` (pre-zeroed by the caller). This is the seam
-    /// for a dot-kernel family ([`crate::kernel::KernelFamily::DEPTH_MULTIPLE`] `> 1`):
-    /// unlike [`SimdOps::accumulate_tile`] it folds `DEPTH_MULTIPLE` consecutive depth
-    /// steps into one hardware instruction (VNNI `vpdpbusd`, `vdpbf16ps`), so it
-    /// *reshapes the accumulation rounding* and lives here rather than on the
-    /// `accumulate_tile` seam (whose contract forbids that). `a`/`b` are the family's
-    /// interleaved packed panels — their exact layout is the contract between the
-    /// family's packers and the overriding token. `kc` is the real (unpadded) depth;
-    /// the token reads `ceil(kc / DEPTH_MULTIPLE)` instruction-groups from the
-    /// depth-padded panel. Any per-instruction signedness/bias correction (VNNI's `+128`
-    /// offset) is applied internally so `acc` holds the true `Σ_k A·B` on return.
+    /// Accumulate one full `MR_REG × NR` microtile from **dot-product**-packed panels into
+    /// the register-resident `acc` (pre-zeroed by the caller). The seam for a dot-kernel
+    /// family ([`crate::kernel::KernelFamily::DEPTH_MULTIPLE`] `> 1`): unlike
+    /// [`SimdOps::accumulate_tile`] it folds `DEPTH_MULTIPLE` consecutive depth steps into
+    /// one hardware instruction (`vpdpbusd`, `vdpbf16ps`), *reshaping the accumulation
+    /// rounding*, so it lives here rather than on `accumulate_tile` (whose contract forbids
+    /// that). `a`/`b` are the family's interleaved panels — their layout is the contract
+    /// between the family's packers and the overriding token. `kc` is the real (unpadded)
+    /// depth; the token reads `ceil(kc / DEPTH_MULTIPLE)` instruction-groups from the
+    /// depth-padded panel. Any signedness/bias correction (VNNI's `+128`) is applied
+    /// internally so `acc` holds the true `Σ_k A·B` on return.
     ///
     /// The default is unreachable: only a dot-capable token (e.g. `Avx512Vnni`,
     /// `Avx512Bf16`) overrides it, and only a dot family ever calls it.

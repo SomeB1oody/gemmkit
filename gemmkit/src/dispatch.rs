@@ -1493,10 +1493,9 @@ pub(crate) unsafe fn execute_int(t: IntTask, par: Parallelism, ws: &mut Workspac
             return;
         }
         let d = dispatched_i8();
-        // Auto VNNI hands small *multi-threaded* problems to the widen kernel (the dot
-        // kernel's pack barrier dominates there). `Rayon(1)`/`Serial` run on one worker,
-        // so they keep VNNI regardless of size. `small_par_fallback` is `None` unless the
-        // VNNI auto path was selected, so every other kernel takes `d.run` unchanged.
+        // Auto VNNI hands small multi-threaded problems to the widen kernel (the dot
+        // kernel's pack barrier dominates there); `Rayon(1)`/`Serial` keep VNNI at any
+        // size. `small_par_fallback` is `None` for every other kernel → `d.run` as-is.
         let run = match d.small_par_fallback {
             Some(fallback)
                 if matches!(par, Parallelism::Rayon(n) if n != 1)
@@ -1595,14 +1594,12 @@ type IntFn = unsafe fn(IntTask, Parallelism, &mut Workspace);
 /// Memoized integer dispatch slot (mirror of [`Dispatched`] but a single kernel —
 /// integer prepack is not yet a public API).
 ///
-/// `small_par_fallback` is the kernel to use for *auto-selected, multi-threaded, small*
-/// problems instead of `run`. It exists only for the VNNI auto path: `vpdpbusd` is so
-/// much faster per FMA that for a small parallel problem its **mandatory** RHS-pack
-/// barrier (the quad layout cannot be read in place) outweighs the compute saving, and
-/// the in-place widen kernel wins. Serial runs (any size) and large parallel runs keep
-/// VNNI. `None` for every other selection, and `None` when VNNI is *forced* (the force
-/// contract must exercise exactly that kernel). The fallback is bit-identical to VNNI
-/// (exact i32), so swapping by shape never perturbs results.
+/// `small_par_fallback` replaces `run` for *auto-selected, multi-threaded, small*
+/// problems. Only the VNNI auto path sets it: VNNI's mandatory RHS-pack barrier (the
+/// quad layout can't be read in place) outweighs the compute saving on a small parallel
+/// problem, so the in-place widen kernel wins; serial and large-parallel runs keep VNNI.
+/// `None` for every other selection and when VNNI is *forced* (force must run exactly
+/// that kernel). Bit-identical to VNNI (exact i32), so the swap never perturbs results.
 #[cfg(feature = "int8")]
 #[derive(Copy, Clone)]
 struct IntDispatched {
@@ -1611,11 +1608,11 @@ struct IntDispatched {
 }
 
 /// Below this `m·n·k`, an auto-selected VNNI kernel hands a *multi-threaded* problem to
-/// the widen fallback (see [`IntDispatched::small_par_fallback`]). Calibrated on the
-/// Ryzen 9950X (Zen5): VNNI clearly wins serial at every size and parallel from
-/// `n ≈ 1024` up, but loses small parallel where the pack barrier dominates. (Defined
-/// on every target so the gate in `execute_int` reads it unconditionally; only the x86
-/// VNNI auto path ever sets `small_par_fallback`, so elsewhere the gate is inert.)
+/// the widen fallback (see [`IntDispatched::small_par_fallback`]). Calibrated on a
+/// Ryzen 9950X (Zen5): VNNI wins serial at every size and parallel from `n ≈ 1024` up,
+/// but loses small parallel to the pack barrier. (Defined on every target so the
+/// `execute_int` gate reads it unconditionally; only the x86 VNNI auto path sets a
+/// fallback, so elsewhere the gate is inert.)
 #[cfg(feature = "int8")]
 const I8_VNNI_MIN_PAR_MNK: usize = 768 * 768 * 768;
 
