@@ -112,9 +112,22 @@ the epilogue. It ships four families: `FloatGemm<T>` (homogeneous `f32`/`f64`),
 out), `IntGemm` (`i8` in, **`i32` accumulator/output** — the first family with
 `Lhs != Out`, reached via the public `gemm_i8` since the homogeneous `gemm<T>`
 surface can't express `Out != Lhs`; it reuses the `KernelSimd` widen seam with an
-`i8 -> i32` sign-extend and exact wrapping `i32` arithmetic, and a denser VNNI
-`vpdpbusd` dot kernel is a deferred increment), and `ComplexGemm<T, CONJ_A, CONJ_B>`
+`i8 -> i32` sign-extend and exact wrapping `i32` arithmetic; its sibling `IntGemmVnni`
+is the denser AVX-512 **VNNI dot kernel**, below), and `ComplexGemm<T, CONJ_A, CONJ_B>`
 (`Complex<f32>`/`Complex<f64>`, via the public `gemm_cplx`).
+
+**Dot-kernel families** add a second L0 seam, [`KernelSimd::dot_accumulate`], for ISAs
+whose hardware folds several depth steps into one *dot* instruction — `vpdpbusd` (4 i8
+steps), `vdpbf16ps` (2 bf16 steps). These reshape the accumulation rounding, so they
+cannot ride `accumulate_tile` (whose contract forbids that); instead the family packs
+its operands **k-group-interleaved** and reports `KernelFamily::DEPTH_MULTIPLE = Q` (the
+group size), the one driver-visible knob: the driver rounds each packed panel's depth up
+to `Q` (`1` for every other family, so they are byte-for-byte unchanged), and the family
+depth-pads the tail. `IntGemmVnni` (`Q = 4`) offsets A by `+128` for the `u8 × i8`
+`vpdpbusd` and subtracts the per-column bias `128·Σ_k B[k][j]` in the dot seam, so it is
+**bit-for-bit equal to `IntGemm`** (exact wrapping `i32`); the auto dispatch falls back
+to the widen kernel for small *parallel* problems, where the dot kernel's mandatory pack
+barrier outweighs its compute win.
 
 `FloatGemm` is always built; the other three families are **optional, off-by-default
 Cargo features** — `half` (`MixedGemm`, pulls `half`), `int8` (`IntGemm`, no extra
@@ -204,8 +217,9 @@ Packed layout is **micropanel-major**: A as panels of `MR` rows (column-by-colum
 `MR` contiguous rows per depth step), B as panels of `NR` columns, tails
 zero-filled. The same `pack_panels` primitive serves both LHS and RHS — they
 differ only in which stride is "leading" vs "depth". The *choice* of layout
-belongs to the family (so a future integer family can interleave for VNNI); the
-mechanical copy is shared and never changes when a family is added.
+belongs to the family — `IntGemmVnni` interleaves four consecutive depth steps per
+lane/column for `vpdpbusd`, padding the panel depth to its `DEPTH_MULTIPLE` — while the
+mechanical `pack_panels` copy is shared and never changes when a family is added.
 
 **Adaptive.** Packing is skipped when it doesn't pay. RHS is packed once per
 panel (always, in v1) and reused across all row blocks. LHS packing has **two

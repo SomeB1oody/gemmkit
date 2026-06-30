@@ -284,6 +284,174 @@ impl KernelSimd<i8, i8, i32, i32> for Avx512 {
     }
 }
 
+// ---- AVX-512 VNNI: i8 -> i32 dot kernel via `vpdpbusd` (4 depth steps / instr) ----
+
+/// AVX-512 VNNI ISA token: the integer dot kernel. A **distinct token** from
+/// [`Avx512`] because the `#[target_feature]` set is per-token — `_mm512_dpbusd_epi32`
+/// is only legal in a codegen context that enables `avx512vnni`, which
+/// [`Avx512::vectorize`] (only `avx512f`) does not. Its [`SimdOps<i32>`] vocabulary and
+/// the `i8 -> i32` load/store seam mirror [`Avx512`] (same `__m512i`, 16 lanes); the one
+/// addition is the [`KernelSimd::dot_accumulate`] override that folds 4 i8 depth steps
+/// and 16 lanes per `vpdpbusd`.
+#[cfg(feature = "int8")]
+#[derive(Copy, Clone, Default)]
+pub struct Avx512Vnni;
+
+#[cfg(feature = "int8")]
+impl Simd for Avx512Vnni {
+    #[inline(always)]
+    unsafe fn vectorize<R>(self, f: impl FnOnce() -> R) -> R {
+        // `vpdpbusd` needs `avx512vnni`; `avx512bw` rides along for the byte ops. The
+        // dispatcher verifies all three before selecting this token.
+        #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+        unsafe fn inner<R>(f: impl FnOnce() -> R) -> R {
+            f()
+        }
+        // SAFETY: dispatcher guarantees avx512f+bw+vnni; `inner` sets the codegen
+        // context and `f` inlines into it.
+        unsafe { inner(f) }
+    }
+}
+
+#[cfg(feature = "int8")]
+impl SimdOps<i32> for Avx512Vnni {
+    type Reg = __m512i;
+    const LANES: usize = 16;
+    const ALIGN: usize = 64;
+
+    #[inline(always)]
+    unsafe fn zero(self) -> __m512i {
+        unsafe { _mm512_setzero_si512() }
+    }
+    #[inline(always)]
+    unsafe fn splat(self, v: i32) -> __m512i {
+        unsafe { _mm512_set1_epi32(v) }
+    }
+    #[inline(always)]
+    unsafe fn load(self, p: *const i32) -> __m512i {
+        unsafe { _mm512_load_si512(p as *const __m512i) }
+    }
+    #[inline(always)]
+    unsafe fn loadu(self, p: *const i32) -> __m512i {
+        unsafe { _mm512_loadu_si512(p as *const __m512i) }
+    }
+    #[inline(always)]
+    unsafe fn store(self, p: *mut i32, v: __m512i) {
+        unsafe { _mm512_store_si512(p as *mut __m512i, v) }
+    }
+    #[inline(always)]
+    unsafe fn storeu(self, p: *mut i32, v: __m512i) {
+        unsafe { _mm512_storeu_si512(p as *mut __m512i, v) }
+    }
+    #[inline(always)]
+    unsafe fn mul(self, a: __m512i, b: __m512i) -> __m512i {
+        unsafe { _mm512_mullo_epi32(a, b) }
+    }
+    #[inline(always)]
+    unsafe fn add(self, a: __m512i, b: __m512i) -> __m512i {
+        unsafe { _mm512_add_epi32(a, b) }
+    }
+    #[inline(always)]
+    unsafe fn mul_add(self, a: __m512i, b: __m512i, c: __m512i) -> __m512i {
+        unsafe { _mm512_add_epi32(_mm512_mullo_epi32(a, b), c) }
+    }
+    #[inline(always)]
+    unsafe fn fnma(self, a: __m512i, b: __m512i, c: __m512i) -> __m512i {
+        unsafe { _mm512_sub_epi32(c, _mm512_mullo_epi32(a, b)) }
+    }
+    #[inline(always)]
+    unsafe fn reduce_sum(self, v: __m512i) -> i32 {
+        unsafe { _mm512_reduce_add_epi32(v) }
+    }
+}
+
+/// `i8 -> i32` via VNNI. The load/store seam matches [`Avx512`] (plain `i32` epilogue;
+/// `load_lhs`/`splat_rhs` are required by the trait but unused — the hot loop runs
+/// through [`Self::dot_accumulate`], which reads the family's k-quad-interleaved panels
+/// directly).
+#[cfg(feature = "int8")]
+impl KernelSimd<i8, i8, i32, i32> for Avx512Vnni {
+    #[inline(always)]
+    unsafe fn load_lhs(self, p: *const i8) -> __m512i {
+        unsafe { _mm512_cvtepi8_epi32(_mm_loadu_si128(p as *const __m128i)) }
+    }
+    #[inline(always)]
+    unsafe fn splat_rhs(self, v: i8) -> __m512i {
+        unsafe { _mm512_set1_epi32(v as i32) }
+    }
+    #[inline(always)]
+    unsafe fn load_out(self, p: *const i32) -> __m512i {
+        unsafe { _mm512_loadu_si512(p as *const __m512i) }
+    }
+    #[inline(always)]
+    unsafe fn store_out(self, p: *mut i32, v: __m512i) {
+        unsafe { _mm512_storeu_si512(p as *mut __m512i, v) }
+    }
+
+    #[allow(clippy::needless_range_loop)]
+    #[inline(always)]
+    unsafe fn dot_accumulate<const MR_REG: usize, const NR: usize>(
+        self,
+        kc: usize,
+        a: *const i8,
+        b: *const i8,
+        acc: &mut [[__m512i; MR_REG]; NR],
+    ) {
+        unsafe {
+            let mr = MR_REG * 16;
+            let nquads = kc.div_ceil(4);
+
+            // Column sums of the *signed* B panel, for the `+128` bias correction. The
+            // packed A holds `A + 128` (unsigned, as `vpdpbusd` requires), so per lane
+            // `Σ_k (A+128)·B = Σ_k A·B + 128·Σ_k B`. B's depth/column pad is 0, so summing
+            // the padded panel equals summing real B. B is broadcast, so every lane shares
+            // the same `colsum[j]`; a scalar sum (mod 2³², matching the i32 accumulation)
+            // suffices. (`s` over one quad is bounded by `4·127`, no overflow; the running
+            // `colsum` wraps.) This recomputes the sum once per A row-panel rather than once
+            // per B panel; the scalar pass is a small fraction of the `vpdpbusd` work and the
+            // B strip is cache-warm, so it is kept here instead of widening the packed-panel
+            // layout (and the driver's buffer sizing) to carry a precomputed column sum.
+            let mut colsum = [0i32; NR];
+            for q in 0..nquads {
+                for j in 0..NR {
+                    let base = q * NR * 4 + j * 4;
+                    let mut s = 0i32;
+                    for t in 0..4 {
+                        s += *b.add(base + t) as i32;
+                    }
+                    colsum[j] = colsum[j].wrapping_add(s);
+                }
+            }
+
+            // Dot accumulation: each `vpdpbusd` folds 4 depth steps × 16 lanes. A register
+            // `i` is 16 rows × 4 contiguous k-bytes (64 B); a B quad broadcasts 4
+            // contiguous k-bytes of one column as an i32.
+            for q in 0..nquads {
+                let a_regs: [__m512i; MR_REG] = core::array::from_fn(|i| {
+                    _mm512_loadu_si512(a.add(q * mr * 4 + i * 64) as *const __m512i)
+                });
+                for j in 0..NR {
+                    let bj = _mm512_set1_epi32(
+                        (b.add(q * NR * 4 + j * 4) as *const i32).read_unaligned(),
+                    );
+                    for i in 0..MR_REG {
+                        acc[j][i] = _mm512_dpbusd_epi32(acc[j][i], a_regs[i], bj);
+                    }
+                }
+            }
+
+            // Subtract the per-column bias `128·colsum[j]` (identical in every lane) to
+            // recover the true signed `Σ_k A·B`.
+            for j in 0..NR {
+                let corr = _mm512_set1_epi32(128i32.wrapping_mul(colsum[j]));
+                for i in 0..MR_REG {
+                    acc[j][i] = _mm512_sub_epi32(acc[j][i], corr);
+                }
+            }
+        }
+    }
+}
+
 // Complex (AVX-512): real `Reg`; `LANES` is the real lane count (16 / 8). Complex GEMM
 // routes through the shared SoA `soa_microkernel`.
 #[cfg(feature = "complex")]

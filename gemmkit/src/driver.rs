@@ -313,6 +313,22 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize>(
             }
         };
 
+        // Dot-product families (VNNI, vdpbf16ps) fold `Fam::DEPTH_MULTIPLE` consecutive
+        // depth steps into one instruction, so every packed micropanel's depth is rounded
+        // up to that multiple (the family's pack depth-pads the tail). `1` for every other
+        // family ⇒ the `next_multiple_of` calls below are identities and nothing changes.
+        let q_depth = Fam::DEPTH_MULTIPLE;
+        let kc_pad_block = kc.next_multiple_of(q_depth);
+
+        // The prepacked-RHS branch below addresses panels with *unpadded* depth, so a
+        // depth-padded (dot) family cannot use it yet. No `DEPTH_MULTIPLE > 1` family has
+        // a prepack API today (`i8` has none; a bf16 dot family is future work), so this
+        // only guards against a future wiring mistake, not a reachable path.
+        debug_assert!(
+            q_depth == 1 || packed.is_none(),
+            "prepacked-RHS path does not depth-pad panels for DEPTH_MULTIPLE > 1"
+        );
+
         let n_mc = m.div_ceil(mc); // row macro-blocks (constant across panels)
         let n_nt_max = nc.div_ceil(nr);
         let n_jobs_max = n_mc * n_nt_max;
@@ -361,10 +377,10 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize>(
         // slot per row-block, written once by the pre-pass) or `n_threads` when
         // per-worker (each worker owns a private scratch slot). For square parallel
         // problems `n_mc < n_threads`, so shared-A uses *fewer* slots, not more.
-        let a_per_region = mc.next_multiple_of(mr) * kc;
+        let a_per_region = mc.next_multiple_of(mr) * kc_pad_block;
         let a_regions = if shared_a { n_mc } else { n_threads };
         let b_elems = if pack_b {
-            nc.next_multiple_of(nr) * kc
+            nc.next_multiple_of(nr) * kc_pad_block
         } else {
             0
         };
@@ -409,6 +425,8 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize>(
             let mut pc = 0;
             while pc < k {
                 let kc_eff = core::cmp::min(kc, k - pc);
+                // Depth-padded panel stride for dot families (identity when `q_depth == 1`).
+                let kc_eff_pad = kc_eff.next_multiple_of(q_depth);
                 let first = pc == 0;
                 let beta_eff = if first { beta } else { Fam::Acc::ONE };
                 let bst = if first {
@@ -432,7 +450,7 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize>(
                             for jt in s..e {
                                 let col = jc + jt * nr;
                                 let nr_eff = core::cmp::min(nr, nc_eff - jt * nr);
-                                let dst = b_base.0.add(jt * kc_eff * nr);
+                                let dst = b_base.0.add(jt * kc_eff_pad * nr);
                                 let src = b.0.offset(pc as isize * rsb + col as isize * csb)
                                     as *const Fam::Rhs;
                                 Fam::pack_rhs(dst, src, rsb, csb, kc_eff, nr_eff, nr);
@@ -543,7 +561,7 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize>(
                                 )
                             } else if pack_b {
                                 (
-                                    b_base.0.add(jt * kc_eff * nr) as *const Fam::Rhs,
+                                    b_base.0.add(jt * kc_eff_pad * nr) as *const Fam::Rhs,
                                     nr as isize,
                                     1,
                                 )
@@ -562,7 +580,7 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize>(
                                 while ir < mc_eff {
                                     let mr_eff = core::cmp::min(mr, mc_eff - ir);
                                     let apan = if packed_a {
-                                        a_panel_base.add((ir / mr) * mr * kc_eff)
+                                        a_panel_base.add((ir / mr) * mr * kc_eff_pad)
                                     } else {
                                         a_panel_base.offset(ir as isize * rsa)
                                     };
