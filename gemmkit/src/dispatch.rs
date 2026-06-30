@@ -918,15 +918,21 @@ const DISP_BF16_NEON: Dispatched<bf16> = Dispatched {
 enum ForcedIsa {
     /// No override: auto-select the best available ISA (the default).
     Auto,
+    /// Scalar: the fallback path when no other ISA is available
     Scalar,
+    /// FMA: the `fma`-based (AVX2) widen kernel
     Fma,
-    Avx512,
-    /// AVX-512 VNNI: the `i8` dot kernel. For types without a VNNI kernel this forces
-    /// the plain AVX-512 path (VNNI implies `avx512f`).
+    // The `Avx512*` variants all imply `avx512f`. `Vnni` and `Bf16` are orthogonal
+    // extensions (a CPU may report either, both, or neither); each selects a distinct
+    // dot kernel for `i8` / `bf16`, and falls back to the `Avx512F` widen kernel for
+    // every other element type.
+    /// AVX-512 foundation (`avx512f`): the widen kernel
+    Avx512F,
+    /// AVX-512 VNNI: the `i8` `vpdpbusd` dot kernel
     Avx512Vnni,
-    /// AVX-512 BF16: the bf16 `vdpbf16ps` dot kernel. For other types this forces the
-    /// plain AVX-512 path (BF16 implies `avx512f`).
+    /// AVX-512 BF16: the `bf16` `vdpbf16ps` dot kernel
     Avx512Bf16,
+    /// NEON: the AArch64 kernel
     Neon,
 }
 
@@ -946,7 +952,7 @@ fn forced_isa() -> ForcedIsa {
             } else if t.eq_ignore_ascii_case("fma") || t.eq_ignore_ascii_case("avx2") {
                 ForcedIsa::Fma
             } else if t.eq_ignore_ascii_case("avx512") || t.eq_ignore_ascii_case("avx512f") {
-                ForcedIsa::Avx512
+                ForcedIsa::Avx512F
             } else if t.eq_ignore_ascii_case("avx512vnni") || t.eq_ignore_ascii_case("vnni") {
                 ForcedIsa::Avx512Vnni
             } else if t.eq_ignore_ascii_case("avx512bf16") || t.eq_ignore_ascii_case("bf16") {
@@ -978,7 +984,7 @@ fn select_f32() -> Dispatched<f32> {
             return DISP_F32_FMA;
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
+        ForcedIsa::Avx512F | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
             assert!(
                 is_x86_feature_detected!("avx512f"),
                 "GEMMKIT_REQUIRE_ISA=avx512, but this CPU/emulator does not report avx512f"
@@ -986,7 +992,7 @@ fn select_f32() -> Dispatched<f32> {
             return DISP_F32_AVX512;
         }
         #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-        ForcedIsa::Fma | ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
+        ForcedIsa::Fma | ForcedIsa::Avx512F | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
             panic!("GEMMKIT_REQUIRE_ISA: requested SIMD ISA is unavailable on this target")
         }
         #[cfg(target_arch = "aarch64")]
@@ -1030,7 +1036,7 @@ fn select_f64() -> Dispatched<f64> {
             return DISP_F64_FMA;
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
+        ForcedIsa::Avx512F | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
             assert!(
                 is_x86_feature_detected!("avx512f"),
                 "GEMMKIT_REQUIRE_ISA=avx512, but this CPU/emulator does not report avx512f"
@@ -1038,7 +1044,7 @@ fn select_f64() -> Dispatched<f64> {
             return DISP_F64_AVX512;
         }
         #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-        ForcedIsa::Fma | ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
+        ForcedIsa::Fma | ForcedIsa::Avx512F | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
             panic!("GEMMKIT_REQUIRE_ISA: requested SIMD ISA is unavailable on this target")
         }
         #[cfg(target_arch = "aarch64")]
@@ -1088,7 +1094,7 @@ fn select_f16() -> Dispatched<f16> {
             return DISP_F16_FMA;
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
+        ForcedIsa::Avx512F | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
             assert!(
                 is_x86_feature_detected!("avx512f"),
                 "GEMMKIT_REQUIRE_ISA=avx512, but this CPU/emulator does not report avx512f"
@@ -1096,7 +1102,7 @@ fn select_f16() -> Dispatched<f16> {
             return DISP_F16_AVX512;
         }
         #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-        ForcedIsa::Fma | ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
+        ForcedIsa::Fma | ForcedIsa::Avx512F | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
             panic!("GEMMKIT_REQUIRE_ISA: requested SIMD ISA is unavailable on this target")
         }
         #[cfg(target_arch = "aarch64")]
@@ -1142,7 +1148,7 @@ fn select_bf16() -> Dispatched<bf16> {
             return DISP_BF16_FMA;
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni => {
+        ForcedIsa::Avx512F | ForcedIsa::Avx512Vnni => {
             assert!(
                 is_x86_feature_detected!("avx512f"),
                 "GEMMKIT_REQUIRE_ISA=avx512, but this CPU/emulator does not report avx512f"
@@ -1158,7 +1164,7 @@ fn select_bf16() -> Dispatched<bf16> {
             return DISP_BF16_AVX512_DOT;
         }
         #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-        ForcedIsa::Fma | ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
+        ForcedIsa::Fma | ForcedIsa::Avx512F | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
             panic!("GEMMKIT_REQUIRE_ISA: requested SIMD ISA is unavailable on this target")
         }
         #[cfg(target_arch = "aarch64")]
@@ -1657,7 +1663,7 @@ fn select_i8() -> IntDispatched {
             return DISP_I8_FMA;
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        ForcedIsa::Avx512 | ForcedIsa::Avx512Bf16 => {
+        ForcedIsa::Avx512F | ForcedIsa::Avx512Bf16 => {
             assert!(
                 is_x86_feature_detected!("avx512f"),
                 "GEMMKIT_REQUIRE_ISA=avx512, but this CPU/emulator does not report avx512f"
@@ -1675,7 +1681,7 @@ fn select_i8() -> IntDispatched {
             return DISP_I8_AVX512VNNI;
         }
         #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-        ForcedIsa::Fma | ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
+        ForcedIsa::Fma | ForcedIsa::Avx512F | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
             panic!("GEMMKIT_REQUIRE_ISA: requested SIMD ISA is unavailable on this target")
         }
         #[cfg(target_arch = "aarch64")]
@@ -1927,7 +1933,7 @@ fn select_c32() -> CplxDispatched<C32> {
             return CDISP_C32_FMA;
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
+        ForcedIsa::Avx512F | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
             assert!(
                 is_x86_feature_detected!("avx512f"),
                 "GEMMKIT_REQUIRE_ISA=avx512, but this CPU/emulator does not report avx512f"
@@ -1935,7 +1941,7 @@ fn select_c32() -> CplxDispatched<C32> {
             return CDISP_C32_AVX512;
         }
         #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-        ForcedIsa::Fma | ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
+        ForcedIsa::Fma | ForcedIsa::Avx512F | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
             panic!("GEMMKIT_REQUIRE_ISA: requested SIMD ISA is unavailable on this target")
         }
         #[cfg(target_arch = "aarch64")]
@@ -1977,7 +1983,7 @@ fn select_c64() -> CplxDispatched<C64> {
             return CDISP_C64_FMA;
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
+        ForcedIsa::Avx512F | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
             assert!(
                 is_x86_feature_detected!("avx512f"),
                 "GEMMKIT_REQUIRE_ISA=avx512, but this CPU/emulator does not report avx512f"
@@ -1985,7 +1991,7 @@ fn select_c64() -> CplxDispatched<C64> {
             return CDISP_C64_AVX512;
         }
         #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-        ForcedIsa::Fma | ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
+        ForcedIsa::Fma | ForcedIsa::Avx512F | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
             panic!("GEMMKIT_REQUIRE_ISA: requested SIMD ISA is unavailable on this target")
         }
         #[cfg(target_arch = "aarch64")]

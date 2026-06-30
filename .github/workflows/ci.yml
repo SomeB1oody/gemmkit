@@ -91,6 +91,60 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: "sde64 -spr --"
           GEMMKIT_REQUIRE_ISA: avx512
 
+  # i8 VNNI (`vpdpbusd`) dot kernel
+  avx512vnni_test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rust: stable
+            target: x86_64-unknown-linux-gnu
+    name: avx512vnni_test/${{ matrix.target }}/${{ matrix.rust }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust }}
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Set up Intel SDE
+        uses: petarpetrovt/setup-sde@v5.0
+      - name: Tests under SDE (force the i8 VNNI dot kernel, all element types)
+        run: |
+          export PATH="$SDE_PATH:$PATH"
+          cargo test -p gemmkit --all-features --release --tests --lib --no-fail-fast
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: "sde64 -spr --"
+          GEMMKIT_REQUIRE_ISA: avx512vnni
+
+  # bf16 (`vdpbf16ps`) dot kernel
+  avx512bf16_test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rust: stable
+            target: x86_64-unknown-linux-gnu
+    name: avx512bf16_test/${{ matrix.target }}/${{ matrix.rust }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust }}
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Set up Intel SDE
+        uses: petarpetrovt/setup-sde@v5.0
+      - name: Tests under SDE (force the bf16 dot kernel, all element types)
+        run: |
+          export PATH="$SDE_PATH:$PATH"
+          cargo test -p gemmkit --all-features --release --tests --lib --no-fail-fast
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: "sde64 -spr --"
+          GEMMKIT_REQUIRE_ISA: avx512bf16
+
   # 32-bit x86 `cargo check` only (no runner)
   i686_check:
     runs-on: ubuntu-latest
