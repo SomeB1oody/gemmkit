@@ -196,12 +196,15 @@ pub unsafe fn pack_rhs_full<Fam: KernelFamily>(
             let mut pc = 0;
             while pc < k {
                 let kc_eff = core::cmp::min(kc, k - pc);
+                // Dot families depth-pad each panel (`Fam::pack_rhs` fills the tail), so the
+                // cursor advances by the padded depth. Identity for `DEPTH_MULTIPLE == 1`.
+                let kc_eff_pad = kc_eff.next_multiple_of(Fam::DEPTH_MULTIPLE);
                 for jt in 0..n_nt {
                     let col = jc + jt * nr;
                     let nr_eff = core::cmp::min(nr, nc_eff - jt * nr);
                     let src = b.offset(pc as isize * rsb + col as isize * csb);
                     Fam::pack_rhs(d, src, rsb, csb, kc_eff, nr_eff, nr);
-                    d = d.add(kc_eff * nr);
+                    d = d.add(kc_eff_pad * nr);
                 }
                 pc += kc;
             }
@@ -320,13 +323,17 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize>(
         let q_depth = Fam::DEPTH_MULTIPLE;
         let kc_pad_block = kc.next_multiple_of(q_depth);
 
-        // The prepacked-RHS branch below addresses panels with *unpadded* depth, so a
-        // depth-padded (dot) family cannot use it yet. No `DEPTH_MULTIPLE > 1` family has
-        // a prepack API today (`i8` has none; a bf16 dot family is future work), so this
-        // only guards against a future wiring mistake, not a reachable path.
-        debug_assert!(
-            q_depth == 1 || packed.is_none(),
-            "prepacked-RHS path does not depth-pad panels for DEPTH_MULTIPLE > 1"
+        // The prepacked-RHS branch pads each panel's depth like the per-call pack, but its
+        // `jc`-block offset assumes a single depth slice (its `n_nt·pc` term would need a
+        // padded cumulative depth otherwise). A `DEPTH_MULTIPLE > 1` family therefore may
+        // use prepack only when the whole contraction is one slice (`kc >= k`), which is
+        // exactly the mixed/dot families' `OUT_IS_ACC = false ⇒ kc = k`. This is a hard
+        // `assert!` (not `debug_assert!`) because violating it makes the consume read RHS
+        // micropanels at wrong byte offsets — a silent miscompute. It is near-free: the
+        // `q_depth == 1` short-circuit means every existing family skips it immediately.
+        assert!(
+            q_depth == 1 || packed.is_none() || kc >= k,
+            "prepacked-RHS with DEPTH_MULTIPLE > 1 requires a single depth slice (kc >= k)"
         );
 
         let n_mc = m.div_ceil(mc); // row macro-blocks (constant across panels)
@@ -553,8 +560,11 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize>(
                             // packed B -> per-slice contiguous panel with (NR, 1)
                             // unpacked B -> read in place with the original strides
                             let (bpan, b_rs_k, b_cs_k) = if prepacked {
+                                // Depth-padded panel stride (identity for `q_depth == 1`).
+                                // The single-slice guard above keeps `pc == 0` for any
+                                // `q_depth > 1` family, so `n_nt * pc` needs no padding.
                                 (
-                                    b_base.0.add(jc_off + nr * (n_nt * pc + jt * kc_eff))
+                                    b_base.0.add(jc_off + nr * (n_nt * pc + jt * kc_eff_pad))
                                         as *const Fam::Rhs,
                                     nr as isize,
                                     1,
@@ -614,7 +624,9 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize>(
 
                 pc += kc;
             }
-            jc_off += n_nt * nr * k;
+            // Each prepacked `jc` block holds `n_nt` panels of `nr × kpad(k)` (single slice
+            // for any depth-padded family — see the guard above). `kpad == k` when q_depth == 1.
+            jc_off += n_nt * nr * k.next_multiple_of(q_depth);
             jc += nc;
         }
     }

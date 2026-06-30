@@ -30,7 +30,7 @@ pub use float::FloatGemm;
 #[cfg(feature = "int8")]
 pub use int::{IntGemm, IntGemmVnni};
 #[cfg(feature = "half")]
-pub use mixed::MixedGemm;
+pub use mixed::{Bf16DotGemm, MixedGemm};
 
 /// State of the `alpha` scale, precomputed once by the driver so the microkernel
 /// never compares floats. `Zero` never reaches the microkernel (the driver

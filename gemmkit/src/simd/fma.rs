@@ -197,8 +197,10 @@ impl KernelSimd<f16, f16, f32, f16> for Fma {
 
 /// `bf16` via integer ops: widen is a 16-bit left shift into `f32`; narrow is the
 /// round-to-nearest-even bias trick (`+ ((bits>>16)&1) + 0x7FFF`, then `>>16`).
-/// Bit-identical to `half::bf16::from_f32`, including NaN (mapped to
-/// `(bits>>16) | 0x0040`), so vector and scalar paths never diverge.
+/// The **narrowing** is bit-identical to `half::bf16::from_f32`, including NaN (mapped to
+/// `(bits>>16) | 0x0040`) — so the bf16 *conversion* matches the scalar path exactly. (Its
+/// MAC matches scalar too; the `vdpbf16ps` dot kernel's fused 2-term MAC does not — only
+/// its conversion does. Conversion bit-identity keeps full and edge tiles consistent.)
 #[cfg(feature = "half")]
 impl KernelSimd<bf16, bf16, f32, bf16> for Fma {
     #[inline(always)]

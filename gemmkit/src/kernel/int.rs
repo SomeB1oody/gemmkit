@@ -13,7 +13,7 @@
 use core::marker::PhantomData;
 
 use super::{AlphaStatus, BetaStatus, KernelFamily};
-use crate::pack::pack_panels;
+use crate::pack::{pack_kgroup_panels, pack_panels};
 use crate::simd::{KernelSimd, SimdOps};
 
 /// Fold `alpha` into the register-resident `acc` and apply the `i32` epilogue
@@ -282,13 +282,11 @@ impl KernelFamily for IntGemmVnni {
     const FORCE_PACK_RHS: bool = true;
     const DEPTH_MULTIPLE: usize = Self::Q;
 
-    /// Pack the `mc × kc` LHS into k-quad-interleaved micropanels: per `mr`-row panel,
-    /// `ceil(kc/4)` quads, each `mr` rows × 4 contiguous depth bytes (row `i`'s four bytes
-    /// at `i*4`). Every byte is offset `+128` into `[0, 255]`; rows past `mc` and depth
-    /// past `kc` are padded with `128` (the offset of `0`, contributing nothing after the
-    /// bias correction). Panel depth is padded to a multiple of 4 (`mr * kc_pad` bytes),
-    /// matching the driver's depth-padded panel stride.
-    #[allow(clippy::needless_range_loop)]
+    /// Pack the `mc × kc` LHS into k-quad-interleaved micropanels (4 contiguous depth bytes
+    /// per row, ready for `vpdpbusd`), via the shared [`pack_kgroup_panels`]. Every byte is
+    /// offset `+128` into `[0, 255]` by the transform; the pad (rows past `mc` / depth past
+    /// `kc`) is `xform(0) = 128`, the offset of `0`, contributing nothing after the bias
+    /// correction.
     #[inline]
     unsafe fn pack_lhs(
         dst: *mut i8,
@@ -299,37 +297,18 @@ impl KernelFamily for IntGemmVnni {
         kc: usize,
         mr: usize,
     ) {
+        // lead = rows (`rs`), depth = cols (`cs`).
         unsafe {
-            let kc_pad = kc.next_multiple_of(Self::Q);
-            let nquads = kc_pad / Self::Q;
-            let n_panels = mc.div_ceil(mr);
-            for p in 0..n_panels {
-                let base_row = p * mr;
-                let panel = dst.add(p * mr * kc_pad);
-                for q in 0..nquads {
-                    for i in 0..mr {
-                        let row = base_row + i;
-                        for t in 0..Self::Q {
-                            let depth = q * Self::Q + t;
-                            let byte = if row < mc && depth < kc {
-                                let v = *src.offset(row as isize * rs + depth as isize * cs);
-                                ((v as i32 + 128) as u8) as i8
-                            } else {
-                                128u8 as i8
-                            };
-                            *panel.add(q * mr * Self::Q + i * Self::Q + t) = byte;
-                        }
-                    }
-                }
-            }
+            pack_kgroup_panels::<i8, { Self::Q }, _>(dst, src, rs, cs, mc, kc, mr, |v| {
+                ((v as i32 + 128) as u8) as i8
+            })
         }
     }
 
-    /// Pack one `kc × nr` RHS panel k-quad-interleaved: `ceil(kc/4)` quads, each `nr`
-    /// columns × 4 contiguous depth bytes (column `j`'s four bytes at `j*4`, ready for an
-    /// i32 broadcast). Values stay *signed*; columns past `nc` and depth past `kc` pad
-    /// with `0` (excluded from the column sum). Panel depth padded to a multiple of 4.
-    #[allow(clippy::needless_range_loop)]
+    /// Pack one `kc × nr` RHS panel k-quad-interleaved (4 contiguous depth bytes per column,
+    /// ready for an i32 broadcast), via the shared [`pack_kgroup_panels`]. Values stay
+    /// *signed* (identity transform); columns past `nc` and depth past `kc` pad with `0`
+    /// (excluded from the column sum).
     #[inline]
     unsafe fn pack_rhs(
         dst: *mut i8,
@@ -340,23 +319,8 @@ impl KernelFamily for IntGemmVnni {
         nc: usize,
         nr: usize,
     ) {
-        unsafe {
-            let kc_pad = kc.next_multiple_of(Self::Q);
-            let nquads = kc_pad / Self::Q;
-            for q in 0..nquads {
-                for j in 0..nr {
-                    for t in 0..Self::Q {
-                        let depth = q * Self::Q + t;
-                        let byte = if j < nc && depth < kc {
-                            *src.offset(depth as isize * rs + j as isize * cs)
-                        } else {
-                            0
-                        };
-                        *dst.add(q * nr * Self::Q + j * Self::Q + t) = byte;
-                    }
-                }
-            }
-        }
+        // lead = cols (`cs`), depth = rows (`rs`).
+        unsafe { pack_kgroup_panels::<i8, { Self::Q }, _>(dst, src, cs, rs, nc, kc, nr, |v| v) }
     }
 
     #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]

@@ -109,7 +109,7 @@ The driver is generic over [`KernelFamily`], not over "do an FMA on `T`". A fami
 bundles the input/accumulator/output types, the pack layout, the microkernel, and
 the epilogue. It ships four families: `FloatGemm<T>` (homogeneous `f32`/`f64`),
 `MixedGemm<N>` (mixed precision — `f16`/`bf16` in, **`f32` accumulator**, narrow
-out), `IntGemm` (`i8` in, **`i32` accumulator/output** — the first family with
+out; its bf16 `vdpbf16ps` dot sibling `Bf16DotGemm` is below), `IntGemm` (`i8` in, **`i32` accumulator/output** — the first family with
 `Lhs != Out`, reached via the public `gemm_i8` since the homogeneous `gemm<T>`
 surface can't express `Out != Lhs`; it reuses the `KernelSimd` widen seam with an
 `i8 -> i32` sign-extend and exact wrapping `i32` arithmetic; its sibling `IntGemmVnni`
@@ -123,11 +123,21 @@ cannot ride `accumulate_tile` (whose contract forbids that); instead the family 
 its operands **k-group-interleaved** and reports `KernelFamily::DEPTH_MULTIPLE = Q` (the
 group size), the one driver-visible knob: the driver rounds each packed panel's depth up
 to `Q` (`1` for every other family, so they are byte-for-byte unchanged), and the family
-depth-pads the tail. `IntGemmVnni` (`Q = 4`) offsets A by `+128` for the `u8 × i8`
-`vpdpbusd` and subtracts the per-column bias `128·Σ_k B[k][j]` in the dot seam, so it is
-**bit-for-bit equal to `IntGemm`** (exact wrapping `i32`); the auto dispatch falls back
-to the widen kernel for small *parallel* problems, where the dot kernel's mandatory pack
-barrier outweighs its compute win.
+depth-pads the tail. Two dot families ship, both AVX-512, each a sibling of the widen
+family it accelerates (the pack layout differs, and `pack_lhs`/`pack_rhs` have no ISA
+parameter, so the interleave must key off the family):
+
+* `IntGemmVnni` (`Q = 4`, sibling of `IntGemm`) offsets A by `+128` for the `u8 × i8`
+  `vpdpbusd` and subtracts the per-column bias `128·Σ_k B[k][j]` in the dot seam, so it is
+  **bit-for-bit equal to `IntGemm`** (exact wrapping `i32`). The auto dispatch falls back
+  to the widen kernel for small *parallel* problems, where the dot kernel's mandatory pack
+  barrier outweighs its compute win.
+* `Bf16DotGemm` (`Q = 2`, sibling of `MixedGemm<bf16>`) packs bf16 in pairs and accumulates
+  in `f32` with `vdpbf16ps`, sharing `MixedGemm`'s `kc = k` rule and narrow epilogue. Its
+  fused 2-term MAC is only *tolerance*-equal to the widen path (not bitwise), but serial,
+  parallel, and prepacked runs share the one kernel and pack layout, so they reproduce each
+  other bit-for-bit. Because the widen bf16 load is load-bound, the dot kernel wins at every
+  size, so it has no widen fallback.
 
 `FloatGemm` is always built; the other three families are **optional, off-by-default
 Cargo features** — `half` (`MixedGemm`, pulls `half`), `int8` (`IntGemm`, no extra
@@ -217,9 +227,12 @@ Packed layout is **micropanel-major**: A as panels of `MR` rows (column-by-colum
 `MR` contiguous rows per depth step), B as panels of `NR` columns, tails
 zero-filled. The same `pack_panels` primitive serves both LHS and RHS — they
 differ only in which stride is "leading" vs "depth". The *choice* of layout
-belongs to the family — `IntGemmVnni` interleaves four consecutive depth steps per
-lane/column for `vpdpbusd`, padding the panel depth to its `DEPTH_MULTIPLE` — while the
-mechanical `pack_panels` copy is shared and never changes when a family is added.
+belongs to the family, but the mechanical copy is shared and never changes when a family
+is added: `pack_panels` for the plain micropanel layout, and `pack_kgroup_panels` for the
+**k-group-interleaved** dot layout (`Q` consecutive depth steps contiguous per lane/column,
+depth padded to `Q`, with a per-element transform — identity for bf16, the `+128` `u8` bias
+for VNNI). Both dot families (`IntGemmVnni` `Q = 4`, `Bf16DotGemm` `Q = 2`) route through
+that one routine, so the interleave index math has a single source of truth.
 
 **Adaptive.** Packing is skipped when it doesn't pay. RHS is packed once per
 panel (always, in v1) and reused across all row blocks. LHS packing has **two
