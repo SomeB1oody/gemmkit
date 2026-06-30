@@ -254,13 +254,12 @@ const MC_REG_PANELS: usize = 8;
 /// Per the BLIS model, with no L3 `NC` is redundant and should stay *large* (B streams
 /// from DRAM; the `MC·KC` A panel is what fits the last-level cache) — shrinking it to
 /// an L2 fit is the wrong direction (more jc panels = more barriers, measured slower).
-/// Going to full-`N` does lift parallel throughput but hurts serial. Branching the
-/// two (serial `512` / parallel full-`N`) is *permitted* under the reproducibility
-/// bar — blocking may depend on the parallelism as long as each config stays
-/// deterministic — but is kept uniform here for simplicity, and this no-L3 path is
-/// dead on machines with an L3 anyway; `512` (= `128·NR`) is the kept middle ground.
-/// The split is a no-L3 / Apple-Silicon perf opportunity — validate there before
-/// changing.
+/// Going to full-`N` lifts parallel throughput but hurts serial. Branching the two
+/// (serial `512` / parallel full-`N`) is *permitted* under the reproducibility bar —
+/// blocking may depend on parallelism as long as each config stays deterministic — but is
+/// kept uniform here for simplicity (and this path is dead where an L3 exists anyway).
+/// `512` (= `128·NR`) is the kept middle ground; the split is a perf opportunity to
+/// validate before changing.
 const NC_NO_L3_PANELS: usize = 128;
 
 impl CacheTopology {

@@ -244,20 +244,18 @@ impl KernelFamily for IntGemm {
 ///
 /// Two things change versus [`IntGemm`], both isolated to this family:
 ///
-/// * **Pack layout** (`DEPTH_MULTIPLE = 4`): A and B are packed *k-quad-interleaved* —
-///   four consecutive depth steps contiguous per lane/column so the kernel can issue one
-///   `vpdpbusd`. Depth is padded to a multiple of 4 (A pad = `128`, B pad = `0`). Both
-///   operands are always packed (`FORCE_PACK_*`), since the interleave cannot be read
-///   in place.
-/// * **Signedness** (`u8 × i8`): `vpdpbusd` multiplies *unsigned* A by *signed* B, but
-///   GEMM is signed × signed. The pack offsets A by `+128` into `[0, 255]`; the kernel's
+/// * **Pack layout** (`DEPTH_MULTIPLE = 4`): A and B are *k-quad-interleaved* — four
+///   consecutive depth steps contiguous per lane/column to feed one `vpdpbusd`. Depth is
+///   padded to a multiple of 4 (A pad = `128`, B pad = `0`); both operands are always
+///   packed (`FORCE_PACK_*`), the interleave can't be read in place.
+/// * **Signedness** (`u8 × i8`): `vpdpbusd` does *unsigned* A × *signed* B, but GEMM is
+///   signed × signed. The pack offsets A by `+128`; the
 ///   [`crate::simd::KernelSimd::dot_accumulate`] override subtracts the per-column bias
-///   `128·Σ_k B[k][j]` so the accumulator holds the true `Σ_k A·B` before the epilogue.
+///   `128·Σ_k B[k][j]` so the accumulator holds the true `Σ_k A·B`.
 ///
-/// The accumulation stays exact: i32 add is associative under wrapping, so the 4-way
-/// `vpdpbusd` grouping plus the integer bias correction equals the ascending-`k` widen
-/// sum **bit-for-bit** — VNNI and [`IntGemm`] produce identical output. The alpha fold
-/// and the `i32` epilogue are identical to [`IntGemm`].
+/// Accumulation stays exact: i32 add is associative under wrapping, so the 4-way grouping
+/// plus the bias correction equals the ascending-`k` widen sum **bit-for-bit** — VNNI and
+/// [`IntGemm`] produce identical output. Alpha fold and `i32` epilogue are shared.
 pub struct IntGemmVnni(PhantomData<()>);
 
 impl Clone for IntGemmVnni {
@@ -282,11 +280,10 @@ impl KernelFamily for IntGemmVnni {
     const FORCE_PACK_RHS: bool = true;
     const DEPTH_MULTIPLE: usize = Self::Q;
 
-    /// Pack the `mc × kc` LHS into k-quad-interleaved micropanels (4 contiguous depth bytes
-    /// per row, ready for `vpdpbusd`), via the shared [`pack_kgroup_panels`]. Every byte is
-    /// offset `+128` into `[0, 255]` by the transform; the pad (rows past `mc` / depth past
-    /// `kc`) is `xform(0) = 128`, the offset of `0`, contributing nothing after the bias
-    /// correction.
+    /// Pack the `mc × kc` LHS k-quad-interleaved (4 contiguous depth bytes per row, ready
+    /// for `vpdpbusd`) via the shared [`pack_kgroup_panels`]. The transform offsets every
+    /// byte `+128`; the pad (rows past `mc` / depth past `kc`) is `xform(0) = 128`,
+    /// contributing nothing after the bias correction.
     #[inline]
     unsafe fn pack_lhs(
         dst: *mut i8,

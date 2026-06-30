@@ -256,26 +256,25 @@ where
 }
 
 /// The bf16 dot GEMM family: `Lhs = Rhs = Out = bf16`, `Acc = f32`, driven by AVX-512
-/// `vdpbf16ps` (2 bf16 depth steps per instruction) instead of [`MixedGemm`]'s
-/// widen-and-FMA. A sibling of `MixedGemm<bf16>`, not a branch in it, because the pack
-/// layout differs: `pack_lhs`/`pack_rhs` are `KernelFamily` methods with no ISA
-/// parameter, so the k-pair interleave must key off the *family*.
+/// `vdpbf16ps` (2 bf16 depth steps per instruction) instead of [`MixedGemm`]'s widen-FMA.
+/// A sibling of `MixedGemm<bf16>`, not a branch in it: `pack_lhs`/`pack_rhs` take no ISA
+/// parameter, so the differing k-pair interleave must key off the *family*.
 ///
 /// What changes versus `MixedGemm<bf16>`, both isolated here:
 ///
-/// * **Pack layout** (`DEPTH_MULTIPLE = 2`): A and B are packed *k-pair-interleaved* —
-///   two consecutive depth steps contiguous per lane/column (a 32-bit `__m512bh` pair) so
-///   the kernel can issue one `vdpbf16ps`. Depth is padded to a multiple of 2 with bf16
-///   `0` (product `0·0 = 0`). Both operands are always packed (`FORCE_PACK_*`).
+/// * **Pack layout** (`DEPTH_MULTIPLE = 2`): A and B are *k-pair-interleaved* — two
+///   consecutive depth steps contiguous per lane/column (a 32-bit `__m512bh` pair) to feed
+///   one `vdpbf16ps`. Depth is padded to a multiple of 2 with bf16 `0` (`0·0 = 0`); both
+///   operands are always packed (`FORCE_PACK_*`).
 /// * **Inner loop**: [`crate::simd::KernelSimd::dot_accumulate`] replaces the widen-FMA
 ///   loop. `OUT_IS_ACC = false` keeps `kc = k`, so the whole contraction accumulates in
-///   `f32` and rounds to bf16 once — the alpha fold and narrow epilogue
-///   ([`mixed_epilogue`]) are byte-for-byte identical to `MixedGemm`.
+///   `f32` and rounds to bf16 once; alpha fold and narrow epilogue ([`mixed_epilogue`])
+///   are shared with `MixedGemm`.
 ///
-/// `vdpbf16ps` forms a fused 2-term bf16 dot with hardware intra-pair rounding, so the
-/// result is *not* bitwise-equal to the widen path — only tolerance-equal. It is still
-/// fully deterministic, and serial/parallel/prepacked runs all share this kernel and
-/// pack layout, so they reproduce each other bit-for-bit.
+/// `vdpbf16ps`'s fused 2-term dot rounds differently from the widen path, so the result is
+/// only tolerance-equal, not bitwise. It is still fully deterministic, and
+/// serial/parallel/prepacked all share this kernel and layout, so they reproduce each
+/// other bit-for-bit.
 pub struct Bf16DotGemm(PhantomData<()>);
 
 impl Clone for Bf16DotGemm {
