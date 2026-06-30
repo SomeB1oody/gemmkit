@@ -13,11 +13,10 @@ readme = "README.md"
 
 [features]
 default = ["std", "parallel"]
-# `dep:raw-cpuid` is x86-only (target-gated below); the activation is a no-op on
-# other targets, and on x86 it is pulled only when `std` is on — matching the
-# `cfg(all(feature = "std", x86))`-gated cpuid detection module that is its sole user.
 std = ["dep:raw-cpuid"]
 parallel = ["std", "dep:rayon"]
+wasm_threads = ["parallel"]
+
 # Optional element-type
 complex = ["dep:num-complex"] # c32/c64 GEMM with conjA/conjB (`gemm_cplx`)
 half = ["dep:half"] # f16/bf16 mixed-precision GEMM (f32 accumulate)
@@ -31,7 +30,7 @@ num-complex = { version = "0.4", default-features = false, optional = true }
 [target.'cfg(any(target_arch = "x86", target_arch = "x86_64"))'.dependencies]
 raw-cpuid = { version = "11", optional = true }
 
-[target.'cfg(not(miri))'.dev-dependencies]
+[target.'cfg(all(not(miri), not(target_family = "wasm")))'.dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 gemm = "0.18"
 matrixmultiply = "0.3"

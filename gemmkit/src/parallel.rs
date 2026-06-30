@@ -34,10 +34,46 @@ impl Default for Parallelism {
 
 #[cfg(feature = "parallel")]
 fn auto_threads() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
+    match std::thread::available_parallelism() {
+        Ok(n) => n.get(),
+        // wasm has no `available_parallelism`
+        // so fall back to the tunable wasm worker count — reached only under `RAYON_USABLE`
+        #[cfg(all(target_arch = "wasm32", feature = "wasm_threads"))]
+        Err(_) => crate::tuning::wasm_threads(),
+        #[cfg(not(all(target_arch = "wasm32", feature = "wasm_threads")))]
+        Err(_) => 1,
+    }
 }
+
+/// gemmkit's own rayon pool for threaded wasm, sized by [`crate::tuning::wasm_threads`].
+/// rayon's *global* pool auto-sizes from `available_parallelism` (unsupported on wasm), so it
+/// would run single-threaded; this explicitly-sized pool is what makes a threaded wasm build
+/// actually parallel. Built lazily on first use (only reached when `RAYON_USABLE`).
+#[cfg(all(target_arch = "wasm32", feature = "wasm_threads"))]
+fn wasm_pool() -> &'static rayon::ThreadPool {
+    use std::sync::OnceLock;
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(crate::tuning::wasm_threads())
+            .build()
+            .expect("gemmkit: failed to build the wasm rayon thread pool")
+    })
+}
+
+/// Whether rayon can spawn workers at runtime. `false` on a wasm build that hasn't opted into
+/// threading, so `parallel` degrades to the serial loop there instead of trapping (baseline
+/// `wasm32-wasip1` has no thread runtime). `true` for: non-wasm; the `wasm_threads` opt-in
+/// (a threaded wasm runtime — `wasm32-wasip1-threads` / browser + SharedArrayBuffer); or
+/// `target_feature = "atomics"` (only settable on nightly `-Zbuild-std`, which is why
+/// `wasm_threads` exists). All compile-time, so a `const` — there is no safe runtime probe
+/// (spawning to test would panic on threadless wasm).
+#[cfg(feature = "parallel")]
+const RAYON_USABLE: bool = cfg!(any(
+    not(target_arch = "wasm32"),
+    feature = "wasm_threads",
+    target_feature = "atomics",
+));
 
 impl Parallelism {
     /// Resolve the number of job partitions (workers) for a problem of the given
@@ -51,24 +87,25 @@ impl Parallelism {
             Parallelism::Rayon(_) => 1,
             #[cfg(feature = "parallel")]
             Parallelism::Rayon(req) => {
+                // Wasm without the threading opt-in
+                if !RAYON_USABLE {
+                    return 1;
+                }
                 let gate = tuning::parallel_threshold();
                 if mnk < gate {
                     return 1;
                 }
                 // Explicit count: honor it, capped by cores and jobs so
-                // `Rayon(huge)` can't over-subscribe or over-allocate pack regions.
+                // `Rayon(huge)` can't over-subscribe or over-allocate pack regions
                 // Only auto (below) is heuristic, so `Rayon(n)` gives the exact
                 // width the tests and scaling diagnostic ask for.
                 if req != 0 {
                     return req.min(auto_threads()).min(n_jobs).max(1);
                 }
-                // Auto: ramp workers with the *linear* dimension (≈ cbrt of the
-                // work), not the total work — per-region fork/join + cursor
-                // contention grows with the worker count, so the optimum tracks ~n,
-                // not n³ (Zen5: 512→8, 1024→16, 2048→32). `div_ceil` avoids a dead
-                // band just above the gate and absorbs cbrt truncation. The stride
-                // is core-count-derived by default and tunable via
-                // `GEMMKIT_THREAD_DIM_STRIDE` (see `tuning::thread_dim_stride`).
+                // Auto: ramp workers with the linear dimension
+                // contention grows with the worker count.
+                // The stride is core-count-derived by default and tunable via
+                // `GEMMKIT_THREAD_DIM_STRIDE`
                 let dim = (mnk as f64).cbrt() as usize; // ≈ n for square problems
                 let want = dim.div_ceil(tuning::thread_dim_stride());
                 want.min(auto_threads()).min(n_jobs).max(1)
@@ -163,8 +200,23 @@ where
 {
     if n_threads <= 1 {
         f(0);
-    } else {
-        use rayon::prelude::*;
+        return;
+    }
+    // Wasm without the threading opt-in
+    if !RAYON_USABLE {
+        for tid in 0..n_threads {
+            f(tid);
+        }
+        return;
+    }
+    use rayon::prelude::*;
+    // Threaded wasm
+    #[cfg(all(target_arch = "wasm32", feature = "wasm_threads"))]
+    {
+        wasm_pool().install(|| (0..n_threads).into_par_iter().for_each(f));
+    }
+    #[cfg(not(all(target_arch = "wasm32", feature = "wasm_threads")))]
+    {
         (0..n_threads).into_par_iter().for_each(f);
     }
 }
@@ -224,6 +276,7 @@ mod tests {
     /// bijectively — every index handed to exactly one puller, none skipped or
     /// duplicated. This is the soundness property the parallel driver relies on.
     #[test]
+    #[cfg(not(target_arch = "wasm32"))]
     fn cursor_partition_is_bijective_under_threads() {
         use std::sync::Mutex;
         let n_jobs = 10_000usize;

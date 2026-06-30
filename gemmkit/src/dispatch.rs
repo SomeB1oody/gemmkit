@@ -11,16 +11,20 @@
 //!
 //! By default the best available ISA is selected at runtime. Setting the
 //! environment variable `GEMMKIT_REQUIRE_ISA` to `scalar`, `fma`, `avx512`,
-//! `avx512vnni`, or `neon` **forces** exactly that kernel (`avx512vnni` selects the
-//! `i8` `vpdpbusd` dot kernel, and the plain AVX-512 path for every other type); if
+//! `avx512vnni`, `avx512bf16`, `neon`, or `simd128` **forces** exactly that kernel
+//! (`avx512vnni` selects the `i8` `vpdpbusd` dot kernel, `avx512bf16` the `bf16`
+//! `vdpbf16ps` dot kernel, and the plain AVX-512 path for every other type); if
 //! the CPU (or an emulator such as
 //! Intel SDE) does not report the required feature — or the requested ISA does
 //! not exist on this target architecture — dispatch **panics** rather than
 //! falling back, so a CI job that means to exercise a given kernel fails loudly
 //! instead of silently testing a different one. (`neon` is only valid on
-//! aarch64, where it is baseline; `fma`/`avx512` only on x86.) `auto`/unset is
-//! the normal auto-selecting behavior. The value is read once (the choice is
-//! memoized), so set it in the process environment before the first GEMM call.
+//! aarch64, where it is baseline; `fma`/`avx512*` only on x86; `simd128` only on a
+//! `wasm32` build compiled with `-C target-feature=+simd128` — there it asserts the
+//! SIMD path is live rather than silently degrading to the scalar fallback when the
+//! flag was forgotten.) `auto`/unset is the normal auto-selecting behavior. The value
+//! is read once (the choice is memoized), so set it in the process environment before
+//! the first GEMM call.
 
 #[cfg(feature = "std")]
 use std::sync::OnceLock;
@@ -58,6 +62,8 @@ use crate::simd::Avx512Vnni;
 use crate::simd::KernelSimd;
 #[cfg(target_arch = "aarch64")]
 use crate::simd::Neon;
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+use crate::simd::Simd128;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use crate::simd::{Avx512, Fma};
 use crate::simd::{ScalarTok, SimdOps};
@@ -627,6 +633,20 @@ unsafe fn gemm_f64_neon(t: Task<f64>, par: Parallelism, ws: &mut Workspace) {
     unsafe { run_typed::<f64, Neon, 4, 4>(Neon, t, par, ws) }
 }
 
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+unsafe fn gemm_f32_simd128(t: Task<f32>, par: Parallelism, ws: &mut Workspace) {
+    // MR = 2*4 = 8, NR = 4 → 8 acc + 2 lhs + 1 rhs = 11 live `v128`
+    // LLVM's wasm backend spills past ~16 live vectors, and wasm has no hardware FMA
+    // (no `LANE_FMA`), so the 4×4 NEON tile would over-subscribe
+    unsafe { run_typed::<f32, Simd128, 2, 4>(Simd128, t, par, ws) }
+}
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+unsafe fn gemm_f64_simd128(t: Task<f64>, par: Parallelism, ws: &mut Workspace) {
+    // MR = 2*2 = 4, NR = 4 → 8 acc + 2 lhs + 1 rhs = 11 live `v128`
+    // (same tile shape as f32, f64 just packs 2 lanes per register)
+    unsafe { run_typed::<f64, Simd128, 2, 4>(Simd128, t, par, ws) }
+}
+
 // ---- prepacked-RHS entry points: one per (type, ISA), same tiles ----
 
 unsafe fn gemm_f32_scalar_packed(r: PackedConsume<f32>, par: Parallelism, ws: &mut Workspace) {
@@ -658,6 +678,14 @@ unsafe fn gemm_f32_neon_packed(r: PackedConsume<f32>, par: Parallelism, ws: &mut
 #[cfg(target_arch = "aarch64")]
 unsafe fn gemm_f64_neon_packed(r: PackedConsume<f64>, par: Parallelism, ws: &mut Workspace) {
     unsafe { run_packed_typed::<f64, Neon, 4, 4>(Neon, r, par, ws) }
+}
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+unsafe fn gemm_f32_simd128_packed(r: PackedConsume<f32>, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_packed_typed::<f32, Simd128, 2, 4>(Simd128, r, par, ws) }
+}
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+unsafe fn gemm_f64_simd128_packed(r: PackedConsume<f64>, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_packed_typed::<f64, Simd128, 2, 4>(Simd128, r, par, ws) }
 }
 
 // ---- mixed-precision (f16 / bf16) entry points: same tiles as f32 (the
@@ -742,6 +770,22 @@ unsafe fn gemm_f16_neon_packed(r: PackedConsume<f16>, par: Parallelism, ws: &mut
 unsafe fn gemm_bf16_neon_packed(r: PackedConsume<bf16>, par: Parallelism, ws: &mut Workspace) {
     unsafe { run_packed_typed_mixed::<bf16, Neon, 4, 4>(Neon, r, par, ws) }
 }
+#[cfg(all(feature = "half", target_arch = "wasm32", target_feature = "simd128"))]
+unsafe fn gemm_f16_simd128(t: Task<f16>, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_typed_mixed::<f16, Simd128, 2, 4>(Simd128, t, par, ws) }
+}
+#[cfg(all(feature = "half", target_arch = "wasm32", target_feature = "simd128"))]
+unsafe fn gemm_bf16_simd128(t: Task<bf16>, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_typed_mixed::<bf16, Simd128, 2, 4>(Simd128, t, par, ws) }
+}
+#[cfg(all(feature = "half", target_arch = "wasm32", target_feature = "simd128"))]
+unsafe fn gemm_f16_simd128_packed(r: PackedConsume<f16>, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_packed_typed_mixed::<f16, Simd128, 2, 4>(Simd128, r, par, ws) }
+}
+#[cfg(all(feature = "half", target_arch = "wasm32", target_feature = "simd128"))]
+unsafe fn gemm_bf16_simd128_packed(r: PackedConsume<bf16>, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_packed_typed_mixed::<bf16, Simd128, 2, 4>(Simd128, r, par, ws) }
+}
 
 type GemmFn<T> = unsafe fn(Task<T>, Parallelism, &mut Workspace);
 type PackedFn<T> = unsafe fn(PackedConsume<T>, Parallelism, &mut Workspace);
@@ -782,6 +826,7 @@ const DISP_F64_SCALAR: Dispatched<f64> = Dispatched {
     nr: 4,
     depth_multiple: 1,
 };
+
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 const DISP_F32_FMA: Dispatched<f32> = Dispatched {
     run: gemm_f32_fma,
@@ -798,6 +843,7 @@ const DISP_F64_FMA: Dispatched<f64> = Dispatched {
     nr: 6,
     depth_multiple: 1,
 };
+
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 const DISP_F32_AVX512: Dispatched<f32> = Dispatched {
     run: gemm_f32_avx512,
@@ -814,6 +860,7 @@ const DISP_F64_AVX512: Dispatched<f64> = Dispatched {
     nr: 12,
     depth_multiple: 1,
 };
+
 #[cfg(target_arch = "aarch64")]
 const DISP_F32_NEON: Dispatched<f32> = Dispatched {
     run: gemm_f32_neon,
@@ -831,8 +878,23 @@ const DISP_F64_NEON: Dispatched<f64> = Dispatched {
     depth_multiple: 1,
 };
 
-// Mixed-precision descriptors. `mr = MR_REG · f32-LANES` (the accumulator width):
-// scalar 4×4, FMA 16×6, AVX-512 32×12, NEON 16×4 — the same tiles as f32.
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+const DISP_F32_SIMD128: Dispatched<f32> = Dispatched {
+    run: gemm_f32_simd128,
+    run_packed: gemm_f32_simd128_packed,
+    mr: 8,
+    nr: 4,
+    depth_multiple: 1,
+};
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+const DISP_F64_SIMD128: Dispatched<f64> = Dispatched {
+    run: gemm_f64_simd128,
+    run_packed: gemm_f64_simd128_packed,
+    mr: 4,
+    nr: 4,
+    depth_multiple: 1,
+};
+
 #[cfg(feature = "half")]
 const DISP_F16_SCALAR: Dispatched<f16> = Dispatched {
     run: gemm_f16_scalar,
@@ -849,6 +911,7 @@ const DISP_BF16_SCALAR: Dispatched<bf16> = Dispatched {
     nr: 4,
     depth_multiple: 1,
 };
+
 #[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
 const DISP_F16_FMA: Dispatched<f16> = Dispatched {
     run: gemm_f16_fma,
@@ -865,6 +928,7 @@ const DISP_BF16_FMA: Dispatched<bf16> = Dispatched {
     nr: 6,
     depth_multiple: 1,
 };
+
 #[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
 const DISP_F16_AVX512: Dispatched<f16> = Dispatched {
     run: gemm_f16_avx512,
@@ -890,6 +954,7 @@ const DISP_BF16_AVX512_DOT: Dispatched<bf16> = Dispatched {
     // k-pair-interleaved pack → the prepack buffer rounds its depth up to 2.
     depth_multiple: 2,
 };
+
 #[cfg(all(feature = "half", target_arch = "aarch64"))]
 const DISP_F16_NEON: Dispatched<f16> = Dispatched {
     run: gemm_f16_neon,
@@ -903,6 +968,23 @@ const DISP_BF16_NEON: Dispatched<bf16> = Dispatched {
     run: gemm_bf16_neon,
     run_packed: gemm_bf16_neon_packed,
     mr: 16,
+    nr: 4,
+    depth_multiple: 1,
+};
+
+#[cfg(all(feature = "half", target_arch = "wasm32", target_feature = "simd128"))]
+const DISP_F16_SIMD128: Dispatched<f16> = Dispatched {
+    run: gemm_f16_simd128,
+    run_packed: gemm_f16_simd128_packed,
+    mr: 8,
+    nr: 4,
+    depth_multiple: 1,
+};
+#[cfg(all(feature = "half", target_arch = "wasm32", target_feature = "simd128"))]
+const DISP_BF16_SIMD128: Dispatched<bf16> = Dispatched {
+    run: gemm_bf16_simd128,
+    run_packed: gemm_bf16_simd128_packed,
+    mr: 8,
     nr: 4,
     depth_multiple: 1,
 };
@@ -922,10 +1004,6 @@ enum ForcedIsa {
     Scalar,
     /// FMA: the `fma`-based (AVX2) widen kernel
     Fma,
-    // The `Avx512*` variants all imply `avx512f`. `Vnni` and `Bf16` are orthogonal
-    // extensions (a CPU may report either, both, or neither); each selects a distinct
-    // dot kernel for `i8` / `bf16`, and falls back to the `Avx512F` widen kernel for
-    // every other element type.
     /// AVX-512 foundation (`avx512f`): the widen kernel
     Avx512F,
     /// AVX-512 VNNI: the `i8` `vpdpbusd` dot kernel
@@ -934,6 +1012,10 @@ enum ForcedIsa {
     Avx512Bf16,
     /// NEON: the AArch64 kernel
     Neon,
+    /// WebAssembly `simd128`. Baseline-by-cfg like `Neon`, but `simd128` is an easily-forgotten
+    /// compile-time `-C target-feature=+simd128`; pinning it makes a build **assert** the SIMD
+    /// path is live (panics if absent) instead of silently falling back to scalar.
+    Simd128,
 }
 
 /// Parse the `GEMMKIT_REQUIRE_ISA` pin. Unset/empty ⇒ [`ForcedIsa::Auto`]; an
@@ -959,9 +1041,11 @@ fn forced_isa() -> ForcedIsa {
                 ForcedIsa::Avx512Bf16
             } else if t.eq_ignore_ascii_case("neon") {
                 ForcedIsa::Neon
+            } else if t.eq_ignore_ascii_case("simd128") || t.eq_ignore_ascii_case("wasm") {
+                ForcedIsa::Simd128
             } else {
                 panic!(
-                    "GEMMKIT_REQUIRE_ISA: unknown value `{t}` (expected scalar|fma|avx512|avx512vnni|avx512bf16|neon|auto)"
+                    "GEMMKIT_REQUIRE_ISA: unknown value `{t}` (expected scalar|fma|avx512|avx512vnni|avx512bf16|neon|simd128|auto)"
                 )
             }
         }
@@ -1001,6 +1085,14 @@ fn select_f32() -> Dispatched<f32> {
         ForcedIsa::Neon => {
             panic!("GEMMKIT_REQUIRE_ISA=neon, but this target is not aarch64")
         }
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        ForcedIsa::Simd128 => return DISP_F32_SIMD128,
+        #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+        ForcedIsa::Simd128 => {
+            panic!(
+                "GEMMKIT_REQUIRE_ISA=simd128, but this build is not wasm32 with -C target-feature=+simd128"
+            )
+        }
         ForcedIsa::Auto => {}
     }
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -1012,13 +1104,24 @@ fn select_f32() -> Dispatched<f32> {
             return DISP_F32_FMA;
         }
     }
-    // NEON is mandatory on aarch64: it is always the Auto choice there, so the
-    // scalar fallback below is gated out (it would be unreachable) on aarch64.
+    // NEON is mandatory on aarch64
     #[cfg(target_arch = "aarch64")]
     {
         DISP_F32_NEON
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    // `simd128` on wasm32, else scalar
+    #[cfg(target_arch = "wasm32")]
+    {
+        #[cfg(target_feature = "simd128")]
+        {
+            DISP_F32_SIMD128
+        }
+        #[cfg(not(target_feature = "simd128"))]
+        {
+            DISP_F32_SCALAR
+        }
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "wasm32")))]
     {
         DISP_F32_SCALAR
     }
@@ -1053,6 +1156,14 @@ fn select_f64() -> Dispatched<f64> {
         ForcedIsa::Neon => {
             panic!("GEMMKIT_REQUIRE_ISA=neon, but this target is not aarch64")
         }
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        ForcedIsa::Simd128 => return DISP_F64_SIMD128,
+        #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+        ForcedIsa::Simd128 => {
+            panic!(
+                "GEMMKIT_REQUIRE_ISA=simd128, but this build is not wasm32 with -C target-feature=+simd128"
+            )
+        }
         ForcedIsa::Auto => {}
     }
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -1064,13 +1175,24 @@ fn select_f64() -> Dispatched<f64> {
             return DISP_F64_FMA;
         }
     }
-    // NEON is mandatory on aarch64: it is always the Auto choice there, so the
-    // scalar fallback below is gated out (it would be unreachable) on aarch64.
+    // NEON is mandatory on aarch64
     #[cfg(target_arch = "aarch64")]
     {
         DISP_F64_NEON
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    // `simd128` on wasm32, else scalar
+    #[cfg(target_arch = "wasm32")]
+    {
+        #[cfg(target_feature = "simd128")]
+        {
+            DISP_F64_SIMD128
+        }
+        #[cfg(not(target_feature = "simd128"))]
+        {
+            DISP_F64_SCALAR
+        }
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "wasm32")))]
     {
         DISP_F64_SCALAR
     }
@@ -1109,6 +1231,12 @@ fn select_f16() -> Dispatched<f16> {
         ForcedIsa::Neon => return DISP_F16_NEON,
         #[cfg(not(target_arch = "aarch64"))]
         ForcedIsa::Neon => panic!("GEMMKIT_REQUIRE_ISA=neon, but this target is not aarch64"),
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        ForcedIsa::Simd128 => return DISP_F16_SIMD128,
+        #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+        ForcedIsa::Simd128 => panic!(
+            "GEMMKIT_REQUIRE_ISA=simd128, but this build is not wasm32 with -C target-feature=+simd128"
+        ),
         ForcedIsa::Auto => {}
     }
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -1127,7 +1255,19 @@ fn select_f16() -> Dispatched<f16> {
     {
         DISP_F16_NEON
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    // `simd128` on wasm32, else scalar
+    #[cfg(target_arch = "wasm32")]
+    {
+        #[cfg(target_feature = "simd128")]
+        {
+            DISP_F16_SIMD128
+        }
+        #[cfg(not(target_feature = "simd128"))]
+        {
+            DISP_F16_SCALAR
+        }
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "wasm32")))]
     {
         DISP_F16_SCALAR
     }
@@ -1171,11 +1311,17 @@ fn select_bf16() -> Dispatched<bf16> {
         ForcedIsa::Neon => return DISP_BF16_NEON,
         #[cfg(not(target_arch = "aarch64"))]
         ForcedIsa::Neon => panic!("GEMMKIT_REQUIRE_ISA=neon, but this target is not aarch64"),
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        ForcedIsa::Simd128 => return DISP_BF16_SIMD128,
+        #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+        ForcedIsa::Simd128 => panic!(
+            "GEMMKIT_REQUIRE_ISA=simd128, but this build is not wasm32 with -C target-feature=+simd128"
+        ),
         ForcedIsa::Auto => {}
     }
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
-        // bf16 dot kernel first — `vdpbf16ps` ~doubles bf16 throughput over widen+FMA.
+        // bf16 dot kernel first - `vdpbf16ps` ~doubles bf16
         if is_x86_feature_detected!("avx512bf16") && is_x86_feature_detected!("avx512f") {
             return DISP_BF16_AVX512_DOT;
         }
@@ -1190,7 +1336,19 @@ fn select_bf16() -> Dispatched<bf16> {
     {
         DISP_BF16_NEON
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    // `simd128` on wasm32, else scalar
+    #[cfg(target_arch = "wasm32")]
+    {
+        #[cfg(target_feature = "simd128")]
+        {
+            DISP_BF16_SIMD128
+        }
+        #[cfg(not(target_feature = "simd128"))]
+        {
+            DISP_BF16_SCALAR
+        }
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "wasm32")))]
     {
         DISP_BF16_SCALAR
     }
@@ -1593,6 +1751,11 @@ unsafe fn gemm_i8_avx512vnni(t: IntTask, par: Parallelism, ws: &mut Workspace) {
 unsafe fn gemm_i8_neon(t: IntTask, par: Parallelism, ws: &mut Workspace) {
     unsafe { run_typed_int::<IntGemm, Neon, 4, 4>(Neon, t, par, ws) }
 }
+// wasm simd128 i8
+#[cfg(all(feature = "int8", target_arch = "wasm32", target_feature = "simd128"))]
+unsafe fn gemm_i8_simd128(t: IntTask, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_typed_int::<IntGemm, Simd128, 2, 4>(Simd128, t, par, ws) }
+}
 
 #[cfg(feature = "int8")]
 type IntFn = unsafe fn(IntTask, Parallelism, &mut Workspace);
@@ -1647,6 +1810,11 @@ const DISP_I8_NEON: IntDispatched = IntDispatched {
     run: gemm_i8_neon,
     small_par_fallback: None,
 };
+#[cfg(all(feature = "int8", target_arch = "wasm32", target_feature = "simd128"))]
+const DISP_I8_SIMD128: IntDispatched = IntDispatched {
+    run: gemm_i8_simd128,
+    small_par_fallback: None,
+};
 
 /// `i8` ISA selection. The widen-and-multiply integer kernel uses only AVX2/AVX-512
 /// integer ops (no VNNI), so the gates mirror the `f32` ladder.
@@ -1688,6 +1856,12 @@ fn select_i8() -> IntDispatched {
         ForcedIsa::Neon => return DISP_I8_NEON,
         #[cfg(not(target_arch = "aarch64"))]
         ForcedIsa::Neon => panic!("GEMMKIT_REQUIRE_ISA=neon, but this target is not aarch64"),
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        ForcedIsa::Simd128 => return DISP_I8_SIMD128,
+        #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+        ForcedIsa::Simd128 => panic!(
+            "GEMMKIT_REQUIRE_ISA=simd128, but this build is not wasm32 with -C target-feature=+simd128"
+        ),
         ForcedIsa::Auto => {}
     }
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -1715,7 +1889,19 @@ fn select_i8() -> IntDispatched {
     {
         DISP_I8_NEON
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    // `simd128` on wasm32, else scalar
+    #[cfg(target_arch = "wasm32")]
+    {
+        #[cfg(target_feature = "simd128")]
+        {
+            DISP_I8_SIMD128
+        }
+        #[cfg(not(target_feature = "simd128"))]
+        {
+            DISP_I8_SCALAR
+        }
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "wasm32")))]
     {
         DISP_I8_SCALAR
     }
@@ -1880,11 +2066,6 @@ unsafe fn gemm_c64_avx512(ca: bool, cb: bool, t: Task<C64>, par: Parallelism, ws
 unsafe fn gemm_c32_neon(ca: bool, cb: bool, t: Task<C32>, par: Parallelism, ws: &mut Workspace) {
     // c32 NEON: real LANES = 4, MR = 2*4 = 8 complex rows, NR = 5 → 20 acc + 4 A + 2 B
     // splat = 26 of the 32 v0–v31, leaving room for the in-flight load/lane temporaries.
-    // Two reasons it wins: MR_REG = 2 broadcasts each RHS scalar across 8 rows, halving the
-    // splat:FMA ratio of a 1-register-row tile; and NR is capped at 5 so every accumulator
-    // stays in a register. A fuller tile (NR = 6 is 30 *named* vregs, more once temporaries
-    // are counted) overflows the 32-register file and spills accumulators to the stack on
-    // every k-step, regressing sharply.
     unsafe { run_complex::<C32, Neon, 2, 5>(Neon, ca, cb, t, par, ws) }
 }
 #[cfg(all(feature = "complex", target_arch = "aarch64"))]
@@ -1892,6 +2073,27 @@ unsafe fn gemm_c64_neon(ca: bool, cb: bool, t: Task<C64>, par: Parallelism, ws: 
     // c64 NEON: real LANES = 2, MR = 2*2 = 4 complex rows, NR = 5 (same 26-vreg budget and
     // the same MR_REG=2 / NR=5 rationale as c32 above).
     unsafe { run_complex::<C64, Neon, 2, 5>(Neon, ca, cb, t, par, ws) }
+}
+// wasm simd128 complex
+// real `Reg` = v128
+// The SoA kernel needs `2·MR_REG·NR` accumulators (re+im) + `2·MR_REG` A regs + 2 B splats
+#[cfg(all(
+    feature = "complex",
+    target_arch = "wasm32",
+    target_feature = "simd128"
+))]
+unsafe fn gemm_c32_simd128(ca: bool, cb: bool, t: Task<C32>, par: Parallelism, ws: &mut Workspace) {
+    // c32 simd128: real LANES = 4, MR = 1*4 = 4 complex rows, NR = 4.
+    unsafe { run_complex::<C32, Simd128, 1, 4>(Simd128, ca, cb, t, par, ws) }
+}
+#[cfg(all(
+    feature = "complex",
+    target_arch = "wasm32",
+    target_feature = "simd128"
+))]
+unsafe fn gemm_c64_simd128(ca: bool, cb: bool, t: Task<C64>, par: Parallelism, ws: &mut Workspace) {
+    // c64 simd128: real LANES = 2, MR = 1*2 = 2 complex rows, NR = 4 (same 12-v128 budget).
+    unsafe { run_complex::<C64, Simd128, 1, 4>(Simd128, ca, cb, t, par, ws) }
 }
 
 #[cfg(feature = "complex")]
@@ -1918,6 +2120,22 @@ const CDISP_C64_AVX512: CplxDispatched<C64> = CplxDispatched {
 const CDISP_C32_NEON: CplxDispatched<C32> = CplxDispatched { run: gemm_c32_neon };
 #[cfg(all(feature = "complex", target_arch = "aarch64"))]
 const CDISP_C64_NEON: CplxDispatched<C64> = CplxDispatched { run: gemm_c64_neon };
+#[cfg(all(
+    feature = "complex",
+    target_arch = "wasm32",
+    target_feature = "simd128"
+))]
+const CDISP_C32_SIMD128: CplxDispatched<C32> = CplxDispatched {
+    run: gemm_c32_simd128,
+};
+#[cfg(all(
+    feature = "complex",
+    target_arch = "wasm32",
+    target_feature = "simd128"
+))]
+const CDISP_C64_SIMD128: CplxDispatched<C64> = CplxDispatched {
+    run: gemm_c64_simd128,
+};
 
 /// `c32` ISA selection (the complex multiply uses only AVX2/AVX-512 float ops).
 #[cfg(feature = "complex")]
@@ -1948,6 +2166,12 @@ fn select_c32() -> CplxDispatched<C32> {
         ForcedIsa::Neon => return CDISP_C32_NEON,
         #[cfg(not(target_arch = "aarch64"))]
         ForcedIsa::Neon => panic!("GEMMKIT_REQUIRE_ISA=neon, but this target is not aarch64"),
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        ForcedIsa::Simd128 => return CDISP_C32_SIMD128,
+        #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+        ForcedIsa::Simd128 => panic!(
+            "GEMMKIT_REQUIRE_ISA=simd128, but this build is not wasm32 with -C target-feature=+simd128"
+        ),
         ForcedIsa::Auto => {}
     }
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -1963,7 +2187,19 @@ fn select_c32() -> CplxDispatched<C32> {
     {
         CDISP_C32_NEON
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    // `simd128` on wasm32, else scalar
+    #[cfg(target_arch = "wasm32")]
+    {
+        #[cfg(target_feature = "simd128")]
+        {
+            CDISP_C32_SIMD128
+        }
+        #[cfg(not(target_feature = "simd128"))]
+        {
+            CDISP_C32_SCALAR
+        }
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "wasm32")))]
     {
         CDISP_C32_SCALAR
     }
@@ -1998,6 +2234,12 @@ fn select_c64() -> CplxDispatched<C64> {
         ForcedIsa::Neon => return CDISP_C64_NEON,
         #[cfg(not(target_arch = "aarch64"))]
         ForcedIsa::Neon => panic!("GEMMKIT_REQUIRE_ISA=neon, but this target is not aarch64"),
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        ForcedIsa::Simd128 => return CDISP_C64_SIMD128,
+        #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+        ForcedIsa::Simd128 => panic!(
+            "GEMMKIT_REQUIRE_ISA=simd128, but this build is not wasm32 with -C target-feature=+simd128"
+        ),
         ForcedIsa::Auto => {}
     }
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -2013,7 +2255,19 @@ fn select_c64() -> CplxDispatched<C64> {
     {
         CDISP_C64_NEON
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    // `simd128` on wasm32, else scalar
+    #[cfg(target_arch = "wasm32")]
+    {
+        #[cfg(target_feature = "simd128")]
+        {
+            CDISP_C64_SIMD128
+        }
+        #[cfg(not(target_feature = "simd128"))]
+        {
+            CDISP_C64_SCALAR
+        }
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "wasm32")))]
     {
         CDISP_C64_SCALAR
     }

@@ -9,6 +9,8 @@ use gemmkit::kernel::FloatGemm;
 #[cfg(target_arch = "aarch64")]
 use gemmkit::simd::Neon;
 use gemmkit::simd::ScalarTok;
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+use gemmkit::simd::Simd128;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use gemmkit::simd::{Avx512, Fma};
 use gemmkit::{MatMut, MatRef, Parallelism, Workspace, gemm, gemm_unchecked};
@@ -454,9 +456,9 @@ fn parallel_equals_serial_mixed() {
 /// Cross-check `f16` against the `gemm` crate (the ecosystem oracle, which also
 /// accumulates `f16` in `f32`): the two must agree to a tight `f16` tolerance.
 /// `gemm`'s `f16` *is* `half::f16` *is* `gemmkit::f16`, so the comparison is direct.
-/// Gated out of Miri (the `gemm` dev-dep is `cfg(not(miri))`).
+/// Gated out of Miri and wasm (the `gemm` dev-dep is `cfg(all(not(miri), not(wasm)))`).
 #[test]
-#[cfg(all(not(miri), feature = "half"))]
+#[cfg(all(not(miri), not(target_family = "wasm"), feature = "half"))]
 fn mixed_f16_matches_gemm_crate() {
     // Includes a large-k case (k = 2048 > the f32 kc blocking ≈ 512) to exercise the
     // mixed-precision single-panel rule: because `Out` (f16) is narrower than `Acc`
@@ -1799,6 +1801,20 @@ fn isa_neon() {
     }
 }
 
+/// wasm `simd128` is a compile-time feature (no runtime detection), so — like the
+/// NEON baseline — no guard is needed: when the build enables `simd128` this test
+/// is compiled and the kernel always runs. Tile matches the production dispatch
+/// choice (`MR_REG=2, NR=4`). The two-rounding `mul_add` rounds within the
+/// `assert_accurate` relative-Frobenius tolerance, so no bitwise compare is implied.
+#[test]
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+fn isa_simd128() {
+    for (m, k, n) in isa_shapes() {
+        driver_case::<f32, Simd128, 2, 4>(Simd128, m, k, n);
+        driver_case::<f64, Simd128, 2, 4>(Simd128, m, k, n);
+    }
+}
+
 /// The SIMD narrow-store (`KernelSimd::store_out`) must be **bit-identical** to the
 /// scalar `NarrowFloat::narrow` (= `half::from_f32`) across edge values — normals,
 /// subnormals, ±0, ±Inf, and NaN — so the full-tile vector path and the partial-tile
@@ -2398,9 +2414,10 @@ fn cplx_unchecked_negative_strides() {
 
 /// Cross-check complex (c32) against the `gemm` crate (which has native c32 and
 /// `conj_lhs`/`conj_rhs` flags); `gemm::c32 == num_complex::Complex32 == gemmkit::c32`,
-/// so the comparison is direct. Gated out of Miri.
+/// so the comparison is direct. Gated out of Miri and wasm (the `gemm` dev-dep is
+/// `cfg(all(not(miri), not(wasm)))`).
 #[test]
-#[cfg(all(not(miri), feature = "complex"))]
+#[cfg(all(not(miri), not(target_family = "wasm"), feature = "complex"))]
 fn complex_matches_gemm_crate() {
     for (m, k, n) in [(64, 48, 40), (96, 65, 72), (33, 17, 19)] {
         for &(ca, cb) in &[(false, false), (true, false), (false, true), (true, true)] {

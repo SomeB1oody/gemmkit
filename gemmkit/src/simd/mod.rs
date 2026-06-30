@@ -33,8 +33,6 @@
 
 use crate::scalar::Scalar;
 
-// `complex` is declared first and `#[macro_use]` so its `impl_complex_simd!` glue macro
-// is in scope for the ISA token modules below (they invoke it for their complex types).
 #[cfg(feature = "complex")]
 #[macro_use]
 mod complex;
@@ -45,6 +43,8 @@ mod fma;
 #[cfg(target_arch = "aarch64")]
 mod neon;
 mod scalar;
+#[cfg(target_arch = "wasm32")]
+mod wasm;
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub use self::avx512::Avx512;
@@ -57,6 +57,8 @@ pub use self::fma::Fma;
 #[cfg(target_arch = "aarch64")]
 pub use self::neon::Neon;
 pub use self::scalar::ScalarTok;
+#[cfg(target_arch = "wasm32")]
+pub use self::wasm::Simd128;
 
 /// The SIMD capability an ISA token must provide to drive a [`crate::kernel::KernelFamily`]
 /// with input types `L`/`R`, accumulator `A`, and output `O`: accumulate in `A`

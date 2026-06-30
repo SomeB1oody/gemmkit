@@ -198,17 +198,17 @@ pub(crate) fn lhs_pack_stride_bytes() -> usize {
 /// implausible values is skipped.
 #[cfg(feature = "std")]
 fn detect() -> CacheTopology {
-    // Miri cannot execute the CPUID instruction; use the calibrated fallback.
+    // use cpuid as backend
     #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), not(miri)))]
     if let Some(t) = cpuid::detect().filter(plausible) {
         return t;
     }
-    // `not(miri)`: the backend reads `/sys`
+    // the backend reads `/sys`
     #[cfg(all(target_os = "linux", not(miri)))]
     if let Some(t) = sysfs::detect().filter(plausible) {
         return t;
     }
-    // `not(miri)`: the backend calls `sysctlbyname`
+    // the backend calls `sysctlbyname`
     #[cfg(all(target_os = "macos", not(miri)))]
     if let Some(t) = sysctl::detect().filter(plausible) {
         return t;
@@ -216,8 +216,9 @@ fn detect() -> CacheTopology {
     ZEN5_FALLBACK
 }
 
-/// Sanity gate so a half-populated CPUID read can't poison blocking.
+/// Sanity gate so a half-populated CPUID read can't poison blocking
 #[cfg(feature = "std")]
+#[cfg_attr(any(target_family = "wasm", miri), allow(dead_code))]
 fn plausible(t: &CacheTopology) -> bool {
     let ok = |l: &Level| l.bytes >= 4 * 1024 && l.line >= 16 && l.assoc >= 1;
     ok(&t.l1d) && ok(&t.l2) && t.l3.as_ref().map(ok).unwrap_or(true)

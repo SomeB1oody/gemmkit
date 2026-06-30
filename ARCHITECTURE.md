@@ -25,7 +25,7 @@ and **no `transmute`**.
 
 ```
 L0  scalar.rs        Scalar (+ Float) — the data-type seam
-L0  simd/            Simd + SimdOps<T> — the ISA seam (tokens: ScalarTok/Fma/Avx512/Neon)
+L0  simd/            Simd + SimdOps<T> — the ISA seam (tokens: ScalarTok/Fma/Avx512/Neon/Simd128)
 L1  kernel/          KernelFamily — the operation-family seam; float microkernel
 L2  pack.rs          micropanel packing primitive
 L3  cache/           CacheTopology + analytical BLIS blocking (cpuid/sysctl/sysfs backends + fallback)
@@ -54,7 +54,7 @@ primitive the whole microkernel needs — `zero`, `splat`, `load`/`loadu`,
 `store`/`storeu`, `mul`, `add`, `mul_add`, `fnma` (fused `c - a·b`, for the complex
 kernel's `acc_re -= ai·bi`), `reduce_sum` — plus `LANES` and `ALIGN`. Because the ISA
 *token* and the element *type* are decoupled, `LANES` varies with the `(ISA, T)` pair
-(f32@FMA = 8, f32@AVX-512 = 16, f32@NEON = 4, f64 halved).
+(f32@FMA = 8, f32@AVX-512 = 16, f32@NEON = 4, f32@wasm-simd128 = 4, f64 halved).
 
 This is the direct answer to matrixmultiply's thin-trait trap. matrixmultiply's
 kernel trait abstracts only the multiply-add, so the entire microkernel had to be
@@ -381,7 +381,22 @@ reversed views all work without copying. `dot` is the `.dot()`-style convenience
   parallelism, API, and microkernel all untouched. The AArch64 NEON token is the
   worked proof: it was added purely additively (new `simd/neon.rs`, two `mod`
   lines, the dispatch wiring, one `isa_neon` test) on a different architecture
-  with 32 vector registers and a wider tile than AVX2.
+  with 32 vector registers and a wider tile than AVX2. The WebAssembly `simd128`
+  token (`simd/wasm.rs`, `Simd128`) is a second, differently-shaped proof: a
+  *compile-time* feature (`cfg`-selected, no runtime detection — like NEON's
+  baseline-by-cfg arm) on a register-poor backend with **no hardware FMA**, so
+  its `mul_add` is the two-rounding `add(mul(a,b),c)` that matches the scalar
+  reference and keeps the path reproducible. It spans the **whole element-type
+  matrix** purely additively — f32/f64 via the homogeneous blanket; i8 (`IntGemm`
+  widen-and-multiply, no `vpdpbusd`), f16/bf16 (`MixedGemm` scalar widen/narrow,
+  no native fp16), and complex (the shared SoA `cplx_microkernel` macro) reuse the
+  exact same seams as the x86/NEON tokens — all with zero kernel/driver edits.
+  Multithreading on wasm is opt-in: `parallel` alone stays safe-serial (the `RAYON_USABLE`
+  guard degrades to the serial loop, since baseline `wasm32-wasip1` has no thread runtime),
+  and the `wasm_threads` feature turns on a gemmkit-owned rayon pool for
+  `wasm32-wasip1-threads`. wasm has no `available_parallelism` and on stable Rust the
+  `atomics` cfg is unsettable, so both the opt-in and the worker count
+  (`GEMMKIT_WASM_THREADS`, default 8) are explicit rather than auto-detected.
 - **No `transmute`** — `OnceLock<fn>`.
 - **Open/closed** — `tests/open_closed.rs` declares a second `KernelFamily`
   entirely outside the crate and drives it through the unchanged `driver::run`.
