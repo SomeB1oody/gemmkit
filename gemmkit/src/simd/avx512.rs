@@ -167,9 +167,13 @@ impl KernelSimd<f16, f16, f32, f16> for Avx512 {
 }
 
 /// `bf16` via integer ops (all AVX-512F): widen = 16-bit left shift into `f32`;
-/// narrow = round-to-nearest-even bias trick then truncate. Bit-identical to
-/// `half::bf16::from_f32`, including NaN (which half forces to `(bits>>16) | 0x0040`
-/// rather than the bias trick's result), so vector and scalar paths never diverge.
+/// narrow = round-to-nearest-even bias trick then truncate. The **narrowing** is
+/// bit-identical to `half::bf16::from_f32`, including NaN (which half forces to
+/// `(bits>>16) | 0x0040` rather than the bias trick's result) — so the bf16 *conversion*
+/// matches the scalar path exactly. (This widen-and-FMA kernel's MAC also matches scalar;
+/// the separate `vdpbf16ps` dot kernel's fused 2-term MAC does not — only its conversion
+/// does. Conversion bit-identity is the load-bearing invariant, keeping full and edge
+/// tiles of one run consistent.)
 #[cfg(feature = "half")]
 impl KernelSimd<bf16, bf16, f32, bf16> for Avx512 {
     #[inline(always)]
@@ -446,6 +450,148 @@ impl KernelSimd<i8, i8, i32, i32> for Avx512Vnni {
                 let corr = _mm512_set1_epi32(128i32.wrapping_mul(colsum[j]));
                 for i in 0..MR_REG {
                     acc[j][i] = _mm512_sub_epi32(acc[j][i], corr);
+                }
+            }
+        }
+    }
+}
+
+// ---- AVX-512 BF16: bf16 -> f32 dot kernel via `vdpbf16ps` (2 depth steps / instr) ----
+
+/// AVX-512 BF16 ISA token: the bf16 dot kernel. A **distinct token** from [`Avx512`]
+/// because the `#[target_feature]` set is per-token — `_mm512_dpbf16_ps` is only legal
+/// in an `avx512bf16`-enabled codegen context, which [`Avx512::vectorize`] (only
+/// `avx512f`) does not provide. Its [`SimdOps<f32>`] vocabulary and the `bf16 -> f32`
+/// load/narrow-store seam mirror [`Avx512`] (same `__m512`, 16 lanes, identical RNE/NaN
+/// narrowing); the one addition is the [`KernelSimd::dot_accumulate`] override that folds
+/// 2 bf16 depth steps per `vdpbf16ps`.
+#[cfg(feature = "half")]
+#[derive(Copy, Clone, Default)]
+pub struct Avx512Bf16;
+
+#[cfg(feature = "half")]
+impl Simd for Avx512Bf16 {
+    #[inline(always)]
+    unsafe fn vectorize<R>(self, f: impl FnOnce() -> R) -> R {
+        #[target_feature(enable = "avx512f,avx512bf16")]
+        unsafe fn inner<R>(f: impl FnOnce() -> R) -> R {
+            f()
+        }
+        // SAFETY: dispatcher guarantees avx512f+bf16; `inner` sets the codegen context.
+        unsafe { inner(f) }
+    }
+}
+
+#[cfg(feature = "half")]
+impl SimdOps<f32> for Avx512Bf16 {
+    type Reg = __m512;
+    const LANES: usize = 16;
+    const ALIGN: usize = 64;
+
+    #[inline(always)]
+    unsafe fn zero(self) -> __m512 {
+        unsafe { _mm512_setzero_ps() }
+    }
+    #[inline(always)]
+    unsafe fn splat(self, v: f32) -> __m512 {
+        unsafe { _mm512_set1_ps(v) }
+    }
+    #[inline(always)]
+    unsafe fn load(self, p: *const f32) -> __m512 {
+        unsafe { _mm512_load_ps(p) }
+    }
+    #[inline(always)]
+    unsafe fn loadu(self, p: *const f32) -> __m512 {
+        unsafe { _mm512_loadu_ps(p) }
+    }
+    #[inline(always)]
+    unsafe fn store(self, p: *mut f32, v: __m512) {
+        unsafe { _mm512_store_ps(p, v) }
+    }
+    #[inline(always)]
+    unsafe fn storeu(self, p: *mut f32, v: __m512) {
+        unsafe { _mm512_storeu_ps(p, v) }
+    }
+    #[inline(always)]
+    unsafe fn mul(self, a: __m512, b: __m512) -> __m512 {
+        unsafe { _mm512_mul_ps(a, b) }
+    }
+    #[inline(always)]
+    unsafe fn add(self, a: __m512, b: __m512) -> __m512 {
+        unsafe { _mm512_add_ps(a, b) }
+    }
+    #[inline(always)]
+    unsafe fn mul_add(self, a: __m512, b: __m512, c: __m512) -> __m512 {
+        unsafe { _mm512_fmadd_ps(a, b, c) }
+    }
+    #[inline(always)]
+    unsafe fn fnma(self, a: __m512, b: __m512, c: __m512) -> __m512 {
+        unsafe { _mm512_fnmadd_ps(a, b, c) }
+    }
+    #[inline(always)]
+    unsafe fn reduce_sum(self, v: __m512) -> f32 {
+        unsafe { _mm512_reduce_add_ps(v) }
+    }
+}
+
+/// `bf16 -> f32` via `vdpbf16ps`. The widen-load / narrow-store seam **delegates to
+/// [`Avx512`]'s `bf16` impl** (one source of truth for the RNE-bias + `half`-NaN
+/// narrowing, which must stay bit-identical to `half::bf16::from_f32` and to the scalar
+/// edge-tile path). `Avx512Bf16::vectorize` enables a superset of `avx512f`, so the
+/// `#[inline(always)]` delegated conversions land in a valid codegen context. `splat_rhs`
+/// is required by the trait but unused (the hot loop runs through [`Self::dot_accumulate`]
+/// off the k-pair-interleaved panels); `load_out` *is* used, by the `beta != 0` C-read.
+#[cfg(feature = "half")]
+impl KernelSimd<bf16, bf16, f32, bf16> for Avx512Bf16 {
+    #[inline(always)]
+    unsafe fn load_lhs(self, p: *const bf16) -> __m512 {
+        unsafe { <Avx512 as KernelSimd<bf16, bf16, f32, bf16>>::load_lhs(Avx512, p) }
+    }
+    #[inline(always)]
+    unsafe fn splat_rhs(self, v: bf16) -> __m512 {
+        unsafe { <Avx512 as KernelSimd<bf16, bf16, f32, bf16>>::splat_rhs(Avx512, v) }
+    }
+    #[inline(always)]
+    unsafe fn load_out(self, p: *const bf16) -> __m512 {
+        unsafe { <Avx512 as KernelSimd<bf16, bf16, f32, bf16>>::load_out(Avx512, p) }
+    }
+    #[inline(always)]
+    unsafe fn store_out(self, p: *mut bf16, v: __m512) {
+        unsafe { <Avx512 as KernelSimd<bf16, bf16, f32, bf16>>::store_out(Avx512, p, v) }
+    }
+
+    #[allow(clippy::needless_range_loop)]
+    #[inline(always)]
+    unsafe fn dot_accumulate<const MR_REG: usize, const NR: usize>(
+        self,
+        kc: usize,
+        a: *const bf16,
+        b: *const bf16,
+        acc: &mut [[__m512; MR_REG]; NR],
+    ) {
+        unsafe {
+            let mr = MR_REG * 16;
+            let npairs = kc.div_ceil(2);
+
+            // Each `vdpbf16ps` folds 2 depth steps: per f32 lane it forms the 2-term bf16
+            // dot `f32(a0)·f32(b0) + f32(a1)·f32(b1)` and adds it to the accumulator. A
+            // register `i` holds 16 rows × 2 contiguous bf16 (64 B → `__m512bh`); a B pair
+            // broadcasts 2 contiguous bf16 of one column as an i32. Odd-`k` tails were
+            // zero-padded in BOTH panels at pack time (product 0·0 = 0), so the loop reads
+            // whole pairs. No bias/signedness correction (bf16 is a plain dot).
+            for p2 in 0..npairs {
+                let a_regs: [__m512bh; MR_REG] = core::array::from_fn(|i| {
+                    core::mem::transmute::<__m512i, __m512bh>(_mm512_loadu_si512(
+                        a.add(p2 * mr * 2 + i * 32) as *const __m512i,
+                    ))
+                });
+                for j in 0..NR {
+                    let bj = core::mem::transmute::<__m512i, __m512bh>(_mm512_set1_epi32(
+                        (b.add(p2 * NR * 2 + j * 2) as *const i32).read_unaligned(),
+                    ));
+                    for i in 0..MR_REG {
+                        acc[j][i] = _mm512_dpbf16_ps(acc[j][i], a_regs[i], bj);
+                    }
                 }
             }
         }

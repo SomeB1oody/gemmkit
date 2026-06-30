@@ -35,6 +35,8 @@ type C32 = num_complex::Complex<f32>;
 type C64 = num_complex::Complex<f64>;
 
 use crate::driver;
+#[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
+use crate::kernel::Bf16DotGemm;
 use crate::kernel::FloatGemm;
 #[cfg(feature = "int8")]
 use crate::kernel::IntGemm;
@@ -48,6 +50,8 @@ use crate::parallel::Parallelism;
 #[cfg(feature = "half")]
 use crate::scalar::NarrowFloat;
 use crate::scalar::{Float, Scalar};
+#[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
+use crate::simd::Avx512Bf16;
 #[cfg(all(feature = "int8", any(target_arch = "x86", target_arch = "x86_64")))]
 use crate::simd::Avx512Vnni;
 #[cfg(any(feature = "half", feature = "int8", feature = "complex"))]
@@ -231,6 +235,15 @@ pub trait GemmScalar: Scalar {
     /// the *same* ISA choice the consuming call will make.
     #[doc(hidden)]
     fn rhs_tile() -> (usize, usize);
+
+    /// The selected kernel family's [`crate::kernel::KernelFamily::DEPTH_MULTIPLE`]. The
+    /// prepack constructor rounds the packed depth up to it so the prepacked buffer's
+    /// layout matches the consuming kernel's. `1` for every family except the bf16
+    /// `vdpbf16ps` dot kernel (`2`), so the default suits `f32`/`f64`/`f16`.
+    #[doc(hidden)]
+    fn rhs_depth_multiple() -> usize {
+        1
+    }
 }
 
 /// Top-level entry used by the API layer: handle the degenerate cases (here,
@@ -486,6 +499,85 @@ unsafe fn run_packed_typed_mixed<N, S, const MR_REG: usize, const NR: usize>(
     }
 }
 
+/// bf16 dot-kernel driver entry (mirror of [`run_typed_mixed`] driving [`Bf16DotGemm`]
+/// instead of `MixedGemm<bf16>`): same orientation swap and `f32`-widened `alpha`/`beta`,
+/// but the k-pair-interleaved pack + `vdpbf16ps` inner loop.
+///
+/// # Safety
+/// As [`run_typed_mixed`].
+#[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
+#[inline]
+unsafe fn run_typed_bf16_dot<S, const MR_REG: usize, const NR: usize>(
+    simd: S,
+    mut t: Task<bf16>,
+    par: Parallelism,
+    ws: &mut Workspace,
+) where
+    S: KernelSimd<bf16, bf16, f32, bf16>,
+{
+    unsafe {
+        orient_transpose(&mut t);
+        driver::run::<Bf16DotGemm, S, MR_REG, NR>(
+            simd,
+            t.m,
+            t.k,
+            t.n,
+            t.alpha.widen(),
+            t.a,
+            t.rsa,
+            t.csa,
+            t.b,
+            t.rsb,
+            t.csb,
+            t.beta.widen(),
+            t.c,
+            t.rsc,
+            t.csc,
+            par,
+            ws,
+        );
+    }
+}
+
+/// Prepacked-RHS bf16 dot entry (mirror of [`run_packed_typed_mixed`] for
+/// [`Bf16DotGemm`]); no swap, `alpha`/`beta` widened to `f32`.
+///
+/// # Safety
+/// As [`run_packed_typed_mixed`].
+#[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
+#[inline]
+unsafe fn run_packed_typed_bf16_dot<S, const MR_REG: usize, const NR: usize>(
+    simd: S,
+    req: PackedConsume<bf16>,
+    par: Parallelism,
+    ws: &mut Workspace,
+) where
+    S: KernelSimd<bf16, bf16, f32, bf16>,
+{
+    unsafe {
+        debug_assert_eq!(NR, req.nr, "prepacked RHS panel width != kernel NR");
+        driver::run_packed_rhs::<Bf16DotGemm, S, MR_REG, NR>(
+            simd,
+            req.m,
+            req.k,
+            req.n,
+            req.alpha.widen(),
+            req.a,
+            req.rsa,
+            req.csa,
+            req.packed,
+            req.kc,
+            req.nc,
+            req.beta.widen(),
+            req.c,
+            req.rsc,
+            req.csc,
+            par,
+            ws,
+        );
+    }
+}
+
 // ---- per-type, per-ISA monomorphized entry points (the dispatch slots) ----
 //
 // Tile geometry (MR_REG, NR) is the *only* per-(type, ISA) knob; everything else
@@ -621,6 +713,19 @@ unsafe fn gemm_f16_avx512_packed(r: PackedConsume<f16>, par: Parallelism, ws: &m
 unsafe fn gemm_bf16_avx512_packed(r: PackedConsume<bf16>, par: Parallelism, ws: &mut Workspace) {
     unsafe { run_packed_typed_mixed::<bf16, Avx512, 2, 12>(Avx512, r, par, ws) }
 }
+#[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
+unsafe fn gemm_bf16_avx512_dot(t: Task<bf16>, par: Parallelism, ws: &mut Workspace) {
+    // bf16 dot: f32 accumulator → MR = 2*16 = 32, NR = 12 (the f32 AVX-512 tile).
+    unsafe { run_typed_bf16_dot::<Avx512Bf16, 2, 12>(Avx512Bf16, t, par, ws) }
+}
+#[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
+unsafe fn gemm_bf16_avx512_dot_packed(
+    r: PackedConsume<bf16>,
+    par: Parallelism,
+    ws: &mut Workspace,
+) {
+    unsafe { run_packed_typed_bf16_dot::<Avx512Bf16, 2, 12>(Avx512Bf16, r, par, ws) }
+}
 #[cfg(all(feature = "half", target_arch = "aarch64"))]
 unsafe fn gemm_f16_neon(t: Task<f16>, par: Parallelism, ws: &mut Workspace) {
     unsafe { run_typed_mixed::<f16, Neon, 4, 4>(Neon, t, par, ws) }
@@ -652,6 +757,12 @@ struct Dispatched<T> {
     run_packed: PackedFn<T>,
     mr: usize,
     nr: usize,
+    /// The dispatched kernel family's [`crate::kernel::KernelFamily::DEPTH_MULTIPLE`].
+    /// `1` for every widen/homogeneous kernel; `2` for the bf16 `vdpbf16ps` dot kernel.
+    /// The prepack constructor rounds the packed depth up to it (via [`GemmScalar`]).
+    /// Read only by the `bf16` prepack path, so it is dead code without the `half` feature.
+    #[cfg_attr(not(feature = "half"), allow(dead_code))]
+    depth_multiple: usize,
 }
 
 // One descriptor per (type, ISA). `mr = MR_REG·LANES`, `nr = NR` — mirrors the
@@ -662,12 +773,14 @@ const DISP_F32_SCALAR: Dispatched<f32> = Dispatched {
     run_packed: gemm_f32_scalar_packed,
     mr: 4,
     nr: 4,
+    depth_multiple: 1,
 };
 const DISP_F64_SCALAR: Dispatched<f64> = Dispatched {
     run: gemm_f64_scalar,
     run_packed: gemm_f64_scalar_packed,
     mr: 4,
     nr: 4,
+    depth_multiple: 1,
 };
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 const DISP_F32_FMA: Dispatched<f32> = Dispatched {
@@ -675,6 +788,7 @@ const DISP_F32_FMA: Dispatched<f32> = Dispatched {
     run_packed: gemm_f32_fma_packed,
     mr: 16,
     nr: 6,
+    depth_multiple: 1,
 };
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 const DISP_F64_FMA: Dispatched<f64> = Dispatched {
@@ -682,6 +796,7 @@ const DISP_F64_FMA: Dispatched<f64> = Dispatched {
     run_packed: gemm_f64_fma_packed,
     mr: 8,
     nr: 6,
+    depth_multiple: 1,
 };
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 const DISP_F32_AVX512: Dispatched<f32> = Dispatched {
@@ -689,6 +804,7 @@ const DISP_F32_AVX512: Dispatched<f32> = Dispatched {
     run_packed: gemm_f32_avx512_packed,
     mr: 32,
     nr: 12,
+    depth_multiple: 1,
 };
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 const DISP_F64_AVX512: Dispatched<f64> = Dispatched {
@@ -696,6 +812,7 @@ const DISP_F64_AVX512: Dispatched<f64> = Dispatched {
     run_packed: gemm_f64_avx512_packed,
     mr: 16,
     nr: 12,
+    depth_multiple: 1,
 };
 #[cfg(target_arch = "aarch64")]
 const DISP_F32_NEON: Dispatched<f32> = Dispatched {
@@ -703,6 +820,7 @@ const DISP_F32_NEON: Dispatched<f32> = Dispatched {
     run_packed: gemm_f32_neon_packed,
     mr: 16,
     nr: 4,
+    depth_multiple: 1,
 };
 #[cfg(target_arch = "aarch64")]
 const DISP_F64_NEON: Dispatched<f64> = Dispatched {
@@ -710,6 +828,7 @@ const DISP_F64_NEON: Dispatched<f64> = Dispatched {
     run_packed: gemm_f64_neon_packed,
     mr: 8,
     nr: 4,
+    depth_multiple: 1,
 };
 
 // Mixed-precision descriptors. `mr = MR_REG · f32-LANES` (the accumulator width):
@@ -720,6 +839,7 @@ const DISP_F16_SCALAR: Dispatched<f16> = Dispatched {
     run_packed: gemm_f16_scalar_packed,
     mr: 4,
     nr: 4,
+    depth_multiple: 1,
 };
 #[cfg(feature = "half")]
 const DISP_BF16_SCALAR: Dispatched<bf16> = Dispatched {
@@ -727,6 +847,7 @@ const DISP_BF16_SCALAR: Dispatched<bf16> = Dispatched {
     run_packed: gemm_bf16_scalar_packed,
     mr: 4,
     nr: 4,
+    depth_multiple: 1,
 };
 #[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
 const DISP_F16_FMA: Dispatched<f16> = Dispatched {
@@ -734,6 +855,7 @@ const DISP_F16_FMA: Dispatched<f16> = Dispatched {
     run_packed: gemm_f16_fma_packed,
     mr: 16,
     nr: 6,
+    depth_multiple: 1,
 };
 #[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
 const DISP_BF16_FMA: Dispatched<bf16> = Dispatched {
@@ -741,6 +863,7 @@ const DISP_BF16_FMA: Dispatched<bf16> = Dispatched {
     run_packed: gemm_bf16_fma_packed,
     mr: 16,
     nr: 6,
+    depth_multiple: 1,
 };
 #[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
 const DISP_F16_AVX512: Dispatched<f16> = Dispatched {
@@ -748,6 +871,7 @@ const DISP_F16_AVX512: Dispatched<f16> = Dispatched {
     run_packed: gemm_f16_avx512_packed,
     mr: 32,
     nr: 12,
+    depth_multiple: 1,
 };
 #[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
 const DISP_BF16_AVX512: Dispatched<bf16> = Dispatched {
@@ -755,6 +879,16 @@ const DISP_BF16_AVX512: Dispatched<bf16> = Dispatched {
     run_packed: gemm_bf16_avx512_packed,
     mr: 32,
     nr: 12,
+    depth_multiple: 1,
+};
+#[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
+const DISP_BF16_AVX512_DOT: Dispatched<bf16> = Dispatched {
+    run: gemm_bf16_avx512_dot,
+    run_packed: gemm_bf16_avx512_dot_packed,
+    mr: 32,
+    nr: 12,
+    // k-pair-interleaved pack → the prepack buffer rounds its depth up to 2.
+    depth_multiple: 2,
 };
 #[cfg(all(feature = "half", target_arch = "aarch64"))]
 const DISP_F16_NEON: Dispatched<f16> = Dispatched {
@@ -762,6 +896,7 @@ const DISP_F16_NEON: Dispatched<f16> = Dispatched {
     run_packed: gemm_f16_neon_packed,
     mr: 16,
     nr: 4,
+    depth_multiple: 1,
 };
 #[cfg(all(feature = "half", target_arch = "aarch64"))]
 const DISP_BF16_NEON: Dispatched<bf16> = Dispatched {
@@ -769,6 +904,7 @@ const DISP_BF16_NEON: Dispatched<bf16> = Dispatched {
     run_packed: gemm_bf16_neon_packed,
     mr: 16,
     nr: 4,
+    depth_multiple: 1,
 };
 
 /// An explicitly requested kernel, parsed from `GEMMKIT_REQUIRE_ISA`.
@@ -788,6 +924,9 @@ enum ForcedIsa {
     /// AVX-512 VNNI: the `i8` dot kernel. For types without a VNNI kernel this forces
     /// the plain AVX-512 path (VNNI implies `avx512f`).
     Avx512Vnni,
+    /// AVX-512 BF16: the bf16 `vdpbf16ps` dot kernel. For other types this forces the
+    /// plain AVX-512 path (BF16 implies `avx512f`).
+    Avx512Bf16,
     Neon,
 }
 
@@ -810,11 +949,13 @@ fn forced_isa() -> ForcedIsa {
                 ForcedIsa::Avx512
             } else if t.eq_ignore_ascii_case("avx512vnni") || t.eq_ignore_ascii_case("vnni") {
                 ForcedIsa::Avx512Vnni
+            } else if t.eq_ignore_ascii_case("avx512bf16") || t.eq_ignore_ascii_case("bf16") {
+                ForcedIsa::Avx512Bf16
             } else if t.eq_ignore_ascii_case("neon") {
                 ForcedIsa::Neon
             } else {
                 panic!(
-                    "GEMMKIT_REQUIRE_ISA: unknown value `{t}` (expected scalar|fma|avx512|avx512vnni|neon|auto)"
+                    "GEMMKIT_REQUIRE_ISA: unknown value `{t}` (expected scalar|fma|avx512|avx512vnni|avx512bf16|neon|auto)"
                 )
             }
         }
@@ -837,7 +978,7 @@ fn select_f32() -> Dispatched<f32> {
             return DISP_F32_FMA;
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni => {
+        ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
             assert!(
                 is_x86_feature_detected!("avx512f"),
                 "GEMMKIT_REQUIRE_ISA=avx512, but this CPU/emulator does not report avx512f"
@@ -845,7 +986,7 @@ fn select_f32() -> Dispatched<f32> {
             return DISP_F32_AVX512;
         }
         #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-        ForcedIsa::Fma | ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni => {
+        ForcedIsa::Fma | ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
             panic!("GEMMKIT_REQUIRE_ISA: requested SIMD ISA is unavailable on this target")
         }
         #[cfg(target_arch = "aarch64")]
@@ -889,7 +1030,7 @@ fn select_f64() -> Dispatched<f64> {
             return DISP_F64_FMA;
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni => {
+        ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
             assert!(
                 is_x86_feature_detected!("avx512f"),
                 "GEMMKIT_REQUIRE_ISA=avx512, but this CPU/emulator does not report avx512f"
@@ -897,7 +1038,7 @@ fn select_f64() -> Dispatched<f64> {
             return DISP_F64_AVX512;
         }
         #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-        ForcedIsa::Fma | ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni => {
+        ForcedIsa::Fma | ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
             panic!("GEMMKIT_REQUIRE_ISA: requested SIMD ISA is unavailable on this target")
         }
         #[cfg(target_arch = "aarch64")]
@@ -947,7 +1088,7 @@ fn select_f16() -> Dispatched<f16> {
             return DISP_F16_FMA;
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni => {
+        ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
             assert!(
                 is_x86_feature_detected!("avx512f"),
                 "GEMMKIT_REQUIRE_ISA=avx512, but this CPU/emulator does not report avx512f"
@@ -955,7 +1096,7 @@ fn select_f16() -> Dispatched<f16> {
             return DISP_F16_AVX512;
         }
         #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-        ForcedIsa::Fma | ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni => {
+        ForcedIsa::Fma | ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
             panic!("GEMMKIT_REQUIRE_ISA: requested SIMD ISA is unavailable on this target")
         }
         #[cfg(target_arch = "aarch64")]
@@ -1008,8 +1149,16 @@ fn select_bf16() -> Dispatched<bf16> {
             );
             return DISP_BF16_AVX512;
         }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        ForcedIsa::Avx512Bf16 => {
+            assert!(
+                is_x86_feature_detected!("avx512bf16") && is_x86_feature_detected!("avx512f"),
+                "GEMMKIT_REQUIRE_ISA=avx512bf16, but this CPU/emulator does not report avx512f+bf16"
+            );
+            return DISP_BF16_AVX512_DOT;
+        }
         #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-        ForcedIsa::Fma | ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni => {
+        ForcedIsa::Fma | ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
             panic!("GEMMKIT_REQUIRE_ISA: requested SIMD ISA is unavailable on this target")
         }
         #[cfg(target_arch = "aarch64")]
@@ -1020,6 +1169,10 @@ fn select_bf16() -> Dispatched<bf16> {
     }
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
+        // bf16 dot kernel first — `vdpbf16ps` ~doubles bf16 throughput over widen+FMA.
+        if is_x86_feature_detected!("avx512bf16") && is_x86_feature_detected!("avx512f") {
+            return DISP_BF16_AVX512_DOT;
+        }
         if is_x86_feature_detected!("avx512f") {
             return DISP_BF16_AVX512;
         }
@@ -1267,7 +1420,17 @@ impl GemmScalar for bf16 {
         nc: usize,
         nr: usize,
     ) {
-        unsafe { driver::pack_rhs_full::<MixedGemm<bf16>>(dst, b, rsb, csb, k, n, kc, nc, nr) }
+        unsafe {
+            // The dot kernel packs k-pair-interleaved; pack through *its* family so the
+            // prepacked layout matches what the consuming call reads. Identified by the
+            // depth multiple (> 1 only for the bf16 dot descriptor).
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            if dispatched_bf16().depth_multiple > 1 {
+                driver::pack_rhs_full::<Bf16DotGemm>(dst, b, rsb, csb, k, n, kc, nc, nr);
+                return;
+            }
+            driver::pack_rhs_full::<MixedGemm<bf16>>(dst, b, rsb, csb, k, n, kc, nc, nr);
+        }
     }
     #[inline]
     unsafe fn pack_lhs_full(
@@ -1281,7 +1444,14 @@ impl GemmScalar for bf16 {
         nc: usize,
         nr: usize,
     ) {
-        unsafe { driver::pack_lhs_full::<MixedGemm<bf16>>(dst, a, rsa, csa, m, k, kc, nc, nr) }
+        unsafe {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            if dispatched_bf16().depth_multiple > 1 {
+                driver::pack_lhs_full::<Bf16DotGemm>(dst, a, rsa, csa, m, k, kc, nc, nr);
+                return;
+            }
+            driver::pack_lhs_full::<MixedGemm<bf16>>(dst, a, rsa, csa, m, k, kc, nc, nr);
+        }
     }
     #[inline]
     unsafe fn dispatch(task: Task<bf16>, par: Parallelism, ws: &mut Workspace) {
@@ -1295,6 +1465,10 @@ impl GemmScalar for bf16 {
     fn rhs_tile() -> (usize, usize) {
         let d = dispatched_bf16();
         (d.mr, d.nr)
+    }
+    #[inline]
+    fn rhs_depth_multiple() -> usize {
+        dispatched_bf16().depth_multiple
     }
 }
 
@@ -1486,7 +1660,7 @@ fn select_i8() -> IntDispatched {
             return DISP_I8_FMA;
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        ForcedIsa::Avx512 => {
+        ForcedIsa::Avx512 | ForcedIsa::Avx512Bf16 => {
             assert!(
                 is_x86_feature_detected!("avx512f"),
                 "GEMMKIT_REQUIRE_ISA=avx512, but this CPU/emulator does not report avx512f"
@@ -1504,7 +1678,7 @@ fn select_i8() -> IntDispatched {
             return DISP_I8_AVX512VNNI;
         }
         #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-        ForcedIsa::Fma | ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni => {
+        ForcedIsa::Fma | ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
             panic!("GEMMKIT_REQUIRE_ISA: requested SIMD ISA is unavailable on this target")
         }
         #[cfg(target_arch = "aarch64")]
@@ -1756,7 +1930,7 @@ fn select_c32() -> CplxDispatched<C32> {
             return CDISP_C32_FMA;
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni => {
+        ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
             assert!(
                 is_x86_feature_detected!("avx512f"),
                 "GEMMKIT_REQUIRE_ISA=avx512, but this CPU/emulator does not report avx512f"
@@ -1764,7 +1938,7 @@ fn select_c32() -> CplxDispatched<C32> {
             return CDISP_C32_AVX512;
         }
         #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-        ForcedIsa::Fma | ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni => {
+        ForcedIsa::Fma | ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
             panic!("GEMMKIT_REQUIRE_ISA: requested SIMD ISA is unavailable on this target")
         }
         #[cfg(target_arch = "aarch64")]
@@ -1806,7 +1980,7 @@ fn select_c64() -> CplxDispatched<C64> {
             return CDISP_C64_FMA;
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni => {
+        ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
             assert!(
                 is_x86_feature_detected!("avx512f"),
                 "GEMMKIT_REQUIRE_ISA=avx512, but this CPU/emulator does not report avx512f"
@@ -1814,7 +1988,7 @@ fn select_c64() -> CplxDispatched<C64> {
             return CDISP_C64_AVX512;
         }
         #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-        ForcedIsa::Fma | ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni => {
+        ForcedIsa::Fma | ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
             panic!("GEMMKIT_REQUIRE_ISA: requested SIMD ISA is unavailable on this target")
         }
         #[cfg(target_arch = "aarch64")]

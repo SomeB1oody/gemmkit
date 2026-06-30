@@ -48,6 +48,8 @@ mod scalar;
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub use self::avx512::Avx512;
+#[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
+pub use self::avx512::Avx512Bf16;
 #[cfg(all(feature = "int8", any(target_arch = "x86", target_arch = "x86_64")))]
 pub use self::avx512::Avx512Vnni;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]

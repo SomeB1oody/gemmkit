@@ -11,9 +11,108 @@
 use core::marker::PhantomData;
 
 use super::{AlphaStatus, BetaStatus, KernelFamily};
-use crate::pack::pack_panels;
+use crate::pack::{pack_kgroup_panels, pack_panels};
 use crate::scalar::NarrowFloat;
 use crate::simd::{KernelSimd, SimdOps};
+
+/// Fold `alpha` into the `f32` accumulators and apply the mixed-precision epilogue:
+/// read the narrow `C` widened, combine in `f32`, round to `N` once on store. Shared
+/// verbatim by [`MixedGemm`] (widen-and-FMA) and [`Bf16DotGemm`] (`vdpbf16ps` dot) —
+/// they differ only in how `acc` is *produced*, so the `f32`-acc / narrow-`Out` epilogue
+/// lives here once. The whole contraction has accumulated in `f32` (`OUT_IS_ACC = false`
+/// ⇒ `kc = k`), so this rounds to `N` exactly once.
+///
+/// # Safety
+/// As [`KernelFamily::microkernel`]; run inside `S`'s [`crate::simd::Simd::vectorize`].
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+#[inline(always)]
+unsafe fn mixed_epilogue<N, S, const MR_REG: usize, const NR: usize>(
+    simd: S,
+    alpha: f32,
+    beta: f32,
+    alpha_status: AlphaStatus,
+    beta_status: BetaStatus,
+    acc: &mut [[<S as SimdOps<f32>>::Reg; MR_REG]; NR],
+    c: *mut N,
+    rsc: isize,
+    csc: isize,
+    mr_eff: usize,
+    nr_eff: usize,
+    scratch: *mut f32,
+) where
+    N: NarrowFloat,
+    S: KernelSimd<N, N, f32, N>,
+{
+    unsafe {
+        let lanes = <S as SimdOps<f32>>::LANES;
+        let mr = MR_REG * lanes;
+
+        // --- fold alpha into the f32 accumulators (skip when alpha == 1) ---
+        if alpha_status == AlphaStatus::Other {
+            let av = simd.splat(alpha);
+            for j in 0..NR {
+                for i in 0..MR_REG {
+                    acc[j][i] = simd.mul(acc[j][i], av);
+                }
+            }
+        }
+
+        // --- epilogue: read narrow C (widened), combine in f32, round to N ---
+        if mr_eff == mr && nr_eff == NR && rsc == 1 {
+            // Fast path: full tile, column-major C → vector widen-load / store.
+            match beta_status {
+                BetaStatus::Zero => {
+                    for j in 0..NR {
+                        let col = c.offset(j as isize * csc);
+                        for i in 0..MR_REG {
+                            simd.store_out(col.add(i * lanes), acc[j][i]);
+                        }
+                    }
+                }
+                BetaStatus::One => {
+                    for j in 0..NR {
+                        let col = c.offset(j as isize * csc);
+                        for i in 0..MR_REG {
+                            let cv = simd.load_out(col.add(i * lanes));
+                            simd.store_out(col.add(i * lanes), simd.add(cv, acc[j][i]));
+                        }
+                    }
+                }
+                BetaStatus::Other => {
+                    let bv = simd.splat(beta);
+                    for j in 0..NR {
+                        let col = c.offset(j as isize * csc);
+                        for i in 0..MR_REG {
+                            let cv = simd.load_out(col.add(i * lanes));
+                            // beta*C + alpha*AB, all in f32, then rounded on store.
+                            simd.store_out(col.add(i * lanes), simd.mul_add(cv, bv, acc[j][i]));
+                        }
+                    }
+                }
+            }
+        } else {
+            // General / partial path: drain f32 acc to scratch, then strided copy-back
+            // with a per-element widen (read C) / narrow (write C).
+            for j in 0..NR {
+                for i in 0..MR_REG {
+                    simd.storeu(scratch.add(j * mr + i * lanes), acc[j][i]);
+                }
+            }
+            for j in 0..nr_eff {
+                for i in 0..mr_eff {
+                    let v = *scratch.add(j * mr + i); // f32 == alpha*AB
+                    let cp = c.offset(i as isize * rsc + j as isize * csc);
+                    let out = match beta_status {
+                        BetaStatus::Zero => v,
+                        BetaStatus::One => (*cp).widen() + v,
+                        BetaStatus::Other => beta * (*cp).widen() + v,
+                    };
+                    *cp = N::narrow(out);
+                }
+            }
+        }
+    }
+}
 
 /// The mixed-precision GEMM family: `Lhs = Rhs = Out = N` (a [`NarrowFloat`], i.e.
 /// `f16` or `bf16`), `Acc = f32`.
@@ -101,7 +200,6 @@ where
     {
         unsafe {
             let lanes = <S as SimdOps<f32>>::LANES;
-            let mr = MR_REG * lanes;
 
             // --- accumulate in f32: widen-load A, widen-broadcast B, fused FMA ---
             let mut acc: [[<S as SimdOps<f32>>::Reg; MR_REG]; NR] = [[simd.zero(); MR_REG]; NR];
@@ -138,70 +236,153 @@ where
                 }
             }
 
-            // --- fold alpha into the f32 accumulators (skip when alpha == 1) ---
-            if alpha_status == AlphaStatus::Other {
-                let av = simd.splat(alpha);
-                for j in 0..NR {
-                    for i in 0..MR_REG {
-                        acc[j][i] = simd.mul(acc[j][i], av);
-                    }
-                }
-            }
+            // alpha fold + narrow epilogue (shared with `Bf16DotGemm`).
+            mixed_epilogue::<N, S, MR_REG, NR>(
+                simd,
+                alpha,
+                beta,
+                alpha_status,
+                beta_status,
+                &mut acc,
+                c,
+                rsc,
+                csc,
+                mr_eff,
+                nr_eff,
+                scratch,
+            );
+        }
+    }
+}
 
-            // --- epilogue: read narrow C (widened), combine in f32, round to N ---
-            if mr_eff == mr && nr_eff == NR && rsc == 1 {
-                // Fast path: full tile, column-major C → vector widen-load / store.
-                match beta_status {
-                    BetaStatus::Zero => {
-                        for j in 0..NR {
-                            let col = c.offset(j as isize * csc);
-                            for i in 0..MR_REG {
-                                simd.store_out(col.add(i * lanes), acc[j][i]);
-                            }
-                        }
-                    }
-                    BetaStatus::One => {
-                        for j in 0..NR {
-                            let col = c.offset(j as isize * csc);
-                            for i in 0..MR_REG {
-                                let cv = simd.load_out(col.add(i * lanes));
-                                simd.store_out(col.add(i * lanes), simd.add(cv, acc[j][i]));
-                            }
-                        }
-                    }
-                    BetaStatus::Other => {
-                        let bv = simd.splat(beta);
-                        for j in 0..NR {
-                            let col = c.offset(j as isize * csc);
-                            for i in 0..MR_REG {
-                                let cv = simd.load_out(col.add(i * lanes));
-                                // beta*C + alpha*AB, all in f32, then rounded on store.
-                                simd.store_out(col.add(i * lanes), simd.mul_add(cv, bv, acc[j][i]));
-                            }
-                        }
-                    }
-                }
-            } else {
-                // General / partial path: drain f32 acc to scratch, then strided
-                // copy-back with a per-element widen (read C) / narrow (write C).
-                for j in 0..NR {
-                    for i in 0..MR_REG {
-                        simd.storeu(scratch.add(j * mr + i * lanes), acc[j][i]);
-                    }
-                }
-                for j in 0..nr_eff {
-                    for i in 0..mr_eff {
-                        let v = *scratch.add(j * mr + i); // f32 == alpha*AB
-                        let cp = c.offset(i as isize * rsc + j as isize * csc);
-                        let out = match beta_status {
-                            BetaStatus::Zero => v,
-                            BetaStatus::One => (*cp).widen() + v,
-                            BetaStatus::Other => beta * (*cp).widen() + v,
-                        };
-                        *cp = N::narrow(out);
-                    }
-                }
-            }
+/// The bf16 dot GEMM family: `Lhs = Rhs = Out = bf16`, `Acc = f32`, driven by AVX-512
+/// `vdpbf16ps` (2 bf16 depth steps per instruction) instead of [`MixedGemm`]'s
+/// widen-and-FMA. A sibling of `MixedGemm<bf16>`, not a branch in it, because the pack
+/// layout differs: `pack_lhs`/`pack_rhs` are `KernelFamily` methods with no ISA
+/// parameter, so the k-pair interleave must key off the *family*.
+///
+/// What changes versus `MixedGemm<bf16>`, both isolated here:
+///
+/// * **Pack layout** (`DEPTH_MULTIPLE = 2`): A and B are packed *k-pair-interleaved* —
+///   two consecutive depth steps contiguous per lane/column (a 32-bit `__m512bh` pair) so
+///   the kernel can issue one `vdpbf16ps`. Depth is padded to a multiple of 2 with bf16
+///   `0` (product `0·0 = 0`). Both operands are always packed (`FORCE_PACK_*`).
+/// * **Inner loop**: [`crate::simd::KernelSimd::dot_accumulate`] replaces the widen-FMA
+///   loop. `OUT_IS_ACC = false` keeps `kc = k`, so the whole contraction accumulates in
+///   `f32` and rounds to bf16 once — the alpha fold and narrow epilogue
+///   ([`mixed_epilogue`]) are byte-for-byte identical to `MixedGemm`.
+///
+/// `vdpbf16ps` forms a fused 2-term bf16 dot with hardware intra-pair rounding, so the
+/// result is *not* bitwise-equal to the widen path — only tolerance-equal. It is still
+/// fully deterministic, and serial/parallel/prepacked runs all share this kernel and
+/// pack layout, so they reproduce each other bit-for-bit.
+pub struct Bf16DotGemm(PhantomData<()>);
+
+impl Clone for Bf16DotGemm {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl Copy for Bf16DotGemm {}
+
+impl Bf16DotGemm {
+    /// Depth steps folded per `vdpbf16ps`.
+    const Q: usize = 2;
+}
+
+impl KernelFamily for Bf16DotGemm {
+    type Lhs = half::bf16;
+    type Rhs = half::bf16;
+    type Acc = f32;
+    type Out = half::bf16;
+
+    const OUT_IS_ACC: bool = false;
+    const FORCE_PACK_LHS: bool = true;
+    const FORCE_PACK_RHS: bool = true;
+    const DEPTH_MULTIPLE: usize = Self::Q;
+
+    /// Pack the `mc × kc` LHS k-pair-interleaved (2 contiguous depth bf16 per row, a
+    /// `__m512bh` pair), via the shared [`pack_kgroup_panels`]. Identity transform; rows
+    /// past `mc` and depth past `kc` pad with bf16 `0` (`xform(0)`).
+    #[inline]
+    unsafe fn pack_lhs(
+        dst: *mut half::bf16,
+        src: *const half::bf16,
+        rs: isize,
+        cs: isize,
+        mc: usize,
+        kc: usize,
+        mr: usize,
+    ) {
+        // lead = rows (`rs`), depth = cols (`cs`).
+        unsafe {
+            pack_kgroup_panels::<half::bf16, { Self::Q }, _>(dst, src, rs, cs, mc, kc, mr, |v| v)
+        }
+    }
+
+    /// Pack one `kc × nr` RHS panel k-pair-interleaved (2 contiguous depth bf16 per column,
+    /// ready for an i32 broadcast), via the shared [`pack_kgroup_panels`]. Identity
+    /// transform; columns past `nc` and depth past `kc` pad with bf16 `0`.
+    #[inline]
+    unsafe fn pack_rhs(
+        dst: *mut half::bf16,
+        src: *const half::bf16,
+        rs: isize,
+        cs: isize,
+        kc: usize,
+        nc: usize,
+        nr: usize,
+    ) {
+        // lead = cols (`cs`), depth = rows (`rs`).
+        unsafe {
+            pack_kgroup_panels::<half::bf16, { Self::Q }, _>(dst, src, cs, rs, nc, kc, nr, |v| v)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    unsafe fn microkernel<S, const MR_REG: usize, const NR: usize>(
+        simd: S,
+        kc: usize,
+        alpha: f32,
+        beta: f32,
+        alpha_status: AlphaStatus,
+        beta_status: BetaStatus,
+        a: *const half::bf16,
+        _a_cs: isize,
+        b: *const half::bf16,
+        _b_rs: isize,
+        _b_cs: isize,
+        c: *mut half::bf16,
+        rsc: isize,
+        csc: isize,
+        mr_eff: usize,
+        nr_eff: usize,
+        scratch: *mut f32,
+    ) where
+        S: KernelSimd<half::bf16, half::bf16, f32, half::bf16>,
+    {
+        unsafe {
+            // Dot accumulation in f32. Full `NR` always: `FORCE_PACK_RHS` zero-pads tail
+            // columns (product 0); the epilogue copies only the live sub-tile.
+            let mut acc: [[<S as SimdOps<f32>>::Reg; MR_REG]; NR] = [[simd.zero(); MR_REG]; NR];
+            simd.dot_accumulate::<MR_REG, NR>(kc, a, b, &mut acc);
+
+            // alpha fold + narrow epilogue (shared with `MixedGemm`).
+            mixed_epilogue::<half::bf16, S, MR_REG, NR>(
+                simd,
+                alpha,
+                beta,
+                alpha_status,
+                beta_status,
+                &mut acc,
+                c,
+                rsc,
+                csc,
+                mr_eff,
+                nr_eff,
+                scratch,
+            );
         }
     }
 }

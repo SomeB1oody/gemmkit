@@ -378,11 +378,15 @@ pub fn prepack_rhs<T: GemmScalar>(b: MatRef<'_, T>) -> PackedRhs<T> {
     };
     let nc = blk.nc.next_multiple_of(nr).max(nr);
 
-    let total = n.div_ceil(nr) * nr * k;
+    // A dot kernel (bf16 `vdpbf16ps`) packs depth in groups, so the panel depth is rounded
+    // up to its `DEPTH_MULTIPLE`; `1` (every other kernel) leaves this unchanged.
+    let k_pad = k.next_multiple_of(<T as GemmScalar>::rhs_depth_multiple());
+    let total = n.div_ceil(nr) * nr * k_pad;
     let mut buf = vec![T::ZERO; total];
     if total > 0 {
-        // SAFETY: `buf` holds `ceil(n/nr)*nr*k` elements (the exact layout size);
-        // `b` is validated in-bounds above; `pack_rhs_full` writes only that range.
+        // SAFETY: `buf` holds `ceil(n/nr)*nr*k_pad` elements (the exact layout size, with
+        // the depth padded to the dispatched family's `DEPTH_MULTIPLE`); `b` is validated
+        // in-bounds above; `pack_rhs_full` writes only that range.
         // `GemmScalar::pack_rhs_full` selects the right kernel family per type.
         unsafe {
             T::pack_rhs_full(
@@ -578,12 +582,15 @@ pub fn prepack_lhs<T: GemmScalar>(a: MatRef<'_, T>) -> PackedLhs<T> {
     };
     let nc = blk.nc.next_multiple_of(nr).max(nr);
 
-    let total = m.div_ceil(nr) * nr * k;
+    // Depth-padded for a dot kernel (see `prepack_rhs`); identity for `DEPTH_MULTIPLE == 1`.
+    let k_pad = k.next_multiple_of(<T as GemmScalar>::rhs_depth_multiple());
+    let total = m.div_ceil(nr) * nr * k_pad;
     let mut buf = vec![T::ZERO; total];
     if total > 0 {
-        // SAFETY: `buf` holds `ceil(m/nr)*nr*k` elements (the exact layout size);
-        // `a` is validated in-bounds above; `pack_lhs_full` writes only that range
-        // and selects the right kernel family per type.
+        // SAFETY: `buf` holds `ceil(m/nr)*nr*k_pad` elements (the exact layout size, with
+        // the depth padded to the dispatched family's `DEPTH_MULTIPLE`); `a` is validated
+        // in-bounds above; `pack_lhs_full` writes only that range and selects the right
+        // kernel family per type.
         unsafe {
             T::pack_lhs_full(
                 buf.as_mut_ptr(),
