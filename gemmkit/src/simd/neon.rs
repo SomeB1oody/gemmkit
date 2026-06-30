@@ -210,6 +210,14 @@ impl SimdOps<f64> for Neon {
 //   (rust-lang/rust#116909, #136306) and so unavailable on stable Rust. A
 //   hand-rolled integer f16->f32 path is not worth the risk for a widen the OoO
 //   core already hides (see bf16 above). Revisit once those stabilize.
+//
+// A bf16 *dot* kernel — `BFDOT` (`vbfdotq_f32`) — would reuse `Bf16DotGemm` as-is
+// (`Q = 2`, identity pack, `kc = k`), adding only a `bf16` token whose conversions
+// delegate to `Neon`. DEFERRED on a harder wall than f16: the NEON bf16 vector type
+// (`bfloat16x8_t`) and `vbfdotq_f32` are unimplemented in Rust `core::arch` on every
+// channel (stable and nightly alike), with no `stdarch_*` feature gate or tracking issue
+// to even enable them. The matrix sibling `BFMMLA` (`vbfmmlaq_f32`) is likewise absent;
+// revisit once stdarch grows NEON bf16 support.
 
 /// `f16` mixed precision (scalar fallback): widens/narrows 4 lanes one at a time
 /// through [`NarrowFloat`], matching the scalar engine's `f16` path. (See the note
@@ -289,9 +297,19 @@ impl KernelSimd<bf16, bf16, f32, bf16> for Neon {
 // The `i32` accumulator ops are native NEON; the `i8 -> i32` widen-load uses a
 // per-lane scalar fallback to avoid loading bytes past a 4-wide panel slot.
 // TODO(neon): vectorize the widen with `vmovl_s8`/`vmovl_s16` over the full `mr`
-// row block at once (where the 8-byte read stays in bounds), and a hardware
-// `i8` dot (`SDOT`) where the `dotprod` extension is present — the NEON analogue of
-// VNNI.
+// row block at once (where the 8-byte read stays in bounds).
+//
+// A hardware `i8` dot kernel — `SDOT` (`vdotq_s32`) — is the NEON analogue of x86 VNNI
+// but cleaner: signed×signed `i8·i8 -> i32` is GEMM's native op, so no `+128` bias or
+// per-column-sum correction. The arch-neutral dot seams already exist
+// (`KernelFamily::DEPTH_MULTIPLE`, `KernelSimd::dot_accumulate`, `pack_kgroup_panels`),
+// so it would add only a `dotprod` token and an identity-pack `IntDotGemm` family
+// (sibling to `IntGemmVnni`, which bakes the `+128` xform into its pack), `Q = 4`,
+// bit-exact to this widen path. DEFERRED like the native f16 path above: `vdotq_s32` is
+// gated behind the unstable `stdarch_neon_dotprod` (rust-lang/rust#117224), stable only
+// in Rust 1.98 — below the crate's stable/MSRV. (`USDOT`, `vusdotq_s32`, would map onto
+// VNNI and reuse `IntGemmVnni`, but `stdarch_neon_i8mm` (#117223) is unstable even on
+// nightly.) Revisit once `stdarch_neon_dotprod` is stable.
 
 #[cfg(feature = "int8")]
 impl SimdOps<i32> for Neon {

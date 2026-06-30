@@ -247,20 +247,23 @@ fn round_down(a: usize, b: usize) -> usize {
 /// changing the value.
 const MC_REG_PANELS: usize = 8;
 
-/// `NC` fallback when the machine reports no L3 (e.g. Apple Silicon, which exposes
-/// no conventional L3): a fixed, cache-agnostic column block of `NC_NO_L3_PANELS ·
-/// NR`. **Calibration point** — it ignores L2 size entirely.
+/// `NC` cap when the machine reports no L3 (e.g. Apple Silicon): the no-L3 column
+/// block is `min(NC_NO_L3_PANELS · NR, N)` — full-`N` up to this ceiling.
+/// **Calibration point** — it ignores L2 size entirely.
 ///
 /// Per the BLIS model, with no L3 `NC` is redundant and should stay *large* (B streams
-/// from DRAM; the `MC·KC` A panel is what fits the last-level cache) — shrinking it to
-/// an L2 fit is the wrong direction (more jc panels = more barriers, measured slower).
-/// Going to full-`N` lifts parallel throughput but hurts serial. Branching the two
-/// (serial `512` / parallel full-`N`) is *permitted* under the reproducibility bar —
-/// blocking may depend on parallelism as long as each config stays deterministic — but is
-/// kept uniform here for simplicity (and this path is dead where an L3 exists anyway).
-/// `512` (= `128·NR`) is the kept middle ground; the split is a perf opportunity to
-/// validate before changing.
-const NC_NO_L3_PANELS: usize = 128;
+/// from DRAM; the `MC·KC` A panel is what fits the last-level cache) — shrinking it to an
+/// L2 fit is the wrong direction (more jc panels = more barriers, measured slower).
+/// Full-`N` collapses to a single jc block, which lifts parallel throughput (no
+/// inter-block barriers) and leaves serial unchanged, so it is applied uniformly: serial
+/// and parallel keep identical blocking and stay bit-identical. The cap bounds that block
+/// so the shared packed-B macro-panel peaks at `NC_NO_L3_PANELS·NR·kc` rather than
+/// full-`N`'s `N·kc` (it bounds the `nc` factor only; `kc` is `k` for the
+/// `OUT_IS_ACC = false` families, so the unchecked `b_elems·sizeof` workspace product
+/// still scales with `k`). `512` (= 2048 cols at NR = 4) keeps the block full-`N` for
+/// typical widths while bounding the panel; revisit and re-validate per hierarchy class
+/// before changing.
+const NC_NO_L3_PANELS: usize = 512;
 
 impl CacheTopology {
     /// Compute `(MC, KC, NC)` analytically (BLIS model) for the given microtile
@@ -332,7 +335,8 @@ impl CacheTopology {
 
         // --- NC: B macro-panel resides in L3 (reserve one way for A) ---
         let nc = if l3 == 0 {
-            // No L3: a fixed, cache-agnostic column block (calibration point).
+            // No L3: full-`N` up to the `NC_NO_L3_PANELS` cap (see its note). Dead where
+            // an L3 exists.
             (NC_NO_L3_PANELS * nr).min(n.next_multiple_of(nr)).max(nr)
         } else {
             let rhs_l3_assoc = l3_assoc.saturating_sub(1).max(1);

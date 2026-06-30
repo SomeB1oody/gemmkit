@@ -160,8 +160,9 @@ register of imags with plain contiguous loads. Because the kernel only consumes 
 layout, both operands are **always** packed (`FORCE_PACK_LHS = FORCE_PACK_RHS = true`).
 The epilogue de-interleaves `C`, folds the complex `alpha`/`beta`, and re-interleaves on
 store. This is the only path to NEON's full FMA throughput on **stable** Rust (the fused
-`FCMLA` is nightly-gated and would also change the rounding relative to the SoA real-FMA
-path) and it raises x86 throughput over the old interleaved-`fmaddsub` kernel.
+`FCMLA` is nightly-gated — `stdarch_neon_fcma`, rust-lang/rust#117222 — and would also
+change the rounding relative to the SoA real-FMA path) and it raises x86 throughput over
+the old interleaved-`fmaddsub` kernel.
 
 The family stays homogeneous (`Acc = T`, so the complex `alpha`/`beta` thread through the
 unchanged driver), but the hot loop runs on the *real* component, which the
