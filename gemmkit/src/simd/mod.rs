@@ -219,8 +219,8 @@ pub trait SimdOps<T: Scalar>: Simd {
     /// when [`Self::LANE_FMA`] is set. The default implementation broadcasts
     /// each lane via a store + [`Self::splat`] (correct for any ISA, but no
     /// faster than the plain `splat` path); lane-capable ISAs override it with a
-    /// single hardware lane-indexed FMA. The result is bit-identical to the
-    /// `splat` path — same fused `a*b + c`.
+    /// single hardware lane-indexed FMA. It performs the same fused `a*b + c` as the
+    /// `splat` path, so the two round consistently within a run.
     ///
     /// # Safety
     /// See the trait-level note; `acc.len()` must be `<= LANES` and `a_regs`
@@ -274,20 +274,22 @@ pub trait SimdOps<T: Scalar>: Simd {
     /// because the hardware cannot reorder, or a **scalable-vector** ISA (SVE/SME, RVV)
     /// whose length is not a compile-time `LANES`, so the fixed-width loop must be
     /// rewritten. Both still do a per-element fused `a·b + c` in ascending `p`, so they
-    /// can satisfy the bit-identity contract below. Instructions that *reshape* the
-    /// accumulation rounding itself (matrix / dot — `bfmmla`, `sdot`) cannot, so they
-    /// are out of scope for this seam: adopting them means revisiting the driver's
-    /// determinism contract, not just overriding this method. Before keeping any
-    /// override, *prove it pays*: check the disassembly for spills, confirm it stays
-    /// bit-identical to the default, and benchmark it — do not assume a hand schedule
-    /// helps.
+    /// round consistently with the edge path. Instructions that *reshape* the
+    /// accumulation rounding itself (matrix / dot — `bfmmla`, `sdot`, VNNI, `vdpbf16ps`)
+    /// are out of scope for *this* seam: they arrive as a new
+    /// [`crate::kernel::KernelFamily`] with a dedicated dot seam (which may round
+    /// differently from the widen path, within tolerance), not as an `accumulate_tile`
+    /// override. Before keeping any override, *prove it pays*: check the disassembly for
+    /// spills, confirm it stays deterministic and accurate to the same tolerance, and
+    /// benchmark it — do not assume a hand schedule helps.
     ///
-    /// Any override **must** preserve the ascending-`p`, fused `a·b + c` order so
-    /// results stay **bit-identical** to the default (the driver's determinism
-    /// contract: full and edge tiles of the same matrix must round the same way).
-    /// Software pipelining reorders *loads*, never the arithmetic, so it is legal.
-    /// Called only for full tiles (`nr_eff == NR`); partial column tiles stay on the
-    /// microkernel's edge path.
+    /// An override **must** stay **deterministic and accurate to the same tolerance**
+    /// under a fixed config, and round consistently with the microkernel's edge path
+    /// within a run (full and edge tiles of the same matrix must agree). It need **not**
+    /// be bitwise-identical to the default. The portable schedule keeps the ascending-`p`,
+    /// fused `a·b + c` order, and software pipelining reorders *loads*, never the
+    /// arithmetic, so it trivially meets that bar. Called only for full tiles
+    /// (`nr_eff == NR`); partial column tiles stay on the microkernel's edge path.
     ///
     /// # Safety
     ///

@@ -7,7 +7,10 @@
 //! of every core getting an equal indivisible slice bounded by the slowest. Thread
 //! count *scales with workload* rather than jumping straight to all cores. The math
 //! is identical for serial and parallel runs and independent of *which* worker
-//! computes a given tile, so output is bit-identical regardless of thread count.
+//! computes a given tile, so output is **reproducible** regardless of thread count:
+//! a fixed config gives the same result. (That the two are also bitwise-equal today
+//! follows from serial and parallel running the same kernel — the promised contract
+//! is reproducibility under a fixed config, not bitwise serial-vs-parallel identity.)
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
