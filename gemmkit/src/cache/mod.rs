@@ -254,9 +254,13 @@ const MC_REG_PANELS: usize = 8;
 /// Per the BLIS model, with no L3 `NC` is redundant and should stay *large* (B streams
 /// from DRAM; the `MC·KC` A panel is what fits the last-level cache) — shrinking it to
 /// an L2 fit is the wrong direction (more jc panels = more barriers, measured slower).
-/// Going to full-`N` does lift parallel throughput but hurts serial, and
-/// thread-count-independent blocking (a bit-identity invariant) can't branch the two;
-/// `512` (= `128·NR`) is the kept middle ground. Perf-validate before changing.
+/// Going to full-`N` does lift parallel throughput but hurts serial. Branching the
+/// two (serial `512` / parallel full-`N`) is *permitted* under the reproducibility
+/// bar — blocking may depend on the parallelism as long as each config stays
+/// deterministic — but is kept uniform here for simplicity, and this no-L3 path is
+/// dead on machines with an L3 anyway; `512` (= `128·NR`) is the kept middle ground.
+/// The split is a no-L3 / Apple-Silicon perf opportunity — validate there before
+/// changing.
 const NC_NO_L3_PANELS: usize = 128;
 
 impl CacheTopology {
@@ -267,7 +271,8 @@ impl CacheTopology {
     /// * `sizeof`: size in bytes of one *packed input* element
     ///
     /// The result is independent of the thread count, so serial and parallel
-    /// runs use identical blocking (a prerequisite for bit-identical output).
+    /// runs use identical blocking — the mechanism behind reproducible output
+    /// under a fixed config.
     pub fn blocking(
         &self,
         mr: usize,
@@ -378,7 +383,7 @@ mod tests {
     }
 
     /// The LHS-pack stride gate: the default `0` knob must resolve to *half the page*
-    /// (the page-derived auto path that bit-identity assertions cannot observe), and
+    /// (the page-derived auto path that determinism assertions cannot observe), and
     /// any non-zero knob must pass through verbatim as a byte threshold. Guards the
     /// `0 => page_size()/2` derivation and the override branch against regression
     /// (e.g. an inverted match or a changed divisor).

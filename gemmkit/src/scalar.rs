@@ -251,7 +251,7 @@ impl Float for f32 {
     #[inline(always)]
     fn mul_add(self, b: Self, c: Self) -> Self {
         // Plain `a*b + c` (not the hardware FMA) so the scalar reference path is
-        // reproducible and matches the non-FMA fallback kernel bit-for-bit.
+        // reproducible and agrees with the non-FMA fallback kernel.
         self * b + c
     }
 }

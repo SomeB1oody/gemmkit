@@ -66,7 +66,7 @@ macro_rules! impl_scalar_ops {
             }
             #[inline(always)]
             unsafe fn mul_add(self, a: Self::Reg, b: Self::Reg, c: Self::Reg) -> Self::Reg {
-                // Plain `a*b + c` keeps the scalar path bit-reproducible and in
+                // Plain `a*b + c` keeps the scalar path reproducible and in
                 // agreement with `Float::mul_add` used by the epilogue.
                 a * b + c
             }

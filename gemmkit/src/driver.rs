@@ -9,7 +9,10 @@
 //! take more). `beta` applies only on the first depth slice; later slices
 //! accumulate. Each output tile is computed start-to-finish by one worker over
 //! the full K, and the blocking is thread-count independent, so the result is
-//! bit-identical for any [`Parallelism`] regardless of how the chunks land.
+//! **reproducible** for any [`Parallelism`] regardless of how the chunks land — a
+//! fixed input/config gives the same output, independent of the worker count.
+//! (Bitwise serial-vs-parallel identity holds today because both paths run the
+//! same kernel, but the contract is reproducibility under a fixed config.)
 
 use core::mem::MaybeUninit;
 
@@ -166,9 +169,9 @@ pub unsafe fn run_packed_rhs<Fam, S, const MR_REG: usize, const NR: usize>(
 /// Pack the entire RHS of a fixed `(k, n)` problem into one micropanel-major
 /// buffer, in the exact order [`run_packed_rhs`] reads panels: `jc` blocks
 /// outermost, then depth slices, then the panels of each slice (cursor advancing
-/// `kc_eff * nr` per panel). The bytes match the driver's own per-slice packing,
-/// so a prepacked GEMM is bit-identical to a plain one — the single source of
-/// truth for the layout. `dst` must hold `ceil(n/nr) * nr * k` elements.
+/// `kc_eff * nr` per panel). The packed bytes match the driver's own per-slice
+/// packing, so a prepacked GEMM reproduces a plain one under the same config — one
+/// single source of truth for the layout. `dst` must hold `ceil(n/nr) * nr * k` elements.
 ///
 /// # Safety
 /// `b` valid for the `k × n` region at `rsb`/`csb`; `dst` valid for the count above.
@@ -501,7 +504,8 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize>(
                                 if shared_a {
                                     // Read the block's A panel that the pre-pass
                                     // packed once (same bytes, same packed read
-                                    // formula as the per-worker case ⇒ bit-identical).
+                                    // formula as the per-worker case ⇒ identical
+                                    // packed input, so the result reproduces it).
                                     a_panel_base =
                                         a_base.0.add(ic_idx * a_stride) as *const Fam::Lhs;
                                     a_cs = mr as isize;

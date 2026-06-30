@@ -111,8 +111,8 @@ where
                 // (e.g. AArch64 NEON, where the FMA pipes stall on operand
                 // delivery at kc-loop boundaries) can override just this loop
                 // with a software-pipelined schedule, leaving the driver,
-                // packing, and epilogue untouched. Bit-identical across the
-                // override.
+                // packing, and epilogue untouched; the override reorders loads,
+                // not arithmetic, so it rounds consistently with the edge path.
                 simd.accumulate_tile::<MR_REG, NR>(kc, a, a_cs, b, b_rs, b_cs, &mut acc);
             } else {
                 // Edge column tile (`nr_eff < NR`): read exactly `nr_eff` columns

@@ -78,16 +78,19 @@ register-blocked kernel, so the *whole-seam* override exists only for cores it
 will **not** fix on its own — an in-order / narrow-OoO core that needs explicit
 software pipelining, or a scalable-vector ISA (SVE/RVV) whose length is not a
 compile-time `LANES`. Every path here — the lane fast path and any override — is
-bound by one contract: **bit-identity**. The accumulation must stay a per-element
-fused `a·b + c` in ascending `p`, so a full tile and an edge tile of the same
-matrix round identically (the L4 driver's determinism guarantee); software
-pipelining reorders *loads*, never the arithmetic, so it is legal. The lane path
-is bit-identical to the `splat` path and on the benchmarked M-series perf-neutral
-(that kernel is FMA-throughput-bound, not B-load-bound) — it earns its place as a
-vocabulary option, not a measured win. Instructions that instead *reshape the
-accumulation rounding itself* — matrix/dot widening (`bfmmla`, `sdot`, VNNI,
-bf16) — cannot meet that contract and are **out of scope for this seam**: they
-arrive as a new [`KernelFamily`] (L1), never an `accumulate_tile` override.
+bound by one contract: **same-run consistency**. Within a run the accumulation
+stays a per-element fused `a·b + c` in ascending `p`, so a full tile and an edge
+tile of the same matrix round identically (the L4 driver's determinism guarantee);
+software pipelining reorders *loads*, never the arithmetic, so it is legal. The
+lane path performs the same per-element fused `a·b + c` as the `splat` path and on
+the benchmarked M-series is perf-neutral (that kernel is FMA-throughput-bound, not
+B-load-bound) — it earns its place as a vocabulary option, not a measured win. An
+override need only stay **deterministic and accurate to the same tolerance** under
+a fixed config; it need not be bitwise-identical to the default. Instructions that
+*reshape the accumulation rounding itself* — matrix/dot widening (`bfmmla`, `sdot`,
+VNNI, bf16) — are out of scope for *this* seam: they arrive as a new
+[`KernelFamily`] (L1) with a dedicated dot seam, never an `accumulate_tile`
+override.
 
 ### `#[target_feature]` correctness
 
@@ -134,8 +137,8 @@ register of imags with plain contiguous loads. Because the kernel only consumes 
 layout, both operands are **always** packed (`FORCE_PACK_LHS = FORCE_PACK_RHS = true`).
 The epilogue de-interleaves `C`, folds the complex `alpha`/`beta`, and re-interleaves on
 store. This is the only path to NEON's full FMA throughput on **stable** Rust (the fused
-`FCMLA` is nightly-gated and would also break determinism) and it raises x86 throughput
-over the old interleaved-`fmaddsub` kernel.
+`FCMLA` is nightly-gated and would also change the rounding relative to the SoA real-FMA
+path) and it raises x86 throughput over the old interleaved-`fmaddsub` kernel.
 
 The family stays homogeneous (`Acc = T`, so the complex `alpha`/`beta` thread through the
 unchanged driver), but the hot loop runs on the *real* component, which the
@@ -244,8 +247,9 @@ once (memoized) and a plausibility gate rejects half-populated reads.
 Blocking is the **BLIS analytical model**: `KC` so the A and B micro-panels coexist
 in L1 without self-eviction; `MC` so the A macro-panel resides in L2 (reserving one
 way for B, capped at `8·MR`); `NC` so the B macro-panel resides in L3 (reserving
-one way for A). The result is **independent of thread count**, which is a
-prerequisite for bit-identical serial/parallel output.
+one way for A). The result is **independent of thread count**, which is the
+mechanism behind reproducible serial/parallel output: a fixed config yields the
+same result regardless of how many workers run.
 
 ## L4 — the driver
 
@@ -266,7 +270,10 @@ Invariants: the depth loop is serial (the C tile is read-modify-written across
 depth); `β` is applied only on the first depth slice so `C ← βC + αAB` holds and
 `β==0` never reads C; each output tile is computed start-to-finish by one worker
 over the full K; the blocking is thread-count-independent. Together these make the
-output **bit-identical** for any [`Parallelism`].
+output **reproducible** for any [`Parallelism`] — a fixed config gives the same
+result regardless of thread count. (Serial and parallel happen to be bitwise-equal
+today because both run the same kernel, but the contract is reproducibility under a
+fixed config, not bitwise serial-vs-parallel identity.)
 
 **Orientation.** If C is row-major-ish (`|csc| < |rsc|`), the dispatch layer
 computes `Cᵀ = Bᵀ·Aᵀ` by swapping A/B and the strides, so the kernel always writes
@@ -285,8 +292,9 @@ rates` instead of `n · slowest`, which matters on heterogeneous big.LITTLE layo
 (Apple P/E, ARM DynamIQ, Intel hybrid) where an equal indivisible split is bounded
 by the slowest core. This forfeits *nothing*: blocking stays thread-count
 independent, the depth loop stays serial, and each output tile is still computed
-wholly by one worker over the full K, so *which* worker computes a tile is
-numerically irrelevant and the output is bit-identical. On the common in-place-LHS path, chunk size targets
+wholly by one worker over the full K, so *which* worker computes a tile does not
+change the result — the output is reproducible (and, with today's single-kernel
+design, bitwise-equal) across thread counts. On the common in-place-LHS path, chunk size targets
 `GEMMKIT_PARALLEL_OVERSAMPLE` chunks per worker (default 8: ~8 chunks/worker bounds
 the heterogeneous tail imbalance to ~⅛ of a worker's share). When the LHS is packed
 *and* there are at least as many row-blocks as workers, the chunk is a whole
