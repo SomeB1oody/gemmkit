@@ -99,6 +99,13 @@ static PARALLEL_OVERSAMPLE: Threshold = Threshold::new("GEMMKIT_PARALLEL_OVERSAM
 // [`thread_dim_stride`]); any non-zero env/setter value overrides verbatim.
 static THREAD_DIM_STRIDE: Threshold = Threshold::new("GEMMKIT_THREAD_DIM_STRIDE", 0);
 
+// Worker count for a threaded wasm build (`wasm_threads` feature). wasm has no
+// `available_parallelism`, so the deployer sets the parallel width here instead — it caps
+// `auto_threads` and sizes gemmkit's wasm rayon pool. Off-target builds stay serial via the
+// `RAYON_USABLE` guard regardless.
+#[cfg(all(target_arch = "wasm32", feature = "wasm_threads"))]
+static WASM_THREADS: Threshold = Threshold::new("GEMMKIT_WASM_THREADS", 8);
+
 // Minimum `m*n*k` for the shared-LHS A-pack to engage (on top of the runtime
 // `n_mc < n_threads` redundancy guard in the driver). The shared pre-pass removes
 // redundant per-worker packs but adds a fork-join barrier per depth slice; it pays
@@ -198,6 +205,19 @@ pub fn thread_dim_stride() -> usize {
 /// auto value).
 pub fn set_thread_dim_stride(v: usize) {
     THREAD_DIM_STRIDE.set(v);
+}
+
+/// Get the worker count for a threaded wasm build (default 8). See [`WASM_THREADS`].
+/// Only exists on `wasm32` with the `wasm_threads` feature, where the runtime cannot
+/// report a core count; elsewhere `available_parallelism` is used instead.
+#[cfg(all(target_arch = "wasm32", feature = "wasm_threads"))]
+pub fn wasm_threads() -> usize {
+    WASM_THREADS.get().max(1)
+}
+/// Override the threaded-wasm worker count (clamped to `>= 1`).
+#[cfg(all(target_arch = "wasm32", feature = "wasm_threads"))]
+pub fn set_wasm_threads(v: usize) {
+    WASM_THREADS.set(v.max(1));
 }
 
 /// Core-count-derived auto ramp granularity. The ramp saturates all `cores` workers at

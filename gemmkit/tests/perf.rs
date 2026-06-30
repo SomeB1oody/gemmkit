@@ -1,28 +1,46 @@
-//! Quick performance comparison vs the `gemm` crate and `matrixmultiply`.
-//! Ignored by default (it is a benchmark, not a correctness gate).
+//! Performance suite — `#[ignore]` benchmarks (not correctness gates), run manually.
 //!
-//! Built only when *not* under Miri: it depends on `gemm`/`matrixmultiply`, which
-//! are `cfg(not(miri))` dev-dependencies (see `Cargo.toml`). The whole file
-//! compiles away under Miri so `cargo miri test` needs no dependency surgery.
+//! * **Native cross-library benchmarks**: gemmkit vs the `gemm` crate / `matrixmultiply`.
+//!   These depend on those dev-deps, which **do not build for wasm** (they are
+//!   `cfg(all(not(miri), not(target_family = "wasm")))` dev-deps — see `Cargo.toml`), so
+//!   each bench that calls them is individually gated `cfg(not(target_family = "wasm"))`.
+//! * **The wasm `simd128` benchmark** (`perf_simd128`): simd128 vs the scalar token,
+//!   mirroring the native `NativeTok` + `bench_native_equal_isa` pattern with the *scalar
+//!   token* as the reference (no external crate on wasm). The shared harness
+//!   (`fill`/`measure`/`gflops`/`Stat`) is `std`-only, so it serves both worlds and the
+//!   file compiles on wasm. (Correctness of the simd128 path is gated separately by
+//!   `isa_simd128` in `tests/correctness.rs`; this is the throughput sanity print.)
 //!
-//! Each benchmark saturates every core, so the two `#[ignore]` tests
-//! (`perf_sgemm`, `perf_scaling`) must not run concurrently. They take a shared
-//! `BENCH_GUARD` lock, so even the default multi-threaded harness serializes them
-//! and `--test-threads=1` is optional. Run with:
+//! The whole file compiles away under Miri. The benchmarks each saturate every core, so
+//! they must not run concurrently — they take a shared `BENCH_GUARD` lock, so even the
+//! default multi-threaded harness serializes them and `--test-threads=1` is optional.
+//! Run them with:
 //!   cargo test -p gemmkit --release --test perf -- --ignored --nocapture
-//! or one at a time:
-//!   cargo test -p gemmkit --release --test perf perf_scaling -- --ignored --nocapture
+//! Run the wasm benchmark (compile-time `+simd128`) under a wasm runtime:
+//!   RUSTFLAGS="-C target-feature=+simd128" CARGO_TARGET_WASM32_WASIP1_RUNNER=wasmtime \
+//!     cargo test -p gemmkit --release --target wasm32-wasip1 \
+//!       --no-default-features --features std --test perf -- --ignored --nocapture
 #![cfg(not(miri))]
 
 use std::time::Instant;
 
+// `driver` / `FloatGemm` / `Workspace` drive the low-level single-ISA benches. Those
+// exist in every config *except* wasm-without-simd128 (there only the public-API tail
+// benches survive), so gate the imports to match — `any(not(wasm32), simd128)` — to stay
+// warning-clean in the scalar-fallback wasm build.
+#[cfg(any(not(target_arch = "wasm32"), target_feature = "simd128"))]
+use gemmkit::Workspace;
+#[cfg(any(not(target_arch = "wasm32"), target_feature = "simd128"))]
 use gemmkit::driver;
+#[cfg(any(not(target_arch = "wasm32"), target_feature = "simd128"))]
 use gemmkit::kernel::FloatGemm;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use gemmkit::simd::Fma;
 #[cfg(target_arch = "aarch64")]
 use gemmkit::simd::Neon;
-use gemmkit::{MatMut, MatRef, Parallelism, Workspace, gemm};
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+use gemmkit::simd::{ScalarTok, Simd128};
+use gemmkit::{MatMut, MatRef, Parallelism, gemm};
 
 /// Serializes the two core-saturating `#[ignore]` benches so the default
 /// multi-threaded test harness can't run them concurrently (which would make every
@@ -94,7 +112,7 @@ fn gflops(m: usize, k: usize, n: usize, secs: f64) -> f64 {
 
 /// f16 GEMM throughput: gemmkit (f32-accumulate mixed kernel) vs the `gemm` crate
 /// (same f16-in-f32-acc convention), reported as a ratio. f16 FLOPs counted like f32.
-#[cfg(feature = "half")]
+#[cfg(all(feature = "half", not(target_family = "wasm")))]
 fn bench_f16(s: usize, parallel: bool) {
     use gemmkit::f16;
     let (m, k, n) = (s, s, s);
@@ -157,7 +175,7 @@ fn bench_f16(s: usize, parallel: bool) {
     );
 }
 
-#[cfg(feature = "half")]
+#[cfg(all(feature = "half", not(target_family = "wasm")))]
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
 fn perf_f16() {
@@ -173,7 +191,7 @@ fn perf_f16() {
 
 /// i8 -> i32 GEMM throughput (no `gemm`-crate baseline — it lacks i8 in 0.18). Just
 /// confirms the widen-and-multiply kernel is SIMD-accelerated, not scalar-bound.
-#[cfg(feature = "int8")]
+#[cfg(all(feature = "int8", not(target_family = "wasm")))]
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
 fn perf_i8() {
@@ -214,7 +232,7 @@ fn perf_i8() {
 /// Complex (c32) GEMM throughput: gemmkit (`gemm_cplx`, no conj) vs the `gemm` crate
 /// (native c32). Complex FLOPs counted as 4× the real count (a complex mul-add is
 /// ~4 real mul + 4 real add), the convention both report.
-#[cfg(feature = "complex")]
+#[cfg(all(feature = "complex", not(target_family = "wasm")))]
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
 fn perf_complex() {
@@ -299,6 +317,9 @@ fn perf_complex() {
     }
 }
 
+// gemmkit best-ISA vs the `gemm` crate + `matrixmultiply` — external crates that do
+// not build for wasm, so this bench (and its `perf_sgemm` caller) is gated off wasm.
+#[cfg(not(target_family = "wasm"))]
 fn bench_one(s: usize, parallel: bool) {
     let (m, k, n) = (s, s, s);
     let a = fill(m * k, 1);
@@ -408,6 +429,16 @@ const NATIVE_NR: usize = 4;
 #[cfg(target_arch = "aarch64")]
 const NATIVE_LABEL: &str = "NEON";
 
+// wasm `simd128` (compile-time feature; no runtime detection)
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+type NativeTok = Simd128;
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+const NATIVE_MR: usize = 2;
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+const NATIVE_NR: usize = 4;
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+const NATIVE_LABEL: &str = "simd128";
+
 /// Equal-ISA comparison: gemmkit's native single-ISA path (forced via the
 /// driver) vs gemm's default (the same ISA on stable). Single-threaded,
 /// column-major.
@@ -473,6 +504,80 @@ fn bench_native_equal_isa(s: usize) {
     );
 }
 
+/// wasm `simd128`, column-major, single-threaded
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+fn bench_simd128_vs_scalar(s: usize) {
+    let (m, k, n) = (s, s, s);
+    let a = fill(m * k, 1);
+    let b = fill(k * n, 2);
+    let mut c = vec![0.0f32; m * n];
+    let mut ws = Workspace::new();
+
+    let s_simd = measure(m, k, n, || unsafe {
+        driver::run::<FloatGemm<f32>, NativeTok, NATIVE_MR, NATIVE_NR>(
+            NativeTok::default(),
+            m,
+            k,
+            n,
+            1.0,
+            a.as_ptr(),
+            1,
+            m as isize,
+            b.as_ptr(),
+            1,
+            k as isize,
+            0.0,
+            c.as_mut_ptr(),
+            1,
+            m as isize,
+            Parallelism::Serial,
+            &mut ws,
+        );
+    });
+    let s_scalar = measure(m, k, n, || unsafe {
+        driver::run::<FloatGemm<f32>, ScalarTok, 4, 4>(
+            ScalarTok,
+            m,
+            k,
+            n,
+            1.0,
+            a.as_ptr(),
+            1,
+            m as isize,
+            b.as_ptr(),
+            1,
+            k as isize,
+            0.0,
+            c.as_mut_ptr(),
+            1,
+            m as isize,
+            Parallelism::Serial,
+            &mut ws,
+        );
+    });
+    let label = NATIVE_LABEL;
+    println!(
+        "  n={s:<5} ser  gemmkit-{label}={:7.2} (±{:>2.0}%)  scalar={:7.2} (±{:>2.0}%)  ({:.2}×)",
+        s_simd.median,
+        s_simd.spread_pct(),
+        s_scalar.median,
+        s_scalar.spread_pct(),
+        s_simd.median / s_scalar.median,
+    );
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture"]
+fn perf_simd128() {
+    let _guard = BENCH_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    println!("\nwasm simd128 GFLOP/s (f32, column-major) — gemmkit simd128 vs scalar token:");
+    for &s in &[128usize, 256, 512, 1024] {
+        bench_simd128_vs_scalar(s);
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
 fn perf_sgemm() {
@@ -501,6 +606,7 @@ fn perf_sgemm() {
 /// only to *estimate* the per-region job count (the parallel work granularity).
 /// Assumes the best available x86 ISA is AVX-512; if the box only has AVX2 the
 /// real tile is 16x6 and the printed job estimate is a lower bound.
+#[cfg(not(target_family = "wasm"))]
 fn native_default_tile() -> (usize, usize) {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
@@ -522,6 +628,7 @@ fn native_default_tile() -> (usize, usize) {
 /// tiny work; a plateau after 8-16 => memory bandwidth or job starvation (compare
 /// against the printed ~jobs/region). Throughput is the median of `REPS`
 /// calibrated batches; the spread column flags differences smaller than the noise.
+#[cfg(not(target_family = "wasm"))]
 fn bench_scaling(s: usize) {
     let (m, k, n) = (s, s, s);
     let a = fill(m * k, 1);
@@ -664,6 +771,7 @@ fn bench_scaling(s: usize) {
     );
 }
 
+#[cfg(not(target_family = "wasm"))]
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
 fn perf_scaling() {

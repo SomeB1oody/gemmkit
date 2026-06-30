@@ -14,14 +14,8 @@ readme = "README.md"
 [features]
 default = ["parallel"]
 parallel = ["gemmkit/parallel"]
-# Forward gemmkit's `half`: `f16`/`bf16` are `GemmScalar` (f32-accumulate), so the
-# generic adapter (`gemm`/`gemm_with`/`dot`) serves them as-is. (gemmkit's `complex`/
-# `int8` are not forwarded here — they aren't `GemmScalar` and need dedicated adapter
-# fns, not a passthrough.)
+wasm_threads = ["parallel", "gemmkit/wasm_threads"]
 half = ["gemmkit/half"]
-# Complex GEMM over `Complex<f32>`/`Complex<f64>` with optional conjugation. Not
-# `GemmScalar`, so it needs dedicated adapter fns (`dot_cplx` / `gemm_cplx[_with]`),
-# which this feature compiles in alongside forwarding `gemmkit/complex`.
 complex = ["gemmkit/complex"]
 
 [dependencies]

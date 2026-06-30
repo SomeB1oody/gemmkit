@@ -246,3 +246,76 @@ jobs:
         env:
           GEMMKIT_REQUIRE_ISA: neon
         run: cargo test -p gemmkit --all-features --no-fail-fast
+
+  # WebAssembly `simd128` backend
+  wasm_simd128:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rust: stable
+            target: wasm32-wasip1
+    name: wasm_simd128/${{ matrix.target }}/${{ matrix.rust }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust }}
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install wasmtime (test runner)
+        run: |
+          curl https://wasmtime.dev/install.sh -sSf | bash
+          echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
+      - name: Hygiene — scalar fallback (no simd128), element families, -D warnings
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo build -p gemmkit --target wasm32-wasip1 --no-default-features --features std,half,int8,complex --tests
+      - name: Hygiene — +simd128, element families, -D warnings
+        env:
+          RUSTFLAGS: -C target-feature=+simd128 -D warnings
+        run: cargo build -p gemmkit --target wasm32-wasip1 --no-default-features --features std,half,int8,complex --tests
+      - name: Correctness under wasmtime — +simd128, element families (pin simd128 to assert the SIMD path is live)
+        env:
+          RUSTFLAGS: -C target-feature=+simd128
+          CARGO_TARGET_WASM32_WASIP1_RUNNER: wasmtime --env GEMMKIT_REQUIRE_ISA=simd128
+        run: cargo test -p gemmkit --target wasm32-wasip1 --no-default-features --features std,half,int8,complex --test correctness --no-fail-fast
+      - name: Guarded parallel — builds + degrades to serial under wasmtime (baseline wasip1 has no threads)
+        env:
+          RUSTFLAGS: -C target-feature=+simd128 -D warnings
+          CARGO_TARGET_WASM32_WASIP1_RUNNER: wasmtime
+        run: |
+          cargo build -p gemmkit --target wasm32-wasip1 --no-default-features --features std,parallel,half,int8,complex --tests
+          cargo test -p gemmkit --target wasm32-wasip1 --no-default-features --features std,parallel,half,int8,complex --test correctness parallel_equals_serial --no-fail-fast
+
+  # Threaded wasm: `wasm32-wasip1-threads` + `wasm_threads` feature
+  wasm_simd128_threads:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rust: stable
+            target: wasm32-wasip1-threads
+    name: wasm_simd128_threads/${{ matrix.target }}/${{ matrix.rust }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust }}
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install wasmtime v46 (last release with wasi-threads)
+        run: |
+          curl https://wasmtime.dev/install.sh -sSf | bash -s -- --version v46.0.1
+          echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
+      - name: Hygiene — threaded build (+wasm_threads), -D warnings
+        env:
+          RUSTFLAGS: -C target-feature=+simd128 -D warnings
+        run: cargo build -p gemmkit --target wasm32-wasip1-threads --no-default-features --features std,parallel,wasm_threads,half,int8,complex --tests
+      - name: Correctness under real 8-way threads (pin simd128 to assert the SIMD path is live)
+        env:
+          RUSTFLAGS: -C target-feature=+simd128
+          CARGO_TARGET_WASM32_WASIP1_THREADS_RUNNER: "wasmtime -W threads=y -W shared-memory=y -S threads=y --env GEMMKIT_REQUIRE_ISA=simd128"
+        run: cargo test -p gemmkit --target wasm32-wasip1-threads --no-default-features --features std,parallel,wasm_threads,half,int8,complex --test correctness --no-fail-fast
