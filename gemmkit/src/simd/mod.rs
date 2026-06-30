@@ -48,6 +48,8 @@ mod scalar;
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub use self::avx512::Avx512;
+#[cfg(all(feature = "int8", any(target_arch = "x86", target_arch = "x86_64")))]
+pub use self::avx512::Avx512Vnni;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub use self::fma::Fma;
 #[cfg(target_arch = "aarch64")]
@@ -88,6 +90,36 @@ pub trait KernelSimd<L: Scalar, R: Scalar, A: Scalar, O: Scalar>: SimdOps<A> {
     /// # Safety
     /// `p` valid for `LANES` writes; run inside [`Simd::vectorize`].
     unsafe fn store_out(self, p: *mut O, v: <Self as SimdOps<A>>::Reg);
+
+    /// Accumulate one full `MR_REG × NR` microtile from **dot-product**-packed panels
+    /// into the register-resident `acc` (pre-zeroed by the caller). This is the seam
+    /// for a dot-kernel family ([`crate::kernel::KernelFamily::DEPTH_MULTIPLE`] `> 1`):
+    /// unlike [`SimdOps::accumulate_tile`] it folds `DEPTH_MULTIPLE` consecutive depth
+    /// steps into one hardware instruction (VNNI `vpdpbusd`, `vdpbf16ps`), so it
+    /// *reshapes the accumulation rounding* and lives here rather than on the
+    /// `accumulate_tile` seam (whose contract forbids that). `a`/`b` are the family's
+    /// interleaved packed panels — their exact layout is the contract between the
+    /// family's packers and the overriding token. `kc` is the real (unpadded) depth;
+    /// the token reads `ceil(kc / DEPTH_MULTIPLE)` instruction-groups from the
+    /// depth-padded panel. Any per-instruction signedness/bias correction (VNNI's `+128`
+    /// offset) is applied internally so `acc` holds the true `Σ_k A·B` on return.
+    ///
+    /// The default is unreachable: only a dot-capable token (e.g. `Avx512Vnni`,
+    /// `Avx512Bf16`) overrides it, and only a dot family ever calls it.
+    ///
+    /// # Safety
+    /// `a`/`b` valid for the family's packed panel at this `(MR_REG, NR, kc)`; `acc`
+    /// pre-initialized. Run inside this token's [`Simd::vectorize`] context.
+    #[inline(always)]
+    unsafe fn dot_accumulate<const MR_REG: usize, const NR: usize>(
+        self,
+        _kc: usize,
+        _a: *const L,
+        _b: *const R,
+        _acc: &mut [[<Self as SimdOps<A>>::Reg; MR_REG]; NR],
+    ) {
+        unreachable!("dot_accumulate is provided only by dot-capable ISA tokens")
+    }
 }
 
 /// Homogeneous blanket: when every family type is the accumulator type, the

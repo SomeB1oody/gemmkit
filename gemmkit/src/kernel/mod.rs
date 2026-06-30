@@ -28,7 +28,7 @@ pub mod mixed;
 pub use complex::ComplexGemm;
 pub use float::FloatGemm;
 #[cfg(feature = "int8")]
-pub use int::IntGemm;
+pub use int::{IntGemm, IntGemmVnni};
 #[cfg(feature = "half")]
 pub use mixed::MixedGemm;
 
@@ -96,6 +96,24 @@ pub trait KernelFamily: Copy + Send + Sync + 'static {
     const FORCE_PACK_LHS: bool = false;
     /// See [`KernelFamily::FORCE_PACK_LHS`].
     const FORCE_PACK_RHS: bool = false;
+
+    /// Packed-panel **depth** is rounded up to this multiple before the driver sizes
+    /// and addresses the packed A/B buffers. `1` (the default) means no rounding —
+    /// every homogeneous / widen family. A *dot-product* family that folds `Q`
+    /// consecutive depth steps into one instruction (VNNI `vpdpbusd`: `Q = 4` i8 steps;
+    /// `vdpbf16ps`: `Q = 2` bf16 steps) sets it to `Q`, so each packed micropanel holds
+    /// whole instruction-groups and the microkernel reads `ceil(kc/Q)` of them.
+    ///
+    /// Contract: a family with `DEPTH_MULTIPLE = Q` MUST make its [`pack_lhs`] /
+    /// [`pack_rhs`] write a panel of `width · kc.next_multiple_of(Q)` elements,
+    /// depth-padding the tail (the pad value is family-specific — e.g. VNNI pads A with
+    /// its `+128` bias of zero and B with zero). The driver strides packed panels by the
+    /// same padded depth, so the two stay in lockstep. For `Q = 1` this is exactly the
+    /// current behavior (no padding), so existing families are unaffected.
+    ///
+    /// [`pack_lhs`]: KernelFamily::pack_lhs
+    /// [`pack_rhs`]: KernelFamily::pack_rhs
+    const DEPTH_MULTIPLE: usize = 1;
 
     /// Pack an `mc × kc` LHS block into micropanel-major layout: a sequence of
     /// panels each `mr` rows tall, every panel stored column-by-column with `mr`

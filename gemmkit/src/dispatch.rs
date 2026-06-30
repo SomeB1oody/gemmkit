@@ -10,8 +10,10 @@
 //! ## Pinning the kernel: `GEMMKIT_REQUIRE_ISA`
 //!
 //! By default the best available ISA is selected at runtime. Setting the
-//! environment variable `GEMMKIT_REQUIRE_ISA` to `scalar`, `fma`, `avx512`, or
-//! `neon` **forces** exactly that kernel; if the CPU (or an emulator such as
+//! environment variable `GEMMKIT_REQUIRE_ISA` to `scalar`, `fma`, `avx512`,
+//! `avx512vnni`, or `neon` **forces** exactly that kernel (`avx512vnni` selects the
+//! `i8` `vpdpbusd` dot kernel, and the plain AVX-512 path for every other type); if
+//! the CPU (or an emulator such as
 //! Intel SDE) does not report the required feature — or the requested ISA does
 //! not exist on this target architecture — dispatch **panics** rather than
 //! falling back, so a CI job that means to exercise a given kernel fails loudly
@@ -36,12 +38,18 @@ use crate::driver;
 use crate::kernel::FloatGemm;
 #[cfg(feature = "int8")]
 use crate::kernel::IntGemm;
+#[cfg(all(feature = "int8", any(target_arch = "x86", target_arch = "x86_64")))]
+use crate::kernel::IntGemmVnni;
+#[cfg(feature = "int8")]
+use crate::kernel::KernelFamily;
 #[cfg(feature = "half")]
 use crate::kernel::MixedGemm;
 use crate::parallel::Parallelism;
 #[cfg(feature = "half")]
 use crate::scalar::NarrowFloat;
 use crate::scalar::{Float, Scalar};
+#[cfg(all(feature = "int8", any(target_arch = "x86", target_arch = "x86_64")))]
+use crate::simd::Avx512Vnni;
 #[cfg(any(feature = "half", feature = "int8", feature = "complex"))]
 use crate::simd::KernelSimd;
 #[cfg(target_arch = "aarch64")]
@@ -777,6 +785,9 @@ enum ForcedIsa {
     Scalar,
     Fma,
     Avx512,
+    /// AVX-512 VNNI: the `i8` dot kernel. For types without a VNNI kernel this forces
+    /// the plain AVX-512 path (VNNI implies `avx512f`).
+    Avx512Vnni,
     Neon,
 }
 
@@ -797,11 +808,13 @@ fn forced_isa() -> ForcedIsa {
                 ForcedIsa::Fma
             } else if t.eq_ignore_ascii_case("avx512") || t.eq_ignore_ascii_case("avx512f") {
                 ForcedIsa::Avx512
+            } else if t.eq_ignore_ascii_case("avx512vnni") || t.eq_ignore_ascii_case("vnni") {
+                ForcedIsa::Avx512Vnni
             } else if t.eq_ignore_ascii_case("neon") {
                 ForcedIsa::Neon
             } else {
                 panic!(
-                    "GEMMKIT_REQUIRE_ISA: unknown value `{t}` (expected scalar|fma|avx512|neon|auto)"
+                    "GEMMKIT_REQUIRE_ISA: unknown value `{t}` (expected scalar|fma|avx512|avx512vnni|neon|auto)"
                 )
             }
         }
@@ -824,7 +837,7 @@ fn select_f32() -> Dispatched<f32> {
             return DISP_F32_FMA;
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        ForcedIsa::Avx512 => {
+        ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni => {
             assert!(
                 is_x86_feature_detected!("avx512f"),
                 "GEMMKIT_REQUIRE_ISA=avx512, but this CPU/emulator does not report avx512f"
@@ -832,7 +845,7 @@ fn select_f32() -> Dispatched<f32> {
             return DISP_F32_AVX512;
         }
         #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-        ForcedIsa::Fma | ForcedIsa::Avx512 => {
+        ForcedIsa::Fma | ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni => {
             panic!("GEMMKIT_REQUIRE_ISA: requested SIMD ISA is unavailable on this target")
         }
         #[cfg(target_arch = "aarch64")]
@@ -876,7 +889,7 @@ fn select_f64() -> Dispatched<f64> {
             return DISP_F64_FMA;
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        ForcedIsa::Avx512 => {
+        ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni => {
             assert!(
                 is_x86_feature_detected!("avx512f"),
                 "GEMMKIT_REQUIRE_ISA=avx512, but this CPU/emulator does not report avx512f"
@@ -884,7 +897,7 @@ fn select_f64() -> Dispatched<f64> {
             return DISP_F64_AVX512;
         }
         #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-        ForcedIsa::Fma | ForcedIsa::Avx512 => {
+        ForcedIsa::Fma | ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni => {
             panic!("GEMMKIT_REQUIRE_ISA: requested SIMD ISA is unavailable on this target")
         }
         #[cfg(target_arch = "aarch64")]
@@ -934,7 +947,7 @@ fn select_f16() -> Dispatched<f16> {
             return DISP_F16_FMA;
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        ForcedIsa::Avx512 => {
+        ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni => {
             assert!(
                 is_x86_feature_detected!("avx512f"),
                 "GEMMKIT_REQUIRE_ISA=avx512, but this CPU/emulator does not report avx512f"
@@ -942,7 +955,7 @@ fn select_f16() -> Dispatched<f16> {
             return DISP_F16_AVX512;
         }
         #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-        ForcedIsa::Fma | ForcedIsa::Avx512 => {
+        ForcedIsa::Fma | ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni => {
             panic!("GEMMKIT_REQUIRE_ISA: requested SIMD ISA is unavailable on this target")
         }
         #[cfg(target_arch = "aarch64")]
@@ -988,7 +1001,7 @@ fn select_bf16() -> Dispatched<bf16> {
             return DISP_BF16_FMA;
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        ForcedIsa::Avx512 => {
+        ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni => {
             assert!(
                 is_x86_feature_detected!("avx512f"),
                 "GEMMKIT_REQUIRE_ISA=avx512, but this CPU/emulator does not report avx512f"
@@ -996,7 +1009,7 @@ fn select_bf16() -> Dispatched<bf16> {
             return DISP_BF16_AVX512;
         }
         #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-        ForcedIsa::Fma | ForcedIsa::Avx512 => {
+        ForcedIsa::Fma | ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni => {
             panic!("GEMMKIT_REQUIRE_ISA: requested SIMD ISA is unavailable on this target")
         }
         #[cfg(target_arch = "aarch64")]
@@ -1305,7 +1318,21 @@ pub(crate) unsafe fn execute_int(t: IntTask, par: Parallelism, ws: &mut Workspac
             scale_c_int(t.beta, t.c, t.m, t.n, t.rsc, t.csc);
             return;
         }
-        (dispatched_i8().run)(t, par, ws);
+        let d = dispatched_i8();
+        // Auto VNNI hands small *multi-threaded* problems to the widen kernel (the dot
+        // kernel's pack barrier dominates there). `Rayon(1)`/`Serial` run on one worker,
+        // so they keep VNNI regardless of size. `small_par_fallback` is `None` unless the
+        // VNNI auto path was selected, so every other kernel takes `d.run` unchanged.
+        let run = match d.small_par_fallback {
+            Some(fallback)
+                if matches!(par, Parallelism::Rayon(n) if n != 1)
+                    && t.m.saturating_mul(t.n).saturating_mul(t.k) < I8_VNNI_MIN_PAR_MNK =>
+            {
+                fallback
+            }
+            _ => d.run,
+        };
+        run(t, par, ws);
     }
 }
 
@@ -1334,12 +1361,13 @@ unsafe fn scale_c_int(beta: i32, c: *mut i32, m: usize, n: usize, rsc: isize, cs
 /// As [`execute_int`].
 #[cfg(feature = "int8")]
 #[inline]
-unsafe fn run_typed_int<S, const MR_REG: usize, const NR: usize>(
+unsafe fn run_typed_int<Fam, S, const MR_REG: usize, const NR: usize>(
     simd: S,
     mut t: IntTask,
     par: Parallelism,
     ws: &mut Workspace,
 ) where
+    Fam: KernelFamily<Lhs = i8, Rhs = i8, Acc = i32, Out = i32>,
     S: KernelSimd<i8, i8, i32, i32>,
 {
     unsafe {
@@ -1355,7 +1383,7 @@ unsafe fn run_typed_int<S, const MR_REG: usize, const NR: usize>(
             t.csb = orsa;
             core::mem::swap(&mut t.rsc, &mut t.csc);
         }
-        driver::run::<IntGemm, S, MR_REG, NR>(
+        driver::run::<Fam, S, MR_REG, NR>(
             simd, t.m, t.k, t.n, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb, t.beta, t.c, t.rsc,
             t.csc, par, ws,
         );
@@ -1364,21 +1392,27 @@ unsafe fn run_typed_int<S, const MR_REG: usize, const NR: usize>(
 
 #[cfg(feature = "int8")]
 unsafe fn gemm_i8_scalar(t: IntTask, par: Parallelism, ws: &mut Workspace) {
-    unsafe { run_typed_int::<ScalarTok, 4, 4>(ScalarTok, t, par, ws) }
+    unsafe { run_typed_int::<IntGemm, ScalarTok, 4, 4>(ScalarTok, t, par, ws) }
 }
 #[cfg(all(feature = "int8", any(target_arch = "x86", target_arch = "x86_64")))]
 unsafe fn gemm_i8_fma(t: IntTask, par: Parallelism, ws: &mut Workspace) {
     // i32 accumulator → MR = 2*8 = 16, NR = 6 (the f32 FMA tile).
-    unsafe { run_typed_int::<Fma, 2, 6>(Fma, t, par, ws) }
+    unsafe { run_typed_int::<IntGemm, Fma, 2, 6>(Fma, t, par, ws) }
 }
 #[cfg(all(feature = "int8", any(target_arch = "x86", target_arch = "x86_64")))]
 unsafe fn gemm_i8_avx512(t: IntTask, par: Parallelism, ws: &mut Workspace) {
     // i32 accumulator → MR = 2*16 = 32, NR = 12 (the f32 AVX-512 tile).
-    unsafe { run_typed_int::<Avx512, 2, 12>(Avx512, t, par, ws) }
+    unsafe { run_typed_int::<IntGemm, Avx512, 2, 12>(Avx512, t, par, ws) }
+}
+#[cfg(all(feature = "int8", any(target_arch = "x86", target_arch = "x86_64")))]
+unsafe fn gemm_i8_avx512vnni(t: IntTask, par: Parallelism, ws: &mut Workspace) {
+    // VNNI dot kernel, same tile as AVX-512: MR = 2*16 = 32, NR = 12 → 24 acc + 2 vA
+    // + 1 vB = 27 ZMM. `vpdpbusd` folds 4 depth steps × 16 lanes per instruction.
+    unsafe { run_typed_int::<IntGemmVnni, Avx512Vnni, 2, 12>(Avx512Vnni, t, par, ws) }
 }
 #[cfg(all(feature = "int8", target_arch = "aarch64"))]
 unsafe fn gemm_i8_neon(t: IntTask, par: Parallelism, ws: &mut Workspace) {
-    unsafe { run_typed_int::<Neon, 4, 4>(Neon, t, par, ws) }
+    unsafe { run_typed_int::<IntGemm, Neon, 4, 4>(Neon, t, par, ws) }
 }
 
 #[cfg(feature = "int8")]
@@ -1386,24 +1420,56 @@ type IntFn = unsafe fn(IntTask, Parallelism, &mut Workspace);
 
 /// Memoized integer dispatch slot (mirror of [`Dispatched`] but a single kernel —
 /// integer prepack is not yet a public API).
+///
+/// `small_par_fallback` is the kernel to use for *auto-selected, multi-threaded, small*
+/// problems instead of `run`. It exists only for the VNNI auto path: `vpdpbusd` is so
+/// much faster per FMA that for a small parallel problem its **mandatory** RHS-pack
+/// barrier (the quad layout cannot be read in place) outweighs the compute saving, and
+/// the in-place widen kernel wins. Serial runs (any size) and large parallel runs keep
+/// VNNI. `None` for every other selection, and `None` when VNNI is *forced* (the force
+/// contract must exercise exactly that kernel). The fallback is bit-identical to VNNI
+/// (exact i32), so swapping by shape never perturbs results.
 #[cfg(feature = "int8")]
 #[derive(Copy, Clone)]
 struct IntDispatched {
     run: IntFn,
+    small_par_fallback: Option<IntFn>,
 }
+
+/// Below this `m·n·k`, an auto-selected VNNI kernel hands a *multi-threaded* problem to
+/// the widen fallback (see [`IntDispatched::small_par_fallback`]). Calibrated on the
+/// Ryzen 9950X (Zen5): VNNI clearly wins serial at every size and parallel from
+/// `n ≈ 1024` up, but loses small parallel where the pack barrier dominates. (Defined
+/// on every target so the gate in `execute_int` reads it unconditionally; only the x86
+/// VNNI auto path ever sets `small_par_fallback`, so elsewhere the gate is inert.)
+#[cfg(feature = "int8")]
+const I8_VNNI_MIN_PAR_MNK: usize = 768 * 768 * 768;
 
 #[cfg(feature = "int8")]
 const DISP_I8_SCALAR: IntDispatched = IntDispatched {
     run: gemm_i8_scalar,
+    small_par_fallback: None,
 };
 #[cfg(all(feature = "int8", any(target_arch = "x86", target_arch = "x86_64")))]
-const DISP_I8_FMA: IntDispatched = IntDispatched { run: gemm_i8_fma };
+const DISP_I8_FMA: IntDispatched = IntDispatched {
+    run: gemm_i8_fma,
+    small_par_fallback: None,
+};
 #[cfg(all(feature = "int8", any(target_arch = "x86", target_arch = "x86_64")))]
 const DISP_I8_AVX512: IntDispatched = IntDispatched {
     run: gemm_i8_avx512,
+    small_par_fallback: None,
+};
+#[cfg(all(feature = "int8", any(target_arch = "x86", target_arch = "x86_64")))]
+const DISP_I8_AVX512VNNI: IntDispatched = IntDispatched {
+    run: gemm_i8_avx512vnni,
+    small_par_fallback: None,
 };
 #[cfg(all(feature = "int8", target_arch = "aarch64"))]
-const DISP_I8_NEON: IntDispatched = IntDispatched { run: gemm_i8_neon };
+const DISP_I8_NEON: IntDispatched = IntDispatched {
+    run: gemm_i8_neon,
+    small_par_fallback: None,
+};
 
 /// `i8` ISA selection. The widen-and-multiply integer kernel uses only AVX2/AVX-512
 /// integer ops (no VNNI), so the gates mirror the `f32` ladder.
@@ -1427,8 +1493,18 @@ fn select_i8() -> IntDispatched {
             );
             return DISP_I8_AVX512;
         }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        ForcedIsa::Avx512Vnni => {
+            assert!(
+                is_x86_feature_detected!("avx512vnni")
+                    && is_x86_feature_detected!("avx512bw")
+                    && is_x86_feature_detected!("avx512f"),
+                "GEMMKIT_REQUIRE_ISA=avx512vnni, but this CPU/emulator does not report avx512f+bw+vnni"
+            );
+            return DISP_I8_AVX512VNNI;
+        }
         #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-        ForcedIsa::Fma | ForcedIsa::Avx512 => {
+        ForcedIsa::Fma | ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni => {
             panic!("GEMMKIT_REQUIRE_ISA: requested SIMD ISA is unavailable on this target")
         }
         #[cfg(target_arch = "aarch64")]
@@ -1439,6 +1515,18 @@ fn select_i8() -> IntDispatched {
     }
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
+        // VNNI dot kernel first — `vpdpbusd` is a structural win over widen-and-multiply,
+        // except for small *parallel* problems, where it hands off to the widen kernel
+        // (`small_par_fallback`) so its mandatory pack barrier does not dominate.
+        if is_x86_feature_detected!("avx512vnni")
+            && is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx512f")
+        {
+            return IntDispatched {
+                small_par_fallback: Some(gemm_i8_avx512),
+                ..DISP_I8_AVX512VNNI
+            };
+        }
         if is_x86_feature_detected!("avx512f") {
             return DISP_I8_AVX512;
         }
@@ -1668,7 +1756,7 @@ fn select_c32() -> CplxDispatched<C32> {
             return CDISP_C32_FMA;
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        ForcedIsa::Avx512 => {
+        ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni => {
             assert!(
                 is_x86_feature_detected!("avx512f"),
                 "GEMMKIT_REQUIRE_ISA=avx512, but this CPU/emulator does not report avx512f"
@@ -1676,7 +1764,7 @@ fn select_c32() -> CplxDispatched<C32> {
             return CDISP_C32_AVX512;
         }
         #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-        ForcedIsa::Fma | ForcedIsa::Avx512 => {
+        ForcedIsa::Fma | ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni => {
             panic!("GEMMKIT_REQUIRE_ISA: requested SIMD ISA is unavailable on this target")
         }
         #[cfg(target_arch = "aarch64")]
@@ -1718,7 +1806,7 @@ fn select_c64() -> CplxDispatched<C64> {
             return CDISP_C64_FMA;
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        ForcedIsa::Avx512 => {
+        ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni => {
             assert!(
                 is_x86_feature_detected!("avx512f"),
                 "GEMMKIT_REQUIRE_ISA=avx512, but this CPU/emulator does not report avx512f"
@@ -1726,7 +1814,7 @@ fn select_c64() -> CplxDispatched<C64> {
             return CDISP_C64_AVX512;
         }
         #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-        ForcedIsa::Fma | ForcedIsa::Avx512 => {
+        ForcedIsa::Fma | ForcedIsa::Avx512 | ForcedIsa::Avx512Vnni => {
             panic!("GEMMKIT_REQUIRE_ISA: requested SIMD ISA is unavailable on this target")
         }
         #[cfg(target_arch = "aarch64")]
