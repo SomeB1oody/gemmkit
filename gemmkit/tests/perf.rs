@@ -110,6 +110,36 @@ fn gflops(m: usize, k: usize, n: usize, secs: f64) -> f64 {
     2.0 * m as f64 * k as f64 * n as f64 / secs / 1e9
 }
 
+/// Byte-for-byte sibling of [`measure`] for **bandwidth-bound** shapes: same warmup,
+/// batch calibration, REPS, and median machinery, but each batch reports moved-bytes
+/// throughput `bytes / secs / 1e9` (GB/s) instead of GFLOP/s. `measure` has already
+/// divided by seconds, so a GFLOP/s `Stat` cannot be post-scaled into GB/s — this is
+/// the parallel estimator, not a wrapper. `bytes` is the total traffic of one `f()`.
+fn measure_gbps<F: FnMut()>(bytes: usize, mut f: F) -> Stat {
+    for _ in 0..3 {
+        f();
+    } // warmup + thread-pool spin-up
+    let t0 = Instant::now();
+    f();
+    let one = t0.elapsed().as_secs_f64().max(1e-9);
+    let iters = ((BATCH_SECS / one).ceil() as usize).clamp(1, 200_000);
+    let mut g: Vec<f64> = Vec::with_capacity(REPS);
+    for _ in 0..REPS {
+        let t = Instant::now();
+        for _ in 0..iters {
+            f();
+        }
+        let secs = t.elapsed().as_secs_f64() / iters as f64;
+        g.push(bytes as f64 / secs / 1e9);
+    }
+    g.sort_by(f64::total_cmp);
+    Stat {
+        median: g[REPS / 2],
+        min: g[0],
+        max: g[REPS - 1],
+    }
+}
+
 /// f16 GEMM throughput: gemmkit (f32-accumulate mixed kernel) vs the `gemm` crate
 /// (same f16-in-f32-acc convention), reported as a ratio. f16 FLOPs counted like f32.
 #[cfg(all(feature = "half", not(target_family = "wasm")))]
@@ -1054,4 +1084,399 @@ fn perf_shared_lhs() {
             bench_shared_lhs(s, rma);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Bandwidth-bound shapes: gemv, gevv, and the STREAM ceiling they are judged against
+// ---------------------------------------------------------------------------
+//
+// gemv (matrix·vector), gevv (rank-k / outer product), and skinny/low-k GEMM have
+// arithmetic intensity ≈ O(1): each input byte feeds only a few flops, so the ceiling
+// is *memory bandwidth*, not compute. The metric is therefore achieved GB/s as a
+// fraction of what the machine's DRAM can sustain, not GFLOP/s. STREAM Triad is that
+// ceiling — a single-core triad for the serial arm, an aggregate multi-core triad for
+// the parallel arm (one core's bandwidth is far below aggregate DRAM bandwidth, so the
+// serial ceiling would be the wrong yardstick for a threaded run).
+
+/// STREAM array length in f32 elements: 64 Mi (256 MiB) ≫ any last-level cache, so the
+/// kernels stream from DRAM and cannot be served from cache.
+const STREAM_LEN: usize = 64 * 1024 * 1024;
+
+/// Single-core STREAM Triad `a[i] = b[i] + α·c[i]` in GB/s (3·N·4 B moved). The scalar
+/// bandwidth ceiling the *serial* gemv/gevv arms are measured against. `black_box`
+/// around the output keeps the optimizer from eliding the streaming loop.
+fn stream_triad_serial() -> Stat {
+    let n = STREAM_LEN;
+    let b = fill(n, 1);
+    let c = fill(n, 2);
+    let mut a = vec![0.0f32; n];
+    let alpha = 1.5f32;
+    measure_gbps(3 * n * 4, || {
+        for i in 0..n {
+            a[i] = b[i] + alpha * c[i];
+        }
+        std::hint::black_box(a.as_ptr());
+    })
+}
+
+/// Single-core STREAM Copy `dst[i] = src[i]` in GB/s (2·N·4 B moved) — the read+write
+/// bandwidth reference next to the triad.
+fn stream_copy_serial() -> Stat {
+    let n = STREAM_LEN;
+    let src = fill(n, 3);
+    let mut dst = vec![0.0f32; n];
+    measure_gbps(2 * n * 4, || {
+        dst.copy_from_slice(&src);
+        std::hint::black_box(dst.as_ptr());
+    })
+}
+
+/// Aggregate STREAM Triad across `threads` `std::thread::scope` chunks (rayon is an
+/// optional dep, not a dev-dep, so it can't be used here). This is the fair ceiling for
+/// the *parallel* gemv/gevv arms: a single core saturates only a fraction of DRAM
+/// bandwidth, so the whole-machine triad is what a threaded output-partitioned gemv is
+/// really racing. The array is large enough (256 MiB) that per-call thread-spawn cost is
+/// a small fraction of the ~10 ms streaming time.
+fn stream_triad_parallel(threads: usize) -> Stat {
+    let n = STREAM_LEN;
+    let b = fill(n, 1);
+    let c = fill(n, 2);
+    let mut a = vec![0.0f32; n];
+    let alpha = 1.5f32;
+    let threads = threads.max(1);
+    let chunk = n.div_ceil(threads);
+    measure_gbps(3 * n * 4, || {
+        std::thread::scope(|s| {
+            for (ai, (bi, ci)) in a
+                .chunks_mut(chunk)
+                .zip(b.chunks(chunk).zip(c.chunks(chunk)))
+            {
+                s.spawn(move || {
+                    for i in 0..ai.len() {
+                        ai[i] = bi[i] + alpha * ci[i];
+                    }
+                    std::hint::black_box(ai.as_ptr());
+                });
+            }
+        });
+        std::hint::black_box(a.as_ptr());
+    })
+}
+
+/// The best aggregate Triad bandwidth over a few thread counts, with the thread count
+/// that reached it. DRAM bandwidth typically saturates well below the logical core count
+/// and can even regress past it (memory-controller contention), so the *peak* — not the
+/// all-cores figure — is the honest ceiling for the parallel arm.
+fn stream_triad_parallel_peak(avail: usize) -> (usize, Stat) {
+    let mut best: Option<(usize, Stat)> = None;
+    for &t in &[2usize, 4, 8, 16, 32] {
+        if t > avail {
+            break;
+        }
+        let s = stream_triad_parallel(t);
+        if best
+            .as_ref()
+            .is_none_or(|(_, prev): &(usize, Stat)| s.median > prev.median)
+        {
+            best = Some((t, s));
+        }
+    }
+    best.unwrap_or_else(|| (1, stream_triad_serial()))
+}
+
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture"]
+fn perf_stream() {
+    let _guard = BENCH_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    println!(
+        "\nSTREAM bandwidth ceiling (f32, {} MiB arrays):",
+        STREAM_LEN * 4 / (1024 * 1024)
+    );
+    let copy = stream_copy_serial();
+    let triad = stream_triad_serial();
+    println!(
+        "  serial   copy ={:7.1} GB/s (±{:>2.0}%)   triad={:7.1} GB/s (±{:>2.0}%)",
+        copy.median,
+        copy.spread_pct(),
+        triad.median,
+        triad.spread_pct()
+    );
+    let avail = std::thread::available_parallelism()
+        .map(|x| x.get())
+        .unwrap_or(1);
+    for &t in &[2usize, 4, 8, 16, 32] {
+        if t > avail {
+            break;
+        }
+        let s = stream_triad_parallel(t);
+        println!(
+            "  {t:3} thr triad={:7.1} GB/s (±{:>2.0}%)",
+            s.median,
+            s.spread_pct()
+        );
+    }
+}
+
+/// gemv `C(m×1) = A(m×k)·x` through the public [`gemm`], reported as GB/s of the minimum
+/// traffic `(m*k + k + m)*4` (A read once, x once, C written once) against the STREAM
+/// `ceiling`, plus GFLOP/s for reference. `k` spans fits-L2 → DRAM. Column-major A/C hit
+/// the axpy form of the gemv path.
+fn bench_gemv(m: usize, k: usize, par: Parallelism, ceiling: f64) {
+    let a = fill(m * k, 1);
+    let x = fill(k, 2);
+    let mut c = vec![0.0f32; m];
+    let bytes = (m * k + k + m) * 4;
+    let st = measure_gbps(bytes, || {
+        gemm(
+            1.0,
+            MatRef::from_col_major(&a, m, k),
+            MatRef::from_col_major(&x, k, 1),
+            0.0,
+            MatMut::from_col_major(&mut c, m, 1),
+            par,
+        );
+    });
+    let gflops = st.median * (2.0 * m as f64 * k as f64) / bytes as f64;
+    let mode = if matches!(par, Parallelism::Serial) {
+        "ser"
+    } else {
+        "par"
+    };
+    println!(
+        "  m={m:<6} k={k:<5} {mode}  {:7.1} GB/s (±{:>2.0}%)  {:3.0}% ceil  {:8.1} GFLOP/s",
+        st.median,
+        st.spread_pct(),
+        100.0 * st.median / ceiling.max(1e-9),
+        gflops
+    );
+}
+
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture"]
+fn perf_gemv() {
+    let _guard = BENCH_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    println!("\ngemv (C[m×1] = A[m×k]·x) — GB/s vs STREAM Triad ceiling:");
+    let avail = std::thread::available_parallelism()
+        .map(|x| x.get())
+        .unwrap_or(1);
+    let ser_ceiling = stream_triad_serial().median;
+    let (peak_thr, par_ceiling) = stream_triad_parallel_peak(avail);
+    let par_ceiling = par_ceiling.median;
+    println!(
+        "  serial ceiling {ser_ceiling:.1} GB/s;  parallel ceiling {par_ceiling:.1} GB/s @ {peak_thr} thr"
+    );
+    for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
+        let ceiling = if matches!(par, Parallelism::Serial) {
+            ser_ceiling
+        } else {
+            par_ceiling
+        };
+        // Fits-L2 → DRAM sweep: `out` (m·4 B) stays within L2 here, so the axpy form's
+        // per-column re-read of `out` is cache-cheap and A's DRAM read dominates.
+        for &k in &[64usize, 256, 1024] {
+            for &m in &[1024usize, 8192, 65536] {
+                bench_gemv(m, k, par, ceiling);
+            }
+        }
+        // `out ∤ cache` sweep: at these `m`, `out` spills L2 (4 MiB) through past L3
+        // (64 MiB), so the axpy form's `k` re-reads of `out` become real DRAM traffic —
+        // the regime output register-blocking is meant to fix. `k` is kept small so A
+        // stays ≤ 512 MiB.
+        for &(m, k) in &[
+            (1_048_576usize, 64usize),
+            (4_194_304, 16),
+            (8_388_608, 8),
+            (16_777_216, 8),
+            (16_777_216, 16), // out ∤ L3 with moderate k: probes A-stream prefetch thrash
+        ] {
+            bench_gemv(m, k, par, ceiling);
+        }
+    }
+}
+
+/// gevv / skinny GEMM `C(m×n) = A(m×k)·B(k×n)` at small `k`, reported as GB/s of the
+/// minimum traffic `(m*k + k*n + m*n)*4` (beta = 0, so C is write-only) against the
+/// STREAM `ceiling`, plus GFLOP/s. At tiny `k` the `m*n` C write dominates, so this is
+/// write-bandwidth-bound.
+fn bench_gevv(m: usize, n: usize, k: usize, par: Parallelism, ceiling: f64) {
+    let a = fill(m * k, 1);
+    let b = fill(k * n, 2);
+    let mut c = vec![0.0f32; m * n];
+    let bytes = (m * k + k * n + m * n) * 4;
+    let st = measure_gbps(bytes, || {
+        gemm(
+            1.0,
+            MatRef::from_col_major(&a, m, k),
+            MatRef::from_col_major(&b, k, n),
+            0.0,
+            MatMut::from_col_major(&mut c, m, n),
+            par,
+        );
+    });
+    let gflops = st.median * (2.0 * m as f64 * k as f64 * n as f64) / bytes as f64;
+    let mode = if matches!(par, Parallelism::Serial) {
+        "ser"
+    } else {
+        "par"
+    };
+    println!(
+        "  m={m:<5} n={n:<5} k={k} {mode}  {:7.1} GB/s (±{:>2.0}%)  {:3.0}% ceil  {:8.1} GFLOP/s",
+        st.median,
+        st.spread_pct(),
+        100.0 * st.median / ceiling.max(1e-9),
+        gflops
+    );
+}
+
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture"]
+fn perf_gevv() {
+    let _guard = BENCH_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    println!(
+        "\ngevv / skinny GEMM (C[m×n] = A[m×k]·B[k×n], small k) — GB/s vs STREAM Triad ceiling:"
+    );
+    let avail = std::thread::available_parallelism()
+        .map(|x| x.get())
+        .unwrap_or(1);
+    let ser_ceiling = stream_triad_serial().median;
+    let (peak_thr, par_ceiling) = stream_triad_parallel_peak(avail);
+    let par_ceiling = par_ceiling.median;
+    println!(
+        "  serial ceiling {ser_ceiling:.1} GB/s;  parallel ceiling {par_ceiling:.1} GB/s @ {peak_thr} thr"
+    );
+    for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
+        let ceiling = if matches!(par, Parallelism::Serial) {
+            ser_ceiling
+        } else {
+            par_ceiling
+        };
+        for &(m, n) in &[(4096usize, 4096usize), (8192, 2048)] {
+            for &k in &[1usize, 2, 4] {
+                bench_gevv(m, n, k, par, ceiling);
+            }
+        }
+    }
+}
+
+/// Forced thread-scaling of a bandwidth-bound gemv: GB/s at `Rayon(t)` for a ladder of `t`,
+/// plus what the auto `Rayon(0)` path actually picks. On a DRAM-bound shape the curve should
+/// climb to the STREAM ceiling within a few threads and then *plateau or dip* (more workers
+/// add no bandwidth and eventually cost sync), which is exactly what the bandwidth cap is
+/// there to hold: the auto row should sit on the plateau, not past it.
+fn bench_gemv_scaling(m: usize, k: usize, ceiling: f64, avail: usize) {
+    let a = fill(m * k, 1);
+    let x = fill(k, 2);
+    let mut c = vec![0.0f32; m];
+    let bytes = (m * k + k + m) * 4;
+    let mut run = |par| {
+        measure_gbps(bytes, || {
+            gemm(
+                1.0,
+                MatRef::from_col_major(&a, m, k),
+                MatRef::from_col_major(&x, k, 1),
+                0.0,
+                MatMut::from_col_major(&mut c, m, 1),
+                par,
+            );
+        })
+    };
+    println!("  m={m} k={k}  (A={} MiB):", m * k * 4 / (1024 * 1024));
+    for &t in &[1usize, 2, 4, 8, 16, 32] {
+        if t > avail {
+            break;
+        }
+        let par = if t == 1 {
+            Parallelism::Serial
+        } else {
+            Parallelism::Rayon(t)
+        };
+        let st = run(par);
+        println!(
+            "    t={t:<3} {:7.1} GB/s (±{:>2.0}%)  {:3.0}% ceil",
+            st.median,
+            st.spread_pct(),
+            100.0 * st.median / ceiling.max(1e-9)
+        );
+    }
+    let st = run(Parallelism::Rayon(0));
+    println!(
+        "    auto  {:7.1} GB/s (±{:>2.0}%)  {:3.0}% ceil",
+        st.median,
+        st.spread_pct(),
+        100.0 * st.median / ceiling.max(1e-9)
+    );
+}
+
+/// Force the small-`k` route on vs off back-to-back (via the threshold setter, so the same
+/// buffers/pool are reused and machine drift cancels) for a skinny GEMM, sweeping `k` to
+/// find where the register-tiling driver catches up. `on % of off` above 100% means the
+/// in-place small-`k` route still beats the driver; the calibrated threshold sits at the
+/// last `k` where it does.
+fn bench_small_k_crossover(m: usize, n: usize, k: usize, par: Parallelism) {
+    let a = fill(m * k, 1);
+    let b = fill(k * n, 2);
+    let mut c = vec![0.0f32; m * n];
+    let bytes = (m * k + k * n + m * n) * 4;
+    let mut run = |v: usize| {
+        gemmkit::tuning::set_small_k_threshold(v);
+        measure_gbps(bytes, || {
+            gemm(
+                1.0,
+                MatRef::from_col_major(&a, m, k),
+                MatRef::from_col_major(&b, k, n),
+                0.0,
+                MatMut::from_col_major(&mut c, m, n),
+                par,
+            );
+        })
+    };
+    let prev = gemmkit::tuning::small_k_threshold();
+    let on = run(k); // k <= threshold -> small-k route
+    let off = run(0); // threshold 0 -> driver route
+    gemmkit::tuning::set_small_k_threshold(prev);
+    let mode = if matches!(par, Parallelism::Serial) {
+        "ser"
+    } else {
+        "par"
+    };
+    println!(
+        "  m={m:<5} n={n:<5} k={k:<3} {mode}  small_k={:7.1} (±{:>2.0}%)  driver={:7.1} (±{:>2.0}%)  (small_k {:.0}% of driver)",
+        on.median,
+        on.spread_pct(),
+        off.median,
+        off.spread_pct(),
+        100.0 * on.median / off.median.max(1e-9)
+    );
+}
+
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture"]
+fn perf_small_k() {
+    let _guard = BENCH_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    println!(
+        "\nsmall-k route crossover (skinny GEMM) — in-place small_k vs register-tiling driver:"
+    );
+    for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
+        for &(m, n) in &[(4096usize, 4096usize), (8192, 2048)] {
+            for &k in &[2usize, 4, 8, 16, 32, 64] {
+                bench_small_k_crossover(m, n, k, par);
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture"]
+fn perf_gemv_scaling() {
+    let _guard = BENCH_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    println!("\ngemv thread-scaling (forced Rayon(t) vs auto) — GB/s vs parallel STREAM ceiling:");
+    let avail = std::thread::available_parallelism()
+        .map(|x| x.get())
+        .unwrap_or(1);
+    let (peak_thr, par_ceiling) = stream_triad_parallel_peak(avail);
+    let ceiling = par_ceiling.median;
+    println!("  parallel ceiling {ceiling:.1} GB/s @ {peak_thr} thr; cores={avail}");
+    // A DRAM-bound axpy shape (out fits cache) and a register-blocked out-∤-L3 shape.
+    bench_gemv_scaling(65536, 1024, ceiling, avail);
+    bench_gemv_scaling(16_777_216, 8, ceiling, avail);
 }

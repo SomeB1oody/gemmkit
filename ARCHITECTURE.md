@@ -31,7 +31,7 @@ L2  pack.rs          micropanel packing primitive
 L3  cache/           CacheTopology + analytical BLIS blocking (cpuid/sysctl/sysfs backends + fallback)
 L4  driver.rs        the generic five-loop nest
 L5  parallel.rs      Parallelism + 1-D job split + work-gate
-L6  special/gemv.rs  matrix·vector special path
+L6  special/         bandwidth-bound special paths (gemv.rs matrix·vector, small_k.rs skinny/low-depth)
 L7  dispatch.rs      OnceLock<fn> ISA selection + orientation + per-(type,ISA) entry
 L8a api.rs           MatRef/MatMut safe API + unchecked raw engine
 L8b gemmkit-ndarray  ArrayBase adapter + dot
@@ -331,12 +331,39 @@ some balance granularity for pack-once reuse; with fewer row-blocks it falls bac
 the fine grain. RHS packing is parallelized the same way (its own cursor) with a
 barrier before compute.
 
-## L6 — gemv
+The `cbrt(mnk)` ramp above models *compute* work. The bandwidth-bound L6 special paths
+instead call `Parallelism::resolve_bandwidth(bytes_touched, rows)`: it gates on a byte floor
+(cache-resident work stays serial regardless of the request, like the compute gate), then
+above it either honors an explicit `Rayon(n)` or ramps the auto count *linearly in touched
+bytes* capped at a topology bandwidth proxy (`bandwidth_cap` — a documented fraction of the
+logical core count, since DRAM saturates far below it and no physical-core / memory-channel
+count is exposed).
+`GEMMKIT_GEMV_PARALLEL_BYTES` / `GEMMKIT_GEMV_THREAD_CAP` tune the floor and cap.
 
-`m == 1` or `n == 1` routes to a memory-bound axpy/dot sweep (both cases reduce to
-one core routine by viewing the matrix, transposed for `m == 1`, as `rows × k`).
-Vectorized for contiguous layouts, correct for all. Deferred: gevv (k ≤ 2), the
-small-matrix horizontal kernel, batched GEMM.
+## L6 — special paths (bandwidth-bound shapes)
+
+These shapes have O(1) arithmetic intensity, so the ceiling is memory bandwidth, not
+compute. Both compute each output element in a **single pass over `k`** and parallelize by
+partitioning disjoint **output** tiles — no cross-thread reduction — so the result is
+bit-identical to the serial run for any worker count. Worker counts come from
+`Parallelism::resolve_bandwidth` (a linear-in-bytes ramp capped by a topology bandwidth
+proxy), not the driver's `cbrt(mnk)` compute ramp: past the few cores that saturate DRAM,
+more workers stop helping.
+
+- **gemv** (`gemv.rs`, `m == 1` or `n == 1`): both cases reduce to one core routine by
+  viewing the matrix (transposed for `m == 1`) as `rows × k`. Column-major (axpy) shape has
+  two bit-identical strategies chosen by cache fit — plain column-outer axpy when the output
+  stays cache-resident, and **output register-blocking** (hold the output panel in registers
+  across the whole `k`-sweep, output/matrix read once) when the output spills the last-level
+  cache and the plain form's per-column re-reads would hit DRAM. Row-major uses the dot form.
+- **small_k** (`small_k.rs`, `k <= small_k_threshold`): skinny / low-depth GEMM (gevv,
+  rank-`k`, tall-skinny). Computes the whole product in one depth panel over the family's
+  microkernel, reading A/B **in place** (unpacked), skipping the driver's blocking/packing/
+  workspace setup that is pure overhead at tiny `k`. Requires column-major A (`rsa == 1`) and
+  a non-`FORCE_PACK` family; otherwise defers to `driver::run`. Wired into every family's
+  dispatch except complex (its planar SoA kernel cannot read in place).
+
+Deferred: the small-matrix horizontal kernel and batched GEMM.
 
 ## L7 — dispatch
 

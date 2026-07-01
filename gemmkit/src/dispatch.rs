@@ -67,7 +67,7 @@ use crate::simd::Simd128;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use crate::simd::{Avx512, Fma};
 use crate::simd::{ScalarTok, SimdOps};
-use crate::special::gemv;
+use crate::special::{gemv, small_k};
 use crate::tuning;
 use crate::workspace::Workspace;
 
@@ -381,13 +381,22 @@ unsafe fn run_typed<T, S, const MR_REG: usize, const NR: usize>(
         // (then it falls through to the general driver, which is also correct).
         if (t.n == 1 || t.m == 1) && core::cmp::min(t.m, t.n) <= tuning::gemv_threshold() {
             gemv::run_typed::<T, S>(
-                simd, t.m, t.k, t.n, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb, t.beta, t.c,
-                t.rsc, t.csc,
+                simd, t.m, t.k, t.n, par, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb, t.beta,
+                t.c, t.rsc, t.csc,
             );
             return;
         }
 
         orient_transpose(&mut t);
+        // Skinny / low-depth shape: the whole product is one depth panel, so the driver's
+        // blocking + packing setup is pure overhead. Read A/B in place over the microkernel.
+        if t.k <= tuning::small_k_threshold() {
+            small_k::run::<FloatGemm<T>, S, MR_REG, NR>(
+                simd, t.m, t.k, t.n, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb, t.beta, t.c,
+                t.rsc, t.csc, par, ws,
+            );
+            return;
+        }
         driver::run::<FloatGemm<T>, S, MR_REG, NR>(
             simd, t.m, t.k, t.n, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb, t.beta, t.c, t.rsc,
             t.csc, par, ws,
@@ -443,6 +452,29 @@ unsafe fn run_typed_mixed<N, S, const MR_REG: usize, const NR: usize>(
 {
     unsafe {
         orient_transpose(&mut t);
+        // Skinny / low-depth shape through the widen microkernel (see [`run_typed`]).
+        if t.k <= tuning::small_k_threshold() {
+            small_k::run::<MixedGemm<N>, S, MR_REG, NR>(
+                simd,
+                t.m,
+                t.k,
+                t.n,
+                t.alpha.widen(),
+                t.a,
+                t.rsa,
+                t.csa,
+                t.b,
+                t.rsb,
+                t.csb,
+                t.beta.widen(),
+                t.c,
+                t.rsc,
+                t.csc,
+                par,
+                ws,
+            );
+            return;
+        }
         driver::run::<MixedGemm<N>, S, MR_REG, NR>(
             simd,
             t.m,
@@ -523,6 +555,31 @@ unsafe fn run_typed_bf16_dot<S, const MR_REG: usize, const NR: usize>(
 {
     unsafe {
         orient_transpose(&mut t);
+        // Skinny / low-depth shape: route through the widen sibling `MixedGemm<bf16>`, not
+        // the dot kernel — at `k <= threshold` `vdpbf16ps` folds nothing and its
+        // `DEPTH_MULTIPLE = 2` pack is pure loss.
+        if t.k <= tuning::small_k_threshold() {
+            small_k::run::<MixedGemm<bf16>, S, MR_REG, NR>(
+                simd,
+                t.m,
+                t.k,
+                t.n,
+                t.alpha.widen(),
+                t.a,
+                t.rsa,
+                t.csa,
+                t.b,
+                t.rsb,
+                t.csb,
+                t.beta.widen(),
+                t.c,
+                t.rsc,
+                t.csc,
+                par,
+                ws,
+            );
+            return;
+        }
         driver::run::<Bf16DotGemm, S, MR_REG, NR>(
             simd,
             t.m,
@@ -1719,6 +1776,16 @@ unsafe fn run_typed_int<Fam, S, const MR_REG: usize, const NR: usize>(
             t.rsb = ocsa;
             t.csb = orsa;
             core::mem::swap(&mut t.rsc, &mut t.csc);
+        }
+        // Skinny / low-depth shape: route through the widen `IntGemm` (never `IntGemmVnni`) —
+        // at tiny `k` VNNI's mandatory quad-pack barrier never amortizes. Stays bit-exact
+        // (i32 modular), so it reproduces the widen and VNNI results alike.
+        if t.k <= tuning::small_k_threshold() {
+            small_k::run::<IntGemm, S, MR_REG, NR>(
+                simd, t.m, t.k, t.n, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb, t.beta, t.c,
+                t.rsc, t.csc, par, ws,
+            );
+            return;
         }
         driver::run::<Fam, S, MR_REG, NR>(
             simd, t.m, t.k, t.n, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb, t.beta, t.c, t.rsc,
