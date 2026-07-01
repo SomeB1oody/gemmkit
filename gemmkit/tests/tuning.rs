@@ -4,6 +4,12 @@
 
 use gemmkit::{MatMut, MatRef, Parallelism, gemm, tuning};
 
+/// Serializes the tests that mutate **route-selecting** knobs (`small_k_threshold`,
+/// `small_mn_dim`). Every other test in this file touches a *different* knob, so it can run
+/// concurrently; these three would otherwise race — a concurrent route flip between a test's
+/// serial and parallel runs could split them across two routes and break a bit-identity check.
+static ROUTE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Naive `C = A·B` for column-major `f64` operands, returned column-major. The reference
 /// the route/knob tests compare against.
 fn naive_col(a: &[f64], b: &[f64], m: usize, k: usize, n: usize) -> Vec<f64> {
@@ -256,6 +262,7 @@ fn parallel_oversample_extremes_stay_correct() {
 /// across `k` values on both sides of the calibrated crossover and with partial tiles.
 #[test]
 fn small_k_threshold_route_correct() {
+    let _route = ROUTE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let prev = tuning::small_k_threshold();
     // MAX = every k takes the in-place small-k route; 0 = every k takes the driver.
     for &force in &[usize::MAX, 0] {
@@ -428,6 +435,105 @@ fn gemv_gevv_serial_parallel_consistent() {
         "gevv",
     );
     tuning::set_gemv_parallel_bytes(prev_floor);
+}
+
+/// Naive `C = A·B` for **row-major A + column-major B**, returned column-major — the small-`m,n`
+/// horizontal route's contiguous-along-`k` layout. `A[i,p] = a[i*k+p]`, `B[p,j] = b[j*k+p]`,
+/// `C[i,j] = c[j*m+i]`.
+fn naive_rowa_colb(a: &[f64], b: &[f64], m: usize, k: usize, n: usize) -> Vec<f64> {
+    let mut c = vec![0.0; m * n];
+    for j in 0..n {
+        for i in 0..m {
+            let mut s = 0.0;
+            for p in 0..k {
+                s += a[i * k + p] * b[j * k + p];
+            }
+            c[j * m + i] = s;
+        }
+    }
+    c
+}
+
+/// `small_mn_dim` is a live knob: forcing every small-`m,n` shape onto the horizontal route
+/// (`usize::MAX`) or off (`0` → the driver) must both stay correct, across `k` (all above the
+/// default `small_k_threshold`, so the route's `k > threshold` gate fires) with partial tiles
+/// (`m,n,k` not multiples of the register tile) and a non-trivial `alpha`/`beta`.
+#[test]
+fn small_mn_route_correct() {
+    let _route = ROUTE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let pmn = tuning::small_mn_dim();
+    // MAX = every small-m,n shape takes the horizontal route; 0 = the driver.
+    for &smn in &[usize::MAX, 0usize] {
+        tuning::set_small_mn_dim(smn);
+        for &(m, k, n) in &[
+            (6, 20, 7),
+            (10, 100, 13),
+            (3, 50, 5),
+            (16, 4096, 16),
+            (4, 17, 4),
+            (2, 33, 8),
+        ] {
+            let a: Vec<f64> = (0..m * k).map(|x| (x % 23) as f64 * 0.1 - 1.0).collect();
+            let b: Vec<f64> = (0..k * n).map(|x| (x % 19) as f64 * 0.2 - 1.5).collect();
+            let ab = naive_rowa_colb(&a, &b, m, k, n);
+            // alpha/beta epilogue over a pre-filled column-major C.
+            let (alpha, beta) = (2.5f64, -0.5f64);
+            let mut cc: Vec<f64> = (0..m * n).map(|x| (x % 7) as f64 * 0.3 - 0.9).collect();
+            let cref: Vec<f64> = (0..m * n)
+                .map(|idx| alpha * ab[idx] + beta * cc[idx])
+                .collect();
+            gemm(
+                alpha,
+                MatRef::from_row_major(&a, m, k),
+                MatRef::from_col_major(&b, k, n),
+                beta,
+                MatMut::from_col_major(&mut cc, m, n),
+                Parallelism::Rayon(0),
+            );
+            for (got, exp) in cc.iter().zip(&cref) {
+                assert!(
+                    (got - exp).abs() <= 1e-10 * (1.0 + exp.abs()),
+                    "smn={smn} {m}x{k}x{n}: {got} vs {exp}"
+                );
+            }
+        }
+    }
+    tuning::set_small_mn_dim(pmn);
+}
+
+/// The horizontal route output-partitions disjoint tiles with no cross-thread reduction, so a
+/// parallel run must equal the serial run **bit-for-bit**. Force the route on and drop the
+/// bandwidth floor so a `16×16` output actually splits across workers.
+#[test]
+fn small_mn_serial_parallel_bit_identical() {
+    let _route = ROUTE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let pmn = tuning::small_mn_dim();
+    let pfloor = tuning::gemv_parallel_bytes();
+    tuning::set_small_mn_dim(usize::MAX); // k = 4096 > default small_k_threshold, so it routes here
+    tuning::set_gemv_parallel_bytes(1); // clear the LLC floor so the small output splits
+    let (m, k, n) = (16usize, 4096usize, 16usize);
+    let a = mkvec(m * k, 7);
+    let b = mkvec(k * n, 8);
+    let run = |par| {
+        let mut c = vec![0.0f32; m * n];
+        gemm(
+            1.0,
+            MatRef::from_row_major(&a, m, k),
+            MatRef::from_col_major(&b, k, n),
+            0.0,
+            MatMut::from_col_major(&mut c, m, n),
+            par,
+        );
+        c
+    };
+    let serial = run(Parallelism::Serial);
+    let parallel = run(Parallelism::Rayon(0));
+    assert_eq!(
+        serial, parallel,
+        "horizontal route: parallel must equal serial bit-for-bit"
+    );
+    tuning::set_small_mn_dim(pmn);
+    tuning::set_gemv_parallel_bytes(pfloor);
 }
 
 /// Assert a serial and a parallel result agree to a tight relative tolerance. Within one route

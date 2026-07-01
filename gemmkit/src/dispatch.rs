@@ -67,7 +67,7 @@ use crate::simd::Simd128;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use crate::simd::{Avx512, Fma};
 use crate::simd::{ScalarTok, SimdOps};
-use crate::special::{gemv, small_k};
+use crate::special::{gemv, small_k, small_mn};
 use crate::tuning;
 use crate::workspace::Workspace;
 
@@ -388,6 +388,25 @@ unsafe fn run_typed<T, S, const MR_REG: usize, const NR: usize>(
         }
 
         orient_transpose(&mut t);
+        // Small `m,n` with a long contraction, and both operands streaming contiguously along
+        // `k` (A rows unit-stride `csa == 1`, B columns unit-stride `rsb == 1`): the driver would
+        // pad the tiny row/col tiles up to a full microtile and pack mostly padding, whereas the
+        // horizontal path computes each output as a direct SIMD dot over `k`, reading A/B in
+        // place. (At small `k` the small_k route below is already the right in-place tool, so this
+        // only claims the long-`k` regime; a strided layout would force a scalar dot that loses to
+        // the driver, so it stays on the driver.)
+        if t.m <= tuning::small_mn_dim()
+            && t.n <= tuning::small_mn_dim()
+            && t.k > tuning::small_k_threshold()
+            && t.csa == 1
+            && t.rsb == 1
+        {
+            small_mn::run::<T, S>(
+                simd, t.m, t.k, t.n, par, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb, t.beta,
+                t.c, t.rsc, t.csc,
+            );
+            return;
+        }
         // Skinny / low-depth shape: the whole product is one depth panel, so the driver's
         // blocking + packing setup is pure overhead. Read A/B in place over the microkernel.
         if t.k <= tuning::small_k_threshold() {

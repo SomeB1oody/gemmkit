@@ -40,7 +40,7 @@ use gemmkit::simd::Fma;
 use gemmkit::simd::Neon;
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 use gemmkit::simd::{ScalarTok, Simd128};
-use gemmkit::{MatMut, MatRef, Parallelism, gemm};
+use gemmkit::{MatMut, MatRef, Parallelism, gemm, gemm_batched};
 
 /// Serializes the two core-saturating `#[ignore]` benches so the default
 /// multi-threaded test harness can't run them concurrently (which would make every
@@ -1632,4 +1632,265 @@ fn perf_gemv_scaling() {
     // by the DRAM proxy) is expected to sit far below the forced-high-t peak.
     bench_gemv_scaling(1024, 1024, ceiling, avail);
     bench_gemv_scaling(8192, 64, ceiling, avail);
+}
+
+// ---- small-matrix horizontal (inner-product) route: perf_small_mn ----
+
+/// Force the horizontal / small_k / driver route for a `gemm` call by pinning the two gates,
+/// run `f`, then restore. `small_mn_dim = MAX` + `small_k_threshold = 0` sends every small-m,n
+/// shape to the horizontal path (its gate needs `k > small_k_threshold`, so drop the latter to
+/// 0); `small_mn_dim = 0` + `small_k_threshold = MAX` forces small_k; both `0` forces the driver.
+#[cfg(not(target_family = "wasm"))]
+fn with_route<R>(small_mn: usize, small_k: usize, f: impl FnOnce() -> R) -> R {
+    let (pm, pk) = (
+        gemmkit::tuning::small_mn_dim(),
+        gemmkit::tuning::small_k_threshold(),
+    );
+    gemmkit::tuning::set_small_mn_dim(small_mn);
+    gemmkit::tuning::set_small_k_threshold(small_k);
+    let r = f();
+    gemmkit::tuning::set_small_mn_dim(pm);
+    gemmkit::tuning::set_small_k_threshold(pk);
+    r
+}
+
+/// `gemm`-crate / `matrixmultiply` GFLOP/s for a small-`m,n` f32 `C = A·B` in the horizontal
+/// path's target layout (`row_major_a` ? row-major A : col-major A; col-major B; col-major C).
+/// Native-only. Returns `(gemm, Option<mm>)`; mm is serial-only.
+#[cfg(not(target_family = "wasm"))]
+fn extern_gflops_small(
+    m: usize,
+    k: usize,
+    n: usize,
+    row_major_a: bool,
+    par: Parallelism,
+) -> (f64, Option<f64>) {
+    let a = fill(m * k, 1);
+    let b = fill(k * n, 2);
+    let mut c = vec![0.0f32; m * n];
+    // A: row-major (col_stride 1, row_stride k) or col-major (col_stride m, row_stride 1).
+    let (a_cs, a_rs) = if row_major_a {
+        (1isize, k as isize)
+    } else {
+        (m as isize, 1isize)
+    };
+    let gpar = if matches!(par, Parallelism::Serial) {
+        gemm::Parallelism::None
+    } else {
+        gemm::Parallelism::Rayon(0)
+    };
+    let g = measure(m, k, n, || unsafe {
+        gemm::gemm(
+            m,
+            n,
+            k,
+            c.as_mut_ptr(),
+            m as isize,
+            1, // dst col-major
+            false,
+            a.as_ptr(),
+            a_cs,
+            a_rs,
+            b.as_ptr(),
+            k as isize,
+            1, // rhs col-major
+            0.0,
+            1.0,
+            false,
+            false,
+            false,
+            gpar,
+        );
+    });
+    let mm = matches!(par, Parallelism::Serial).then(|| {
+        measure(m, k, n, || unsafe {
+            matrixmultiply::sgemm(
+                m,
+                k,
+                n,
+                1.0,
+                a.as_ptr(),
+                a_rs,
+                a_cs, // lhs (row_stride, col_stride)
+                b.as_ptr(),
+                1,
+                k as isize, // rhs col-major (row_stride 1, col_stride k)
+                0.0,
+                c.as_mut_ptr(),
+                1,
+                m as isize, // dst col-major
+            );
+        })
+        .median
+    });
+    (g.median, mm)
+}
+
+/// One `perf_small_mn` row: the horizontal path vs the small_k route vs the register-tiling
+/// driver on a small-`m,n` / long-`k` shape, plus the `gemm`-crate and `matrixmultiply`
+/// baselines — all GFLOP/s, back-to-back over the same buffers so drift cancels. `row_major_a`
+/// selects the horizontal path's contiguous-`k` fast-path layout (row-major A, col-major B) vs
+/// col-major A (its strided fallback).
+#[cfg(not(target_family = "wasm"))]
+fn bench_small_mn(m: usize, n: usize, k: usize, row_major_a: bool, par: Parallelism) {
+    let a = fill(m * k, 1);
+    let b = fill(k * n, 2);
+    let mut c = vec![0.0f32; m * n];
+    let mut run = || {
+        measure(m, k, n, || {
+            let av = if row_major_a {
+                MatRef::from_row_major(&a, m, k)
+            } else {
+                MatRef::from_col_major(&a, m, k)
+            };
+            gemm(
+                1.0,
+                av,
+                MatRef::from_col_major(&b, k, n),
+                0.0,
+                MatMut::from_col_major(&mut c, m, n),
+                par,
+            );
+        })
+    };
+    let horiz = with_route(usize::MAX, 0, &mut run);
+    let smallk = with_route(0, usize::MAX, &mut run);
+    let driver = with_route(0, 0, &mut run);
+    let (g, mm) = extern_gflops_small(m, k, n, row_major_a, par);
+    let mode = if matches!(par, Parallelism::Serial) {
+        "ser"
+    } else {
+        "par"
+    };
+    let mm_s = mm
+        .map(|v| format!("  mm={v:6.1} ({:.2}×)", horiz.median / v.max(1e-9)))
+        .unwrap_or_default();
+    println!(
+        "  {m:>2}×{n:<2} k={k:<5} {mode}  horiz={:7.1}  small_k={:7.1}  driver={:7.1} ({:.2}× h)  gemm={:6.1} ({:.2}× h){mm_s}",
+        horiz.median,
+        smallk.median,
+        driver.median,
+        horiz.median / driver.median.max(1e-9),
+        g,
+        horiz.median / g.max(1e-9),
+    );
+}
+
+/// Small-matrix horizontal (inner-product) route: small `m,n`, long `k`. Sweeps the output
+/// dimensions against the contraction, forcing each of the three gemmkit routes (horizontal /
+/// small_k / driver) plus the `gemm`-crate and `matrixmultiply` baselines. The crossover — where
+/// the driver catches up as `m,n` grow — is visible in the `×h` (driver-over-horizontal) ratio.
+#[cfg(not(target_family = "wasm"))]
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture"]
+fn perf_small_mn() {
+    let _guard = BENCH_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    println!(
+        "\nsmall-m,n horizontal route (C[m×n]=A·B, small m,n, long k) — GFLOP/s, row-major A + col-major B (fast-path layout):"
+    );
+    for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
+        for &s in &[2usize, 4, 8, 16, 32] {
+            for &k in &[64usize, 256, 1024, 4096] {
+                bench_small_mn(s, s, k, true, par);
+            }
+        }
+        // A couple of non-square small shapes.
+        for &(m, n) in &[(2usize, 8usize), (8, 2), (4, 16), (16, 4)] {
+            for &k in &[256usize, 4096] {
+                bench_small_mn(m, n, k, true, par);
+            }
+        }
+    }
+    // The route needs A rows / B cols unit-stride along `k`; a col-major A (strided along `k`)
+    // would force a scalar dot that loses to the driver's packed microkernel, so the dispatch
+    // gate excludes it and those shapes stay on the driver.
+}
+
+// ---- batched GEMM: perf_batched ----
+
+/// One `perf_batched` row: `gemm_batched` (auto) vs the two honest baselines — a naive serial loop
+/// of `gemm(Serial)` and a naive parallel loop of `gemm(Rayon(0))` (per-element internal
+/// parallelism) — over `batch` contiguously-packed column-major `m×k · k×n` elements, as **total**
+/// GFLOP/s (`2·batch·m·k·n`). There is no batched entry in the `gemm` crate / `matrixmultiply`, so
+/// the naive loops are the only honest baselines. Passing `m·batch` to `measure` folds the batch
+/// into its `2·m·k·n` count so the reported figure is whole-batch throughput.
+fn bench_batched(batch: usize, m: usize, k: usize, n: usize) {
+    let a = fill(batch * m * k, 1);
+    let b = fill(batch * k * n, 2);
+    let mut c = vec![0.0f32; batch * m * n];
+
+    let batched = measure(m * batch, k, n, || {
+        gemm_batched(
+            batch,
+            1.0,
+            MatRef::new(&a, m, k, 1, m as isize),
+            (m * k) as isize,
+            MatRef::new(&b, k, n, 1, k as isize),
+            (k * n) as isize,
+            0.0,
+            MatMut::new(&mut c, m, n, 1, m as isize),
+            (m * n) as isize,
+            Parallelism::Rayon(0),
+        );
+    });
+    let mut naive = |par| {
+        measure(m * batch, k, n, || {
+            for bi in 0..batch {
+                let (ao, bo, co) = (bi * m * k, bi * k * n, bi * m * n);
+                gemm(
+                    1.0,
+                    MatRef::from_col_major(&a[ao..ao + m * k], m, k),
+                    MatRef::from_col_major(&b[bo..bo + k * n], k, n),
+                    0.0,
+                    MatMut::from_col_major(&mut c[co..co + m * n], m, n),
+                    par,
+                );
+            }
+        })
+    };
+    let loop_ser = naive(Parallelism::Serial);
+    let loop_par = naive(Parallelism::Rayon(0));
+    println!(
+        "  b={batch:<6} {m}×{k}×{n:<5}  batched={:8.1} (±{:>2.0}%)  loop_ser={:8.1} ({:.2}×)  loop_par={:8.1} ({:.2}×)",
+        batched.median,
+        batched.spread_pct(),
+        loop_ser.median,
+        batched.median / loop_ser.median.max(1e-9),
+        loop_par.median,
+        batched.median / loop_par.median.max(1e-9),
+    );
+}
+
+/// Batched GEMM throughput: `gemm_batched` (auto) vs a naive serial / naive parallel loop of
+/// single `gemm()` calls, as total GFLOP/s. The batch-parallel schedule assigns whole GEMMs to
+/// workers (each element serial, cache-hot), so the win over the naive parallel loop is avoiding
+/// its per-element fork/join. The few-but-large tail (batch < cores) uses at most `batch` workers.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture"]
+fn perf_batched() {
+    let _guard = BENCH_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    println!(
+        "\nbatched GEMM (total GFLOP/s) — gemm_batched(auto) vs naive serial/parallel gemm() loops:"
+    );
+    for &(m, k, n) in &[
+        (4usize, 4usize, 4usize),
+        (8, 8, 8),
+        (16, 16, 16),
+        (32, 32, 64),
+        (4, 4, 1024),
+    ] {
+        for &batch in &[64usize, 1024, 16384] {
+            bench_batched(batch, m, k, n);
+        }
+    }
+    // Few but large: fewer elements than cores, so batch-parallel uses only `batch` workers.
+    // A cache-resident element (256³) that scales poorly favors batch-parallelism; a bigger,
+    // DRAM-touching element (512³) is where a per-element internal split would use more cores.
+    println!("  few-but-large (batch < cores):");
+    for &batch in &[4usize, 8] {
+        bench_batched(batch, 256, 256, 256);
+    }
+    for &batch in &[2usize, 4] {
+        bench_batched(batch, 512, 512, 512);
+    }
 }

@@ -157,6 +157,97 @@ impl Parallelism {
     }
 }
 
+/// How to schedule a batched GEMM (many independent products) across workers, chosen by
+/// [`Parallelism::resolve_batch`]. Without the `parallel` feature only `Serial` is ever produced.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+pub(crate) enum BatchPlan {
+    /// Run the whole batch on the calling thread, each element serially.
+    Serial,
+    /// Parallelize **across the batch**: `n` workers each run whole GEMMs serially and
+    /// cache-hot, so the batch pays one fork/join instead of one per element. Every element runs
+    /// serially on one worker, so the batch stays bit-identical across worker counts.
+    BatchParallel(usize),
+    /// Loop the batch sequentially, giving **each** element the full engine parallelism in turn.
+    /// For few (`< budget`) but large, DRAM-bound elements that scale across cores on their own,
+    /// where a per-element split beats confining each element to one core. Splitting an element
+    /// across workers relies on its per-element route being serial==parallel bit-identical, which
+    /// the `m, n > 1` routes (driver / small_k / small_mn, all output-tile-partitioned) are under
+    /// the current thread-independent blocking; gemv (held only to reproducibility) is excluded.
+    SequentialInternal,
+}
+
+impl Parallelism {
+    /// Pick the batched schedule for `batch` products of shape `m×k×n` (`sizeof` bytes/element).
+    /// The batch is embarrassingly parallel over independent elements — not a single big GEMM — so
+    /// this does **not** use the `cbrt(mnk)` compute ramp: it hands whole elements to workers once
+    /// the *total* work justifies a fork.
+    ///
+    /// With enough elements to fill the workers (`batch >= budget`), each worker runs whole GEMMs
+    /// serially and cache-hot. With fewer elements than workers, the spare workers would idle, so
+    /// the choice is between running each element on one core (batch-parallel) and splitting each
+    /// element across all cores in turn (`SequentialInternal`): a **cache-resident** element (its
+    /// A/B/C fit L2) saturates one core's L2 and scales poorly, so batch-parallel wins; a larger,
+    /// **DRAM-bound** element scales with aggregate core bandwidth, so the per-element split wins.
+    /// `SequentialInternal` splits an element across workers, so the batch inherits that element's
+    /// serial==parallel behavior. It is used only for `m, n > 1` shapes — whose driver / small_k /
+    /// small_mn route reduces each output within one worker, so serial and parallel agree
+    /// bit-for-bit under the current thread-independent blocking — never gemv, which the library
+    /// holds only to reproducibility.
+    #[cfg_attr(not(feature = "parallel"), allow(unused_variables))]
+    pub(crate) fn resolve_batch(
+        self,
+        m: usize,
+        k: usize,
+        n: usize,
+        sizeof: usize,
+        batch: usize,
+    ) -> BatchPlan {
+        let batch = batch.max(1);
+        let elem_mnk = m.saturating_mul(k).saturating_mul(n);
+        match self {
+            Parallelism::Serial => BatchPlan::Serial,
+            #[cfg(not(feature = "parallel"))]
+            Parallelism::Rayon(_) => BatchPlan::Serial,
+            #[cfg(feature = "parallel")]
+            Parallelism::Rayon(req) => {
+                if !RAYON_USABLE {
+                    return BatchPlan::Serial;
+                }
+                // Cheap total-work gate first (before probing the core count): a trivially small
+                // batch stays serial, so a tiny batch never pays the `available_parallelism` cost.
+                if elem_mnk.saturating_mul(batch) < tuning::parallel_threshold() {
+                    return BatchPlan::Serial;
+                }
+                let budget = if req != 0 {
+                    req.min(auto_threads())
+                } else {
+                    auto_threads()
+                };
+                if budget <= 1 {
+                    return BatchPlan::Serial;
+                }
+                if batch >= budget {
+                    // Enough independent elements to keep every worker busy on its own.
+                    return BatchPlan::BatchParallel(budget);
+                }
+                // Fewer elements than workers. A DRAM-bound element (working set spills L2) scales
+                // across cores, so hand it the whole machine in turn — but only for `m, n > 1`
+                // (whose route reduces each output within one worker, so splitting it across
+                // workers keeps the batch reproducible); a gemv-shaped element stays
+                // one-core-per-element.
+                let elem_bytes = (m.saturating_mul(k) + k.saturating_mul(n) + m.saturating_mul(n))
+                    .saturating_mul(sizeof);
+                let l2 = crate::cache::topology().l2.effective_bytes().max(1);
+                if m > 1 && n > 1 && elem_bytes > l2 {
+                    BatchPlan::SequentialInternal
+                } else {
+                    BatchPlan::BatchParallel(batch)
+                }
+            }
+        }
+    }
+}
+
 /// Maximum worker count for a bandwidth-bound shape, from the `GEMMKIT_GEMV_THREAD_CAP`
 /// knob (`0` ⇒ this auto proxy; non-zero ⇒ verbatim). DRAM saturates at far fewer workers
 /// than the logical core count: SMT siblings share a core's load/store units and memory

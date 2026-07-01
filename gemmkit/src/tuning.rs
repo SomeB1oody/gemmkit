@@ -94,6 +94,15 @@ static GEMV_THRESHOLD: Threshold = Threshold::new("GEMMKIT_GEMV_THRESHOLD", usiz
 // behind by `k = 32`, so the crossover sits between.
 static SMALL_K_THRESHOLD: Threshold = Threshold::new("GEMMKIT_SMALL_K_THRESHOLD", 16);
 
+// Largest `m` *and* `n` for which a shape (with the contraction `k` not itself tiny, and A/B
+// streaming contiguously along `k`) takes the small-matrix horizontal (inner-product) route:
+// each output element is a single SIMD-reduced dot over `k`, reading A/B in place with no
+// packing/blocking. The driver pads tiny row/col tiles to a full microtile, wasting most of its
+// work when both output dimensions are far below the microtile; this route computes exactly the
+// `m*n` outputs. `0` disables the route. Calibrated on Zen5 (AVX-512): the horizontal path wins
+// by 2-50× through `16×16`; by `32×32` the driver's packed microkernel catches up at small `k`.
+static SMALL_MN_DIM: Threshold = Threshold::new("GEMMKIT_SMALL_MN_DIM", 16);
+
 // Byte floor below which a bandwidth-bound gemv/gevv stays single-threaded: below it the
 // touched data (the matrix for gemv, the output for gevv) is LLC-resident and one core gets
 // the full LLC bandwidth, so splitting only loses (fork/join + shared-LLC contention, no DRAM
@@ -200,6 +209,17 @@ pub fn small_k_threshold() -> usize {
 /// Override the small-`k` route threshold.
 pub fn set_small_k_threshold(v: usize) {
     SMALL_K_THRESHOLD.set(v);
+}
+
+/// Get the small-matrix horizontal route dimension cap: a shape with both `m` and `n` at or
+/// below this (and `k` above the small-`k` threshold) takes the horizontal inner-product path.
+/// `0` disables the route.
+pub fn small_mn_dim() -> usize {
+    SMALL_MN_DIM.get()
+}
+/// Override the small-matrix horizontal route dimension cap (`0` disables the route).
+pub fn set_small_mn_dim(v: usize) {
+    SMALL_MN_DIM.set(v);
 }
 
 /// Get the gemv/gevv parallelism byte floor. `0` means *auto* — derive it from the LLC size
