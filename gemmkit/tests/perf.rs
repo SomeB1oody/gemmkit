@@ -1381,6 +1381,69 @@ fn perf_gemv() {
     }
 }
 
+/// Investigation: for a gemv shape, measure the dedicated gemv special path vs the general
+/// driver (reached by disabling the gemv path) vs the `gemm` crate. Confirms the special
+/// path is the right choice — the driver, which packs A into micropanels for a compute-bound
+/// kernel, is far slower on a bandwidth-bound gemv — and tracks the remaining gap to `gemm`.
+#[cfg(not(target_family = "wasm"))]
+fn bench_gemv_paths(m: usize, k: usize, par: Parallelism) {
+    let a = fill(m * k, 1);
+    let x = fill(k, 2);
+    let mut c = vec![0.0f32; m];
+    let bytes = (m * k + k + m) * 4;
+    let mut run = || {
+        measure_gbps(bytes, || {
+            gemm(
+                1.0,
+                MatRef::from_col_major(&a, m, k),
+                MatRef::from_col_major(&x, k, 1),
+                0.0,
+                MatMut::from_col_major(&mut c, m, 1),
+                par,
+            )
+        })
+    };
+    let prev = gemmkit::tuning::gemv_threshold();
+    gemmkit::tuning::set_gemv_threshold(usize::MAX - 1); // gemv path on
+    let axpy = run();
+    gemmkit::tuning::set_gemv_threshold(0); // gemv path off -> general driver (packs A)
+    let driver = run();
+    gemmkit::tuning::set_gemv_threshold(prev);
+    let (g, _) = extern_baselines(m, k, 1, bytes, par);
+    let mode = if matches!(par, Parallelism::Serial) {
+        "ser"
+    } else {
+        "par"
+    };
+    println!(
+        "  m={m:<8} k={k:<5} {mode}  axpy={:7.1}  driver={:7.1} ({:.2}× axpy)  gemm={:7.1} ({:.2}× axpy)",
+        axpy.median,
+        driver.median,
+        driver.median / axpy.median.max(1e-9),
+        g,
+        g / axpy.median.max(1e-9),
+    );
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture"]
+fn perf_gemv_paths() {
+    let _guard = BENCH_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    println!("\ngemv path investigation — axpy special path vs general driver vs gemm crate:");
+    for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
+        for &(m, k) in &[
+            (4_194_304usize, 16usize),
+            (4_194_304, 32),
+            (2_097_152, 48),
+            (2_097_152, 64),
+            (1_048_576, 96),
+        ] {
+            bench_gemv_paths(m, k, par);
+        }
+    }
+}
+
 /// gevv / skinny GEMM `C(m×n) = A(m×k)·B(k×n)` at small `k`, reported as GB/s of the
 /// minimum traffic `(m*k + k*n + m*n)*4` (beta = 0, so C is write-only) against the STREAM
 /// `ceiling`, plus the `gemm`-crate / `matrixmultiply` GB/s on the same shape (`kit ×` is

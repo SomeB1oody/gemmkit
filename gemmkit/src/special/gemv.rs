@@ -105,7 +105,7 @@ unsafe fn core<T, S>(
         // Which shape, decided once (same for every worker ⇒ every worker runs the same
         // per-row arithmetic, so the row partition is bit-identical to the serial sweep).
         let axpy = mat_rs == 1 && out_s == 1;
-        let output_block = axpy && output_register_block(rows, sizeof);
+        let output_block = axpy && output_register_block(rows, sizeof, k);
         let dot = !axpy && mat_cs == 1 && vec_s == 1;
 
         // Bandwidth-capped worker count. `bytes_touched` is the minimum traffic (matrix
@@ -172,20 +172,22 @@ unsafe fn core<T, S>(
     }
 }
 
-/// Whether to register-block the output for the axpy-shape gemv: worthwhile once `out`
-/// (`rows·sizeof` bytes) cannot stay resident in the last-level cache across the `k`-sweep,
-/// so the plain column-outer form's per-column re-read of `out` would hit DRAM. Below that,
-/// `out` stays cached and the plain form's perfectly contiguous single-stream matrix read
-/// wins. Half the LLC is the crossover: `out` must coexist with the streaming matrix
-/// column, so it starts spilling well before it fills the level on its own.
+/// Register-block the output for an axpy-shape gemv when *both* hold: the output
+/// (`rows·sizeof` bytes) spills the L2, so the plain column-outer form's per-column re-read
+/// of the output leaves the core's private cache; and `k` is small enough that the
+/// register-blocked form's `k` concurrent matrix column-streams (one per depth step it reads
+/// in place) stay within the hardware prefetcher's tracking window. When the output fits L2
+/// the plain form's re-reads are cheap and its single contiguous matrix stream wins; when `k`
+/// is large the register-blocked form's many streams thrash the prefetcher and the plain form
+/// wins. The `K_STREAM_MAX = 32` bound is calibrated on Zen5: at `k ≤ 16` register-blocking
+/// runs ~20% faster than the plain form on a DRAM-resident output, is a wash near `k = 32`,
+/// and regresses by `k ≈ 48` as the streams exceed the prefetcher.
+const K_STREAM_MAX: usize = 32;
+
 #[inline]
-fn output_register_block(rows: usize, sizeof: usize) -> bool {
-    let topo = crate::cache::topology();
-    let llc = topo
-        .l3
-        .map(|l| l.effective_bytes())
-        .unwrap_or_else(|| topo.l2.effective_bytes());
-    rows.saturating_mul(sizeof) > (llc / 2).max(1)
+fn output_register_block(rows: usize, sizeof: usize, k: usize) -> bool {
+    k <= K_STREAM_MAX
+        && rows.saturating_mul(sizeof) > crate::cache::topology().l2.effective_bytes().max(1)
 }
 
 /// Register-blocked axpy over output rows `[s, e)`: the output panel is held in SIMD
