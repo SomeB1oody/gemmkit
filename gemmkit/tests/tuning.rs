@@ -290,8 +290,9 @@ fn small_k_threshold_route_correct() {
     tuning::set_small_k_threshold(prev);
 }
 
-/// `gemv_parallel_bytes` is a live knob: the byte floor forced to `0` (parallelize any
-/// gemv) or `usize::MAX` (never) must both produce the correct matrix·vector result.
+/// `gemv_parallel_bytes` is a live knob: the byte floor forced to `1` (parallelize any gemv)
+/// or `usize::MAX` (never) must both produce the correct matrix·vector result. (`0` is *auto*
+/// — an LLC-derived floor — not an extreme, so it is not exercised here.)
 #[test]
 fn gemv_parallel_bytes_route_correct() {
     let prev = tuning::gemv_parallel_bytes();
@@ -299,7 +300,7 @@ fn gemv_parallel_bytes_route_correct() {
     let a: Vec<f64> = (0..m * k).map(|x| (x % 23) as f64 * 0.1 - 1.0).collect();
     let b: Vec<f64> = (0..k * n).map(|x| (x % 19) as f64 * 0.2 - 1.5).collect();
     let cref = naive_col(&a, &b, m, k, n);
-    for &force in &[0usize, usize::MAX] {
+    for &force in &[1usize, usize::MAX] {
         tuning::set_gemv_parallel_bytes(force);
         let mut cc = vec![0.0f64; m * n];
         gemm(
@@ -326,7 +327,11 @@ fn gemv_parallel_bytes_route_correct() {
 #[test]
 fn gemv_thread_cap_stays_correct() {
     let prev = tuning::gemv_thread_cap();
-    // Large enough that the default byte floor is cleared and the cap actually bites.
+    // Drop the byte floor so this modest gemv clears it and the cap actually bites (the
+    // assertions are correctness/bit-identity, which hold at any worker count, so racing the
+    // floor knob with its own test cannot flake). Restored at the end.
+    let prev_floor = tuning::gemv_parallel_bytes();
+    tuning::set_gemv_parallel_bytes(1);
     let (m, k, n) = (200_000usize, 3usize, 1usize);
     let a: Vec<f64> = (0..m * k).map(|x| (x % 31) as f64 * 0.05 - 0.7).collect();
     let b: Vec<f64> = (0..k * n).map(|x| (x % 17) as f64 * 0.1 - 0.8).collect();
@@ -366,15 +371,20 @@ fn gemv_thread_cap_stays_correct() {
         }
     }
     tuning::set_gemv_thread_cap(prev);
+    tuning::set_gemv_parallel_bytes(prev_floor);
 }
 
 /// Output-partitioning of gemv and gevv adds no cross-thread reduction, so a parallel run
-/// must be **bit-identical** to the serial one (not merely close). Sizes are chosen so the
-/// default byte floor is cleared and the work splits across several workers, with partial
-/// tiles / a sub-lane tail. The assertion holds regardless of how many workers the auto
-/// path picks, so it does not bake in a machine-specific thread count.
+/// must be **bit-identical** to the serial one (not merely close), with partial tiles / a
+/// sub-lane tail. The assertion holds regardless of how many workers the auto path picks, so
+/// it does not bake in a machine-specific thread count.
 #[test]
 fn gemv_gevv_serial_parallel_bit_identical() {
+    // Drop the byte floor so these modest shapes actually split across workers on any machine
+    // (the LLC-derived auto floor would keep them serial on a large-cache host). Bit-identity
+    // holds at any worker count, so racing the floor knob cannot flake. Restored at the end.
+    let prev_floor = tuning::gemv_parallel_bytes();
+    tuning::set_gemv_parallel_bytes(1);
     // gemv: m·k large enough to split; m not a multiple of the register-block width, so the
     // sub-lane tail is exercised.
     let (m, k) = (300_007usize, 5usize);
@@ -420,6 +430,7 @@ fn gemv_gevv_serial_parallel_bit_identical() {
         run_gevv(Parallelism::Rayon(0)),
         "gevv serial vs parallel must be bit-identical"
     );
+    tuning::set_gemv_parallel_bytes(prev_floor);
 }
 
 /// Small deterministic `f32` fill (a xorshift, so the values are not all equal and the

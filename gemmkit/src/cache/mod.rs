@@ -194,6 +194,24 @@ pub(crate) fn lhs_pack_stride_bytes() -> usize {
     }
 }
 
+/// The gemv/gevv parallelism byte floor: below this much touched data the problem is
+/// LLC-resident and one core already gets the full LLC bandwidth, so splitting only adds
+/// fork/join and shared-cache contention with no DRAM to gain. `GEMMKIT_GEMV_PARALLEL_BYTES`
+/// overrides it; `0` (the default) derives a quarter of the LLC. Centralized here (like
+/// [`lhs_pack_stride_bytes`]) as the one home for the `0 => auto` derivation.
+pub(crate) fn gemv_parallel_floor_bytes() -> usize {
+    match crate::tuning::gemv_parallel_bytes() {
+        0 => {
+            let t = topology();
+            let llc =
+                t.l3.map(|l| l.effective_bytes())
+                    .unwrap_or(t.l2.effective_bytes());
+            (llc / 4).max(1)
+        }
+        v => v,
+    }
+}
+
 /// Run the fallback chain once. Never panics: any backend that fails or returns
 /// implausible values is skipped.
 #[cfg(feature = "std")]

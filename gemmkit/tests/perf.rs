@@ -1217,11 +1217,9 @@ fn perf_stream() {
     }
 }
 
-/// External-library GB/s for a column-major f32 `C(m×n) = A(m×k)·B(k×n)` (`beta = 0`) at
-/// the given `bytes` and parallelism: the `gemm` crate, and — serial only, as it is
-/// single-threaded here — `matrixmultiply`. Both are dev-deps that do not build for wasm, so
-/// this is native-only; returns `(gemm_gbps, mm_gbps)` and is the same-shape baseline the
-/// gemv/gevv rows are compared against.
+/// External-library GB/s for a column-major f32 `C(m×n) = A(m×k)·B(k×n)` (`beta = 0`) — the
+/// same-shape baseline the gemv/gevv rows compare against: the `gemm` crate, plus (serial only)
+/// `matrixmultiply`. Native-only (both are wasm-excluded dev-deps). Returns `(gemm, mm)`.
 #[cfg(not(target_family = "wasm"))]
 fn extern_baselines(
     m: usize,
@@ -1629,4 +1627,9 @@ fn perf_gemv_scaling() {
     // A DRAM-bound axpy shape (out fits cache) and a register-blocked out-∤-L3 shape.
     bench_gemv_scaling(65536, 1024, ceiling, avail);
     bench_gemv_scaling(16_777_216, 8, ceiling, avail);
+    // Cache-resident shapes (A fits L3): the ceiling here is aggregate cache bandwidth, which
+    // keeps scaling with cores well past the DRAM-saturation count — so the auto row (capped
+    // by the DRAM proxy) is expected to sit far below the forced-high-t peak.
+    bench_gemv_scaling(1024, 1024, ceiling, avail);
+    bench_gemv_scaling(8192, 64, ceiling, avail);
 }

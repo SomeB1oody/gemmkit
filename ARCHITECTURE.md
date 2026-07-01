@@ -332,12 +332,13 @@ the fine grain. RHS packing is parallelized the same way (its own cursor) with a
 barrier before compute.
 
 The `cbrt(mnk)` ramp above models *compute* work. The bandwidth-bound L6 special paths
-instead call `Parallelism::resolve_bandwidth(bytes_touched, rows)`: it gates on a byte floor
-(cache-resident work stays serial regardless of the request, like the compute gate), then
-above it either honors an explicit `Rayon(n)` or ramps the auto count *linearly in touched
-bytes* capped at a topology bandwidth proxy (`bandwidth_cap` — a documented fraction of the
-logical core count, since DRAM saturates far below it and no physical-core / memory-channel
-count is exposed).
+instead call `Parallelism::resolve_bandwidth(bytes_touched, rows)`: below an LLC-derived byte
+floor the touched data is cache-resident and one core already gets the full LLC bandwidth, so
+it stays serial (splitting there only loses — the thread-scaling curve *dips* at 2–4 workers
+on fork/join and shared-cache contention, with no DRAM to gain); above the floor the auto
+count steps straight to a topology bandwidth cap (`bandwidth_cap` — a documented fraction of
+the logical core count, since DRAM saturates far below it). It is a *step*, not a ramp,
+because for a bandwidth-bound shape a few workers is the worst point on the curve.
 `GEMMKIT_GEMV_PARALLEL_BYTES` / `GEMMKIT_GEMV_THREAD_CAP` tune the floor and cap.
 
 ## L6 — special paths (bandwidth-bound shapes)

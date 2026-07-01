@@ -173,15 +173,13 @@ unsafe fn core<T, S>(
 }
 
 /// Register-block the output for an axpy-shape gemv when *both* hold: the output
-/// (`rows·sizeof` bytes) spills the L2, so the plain column-outer form's per-column re-read
-/// of the output leaves the core's private cache; and `k` is small enough that the
-/// register-blocked form's `k` concurrent matrix column-streams (one per depth step it reads
-/// in place) stay within the hardware prefetcher's tracking window. When the output fits L2
-/// the plain form's re-reads are cheap and its single contiguous matrix stream wins; when `k`
-/// is large the register-blocked form's many streams thrash the prefetcher and the plain form
-/// wins. The `K_STREAM_MAX = 32` bound is calibrated on Zen5: at `k ≤ 16` register-blocking
-/// runs ~20% faster than the plain form on a DRAM-resident output, is a wash near `k = 32`,
-/// and regresses by `k ≈ 48` as the streams exceed the prefetcher.
+/// (`rows·sizeof` bytes) spills L2, so the plain column-outer form's per-column re-read of the
+/// output leaves the core's private cache; and `k` is small enough that the register-blocked
+/// form's `k` in-place matrix column-streams (one per depth step) stay within the hardware
+/// prefetcher's window. When the output fits L2 the plain form's re-reads are cheap and its
+/// single contiguous matrix stream wins; when `k` is large its many streams thrash the
+/// prefetcher. `K_STREAM_MAX = 32` is calibrated on Zen5: register-blocking wins by `k ≤ 16`,
+/// is a wash near `k = 32`, and regresses by `k ≈ 48` as the streams exceed the prefetcher.
 const K_STREAM_MAX: usize = 32;
 
 #[inline]
@@ -322,11 +320,10 @@ unsafe fn axpy_plain<T, S>(
                 *op = beta * *op;
             }
         }
-        // Fold KB columns per output load/store: the output panel is re-read/written once per
-        // KB-group instead of once per column, cutting its cache traffic (the axpy form's main
-        // overhead once the matrix read is DRAM-bound) KB-fold, while keeping only KB
-        // concurrent matrix column-streams — few enough not to thrash the prefetcher. The
-        // fused steps run in ascending `k`, so this is bit-identical to the one-column form.
+        // Fold KB columns per output load/store: the output panel is touched once per KB-group
+        // instead of once per column, cutting its cache traffic (the axpy form's main cost once
+        // the matrix read is DRAM-bound) while keeping only KB concurrent matrix column-streams.
+        // The fused steps run in ascending `k`, so this is bit-identical to the one-column form.
         const KB: usize = 4;
         let mut kk = 0;
         while kk + KB <= k {
