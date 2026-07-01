@@ -116,16 +116,14 @@ impl Parallelism {
     /// Resolve the worker count for a **bandwidth-bound** shape (gemv / gevv) touching
     /// `bytes_touched` bytes over `rows` partitionable output rows.
     ///
-    /// Unlike [`Parallelism::resolve`] — whose `cbrt(mnk)` ramp models *compute* and
-    /// undercounts the linear memory work of a gemv (`mnk = m·k`, but the bytes are `~m·k`)
-    /// — this gates and ramps on memory: below a byte floor the data is cache-resident and
-    /// a single core already saturates its own bandwidth, so it stays serial; above it the
-    /// auto count ramps linearly in bytes and is capped by a topology bandwidth proxy,
-    /// because past a few cores more workers add no DRAM bandwidth (and eventually regress
-    /// on sync overhead). Below the byte floor the shape stays serial regardless of the
-    /// request (the same order as [`resolve`]'s work gate — tiny work never parallelizes);
-    /// above it an explicit `Rayon(n)` is honored (capped only by cores and rows), so the
-    /// scaling diagnostic can force any width on a large enough problem.
+    /// Unlike [`Parallelism::resolve`] — whose `cbrt(mnk)` ramp models *compute* — this gates
+    /// on memory: below an LLC-derived byte floor the touched data is cache-resident, so it
+    /// stays serial (splitting only loses — the scaling curve dips at a few workers on
+    /// fork/join and shared-cache contention, with no DRAM to gain). Above the floor the auto
+    /// count steps straight to the topology bandwidth cap: a *few* workers is the worst point
+    /// on the curve, so a ramp through it is worse than jumping to the cap. The floor gate
+    /// precedes the request (like [`resolve`]'s work gate), so below it even an explicit
+    /// `Rayon(n)` stays serial; above it `Rayon(n)` is honored (capped by cores and rows).
     #[cfg_attr(not(feature = "parallel"), allow(unused_variables))]
     pub(crate) fn resolve_bandwidth(self, bytes_touched: usize, rows: usize) -> usize {
         let rows = rows.max(1);
@@ -139,8 +137,9 @@ impl Parallelism {
                 if !RAYON_USABLE {
                     return 1;
                 }
-                // Cache-resident / small: no DRAM bandwidth to win by threading.
-                if bytes_touched < tuning::gemv_parallel_bytes() {
+                // Cache-resident / small: one core already gets the full LLC bandwidth, so
+                // splitting only loses (fork/join + shared-cache contention, no DRAM to gain).
+                if bytes_touched < crate::cache::gemv_parallel_floor_bytes() {
                     return 1;
                 }
                 // Explicit count: honor it, capped by cores and rows (like `resolve`), so a
@@ -148,14 +147,11 @@ impl Parallelism {
                 if req != 0 {
                     return req.min(auto_threads()).min(rows).max(1);
                 }
-                // Auto: ramp linearly with the touched bytes (memory work is linear), then
-                // cap by the topology bandwidth proxy — the plateau where DRAM saturates.
-                let quantum = tuning::gemv_parallel_bytes().max(1);
-                let want = (bytes_touched / quantum).max(1);
-                want.min(bandwidth_cap())
-                    .min(auto_threads())
-                    .min(rows)
-                    .max(1)
+                // Auto: step straight to the cap. A *few* workers is the worst choice for a
+                // bandwidth-bound shape — the scaling curve dips there (fork/join + shared-cache
+                // contention) before the cap's aggregate DRAM bandwidth pays off — so a ramp
+                // through the dip beats neither serial (below the floor) nor the cap.
+                bandwidth_cap().min(auto_threads()).min(rows).max(1)
             }
         }
     }

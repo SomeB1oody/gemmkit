@@ -94,12 +94,12 @@ static GEMV_THRESHOLD: Threshold = Threshold::new("GEMMKIT_GEMV_THRESHOLD", usiz
 // behind by `k = 32`, so the crossover sits between.
 static SMALL_K_THRESHOLD: Threshold = Threshold::new("GEMMKIT_SMALL_K_THRESHOLD", 16);
 
-// Byte floor below which a bandwidth-bound gemv/gevv stays single-threaded, and the
-// per-worker ramp quantum above it: the auto worker count is `bytes_touched / this`,
-// capped by the topology bandwidth proxy. Below roughly one core's L2 the touched data is
-// cache-resident and a single core already saturates its own bandwidth, so fork/join would
-// only add overhead. Calibrated on Zen5 (1 MiB L2).
-static GEMV_PARALLEL_BYTES: Threshold = Threshold::new("GEMMKIT_GEMV_PARALLEL_BYTES", 1024 * 1024);
+// Byte floor below which a bandwidth-bound gemv/gevv stays single-threaded: below it the
+// touched data (the matrix for gemv, the output for gevv) is LLC-resident and one core gets
+// the full LLC bandwidth, so splitting only loses (fork/join + shared-LLC contention, no DRAM
+// to gain). `0` (the default) derives the floor from the LLC size (see
+// `crate::cache::gemv_parallel_floor_bytes`); any non-zero value overrides it.
+static GEMV_PARALLEL_BYTES: Threshold = Threshold::new("GEMMKIT_GEMV_PARALLEL_BYTES", 0);
 
 // Maximum workers a bandwidth-bound gemv/gevv may use. `0` (the default) derives a proxy
 // from the logical core count (see `parallel::bandwidth_cap`); any non-zero value is a hard
@@ -202,12 +202,12 @@ pub fn set_small_k_threshold(v: usize) {
     SMALL_K_THRESHOLD.set(v);
 }
 
-/// Get the gemv/gevv parallelism byte floor and per-worker ramp quantum. Always `>= 1`
-/// so it can never be a zero divisor in the worker-count ramp.
+/// Get the gemv/gevv parallelism byte floor. `0` means *auto* — derive it from the LLC size
+/// (see `crate::cache::gemv_parallel_floor_bytes`); any non-zero value is the floor verbatim.
 pub fn gemv_parallel_bytes() -> usize {
-    GEMV_PARALLEL_BYTES.get().max(1)
+    GEMV_PARALLEL_BYTES.get()
 }
-/// Override the gemv/gevv parallelism byte floor / ramp quantum.
+/// Override the gemv/gevv parallelism byte floor (`0` restores the LLC-derived auto value).
 pub fn set_gemv_parallel_bytes(v: usize) {
     GEMV_PARALLEL_BYTES.set(v);
 }
