@@ -399,20 +399,9 @@ unsafe fn dot_rows<T, S>(
     S: SimdOps<T>,
 {
     unsafe {
-        let lanes = <S as SimdOps<T>>::LANES;
         for i in s..e {
             let row = mat.offset(i as isize * mat_rs);
-            let mut acc = simd.zero();
-            let mut kk = 0;
-            while kk + lanes <= k {
-                acc = simd.mul_add(simd.loadu(row.add(kk)), simd.loadu(vec.add(kk)), acc);
-                kk += lanes;
-            }
-            let mut dot = simd.reduce_sum(acc);
-            while kk < k {
-                dot = (*row.add(kk)).mul_add(*vec.add(kk), dot);
-                kk += 1;
-            }
+            let dot = super::dot_contiguous::<T, S>(simd, k, row, vec);
             let op = out.offset(i as isize * out_s);
             let ov = if beta == T::ZERO {
                 T::ZERO

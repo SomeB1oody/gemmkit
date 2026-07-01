@@ -31,7 +31,7 @@ L2  pack.rs          micropanel packing primitive
 L3  cache/           CacheTopology + analytical BLIS blocking (cpuid/sysctl/sysfs backends + fallback)
 L4  driver.rs        the generic five-loop nest
 L5  parallel.rs      Parallelism + 1-D job split + work-gate
-L6  special/         bandwidth-bound special paths (gemv.rs matrix·vector, small_k.rs skinny/low-depth)
+L6  special/         special paths (gemv.rs matrix·vector, small_k.rs skinny/low-depth, small_mn.rs small-m,n horizontal, batched.rs many-GEMM orchestration)
 L7  dispatch.rs      OnceLock<fn> ISA selection + orientation + per-(type,ISA) entry
 L8a api.rs           MatRef/MatMut safe API + unchecked raw engine
 L8b gemmkit-ndarray  ArrayBase adapter + dot
@@ -347,9 +347,9 @@ These shapes have O(1) arithmetic intensity, so the ceiling is memory bandwidth,
 compute. Both compute each output element in a **single pass over `k`** and parallelize by
 partitioning disjoint **output** tiles — no cross-thread reduction — so the result is
 bit-identical to the serial run for any worker count. Worker counts come from
-`Parallelism::resolve_bandwidth` (a linear-in-bytes ramp capped by a topology bandwidth
-proxy), not the driver's `cbrt(mnk)` compute ramp: past the few cores that saturate DRAM,
-more workers stop helping.
+`Parallelism::resolve_bandwidth` (serial below an LLC-derived byte floor, then a step
+straight to a topology bandwidth cap), not the driver's `cbrt(mnk)` compute ramp: past the
+few cores that saturate DRAM, more workers stop helping.
 
 - **gemv** (`gemv.rs`, `m == 1` or `n == 1`): both cases reduce to one core routine by
   viewing the matrix (transposed for `m == 1`) as `rows × k`. Column-major (axpy) shape has
@@ -367,8 +367,36 @@ more workers stop helping.
   workspace setup that is pure overhead at tiny `k`. Requires column-major A (`rsa == 1`) and
   a non-`FORCE_PACK` family; otherwise defers to `driver::run`. Wired into every family's
   dispatch except complex (its planar SoA kernel cannot read in place).
+- **small_mn** (`small_mn.rs`, `m, n <= small_mn_dim` and `k > small_k_threshold`): the
+  small-matrix **horizontal (inner-product)** kernel. When both output dimensions are far
+  below the microtile, the driver pads the tiny row/col tiles to a full `MR × NR` microtile
+  and packs mostly padding; this route computes each output as a direct SIMD dot over `k`
+  (`gemv`'s `dot_rows` generalized to an `m×n` grid — they share `dot_contiguous`), reading
+  A/B in place with the output register-blocked into `MT × NT` tiles. Gated to the
+  contiguous-along-`k` layout (A rows unit-stride `csa == 1`, B cols unit-stride `rsb == 1`);
+  a strided layout would need a scalar dot that loses to the driver, so it stays on the
+  driver. Float-only (`f32`/`f64`); mixed/int/complex would need widen-load variants.
 
-Deferred: the small-matrix horizontal kernel and batched GEMM.
+The special paths above are **bandwidth-bound**; each output element is one fixed-order
+reduction computed wholly by one worker, so they are bit-identical to the serial run for any
+worker count.
+
+- **batched** (`batched.rs`): `gemm_batched` computes many independent products `C_b =
+  α·A_b·B_b + β·C_b` in one call. It is an **orchestration layer**, not a new microkernel:
+  each element re-dispatches through `dispatch::execute`, so batched composes with every route
+  above automatically. `Parallelism::resolve_batch` picks the schedule: **serial** below a
+  total-work gate; **batch-parallel** (each element run serially and cache-hot on one worker, so
+  the batch pays one fork/join instead of one per element) when there are enough elements to
+  fill the workers or the elements are cache-resident; and, for the few-but-large **DRAM-bound**
+  case (fewer elements than cores, each spilling L2 and scaling across cores on its own), a
+  sequential loop giving **each** element the full engine parallelism. That last schedule splits
+  an element across workers, so it is used only for `m, n > 1` shapes (whose driver / small_k /
+  small_mn route reduces each output within one worker, so serial and parallel agree under the
+  current thread-independent blocking), never gemv; the serial and batch-parallel schedules run
+  each element serially, so they are **bit-identical across worker counts**. The
+  batch-parallel workers pack through a *second* per-thread pool (`workspace::BATCH_POOL`, reused
+  across calls) distinct from the plain thread-local pool, so a worker running inline while
+  `gemm_batched`'s outer `with_thread_pool` holds the plain pool cannot re-borrow it.
 
 ## L7 — dispatch
 
@@ -385,6 +413,10 @@ line each.
   Shape mismatch, out-of-bounds strides, and C aliasing A/B all **panic** before
   any unsafe work. (In safe Rust, `&mut` C cannot overlap `&` A/B anyway; the alias
   check is a defensive guarantee.)
+- **Batched** ([`gemm_batched`] / `gemm_batched_with`): strided-batched `C_b <-
+  α·A_b·B_b + β·C_b`. One element shape + strides plus a per-operand batch stride;
+  validation additionally checks every element (including the last) is in bounds and
+  the `batch` C regions are pairwise disjoint.
 - **Unchecked** ([`gemm_unchecked`]): the raw pointer + `isize` stride engine for
   advanced callers (e.g. the ndarray adapter) that validate their own inputs and
   may use negative strides.

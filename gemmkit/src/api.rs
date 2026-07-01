@@ -136,6 +136,46 @@ fn check_view<T>(data: &[T], rows: usize, cols: usize, rs: isize, cs: isize, nam
     }
 }
 
+/// Bounds check for a **strided-batched** view: the `batch` element views (element `bi` based at
+/// slice offset `bi * batch_stride`) must all address inside `data`, including the last element.
+/// The batch stride must be non-negative for the safe API (like the element strides). Returns the
+/// element extent (highest offset + 1) so the caller can reuse it for the inter-element
+/// disjointness check.
+#[allow(clippy::too_many_arguments)]
+fn check_batched_view<T>(
+    data: &[T],
+    rows: usize,
+    cols: usize,
+    rs: isize,
+    cs: isize,
+    batch: usize,
+    batch_stride: isize,
+    name: &str,
+) -> usize {
+    let e = match extent(rows, cols, rs, cs) {
+        Some(e) => e,
+        None => panic!("gemmkit: {name} view has negative strides; use the unchecked API"),
+    };
+    // Only element 0 exists when batch <= 1, so the batch stride is irrelevant there.
+    let last_base = if batch <= 1 {
+        0
+    } else {
+        if batch_stride < 0 {
+            panic!("gemmkit: {name} batch stride ({batch_stride}) must be non-negative");
+        }
+        (batch - 1).saturating_mul(batch_stride as usize)
+    };
+    let need = last_base.saturating_add(e);
+    if need > data.len() {
+        panic!(
+            "gemmkit: {name} batched view ({batch}× {rows}x{cols}, batch stride {batch_stride}) \
+             needs {need} elements but slice has {}",
+            data.len()
+        );
+    }
+    e
+}
+
 /// `true` if a strided `rows×cols` view maps two *distinct* `(i,j)` to the same
 /// offset. Such a view is fine to read from (a broadcast input) but invalid as an
 /// output: the parallel driver assumes output tiles are disjoint, so writing
@@ -264,6 +304,188 @@ pub fn gemm_with<T: GemmScalar>(
                 rsc: c.rs,
                 csc: c.cs,
             },
+            par,
+            ws,
+        );
+    }
+}
+
+/// Strided-batched GEMM: `C_b <- alpha·A_b·B_b + beta·C_b` for `b in 0..batch`, one call,
+/// parallelized **across the batch**. All elements share the single-element shape and strides of
+/// `a`/`b`/`c`; consecutive elements are `*_batch_stride` apart in their slices (`A_b` at
+/// `a.data + b·a_batch_stride`, etc.). A `*_batch_stride` of `0` broadcasts one operand across the
+/// whole batch (valid for the read-only `A`/`B`, never for `C`). Uses the thread-local workspace
+/// pool.
+///
+/// Each element re-dispatches through the full engine, so the result **reproduces** a loop of
+/// [`gemm`] calls and is **deterministic** across thread counts (reproducible under a fixed
+/// config, the library's determinism contract). The serial and batch-parallel schedules run each
+/// element serially, so they are additionally bit-identical across thread counts; the
+/// few-but-large schedule runs each element through the parallel engine and so inherits its
+/// per-element serial==parallel behavior.
+///
+/// # Panics
+/// If the per-element dimensions disagree (`A.cols != B.rows`, `A.rows != C.rows`,
+/// `B.cols != C.cols`); if any element view (including the last, `b == batch-1`) addresses outside
+/// its slice; if a batch stride is negative; if the `batch` output regions overlap each other
+/// (`C` batch stride below the element extent) or a `C` element aliases itself; or if `C`'s
+/// storage overlaps `A`'s or `B`'s.
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_batched<T: GemmScalar>(
+    batch: usize,
+    alpha: T,
+    a: MatRef<'_, T>,
+    a_batch_stride: isize,
+    b: MatRef<'_, T>,
+    b_batch_stride: isize,
+    beta: T,
+    c: MatMut<'_, T>,
+    c_batch_stride: isize,
+    par: Parallelism,
+) {
+    workspace::with_thread_pool(|ws| {
+        gemm_batched_with(
+            ws,
+            batch,
+            alpha,
+            a,
+            a_batch_stride,
+            b,
+            b_batch_stride,
+            beta,
+            c,
+            c_batch_stride,
+            par,
+        );
+    });
+}
+
+/// Like [`gemm_batched`] but reuses a caller-owned [`Workspace`]. The serial and few-but-large
+/// schedules pack through `ws`; the batch-parallel schedule instead packs through each worker's
+/// own persistent per-thread batched pool (a single shared `ws` cannot back concurrent packing),
+/// which is reused across calls the same way `ws` is.
+///
+/// # Panics
+/// Same conditions as [`gemm_batched`].
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_batched_with<T: GemmScalar>(
+    ws: &mut Workspace,
+    batch: usize,
+    alpha: T,
+    a: MatRef<'_, T>,
+    a_batch_stride: isize,
+    b: MatRef<'_, T>,
+    b_batch_stride: isize,
+    beta: T,
+    c: MatMut<'_, T>,
+    c_batch_stride: isize,
+    par: Parallelism,
+) {
+    // A zero-length batch is a pure no-op — nothing to validate (the views are unused).
+    if batch == 0 {
+        return;
+    }
+
+    assert_eq!(
+        a.cols, b.rows,
+        "gemmkit: A.cols ({}) != B.rows ({})",
+        a.cols, b.rows
+    );
+    assert_eq!(
+        a.rows, c.rows,
+        "gemmkit: A.rows ({}) != C.rows ({})",
+        a.rows, c.rows
+    );
+    assert_eq!(
+        b.cols, c.cols,
+        "gemmkit: B.cols ({}) != C.cols ({})",
+        b.cols, c.cols
+    );
+
+    check_batched_view(
+        a.data,
+        a.rows,
+        a.cols,
+        a.rs,
+        a.cs,
+        batch,
+        a_batch_stride,
+        "A",
+    );
+    check_batched_view(
+        b.data,
+        b.rows,
+        b.cols,
+        b.rs,
+        b.cs,
+        batch,
+        b_batch_stride,
+        "B",
+    );
+    let c_extent = check_batched_view(
+        c.data,
+        c.rows,
+        c.cols,
+        c.rs,
+        c.cs,
+        batch,
+        c_batch_stride,
+        "C",
+    );
+
+    // Each C element must address every (i,j) uniquely (a self-aliasing element would race in
+    // parallel), and — since the batch writes them concurrently — the elements must not overlap
+    // each other. Disjointness is enforced conservatively: the batch stride must clear one
+    // element's whole extent (sufficient, and simpler than a per-offset overlap test — it can
+    // reject an exotic layout that threads later elements through a strided element's internal
+    // gaps, but never accepts a real overlap). (`c_batch_stride >= 0` here: `check_batched_view`.)
+    if self_aliases(c.rows, c.cols, c.rs, c.cs) {
+        panic!(
+            "gemmkit: batched C element aliases itself (strides {},{} map distinct elements to \
+             the same memory); C must address each (i,j) uniquely",
+            c.rs, c.cs
+        );
+    }
+    if batch > 1 && (c_batch_stride as usize) < c_extent {
+        panic!(
+            "gemmkit: C batch stride ({c_batch_stride}) must be at least the element extent \
+             ({c_extent}) so the batched C outputs stay disjoint"
+        );
+    }
+
+    // C must not alias A or B (it is written). The whole-slice check is defensive — safe Rust's
+    // borrow checker already forbids overlapping &mut/& slices.
+    let cp = c.data.as_ptr();
+    let cl = c.data.len();
+    if overlaps(cp, cl, a.data.as_ptr(), a.data.len())
+        || overlaps(cp, cl, b.data.as_ptr(), b.data.len())
+    {
+        panic!("gemmkit: batched C aliases A or B");
+    }
+
+    // SAFETY: validated above — per-element shapes agree, every element view (incl. the last) is
+    // in bounds, the C outputs are pairwise disjoint and address uniquely, and C does not alias
+    // A/B.
+    unsafe {
+        crate::special::batched::run(
+            batch,
+            a.rows,
+            a.cols,
+            b.cols,
+            alpha,
+            a.data.as_ptr(),
+            a.rs,
+            a.cs,
+            a_batch_stride,
+            b.data.as_ptr(),
+            b.rs,
+            b.cs,
+            b_batch_stride,
+            beta,
+            c.data.as_mut_ptr(),
+            c.rs,
+            c.cs,
+            c_batch_stride,
             par,
             ws,
         );

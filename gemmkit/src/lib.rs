@@ -65,8 +65,9 @@ mod special;
 mod workspace;
 
 pub use api::{
-    MatMut, MatRef, PackedLhs, PackedRhs, gemm, gemm_packed_a, gemm_packed_a_with, gemm_packed_b,
-    gemm_packed_b_with, gemm_unchecked, gemm_unchecked_with, gemm_with, prepack_lhs, prepack_rhs,
+    MatMut, MatRef, PackedLhs, PackedRhs, gemm, gemm_batched, gemm_batched_with, gemm_packed_a,
+    gemm_packed_a_with, gemm_packed_b, gemm_packed_b_with, gemm_unchecked, gemm_unchecked_with,
+    gemm_with, prepack_lhs, prepack_rhs,
 };
 #[cfg(feature = "complex")]
 pub use api::{gemm_cplx, gemm_cplx_unchecked, gemm_cplx_unchecked_with, gemm_cplx_with};

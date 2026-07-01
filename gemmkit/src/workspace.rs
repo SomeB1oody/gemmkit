@@ -131,9 +131,20 @@ pub(crate) struct Regions<T> {
 
 std::thread_local! {
     static POOL: core::cell::RefCell<Workspace> = const { core::cell::RefCell::new(Workspace::new()) };
+    // A second per-thread pool used only by the batched path's per-worker packing. It is
+    // *distinct* from `POOL` so a batch-parallel worker running inline under an outer
+    // `with_thread_pool` (which is holding `POOL`) can borrow its own scratch without a re-borrow
+    // panic — while still reusing the buffer across batched calls (unlike a fresh `Workspace`).
+    static BATCH_POOL: core::cell::RefCell<Workspace> = const { core::cell::RefCell::new(Workspace::new()) };
 }
 
 /// Run `f` with the current thread's pooled workspace.
 pub(crate) fn with_thread_pool<R>(f: impl FnOnce(&mut Workspace) -> R) -> R {
     POOL.with(|p| f(&mut p.borrow_mut()))
+}
+
+/// Run `f` with the current thread's *batched* pool (see [`BATCH_POOL`]). Used by the batched
+/// path so each worker reuses persistent packing buffers across calls.
+pub(crate) fn with_batch_pool<R>(f: impl FnOnce(&mut Workspace) -> R) -> R {
+    BATCH_POOL.with(|p| f(&mut p.borrow_mut()))
 }
