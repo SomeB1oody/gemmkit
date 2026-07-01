@@ -1217,10 +1217,98 @@ fn perf_stream() {
     }
 }
 
+/// External-library GB/s for a column-major f32 `C(m×n) = A(m×k)·B(k×n)` (`beta = 0`) at
+/// the given `bytes` and parallelism: the `gemm` crate, and — serial only, as it is
+/// single-threaded here — `matrixmultiply`. Both are dev-deps that do not build for wasm, so
+/// this is native-only; returns `(gemm_gbps, mm_gbps)` and is the same-shape baseline the
+/// gemv/gevv rows are compared against.
+#[cfg(not(target_family = "wasm"))]
+fn extern_baselines(
+    m: usize,
+    k: usize,
+    n: usize,
+    bytes: usize,
+    par: Parallelism,
+) -> (f64, Option<f64>) {
+    let a = fill(m * k, 1);
+    let b = fill(k * n, 2);
+    let mut c = vec![0.0f32; m * n];
+    let gpar = if matches!(par, Parallelism::Serial) {
+        gemm::Parallelism::None
+    } else {
+        gemm::Parallelism::Rayon(0)
+    };
+    let g = measure_gbps(bytes, || unsafe {
+        gemm::gemm(
+            m,
+            n,
+            k,
+            c.as_mut_ptr(),
+            m as isize,
+            1,
+            false,
+            a.as_ptr(),
+            m as isize,
+            1,
+            b.as_ptr(),
+            k as isize,
+            1,
+            0.0,
+            1.0,
+            false,
+            false,
+            false,
+            gpar,
+        );
+    });
+    // matrixmultiply is single-threaded as used here, so only compare it on the serial arm.
+    let mm = matches!(par, Parallelism::Serial).then(|| {
+        measure_gbps(bytes, || unsafe {
+            matrixmultiply::sgemm(
+                m,
+                k,
+                n,
+                1.0,
+                a.as_ptr(),
+                1,
+                m as isize,
+                b.as_ptr(),
+                1,
+                k as isize,
+                0.0,
+                c.as_mut_ptr(),
+                1,
+                m as isize,
+            );
+        })
+        .median
+    });
+    (g.median, mm)
+}
+
+/// Format the external-baseline tail (`gemm=… (kit …×)  mm=… (kit …×)`) for a `kit`-GB/s
+/// gemmkit result on the given shape. Empty on wasm (no external crate there).
+#[allow(unused_variables)]
+fn baseline_tail(m: usize, k: usize, n: usize, bytes: usize, par: Parallelism, kit: f64) -> String {
+    #[cfg(not(target_family = "wasm"))]
+    {
+        let (g, mm) = extern_baselines(m, k, n, bytes, par);
+        let mm_s = mm
+            .map(|v| format!("  mm={v:6.1} (kit {:.2}×)", kit / v.max(1e-9)))
+            .unwrap_or_default();
+        format!("  gemm={g:6.1} (kit {:.2}×){mm_s}", kit / g.max(1e-9))
+    }
+    #[cfg(target_family = "wasm")]
+    {
+        String::new()
+    }
+}
+
 /// gemv `C(m×1) = A(m×k)·x` through the public [`gemm`], reported as GB/s of the minimum
 /// traffic `(m*k + k + m)*4` (A read once, x once, C written once) against the STREAM
-/// `ceiling`, plus GFLOP/s for reference. `k` spans fits-L2 → DRAM. Column-major A/C hit
-/// the axpy form of the gemv path.
+/// `ceiling`, plus the `gemm`-crate / `matrixmultiply` GB/s on the same shape (`kit ×` is
+/// gemmkit's speedup over each). `k` spans fits-L2 → DRAM; column-major A/C hit the axpy
+/// form of the gemv path.
 fn bench_gemv(m: usize, k: usize, par: Parallelism, ceiling: f64) {
     let a = fill(m * k, 1);
     let x = fill(k, 2);
@@ -1236,18 +1324,17 @@ fn bench_gemv(m: usize, k: usize, par: Parallelism, ceiling: f64) {
             par,
         );
     });
-    let gflops = st.median * (2.0 * m as f64 * k as f64) / bytes as f64;
     let mode = if matches!(par, Parallelism::Serial) {
         "ser"
     } else {
         "par"
     };
+    let tail = baseline_tail(m, k, 1, bytes, par, st.median);
     println!(
-        "  m={m:<6} k={k:<5} {mode}  {:7.1} GB/s (±{:>2.0}%)  {:3.0}% ceil  {:8.1} GFLOP/s",
+        "  m={m:<8} k={k:<5} {mode}  kit={:7.1} GB/s (±{:>2.0}%)  {:3.0}% ceil{tail}",
         st.median,
         st.spread_pct(),
         100.0 * st.median / ceiling.max(1e-9),
-        gflops
     );
 }
 
@@ -1295,8 +1382,9 @@ fn perf_gemv() {
 }
 
 /// gevv / skinny GEMM `C(m×n) = A(m×k)·B(k×n)` at small `k`, reported as GB/s of the
-/// minimum traffic `(m*k + k*n + m*n)*4` (beta = 0, so C is write-only) against the
-/// STREAM `ceiling`, plus GFLOP/s. At tiny `k` the `m*n` C write dominates, so this is
+/// minimum traffic `(m*k + k*n + m*n)*4` (beta = 0, so C is write-only) against the STREAM
+/// `ceiling`, plus the `gemm`-crate / `matrixmultiply` GB/s on the same shape (`kit ×` is
+/// gemmkit's speedup). At tiny `k` the `m*n` C write dominates, so this is
 /// write-bandwidth-bound.
 fn bench_gevv(m: usize, n: usize, k: usize, par: Parallelism, ceiling: f64) {
     let a = fill(m * k, 1);
@@ -1313,18 +1401,17 @@ fn bench_gevv(m: usize, n: usize, k: usize, par: Parallelism, ceiling: f64) {
             par,
         );
     });
-    let gflops = st.median * (2.0 * m as f64 * k as f64 * n as f64) / bytes as f64;
     let mode = if matches!(par, Parallelism::Serial) {
         "ser"
     } else {
         "par"
     };
+    let tail = baseline_tail(m, k, n, bytes, par, st.median);
     println!(
-        "  m={m:<5} n={n:<5} k={k} {mode}  {:7.1} GB/s (±{:>2.0}%)  {:3.0}% ceil  {:8.1} GFLOP/s",
+        "  m={m:<5} n={n:<5} k={k} {mode}  kit={:7.1} GB/s (±{:>2.0}%)  {:3.0}% ceil{tail}",
         st.median,
         st.spread_pct(),
         100.0 * st.median / ceiling.max(1e-9),
-        gflops
     );
 }
 
