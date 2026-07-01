@@ -352,9 +352,11 @@ more workers stop helping.
 
 - **gemv** (`gemv.rs`, `m == 1` or `n == 1`): both cases reduce to one core routine by
   viewing the matrix (transposed for `m == 1`) as `rows × k`. Column-major (axpy) shape has
-  two bit-identical strategies chosen by cache fit and `k` — plain column-outer axpy when the
+  two bit-identical strategies chosen by cache fit and `k` — column-outer axpy when the
   output stays L2-resident (its re-reads are cheap and its single contiguous matrix stream is
-  ideal), and **output register-blocking** (hold the output panel in registers across the
+  ideal; it folds `KB` columns per output load/store, so the axpy form is limited by DRAM
+  bandwidth rather than load/store-port throughput), and **output register-blocking** (hold
+  the output panel in registers across the
   whole `k`-sweep, output/matrix read once) when the output spills L2 *and* `k` is small
   enough that the register-blocked form's `k` in-place matrix column-streams stay within the
   prefetcher's window. Row-major uses the dot form.

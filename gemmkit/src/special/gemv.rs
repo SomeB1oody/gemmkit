@@ -322,7 +322,41 @@ unsafe fn axpy_plain<T, S>(
                 *op = beta * *op;
             }
         }
-        for kk in 0..k {
+        // Fold KB columns per output load/store: the output panel is re-read/written once per
+        // KB-group instead of once per column, cutting its cache traffic (the axpy form's main
+        // overhead once the matrix read is DRAM-bound) KB-fold, while keeping only KB
+        // concurrent matrix column-streams — few enough not to thrash the prefetcher. The
+        // fused steps run in ascending `k`, so this is bit-identical to the one-column form.
+        const KB: usize = 4;
+        let mut kk = 0;
+        while kk + KB <= k {
+            let scal: [T; KB] =
+                core::array::from_fn(|j| alpha * *vec.offset((kk + j) as isize * vec_s));
+            let sv: [S::Reg; KB] = core::array::from_fn(|j| simd.splat(scal[j]));
+            let col: [*const T; KB] =
+                core::array::from_fn(|j| mat.offset((kk + j) as isize * mat_cs));
+            let mut i = s;
+            while i + lanes <= e {
+                let mut ov = simd.loadu(out.add(i));
+                for j in 0..KB {
+                    ov = simd.mul_add(simd.loadu(col[j].add(i)), sv[j], ov);
+                }
+                simd.storeu(out.add(i), ov);
+                i += lanes;
+            }
+            while i < e {
+                let op = out.add(i);
+                let mut o = *op;
+                for j in 0..KB {
+                    o = scal[j].mul_add(*col[j].add(i), o);
+                }
+                *op = o;
+                i += 1;
+            }
+            kk += KB;
+        }
+        // Remainder columns (`k % KB`): one column at a time.
+        while kk < k {
             let scal = alpha * *vec.offset(kk as isize * vec_s);
             let sv = simd.splat(scal);
             let col = mat.offset(kk as isize * mat_cs);
@@ -338,6 +372,7 @@ unsafe fn axpy_plain<T, S>(
                 *op = scal.mul_add(*col.add(i), *op);
                 i += 1;
             }
+            kk += 1;
         }
     }
 }
