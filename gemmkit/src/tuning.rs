@@ -86,6 +86,28 @@ static LHS_PACK_STRIDE: Threshold = Threshold::new("GEMMKIT_LHS_PACK_STRIDE", 0)
 // when the other dimension is 1. (Shape, not size, decides; this only caps it.)
 static GEMV_THRESHOLD: Threshold = Threshold::new("GEMMKIT_GEMV_THRESHOLD", usize::MAX - 1);
 
+// At or below this `k`, a (non-gemv) shape takes the generic small-`k` route — computing
+// the whole product in one depth panel over the microkernel, reading A/B in place, no
+// packing. Above it the register-tiling driver wins: packing A into contiguous panels pays
+// for the better microkernel depth-walk once `k` is large enough. Calibrated on Zen5 —
+// in-place stays ahead through `k = 16` (~120-140% of the driver on skinny GEMM) and falls
+// behind by `k = 32`, so the crossover sits between.
+static SMALL_K_THRESHOLD: Threshold = Threshold::new("GEMMKIT_SMALL_K_THRESHOLD", 16);
+
+// Byte floor below which a bandwidth-bound gemv/gevv stays single-threaded, and the
+// per-worker ramp quantum above it: the auto worker count is `bytes_touched / this`,
+// capped by the topology bandwidth proxy. Below roughly one core's L2 the touched data is
+// cache-resident and a single core already saturates its own bandwidth, so fork/join would
+// only add overhead. Calibrated on Zen5 (1 MiB L2).
+static GEMV_PARALLEL_BYTES: Threshold = Threshold::new("GEMMKIT_GEMV_PARALLEL_BYTES", 1024 * 1024);
+
+// Maximum workers a bandwidth-bound gemv/gevv may use. `0` (the default) derives a proxy
+// from the logical core count (see `parallel::bandwidth_cap`); any non-zero value is a hard
+// cap. This is the escape hatch for the fact that the memory-parallel width is a heuristic:
+// no physical-core / memory-channel count is exposed, and DRAM saturates at far fewer
+// workers than the logical core count. Raise it on a high-bandwidth shared-L2 part (Apple).
+static GEMV_THREAD_CAP: Threshold = Threshold::new("GEMMKIT_GEMV_THREAD_CAP", 0);
+
 // Dynamic-scheduling granularity: the parallel driver aims for this many work
 // chunks *per worker*, handed out from a shared cursor on demand, so faster cores
 // (heterogeneous big.LITTLE P/E layouts) pull proportionally more. Higher = finer
@@ -169,6 +191,35 @@ pub fn gemv_threshold() -> usize {
 /// Override the gemv special-path cap.
 pub fn set_gemv_threshold(v: usize) {
     GEMV_THRESHOLD.set(v);
+}
+
+/// Get the small-`k` route threshold (`k` at/below this takes the generic small-`k` path).
+pub fn small_k_threshold() -> usize {
+    SMALL_K_THRESHOLD.get()
+}
+/// Override the small-`k` route threshold.
+pub fn set_small_k_threshold(v: usize) {
+    SMALL_K_THRESHOLD.set(v);
+}
+
+/// Get the gemv/gevv parallelism byte floor and per-worker ramp quantum. Always `>= 1`
+/// so it can never be a zero divisor in the worker-count ramp.
+pub fn gemv_parallel_bytes() -> usize {
+    GEMV_PARALLEL_BYTES.get().max(1)
+}
+/// Override the gemv/gevv parallelism byte floor / ramp quantum.
+pub fn set_gemv_parallel_bytes(v: usize) {
+    GEMV_PARALLEL_BYTES.set(v);
+}
+
+/// Get the gemv/gevv worker cap. `0` means *auto* — derive a bandwidth proxy from the
+/// core count (see `crate::parallel::bandwidth_cap`); any non-zero value is a hard cap.
+pub fn gemv_thread_cap() -> usize {
+    GEMV_THREAD_CAP.get()
+}
+/// Override the gemv/gevv worker cap (`0` restores the core-derived auto proxy).
+pub fn set_gemv_thread_cap(v: usize) {
+    GEMV_THREAD_CAP.set(v);
 }
 
 /// Get the parallel dynamic-scheduling oversample factor (chunks per worker).

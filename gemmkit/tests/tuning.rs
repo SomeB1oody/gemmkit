@@ -4,6 +4,22 @@
 
 use gemmkit::{MatMut, MatRef, Parallelism, gemm, tuning};
 
+/// Naive `C = A·B` for column-major `f64` operands, returned column-major. The reference
+/// the route/knob tests compare against.
+fn naive_col(a: &[f64], b: &[f64], m: usize, k: usize, n: usize) -> Vec<f64> {
+    let mut c = vec![0.0; m * n];
+    for j in 0..n {
+        for i in 0..m {
+            let mut s = 0.0;
+            for p in 0..k {
+                s += a[p * m + i] * b[j * k + p];
+            }
+            c[j * m + i] = s;
+        }
+    }
+    c
+}
+
 /// `usize::MAX` must not collide with the internal "unset" sentinel: setting the
 /// maximum should take effect (clamped to `usize::MAX - 1`), not be ignored.
 #[test]
@@ -233,4 +249,189 @@ fn parallel_oversample_extremes_stay_correct() {
             }
         }
     }
+}
+
+/// `small_k_threshold` is a live knob: forcing every shape onto the in-place small-`k`
+/// route (`usize::MAX`) or onto the register-tiling driver (`0`) must both stay correct,
+/// across `k` values on both sides of the calibrated crossover and with partial tiles.
+#[test]
+fn small_k_threshold_route_correct() {
+    let prev = tuning::small_k_threshold();
+    // MAX = every k takes the in-place small-k route; 0 = every k takes the driver.
+    for &force in &[usize::MAX, 0] {
+        tuning::set_small_k_threshold(force);
+        for &(m, k, n) in &[
+            (33, 3, 19),
+            (64, 8, 40),
+            (128, 16, 50),
+            (40, 20, 28),
+            (97, 2, 80),
+        ] {
+            let a: Vec<f64> = (0..m * k).map(|x| (x % 23) as f64 * 0.1 - 1.0).collect();
+            let b: Vec<f64> = (0..k * n).map(|x| (x % 19) as f64 * 0.2 - 1.5).collect();
+            let cref = naive_col(&a, &b, m, k, n);
+            let mut cc = vec![0.0f64; m * n];
+            gemm(
+                1.0,
+                MatRef::from_col_major(&a, m, k),
+                MatRef::from_col_major(&b, k, n),
+                0.0,
+                MatMut::from_col_major(&mut cc, m, n),
+                Parallelism::Rayon(0),
+            );
+            for (got, exp) in cc.iter().zip(&cref) {
+                assert!(
+                    (got - exp).abs() <= 1e-10 * (1.0 + exp.abs()),
+                    "force={force} {m}x{k}x{n}: {got} vs {exp}"
+                );
+            }
+        }
+    }
+    tuning::set_small_k_threshold(prev);
+}
+
+/// `gemv_parallel_bytes` is a live knob: the byte floor forced to `0` (parallelize any
+/// gemv) or `usize::MAX` (never) must both produce the correct matrix·vector result.
+#[test]
+fn gemv_parallel_bytes_route_correct() {
+    let prev = tuning::gemv_parallel_bytes();
+    let (m, k, n) = (2000usize, 3usize, 1usize); // n == 1 gemv shape
+    let a: Vec<f64> = (0..m * k).map(|x| (x % 23) as f64 * 0.1 - 1.0).collect();
+    let b: Vec<f64> = (0..k * n).map(|x| (x % 19) as f64 * 0.2 - 1.5).collect();
+    let cref = naive_col(&a, &b, m, k, n);
+    for &force in &[0usize, usize::MAX] {
+        tuning::set_gemv_parallel_bytes(force);
+        let mut cc = vec![0.0f64; m * n];
+        gemm(
+            1.0,
+            MatRef::from_col_major(&a, m, k),
+            MatRef::from_col_major(&b, k, n),
+            0.0,
+            MatMut::from_col_major(&mut cc, m, n),
+            Parallelism::Rayon(0),
+        );
+        for (got, exp) in cc.iter().zip(&cref) {
+            assert!(
+                (got - exp).abs() <= 1e-10 * (1.0 + exp.abs()),
+                "floor={force}: {got} vs {exp}"
+            );
+        }
+    }
+    tuning::set_gemv_parallel_bytes(prev);
+}
+
+/// `gemv_thread_cap` is a live knob: capping the bandwidth-bound worker count at `1`
+/// (single worker) or a large value (many) must leave a parallel gemv both correct against
+/// a naive reference and bit-identical to the serial run (output-partitioning is exact).
+#[test]
+fn gemv_thread_cap_stays_correct() {
+    let prev = tuning::gemv_thread_cap();
+    // Large enough that the default byte floor is cleared and the cap actually bites.
+    let (m, k, n) = (200_000usize, 3usize, 1usize);
+    let a: Vec<f64> = (0..m * k).map(|x| (x % 31) as f64 * 0.05 - 0.7).collect();
+    let b: Vec<f64> = (0..k * n).map(|x| (x % 17) as f64 * 0.1 - 0.8).collect();
+    let cref = naive_col(&a, &b, m, k, n);
+    let serial = {
+        let mut cc = vec![0.0f64; m * n];
+        gemm(
+            1.0,
+            MatRef::from_col_major(&a, m, k),
+            MatRef::from_col_major(&b, k, n),
+            0.0,
+            MatMut::from_col_major(&mut cc, m, n),
+            Parallelism::Serial,
+        );
+        cc
+    };
+    for &cap in &[1usize, 64] {
+        tuning::set_gemv_thread_cap(cap);
+        let mut cc = vec![0.0f64; m * n];
+        gemm(
+            1.0,
+            MatRef::from_col_major(&a, m, k),
+            MatRef::from_col_major(&b, k, n),
+            0.0,
+            MatMut::from_col_major(&mut cc, m, n),
+            Parallelism::Rayon(0),
+        );
+        for ((got, exp), ser) in cc.iter().zip(&cref).zip(&serial) {
+            assert!(
+                (got - exp).abs() <= 1e-10 * (1.0 + exp.abs()),
+                "cap={cap}: {got} vs {exp}"
+            );
+            assert_eq!(
+                got, ser,
+                "cap={cap}: parallel gemv must equal serial bit-for-bit"
+            );
+        }
+    }
+    tuning::set_gemv_thread_cap(prev);
+}
+
+/// Output-partitioning of gemv and gevv adds no cross-thread reduction, so a parallel run
+/// must be **bit-identical** to the serial one (not merely close). Sizes are chosen so the
+/// default byte floor is cleared and the work splits across several workers, with partial
+/// tiles / a sub-lane tail. The assertion holds regardless of how many workers the auto
+/// path picks, so it does not bake in a machine-specific thread count.
+#[test]
+fn gemv_gevv_serial_parallel_bit_identical() {
+    // gemv: m·k large enough to split; m not a multiple of the register-block width, so the
+    // sub-lane tail is exercised.
+    let (m, k) = (300_007usize, 5usize);
+    let a = mkvec(m * k, 1);
+    let x = mkvec(k, 2);
+    let run_gemv = |par| {
+        let mut c = vec![0.0f32; m];
+        gemm(
+            1.0,
+            MatRef::from_col_major(&a, m, k),
+            MatRef::from_col_major(&x, k, 1),
+            0.0,
+            MatMut::from_col_major(&mut c, m, 1),
+            par,
+        );
+        c
+    };
+    assert_eq!(
+        run_gemv(Parallelism::Serial),
+        run_gemv(Parallelism::Rayon(0)),
+        "gemv serial vs parallel must be bit-identical"
+    );
+
+    // gevv / skinny GEMM: enough C bytes that the ramp gives several workers; dims not
+    // multiples of MR/NR so partial tiles are exercised.
+    let (gm, gk, gn) = (1201usize, 3usize, 1199usize);
+    let ga = mkvec(gm * gk, 3);
+    let gb = mkvec(gk * gn, 4);
+    let run_gevv = |par| {
+        let mut c = vec![0.0f32; gm * gn];
+        gemm(
+            1.0,
+            MatRef::from_col_major(&ga, gm, gk),
+            MatRef::from_col_major(&gb, gk, gn),
+            0.0,
+            MatMut::from_col_major(&mut c, gm, gn),
+            par,
+        );
+        c
+    };
+    assert_eq!(
+        run_gevv(Parallelism::Serial),
+        run_gevv(Parallelism::Rayon(0)),
+        "gevv serial vs parallel must be bit-identical"
+    );
+}
+
+/// Small deterministic `f32` fill (a xorshift, so the values are not all equal and the
+/// reductions are non-trivial) for the bit-identity test.
+fn mkvec(n: usize, seed: u64) -> Vec<f32> {
+    let mut s = seed | 1;
+    (0..n)
+        .map(|_| {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+        })
+        .collect()
 }

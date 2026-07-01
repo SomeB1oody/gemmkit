@@ -112,7 +112,82 @@ impl Parallelism {
             }
         }
     }
+
+    /// Resolve the worker count for a **bandwidth-bound** shape (gemv / gevv) touching
+    /// `bytes_touched` bytes over `rows` partitionable output rows.
+    ///
+    /// Unlike [`Parallelism::resolve`] — whose `cbrt(mnk)` ramp models *compute* and
+    /// undercounts the linear memory work of a gemv (`mnk = m·k`, but the bytes are `~m·k`)
+    /// — this gates and ramps on memory: below a byte floor the data is cache-resident and
+    /// a single core already saturates its own bandwidth, so it stays serial; above it the
+    /// auto count ramps linearly in bytes and is capped by a topology bandwidth proxy,
+    /// because past a few cores more workers add no DRAM bandwidth (and eventually regress
+    /// on sync overhead). Below the byte floor the shape stays serial regardless of the
+    /// request (the same order as [`resolve`]'s work gate — tiny work never parallelizes);
+    /// above it an explicit `Rayon(n)` is honored (capped only by cores and rows), so the
+    /// scaling diagnostic can force any width on a large enough problem.
+    #[cfg_attr(not(feature = "parallel"), allow(unused_variables))]
+    pub(crate) fn resolve_bandwidth(self, bytes_touched: usize, rows: usize) -> usize {
+        let rows = rows.max(1);
+        match self {
+            Parallelism::Serial => 1,
+            #[cfg(not(feature = "parallel"))]
+            Parallelism::Rayon(_) => 1,
+            #[cfg(feature = "parallel")]
+            Parallelism::Rayon(req) => {
+                // Wasm without the threading opt-in.
+                if !RAYON_USABLE {
+                    return 1;
+                }
+                // Cache-resident / small: no DRAM bandwidth to win by threading.
+                if bytes_touched < tuning::gemv_parallel_bytes() {
+                    return 1;
+                }
+                // Explicit count: honor it, capped by cores and rows (like `resolve`), so a
+                // forced width is exact for the tests and the scaling diagnostic.
+                if req != 0 {
+                    return req.min(auto_threads()).min(rows).max(1);
+                }
+                // Auto: ramp linearly with the touched bytes (memory work is linear), then
+                // cap by the topology bandwidth proxy — the plateau where DRAM saturates.
+                let quantum = tuning::gemv_parallel_bytes().max(1);
+                let want = (bytes_touched / quantum).max(1);
+                want.min(bandwidth_cap())
+                    .min(auto_threads())
+                    .min(rows)
+                    .max(1)
+            }
+        }
+    }
 }
+
+/// Maximum worker count for a bandwidth-bound shape, from the `GEMMKIT_GEMV_THREAD_CAP`
+/// knob (`0` ⇒ this auto proxy; non-zero ⇒ verbatim). DRAM saturates at far fewer workers
+/// than the logical core count: SMT siblings share a core's load/store units and memory
+/// ports, and only a handful of physical cores saturate the memory controllers. No
+/// physical-core / memory-channel count is exposed (`l2.shared_by` is the GEMM-worker
+/// cluster size, `1` on x86/Neoverse), so quarter the logical count as a documented proxy
+/// (÷2 for SMT, ÷2 because roughly half the physical cores saturate DDR), floored at 2.
+/// Calibrated on Zen5, where a bandwidth-bound gemv plateaus around a quarter of the 32
+/// logical cores. A high-bandwidth shared-L2 part (Apple) wants more — raise the knob.
+#[cfg(feature = "parallel")]
+fn bandwidth_cap() -> usize {
+    match tuning::gemv_thread_cap() {
+        0 => (auto_threads() / 4).max(2),
+        v => v.max(1),
+    }
+}
+
+/// `Send + Sync` raw-pointer shim so worker closures can capture shared matrices. Soundness
+/// rests on the caller's invariants: workers write disjoint output tiles / private packing
+/// buffers and only read shared inputs, and the safe API validates that `C` does not alias
+/// `A`/`B`. Shared by the driver and the [`crate::special`] paths so the single unsafe
+/// Send/Sync justification lives in one place.
+#[derive(Copy, Clone)]
+pub(crate) struct Ptr<T>(pub(crate) *mut T);
+// SAFETY: see the type comment — access is disjoint by construction.
+unsafe impl<T> Send for Ptr<T> {}
+unsafe impl<T> Sync for Ptr<T> {}
 
 /// A shared, lock-free cursor that hands out contiguous job ranges on demand — the
 /// *dynamic* analogue of a static `n_jobs / n_threads` split.

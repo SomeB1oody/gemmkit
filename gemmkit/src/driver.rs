@@ -18,25 +18,17 @@ use core::mem::MaybeUninit;
 
 use crate::cache;
 use crate::kernel::{AlphaStatus, BetaStatus, KernelFamily, SCRATCH_LEN};
-use crate::parallel::{self, Parallelism};
+use crate::parallel::{self, Parallelism, Ptr};
 use crate::scalar::Scalar;
 use crate::simd::{KernelSimd, SimdOps};
 use crate::tuning;
 use crate::workspace::Workspace;
 
-/// `Send + Sync` raw-pointer shim so worker closures can capture the shared
-/// matrices. Soundness rests on the driver's invariants: workers write disjoint
-/// C tiles / A buffers and only read shared inputs, and `C` is validated not to
-/// alias `A`/`B` by the safe API layer.
-#[derive(Copy, Clone)]
-struct Ptr<T>(*mut T);
-// SAFETY: see the type comment — access is disjoint by construction.
-unsafe impl<T> Send for Ptr<T> {}
-unsafe impl<T> Sync for Ptr<T> {}
-
+/// Precomputed `alpha` state so the microkernel never compares floats. `alpha == 0` is
+/// handled upstream (routed to the scale-only path), so only One / Other reach here. Shared
+/// with the [`crate::special`] paths.
 #[inline]
-fn alpha_status<T: crate::scalar::Scalar>(a: T) -> AlphaStatus {
-    // `alpha == 0` is handled upstream, so only One / Other reach here.
+pub(crate) fn alpha_status<T: crate::scalar::Scalar>(a: T) -> AlphaStatus {
     if a == T::ONE {
         AlphaStatus::One
     } else {
@@ -44,8 +36,9 @@ fn alpha_status<T: crate::scalar::Scalar>(a: T) -> AlphaStatus {
     }
 }
 
+/// Precomputed `beta` state for the microkernel. Shared with the [`crate::special`] paths.
 #[inline]
-fn beta_status<T: crate::scalar::Scalar>(b: T) -> BetaStatus {
+pub(crate) fn beta_status<T: crate::scalar::Scalar>(b: T) -> BetaStatus {
     if b == T::ZERO {
         BetaStatus::Zero
     } else if b == T::ONE {
