@@ -94,16 +94,15 @@ pub(crate) unsafe fn run<T: GemmScalar>(
             // and every element runs *serially* on one worker — so no element is split across
             // workers and the batch is bit-identical to the serial run for any worker count,
             // independent of whether a route is serial==parallel bit-identical. Each worker packs
-            // through its own persistent batched pool (reused across calls), distinct from the plain
-            // `with_thread_pool` one so a worker running its inline inner work while
-            // `gemm_batched`'s outer `with_thread_pool` holds the plain pool reuses a real buffer
-            // rather than the re-entrant fresh-scratch fallback.
+            // through the re-entrancy-safe thread-local pool; the calling thread, which still holds
+            // that pool via `gemm_batched`'s outer `with_thread_pool`, takes the fresh-scratch
+            // fallback for the share it runs inline while the other workers reuse theirs.
             BatchPlan::BatchParallel(n_threads) => {
                 let (ap, bp, cp) = (Ptr(a as *mut T), Ptr(b as *mut T), Ptr(c));
                 let cur = JobCursor::new(batch, parallel::job_grain(batch, n_threads));
                 parallel::for_each_worker(n_threads, |_tid| {
                     let (ap, bp, cp) = (ap, bp, cp);
-                    workspace::with_batch_pool(|wsb| {
+                    workspace::with_thread_pool(|wsb| {
                         while let Some((s, e)) = cur.next_chunk() {
                             for bi in s..e {
                                 let task = Task {
@@ -173,7 +172,7 @@ pub(crate) unsafe fn run_ptr<T: GemmScalar>(
         parallel::for_each_worker(n_threads, |_tid| {
             // Capture the whole `Ptr` (Send + Sync), not its raw-pointer field.
             let bp = base;
-            workspace::with_batch_pool(|wsb| {
+            workspace::with_thread_pool(|wsb| {
                 while let Some((s, e)) = cur.next_chunk() {
                     for pi in s..e {
                         let task = (*(bp.0 as *const GemmProblem<T>).add(pi)).task();
