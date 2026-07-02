@@ -35,10 +35,11 @@
 //!
 //! ## Features
 //!
-//! * `std` (default) — runtime cache/feature detection and the thread-local
-//!   workspace pool.
-//! * `parallel` (default) — rayon multithreading. With it off everything still
-//!   compiles and runs single-threaded.
+//! * `std` (default) — runtime cache/CPU-feature detection, the
+//!   `GEMMKIT_REQUIRE_ISA` and tuning env knobs, and the thread-local workspace
+//!   pool. **With `std` off the crate is `#![no_std]`**, needing only `core` + `alloc`
+//! * `parallel` (default, implies `std`) — rayon multithreading. With it off
+//!   everything still compiles and runs single-threaded.
 //! * `complex` — complex GEMM over `c32`/`c64` with optional conjugation
 //!   ([`gemm_cplx`]); pulls in `num-complex`.
 //! * `half` — `f16`/`bf16` mixed-precision GEMM (`f32` accumulate); pulls in `half`.
@@ -47,8 +48,13 @@
 //! These three element-type families are off by default, so a plain `f32`/`f64`
 //! build pays for none of their codegen or dependencies.
 
+#![cfg_attr(not(feature = "std"), no_std)]
 #![warn(missing_docs)]
 #![allow(clippy::missing_safety_doc)] // safety documented at the module / contract level
+
+// Heap-backed packing needs `alloc` in both builds; keep it unconditional so
+// downstream `alloc::` imports resolve under `std` too, with no cfg noise.
+extern crate alloc;
 
 pub mod cache;
 pub mod driver;

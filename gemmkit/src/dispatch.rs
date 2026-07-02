@@ -26,6 +26,15 @@
 //! is read once (the choice is memoized), so set it in the process environment before
 //! the first GEMM call.
 
+#![cfg_attr(
+    not(feature = "std"),
+    allow(
+        clippy::assertions_on_constants,
+        clippy::nonminimal_bool,
+        clippy::eq_op
+    )
+)]
+
 #[cfg(feature = "std")]
 use std::sync::OnceLock;
 
@@ -70,6 +79,23 @@ use crate::simd::{ScalarTok, SimdOps};
 use crate::special::{gemv, small_k, small_mn};
 use crate::tuning;
 use crate::workspace::Workspace;
+
+/// x86 ISA probe for the `select_*` ladders: the runtime `is_x86_feature_detected!`
+/// with `std`, else a compile-time `cfg!(target_feature = …)` — off `std` there is no
+/// runtime CPU detection (`raw-cpuid` is `std`-gated), so a no_std build runs whatever
+/// its compile-time target-features guarantee.
+#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+macro_rules! x86_isa_detected {
+    ($feat:tt) => {
+        is_x86_feature_detected!($feat)
+    };
+}
+#[cfg(all(not(feature = "std"), any(target_arch = "x86", target_arch = "x86_64")))]
+macro_rules! x86_isa_detected {
+    ($feat:tt) => {
+        cfg!(target_feature = $feat)
+    };
+}
 
 /// A fully described GEMM problem (`C <- alpha·A·B + beta·C`) with raw pointers
 /// and `isize` strides. This is the homogeneous-type dispatch boundary.
@@ -1254,7 +1280,7 @@ fn select_f32() -> Dispatched<f32> {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         ForcedIsa::Fma => {
             assert!(
-                is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma"),
+                x86_isa_detected!("avx2") && x86_isa_detected!("fma"),
                 "GEMMKIT_REQUIRE_ISA=fma, but this CPU/emulator does not report avx2+fma"
             );
             return DISP_F32_FMA;
@@ -1262,7 +1288,7 @@ fn select_f32() -> Dispatched<f32> {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         ForcedIsa::Avx512F | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
             assert!(
-                is_x86_feature_detected!("avx512f"),
+                x86_isa_detected!("avx512f"),
                 "GEMMKIT_REQUIRE_ISA=avx512, but this CPU/emulator does not report avx512f"
             );
             return DISP_F32_AVX512;
@@ -1289,10 +1315,10 @@ fn select_f32() -> Dispatched<f32> {
     }
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
-        if is_x86_feature_detected!("avx512f") {
+        if x86_isa_detected!("avx512f") {
             return DISP_F32_AVX512;
         }
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if x86_isa_detected!("avx2") && x86_isa_detected!("fma") {
             return DISP_F32_FMA;
         }
     }
@@ -1325,7 +1351,7 @@ fn select_f64() -> Dispatched<f64> {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         ForcedIsa::Fma => {
             assert!(
-                is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma"),
+                x86_isa_detected!("avx2") && x86_isa_detected!("fma"),
                 "GEMMKIT_REQUIRE_ISA=fma, but this CPU/emulator does not report avx2+fma"
             );
             return DISP_F64_FMA;
@@ -1333,7 +1359,7 @@ fn select_f64() -> Dispatched<f64> {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         ForcedIsa::Avx512F | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
             assert!(
-                is_x86_feature_detected!("avx512f"),
+                x86_isa_detected!("avx512f"),
                 "GEMMKIT_REQUIRE_ISA=avx512, but this CPU/emulator does not report avx512f"
             );
             return DISP_F64_AVX512;
@@ -1360,10 +1386,10 @@ fn select_f64() -> Dispatched<f64> {
     }
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
-        if is_x86_feature_detected!("avx512f") {
+        if x86_isa_detected!("avx512f") {
             return DISP_F64_AVX512;
         }
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if x86_isa_detected!("avx2") && x86_isa_detected!("fma") {
             return DISP_F64_FMA;
         }
     }
@@ -1400,9 +1426,7 @@ fn select_f16() -> Dispatched<f16> {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         ForcedIsa::Fma => {
             assert!(
-                is_x86_feature_detected!("avx2")
-                    && is_x86_feature_detected!("fma")
-                    && is_x86_feature_detected!("f16c"),
+                x86_isa_detected!("avx2") && x86_isa_detected!("fma") && x86_isa_detected!("f16c"),
                 "GEMMKIT_REQUIRE_ISA=fma for f16, but this CPU does not report avx2+fma+f16c"
             );
             return DISP_F16_FMA;
@@ -1410,7 +1434,7 @@ fn select_f16() -> Dispatched<f16> {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         ForcedIsa::Avx512F | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
             assert!(
-                is_x86_feature_detected!("avx512f"),
+                x86_isa_detected!("avx512f"),
                 "GEMMKIT_REQUIRE_ISA=avx512, but this CPU/emulator does not report avx512f"
             );
             return DISP_F16_AVX512;
@@ -1433,13 +1457,10 @@ fn select_f16() -> Dispatched<f16> {
     }
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
-        if is_x86_feature_detected!("avx512f") {
+        if x86_isa_detected!("avx512f") {
             return DISP_F16_AVX512;
         }
-        if is_x86_feature_detected!("avx2")
-            && is_x86_feature_detected!("fma")
-            && is_x86_feature_detected!("f16c")
-        {
+        if x86_isa_detected!("avx2") && x86_isa_detected!("fma") && x86_isa_detected!("f16c") {
             return DISP_F16_FMA;
         }
     }
@@ -1474,7 +1495,7 @@ fn select_bf16() -> Dispatched<bf16> {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         ForcedIsa::Fma => {
             assert!(
-                is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma"),
+                x86_isa_detected!("avx2") && x86_isa_detected!("fma"),
                 "GEMMKIT_REQUIRE_ISA=fma, but this CPU/emulator does not report avx2+fma"
             );
             return DISP_BF16_FMA;
@@ -1482,7 +1503,7 @@ fn select_bf16() -> Dispatched<bf16> {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         ForcedIsa::Avx512F | ForcedIsa::Avx512Vnni => {
             assert!(
-                is_x86_feature_detected!("avx512f"),
+                x86_isa_detected!("avx512f"),
                 "GEMMKIT_REQUIRE_ISA=avx512, but this CPU/emulator does not report avx512f"
             );
             return DISP_BF16_AVX512;
@@ -1490,7 +1511,7 @@ fn select_bf16() -> Dispatched<bf16> {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         ForcedIsa::Avx512Bf16 => {
             assert!(
-                is_x86_feature_detected!("avx512bf16") && is_x86_feature_detected!("avx512f"),
+                x86_isa_detected!("avx512bf16") && x86_isa_detected!("avx512f"),
                 "GEMMKIT_REQUIRE_ISA=avx512bf16, but this CPU/emulator does not report avx512f+bf16"
             );
             return DISP_BF16_AVX512_DOT;
@@ -1514,13 +1535,13 @@ fn select_bf16() -> Dispatched<bf16> {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         // bf16 dot kernel first - `vdpbf16ps` ~doubles bf16
-        if is_x86_feature_detected!("avx512bf16") && is_x86_feature_detected!("avx512f") {
+        if x86_isa_detected!("avx512bf16") && x86_isa_detected!("avx512f") {
             return DISP_BF16_AVX512_DOT;
         }
-        if is_x86_feature_detected!("avx512f") {
+        if x86_isa_detected!("avx512f") {
             return DISP_BF16_AVX512;
         }
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if x86_isa_detected!("avx2") && x86_isa_detected!("fma") {
             return DISP_BF16_FMA;
         }
     }
@@ -2027,7 +2048,7 @@ fn select_i8() -> IntDispatched {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         ForcedIsa::Fma => {
             assert!(
-                is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma"),
+                x86_isa_detected!("avx2") && x86_isa_detected!("fma"),
                 "GEMMKIT_REQUIRE_ISA=fma, but this CPU/emulator does not report avx2+fma"
             );
             return DISP_I8_FMA;
@@ -2035,7 +2056,7 @@ fn select_i8() -> IntDispatched {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         ForcedIsa::Avx512F | ForcedIsa::Avx512Bf16 => {
             assert!(
-                is_x86_feature_detected!("avx512f"),
+                x86_isa_detected!("avx512f"),
                 "GEMMKIT_REQUIRE_ISA=avx512, but this CPU/emulator does not report avx512f"
             );
             return DISP_I8_AVX512;
@@ -2043,9 +2064,9 @@ fn select_i8() -> IntDispatched {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         ForcedIsa::Avx512Vnni => {
             assert!(
-                is_x86_feature_detected!("avx512vnni")
-                    && is_x86_feature_detected!("avx512bw")
-                    && is_x86_feature_detected!("avx512f"),
+                x86_isa_detected!("avx512vnni")
+                    && x86_isa_detected!("avx512bw")
+                    && x86_isa_detected!("avx512f"),
                 "GEMMKIT_REQUIRE_ISA=avx512vnni, but this CPU/emulator does not report avx512f+bw+vnni"
             );
             return DISP_I8_AVX512VNNI;
@@ -2071,19 +2092,19 @@ fn select_i8() -> IntDispatched {
         // VNNI dot kernel first — `vpdpbusd` is a structural win over widen-and-multiply,
         // except for small *parallel* problems, where it hands off to the widen kernel
         // (`small_par_fallback`) so its mandatory pack barrier does not dominate.
-        if is_x86_feature_detected!("avx512vnni")
-            && is_x86_feature_detected!("avx512bw")
-            && is_x86_feature_detected!("avx512f")
+        if x86_isa_detected!("avx512vnni")
+            && x86_isa_detected!("avx512bw")
+            && x86_isa_detected!("avx512f")
         {
             return IntDispatched {
                 small_par_fallback: Some(gemm_i8_avx512),
                 ..DISP_I8_AVX512VNNI
             };
         }
-        if is_x86_feature_detected!("avx512f") {
+        if x86_isa_detected!("avx512f") {
             return DISP_I8_AVX512;
         }
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if x86_isa_detected!("avx2") && x86_isa_detected!("fma") {
             return DISP_I8_FMA;
         }
     }
@@ -2347,7 +2368,7 @@ fn select_c32() -> CplxDispatched<C32> {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         ForcedIsa::Fma => {
             assert!(
-                is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma"),
+                x86_isa_detected!("avx2") && x86_isa_detected!("fma"),
                 "GEMMKIT_REQUIRE_ISA=fma, but this CPU/emulator does not report avx2+fma"
             );
             return CDISP_C32_FMA;
@@ -2355,7 +2376,7 @@ fn select_c32() -> CplxDispatched<C32> {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         ForcedIsa::Avx512F | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
             assert!(
-                is_x86_feature_detected!("avx512f"),
+                x86_isa_detected!("avx512f"),
                 "GEMMKIT_REQUIRE_ISA=avx512, but this CPU/emulator does not report avx512f"
             );
             return CDISP_C32_AVX512;
@@ -2378,10 +2399,10 @@ fn select_c32() -> CplxDispatched<C32> {
     }
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
-        if is_x86_feature_detected!("avx512f") {
+        if x86_isa_detected!("avx512f") {
             return CDISP_C32_AVX512;
         }
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if x86_isa_detected!("avx2") && x86_isa_detected!("fma") {
             return CDISP_C32_FMA;
         }
     }
@@ -2415,7 +2436,7 @@ fn select_c64() -> CplxDispatched<C64> {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         ForcedIsa::Fma => {
             assert!(
-                is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma"),
+                x86_isa_detected!("avx2") && x86_isa_detected!("fma"),
                 "GEMMKIT_REQUIRE_ISA=fma, but this CPU/emulator does not report avx2+fma"
             );
             return CDISP_C64_FMA;
@@ -2423,7 +2444,7 @@ fn select_c64() -> CplxDispatched<C64> {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         ForcedIsa::Avx512F | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
             assert!(
-                is_x86_feature_detected!("avx512f"),
+                x86_isa_detected!("avx512f"),
                 "GEMMKIT_REQUIRE_ISA=avx512, but this CPU/emulator does not report avx512f"
             );
             return CDISP_C64_AVX512;
@@ -2446,10 +2467,10 @@ fn select_c64() -> CplxDispatched<C64> {
     }
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
-        if is_x86_feature_detected!("avx512f") {
+        if x86_isa_detected!("avx512f") {
             return CDISP_C64_AVX512;
         }
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if x86_isa_detected!("avx2") && x86_isa_detected!("fma") {
             return CDISP_C64_FMA;
         }
     }

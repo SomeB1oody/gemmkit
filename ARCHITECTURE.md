@@ -406,7 +406,10 @@ scalar`) runs once; the winning monomorphized entry point is cached; later calls
 are a plain indirect call. **No `transmute`, no `AtomicPtr<()>`** — the slot is a
 typed function pointer. A per-`(type, ISA)` wrapper picks the `(MR_REG, NR)` tile
 and calls the generic driver; that is the *only* per-(type,ISA) code, and it is one
-line each.
+line each. Without `std` this collapses to compile-time selection: there is no
+`OnceLock` and no runtime detection (`raw-cpuid` is `std`-gated), so each `select_*`
+picks the kernel straight from `target_feature` cfgs and rebuilds the descriptor per
+call.
 
 ## L8 — API
 
@@ -452,14 +455,17 @@ array, batch on axis 0) and packed (`prepack_rhs`/`prepack_lhs` + their consumer
   caller-owned `Workspace` whose second-and-later uses allocate nothing. The pool
   accessor is **re-entrancy-safe**: if a GEMM is nested on a thread already inside
   one (nested rayon work-stealing), it hands out a fresh scratch that once rather
-  than double-borrowing the `RefCell`.
+  than double-borrowing the `RefCell`. Without `std` there is no pool (and no
+  threads to re-enter, since `parallel` requires `std`): each default call runs on
+  a fresh `Workspace`, so `gemm_with` is the zero-alloc-after-first path there.
 
 ## How this maps to the rigor criteria
 
 - **No macro-generated kernels** — each microkernel is a single generic function (the
-  real one; the one shared SoA complex one); the only `macro_rules!` in the crate
-  generate `SimdOps` *impl boilerplate* — the scalar token's element ops and the thin
-  complex glue — never kernel bodies.
+  real one; the one shared SoA complex one); the `macro_rules!` in the crate generate
+  `SimdOps` *impl boilerplate* (the scalar token's element ops and the thin complex
+  glue) plus a one-line compile-time-vs-runtime ISA-detection shim — never kernel
+  bodies.
 - **One kernel, all ISAs** — adding an ISA is a `SimdOps` impl + one `vectorize`
   trampoline + a few dispatch lines, with the driver, packing, blocking,
   parallelism, API, and microkernel all untouched. The AArch64 NEON token is the

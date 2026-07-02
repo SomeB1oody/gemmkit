@@ -59,13 +59,13 @@ impl Workspace {
         unsafe {
             let layout = Layout::from_size_align(new_cap, ALIGN).expect("valid layout");
             let p = if self.ptr.is_null() {
-                std::alloc::alloc(layout)
+                alloc::alloc::alloc(layout)
             } else {
                 let old = Layout::from_size_align(self.cap, ALIGN).expect("valid layout");
-                std::alloc::realloc(self.ptr, old, new_cap)
+                alloc::alloc::realloc(self.ptr, old, new_cap)
             };
             if p.is_null() {
-                std::alloc::handle_alloc_error(layout);
+                alloc::alloc::handle_alloc_error(layout);
             }
             self.ptr = p;
             self.cap = new_cap;
@@ -116,7 +116,7 @@ impl Drop for Workspace {
             // SAFETY: `ptr`/`cap` describe the live allocation.
             unsafe {
                 let layout = Layout::from_size_align(self.cap, ALIGN).expect("valid layout");
-                std::alloc::dealloc(self.ptr, layout);
+                alloc::alloc::dealloc(self.ptr, layout);
             }
         }
     }
@@ -129,6 +129,7 @@ pub(crate) struct Regions<T> {
     pub b_base: *mut T,
 }
 
+#[cfg(feature = "std")]
 std::thread_local! {
     static POOL: core::cell::RefCell<Workspace> = const { core::cell::RefCell::new(Workspace::new()) };
 }
@@ -139,9 +140,19 @@ std::thread_local! {
 /// the outer call still holds the pool. The pool is then already borrowed on this thread, so this
 /// hands out a fresh scratch workspace *that one time* rather than panicking. Packing buffers hold
 /// no result state, so the fallback is transparent — only the buffer reuse is skipped.
+#[cfg(feature = "std")]
 pub(crate) fn with_thread_pool<R>(f: impl FnOnce(&mut Workspace) -> R) -> R {
     POOL.with(|p| match p.try_borrow_mut() {
         Ok(mut ws) => f(&mut ws),
         Err(_) => f(&mut Workspace::new()),
     })
+}
+
+/// Run `f` on a fresh workspace. Without `std` there is no thread-local pool (and, since `parallel`
+/// requires `std`, no threads to re-enter): a per-call `Workspace` is correct. This trades the
+/// pool's allocation-amortization for portability — callers wanting reuse hold a [`Workspace`] and
+/// thread it through [`crate::gemm_with`], the zero-alloc-after-first path.
+#[cfg(not(feature = "std"))]
+pub(crate) fn with_thread_pool<R>(f: impl FnOnce(&mut Workspace) -> R) -> R {
+    f(&mut Workspace::new())
 }

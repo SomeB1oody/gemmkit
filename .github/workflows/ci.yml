@@ -163,6 +163,32 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check -p gemmkit --target i686-unknown-linux-gnu --all-features
 
+  # no_std targets
+  no_std:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rust: stable
+            target: x86_64-unknown-none
+          - rust: stable
+            target: aarch64-unknown-none
+          - rust: stable
+            target: wasm32-unknown-unknown
+    name: no_std/${{ matrix.target }}/${{ matrix.rust }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust }}
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: build no_std (default)
+        run: cargo build -p gemmkit --no-default-features --target ${{ matrix.target }}
+      - name: build no_std + element-type families (f16/bf16, i8, complex)
+        run: cargo build -p gemmkit --no-default-features --features half,int8,complex --target ${{ matrix.target }}
+
   lint:
     runs-on: ubuntu-latest
     strategy:

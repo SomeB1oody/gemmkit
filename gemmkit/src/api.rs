@@ -17,6 +17,8 @@ use crate::dispatch::ComplexScalar;
 use crate::dispatch::{self, GemmProblem, GemmScalar, PackedConsume, Task};
 use crate::parallel::Parallelism;
 use crate::workspace::{self, Workspace};
+use alloc::vec;
+use alloc::vec::Vec;
 
 /// An immutable strided matrix view over a slice.
 ///
