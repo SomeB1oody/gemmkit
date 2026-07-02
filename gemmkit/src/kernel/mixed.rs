@@ -268,7 +268,7 @@ where
 ///   operands are always packed (`FORCE_PACK_*`).
 /// * **Inner loop**: [`crate::simd::KernelSimd::dot_accumulate`] replaces the widen-FMA
 ///   loop. `OUT_IS_ACC = false` keeps `kc = k`, so the whole contraction accumulates in
-///   `f32` and rounds to bf16 once; alpha fold and narrow epilogue ([`mixed_epilogue`])
+///   `f32` and rounds to bf16 once; alpha fold and narrow epilogue (`mixed_epilogue`)
 ///   are shared with `MixedGemm`.
 ///
 /// `vdpbf16ps`'s fused 2-term dot rounds differently from the widen path, so the result is
@@ -301,7 +301,7 @@ impl KernelFamily for Bf16DotGemm {
     const DEPTH_MULTIPLE: usize = Self::Q;
 
     /// Pack the `mc × kc` LHS k-pair-interleaved (2 contiguous depth bf16 per row, a
-    /// `__m512bh` pair), via the shared [`pack_kgroup_panels`]. Identity transform; rows
+    /// `__m512bh` pair), via the shared `pack_kgroup_panels`. Identity transform; rows
     /// past `mc` and depth past `kc` pad with bf16 `0` (`xform(0)`).
     #[inline]
     unsafe fn pack_lhs(
@@ -320,7 +320,7 @@ impl KernelFamily for Bf16DotGemm {
     }
 
     /// Pack one `kc × nr` RHS panel k-pair-interleaved (2 contiguous depth bf16 per column,
-    /// ready for an i32 broadcast), via the shared [`pack_kgroup_panels`]. Identity
+    /// ready for an i32 broadcast), via the shared `pack_kgroup_panels`. Identity
     /// transform; columns past `nc` and depth past `kc` pad with bf16 `0`.
     #[inline]
     unsafe fn pack_rhs(

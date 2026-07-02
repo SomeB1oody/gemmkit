@@ -102,6 +102,65 @@ pub struct Task<T> {
     pub csc: isize,
 }
 
+/// One GEMM problem for the pointer-array batched API ([`crate::gemm_batched_ptr_unchecked`]):
+/// `C <- alpha·A·B + beta·C` over raw pointers and `isize` strides, so each element of a batch can
+/// have its own shape and live anywhere in memory (unlike the strided [`crate::gemm_batched`],
+/// which shares one shape and steps by a fixed batch stride).
+#[derive(Copy, Clone)]
+pub struct GemmProblem<T> {
+    /// Rows of A and C.
+    pub m: usize,
+    /// Shared dimension (cols of A, rows of B).
+    pub k: usize,
+    /// Cols of B and C.
+    pub n: usize,
+    /// Product scale.
+    pub alpha: T,
+    /// LHS base pointer.
+    pub a: *const T,
+    /// LHS row stride.
+    pub rsa: isize,
+    /// LHS column stride.
+    pub csa: isize,
+    /// RHS base pointer.
+    pub b: *const T,
+    /// RHS row stride.
+    pub rsb: isize,
+    /// RHS column stride.
+    pub csb: isize,
+    /// Accumulator scale.
+    pub beta: T,
+    /// Output base pointer.
+    pub c: *mut T,
+    /// Output row stride.
+    pub rsc: isize,
+    /// Output column stride.
+    pub csc: isize,
+}
+
+impl<T: Copy> GemmProblem<T> {
+    /// The equivalent internal [`Task`] (a field move; no allocation).
+    #[inline]
+    pub(crate) fn task(&self) -> Task<T> {
+        Task {
+            m: self.m,
+            k: self.k,
+            n: self.n,
+            alpha: self.alpha,
+            a: self.a,
+            rsa: self.rsa,
+            csa: self.csa,
+            b: self.b,
+            rsb: self.rsb,
+            csb: self.csb,
+            beta: self.beta,
+            c: self.c,
+            rsc: self.rsc,
+            csc: self.csc,
+        }
+    }
+}
+
 /// A GEMM whose RHS is already prepacked: `C <- alpha·A·(prepacked B) + beta·C`.
 /// Carries the blocking geometry the buffer was packed for (`nr`, `kc`, `nc`),
 /// which the driver reads back verbatim so a reused panel always matches its
@@ -471,6 +530,34 @@ unsafe fn run_typed_mixed<N, S, const MR_REG: usize, const NR: usize>(
 {
     unsafe {
         orient_transpose(&mut t);
+        // Small `m,n` + long `k` + contiguous-along-`k` layout: the horizontal path, widening
+        // `N → f32` on load and accumulating in `f32` (see [`run_typed`]'s float gate).
+        if t.m <= tuning::small_mn_dim()
+            && t.n <= tuning::small_mn_dim()
+            && t.k > tuning::small_k_threshold()
+            && t.csa == 1
+            && t.rsb == 1
+        {
+            small_mn::run_mixed::<N, S>(
+                simd,
+                t.m,
+                t.k,
+                t.n,
+                par,
+                t.alpha.widen(),
+                t.a,
+                t.rsa,
+                t.csa,
+                t.b,
+                t.rsb,
+                t.csb,
+                t.beta.widen(),
+                t.c,
+                t.rsc,
+                t.csc,
+            );
+            return;
+        }
         // Skinny / low-depth shape through the widen microkernel (see [`run_typed`]).
         if t.k <= tuning::small_k_threshold() {
             small_k::run::<MixedGemm<N>, S, MR_REG, NR>(
@@ -574,6 +661,35 @@ unsafe fn run_typed_bf16_dot<S, const MR_REG: usize, const NR: usize>(
 {
     unsafe {
         orient_transpose(&mut t);
+        // Small `m,n` + long `k` + contiguous layout: the horizontal widen path. Like the small-`k`
+        // case below it bypasses the dot kernel — a tiny `m,n` output folds nothing under
+        // `vdpbf16ps` and its `DEPTH_MULTIPLE = 2` pack is pure loss.
+        if t.m <= tuning::small_mn_dim()
+            && t.n <= tuning::small_mn_dim()
+            && t.k > tuning::small_k_threshold()
+            && t.csa == 1
+            && t.rsb == 1
+        {
+            small_mn::run_mixed::<bf16, S>(
+                simd,
+                t.m,
+                t.k,
+                t.n,
+                par,
+                t.alpha.widen(),
+                t.a,
+                t.rsa,
+                t.csa,
+                t.b,
+                t.rsb,
+                t.csb,
+                t.beta.widen(),
+                t.c,
+                t.rsc,
+                t.csc,
+            );
+            return;
+        }
         // Skinny / low-depth shape: route through the widen sibling `MixedGemm<bf16>`, not
         // the dot kernel — at `k <= threshold` `vdpbf16ps` folds nothing and its
         // `DEPTH_MULTIPLE = 2` pack is pure loss.

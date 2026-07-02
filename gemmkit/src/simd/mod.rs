@@ -386,7 +386,7 @@ pub trait SimdOps<T: Scalar>: Simd {
     /// [`crate::kernel::ComplexGemm`] microkernel cannot name through its
     /// `KernelSimd<T, T, T, T>` bound. The default is unreachable — only the complex
     /// `SimdOps<Complex<_>>` impls override it (each forwards to the shared, ISA-generic
-    /// [`complex::soa_microkernel`], which has the real ops concretely). The alpha/beta
+    /// `complex::soa_microkernel`, which has the real ops concretely). The alpha/beta
     /// state arrives as plain bools (the L1 `AlphaStatus`/`BetaStatus` would be an upward
     /// dependency from this L0 seam).
     ///

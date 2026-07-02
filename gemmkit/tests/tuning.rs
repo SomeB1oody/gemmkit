@@ -501,6 +501,57 @@ fn small_mn_route_correct() {
     tuning::set_small_mn_dim(pmn);
 }
 
+/// The mixed-precision (f16, f32-accumulate) horizontal route must be correct forced on
+/// (`usize::MAX`) and off (`0` → the widen driver), across `k` with partial tiles. Compared to an
+/// f32 reference with a tolerance (the narrow output rounds once in the epilogue).
+#[cfg(feature = "half")]
+#[test]
+fn small_mn_mixed_route_correct() {
+    use gemmkit::f16;
+    let _route = ROUTE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let pmn = tuning::small_mn_dim();
+    for &smn in &[usize::MAX, 0usize] {
+        tuning::set_small_mn_dim(smn);
+        for &(m, k, n) in &[(6, 20, 7), (16, 4096, 16), (4, 17, 4), (2, 33, 8)] {
+            let af: Vec<f32> = (0..m * k).map(|x| (x % 23) as f32 * 0.1 - 1.0).collect();
+            let bf: Vec<f32> = (0..k * n).map(|x| (x % 19) as f32 * 0.2 - 1.5).collect();
+            let a: Vec<f16> = af.iter().map(|&x| f16::from_f32(x)).collect();
+            let b: Vec<f16> = bf.iter().map(|&x| f16::from_f32(x)).collect();
+            // f32 reference over the widened inputs (row-major A, col-major B → col-major C).
+            let cref: Vec<f32> = {
+                let mut c = vec![0.0f32; m * n];
+                for j in 0..n {
+                    for i in 0..m {
+                        let mut s = 0.0f32;
+                        for p in 0..k {
+                            s += a[i * k + p].to_f32() * b[j * k + p].to_f32();
+                        }
+                        c[j * m + i] = s;
+                    }
+                }
+                c
+            };
+            let mut cc = vec![f16::from_f32(0.0); m * n];
+            gemm(
+                f16::from_f32(1.0),
+                MatRef::from_row_major(&a, m, k),
+                MatRef::from_col_major(&b, k, n),
+                f16::from_f32(0.0),
+                MatMut::from_col_major(&mut cc, m, n),
+                Parallelism::Rayon(0),
+            );
+            for (got, exp) in cc.iter().zip(&cref) {
+                let g = got.to_f32();
+                assert!(
+                    (g - exp).abs() <= 1e-2 * (1.0 + exp.abs()),
+                    "smn={smn} f16 {m}x{k}x{n}: {g} vs {exp}"
+                );
+            }
+        }
+    }
+    tuning::set_small_mn_dim(pmn);
+}
+
 /// The horizontal route output-partitions disjoint tiles with no cross-thread reduction, so a
 /// parallel run must equal the serial run **bit-for-bit**. Force the route on and drop the
 /// bandwidth floor so a `16×16` output actually splits across workers.

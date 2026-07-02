@@ -246,6 +246,33 @@ impl Parallelism {
             }
         }
     }
+
+    /// Worker count for a **heterogeneous** batch of `count` independent products with total work
+    /// `total_mnk`. Simpler than [`resolve_batch`]: elements vary in size, so there is no uniform
+    /// cache-residency test — just assign whole GEMMs to workers (each run serially) once the total
+    /// work clears the gate. Every element runs on one worker, so the batch is bit-identical across
+    /// worker counts. Returns `1` for the serial fallback.
+    #[cfg_attr(not(feature = "parallel"), allow(unused_variables))]
+    pub(crate) fn resolve_batch_flat(self, total_mnk: usize, count: usize) -> usize {
+        let count = count.max(1);
+        match self {
+            Parallelism::Serial => 1,
+            #[cfg(not(feature = "parallel"))]
+            Parallelism::Rayon(_) => 1,
+            #[cfg(feature = "parallel")]
+            Parallelism::Rayon(req) => {
+                if !RAYON_USABLE || total_mnk < tuning::parallel_threshold() {
+                    return 1;
+                }
+                let budget = if req != 0 {
+                    req.min(auto_threads())
+                } else {
+                    auto_threads()
+                };
+                budget.min(count).max(1)
+            }
+        }
+    }
 }
 
 /// Maximum worker count for a bandwidth-bound shape, from the `GEMMKIT_GEMV_THREAD_CAP`

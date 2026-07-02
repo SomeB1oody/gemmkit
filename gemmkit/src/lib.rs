@@ -65,7 +65,8 @@ mod special;
 mod workspace;
 
 pub use api::{
-    MatMut, MatRef, PackedLhs, PackedRhs, gemm, gemm_batched, gemm_batched_with, gemm_packed_a,
+    BatchProblem, MatMut, MatRef, PackedLhs, PackedRhs, gemm, gemm_batched,
+    gemm_batched_ptr_unchecked, gemm_batched_slice, gemm_batched_with, gemm_packed_a,
     gemm_packed_a_with, gemm_packed_b, gemm_packed_b_with, gemm_unchecked, gemm_unchecked_with,
     gemm_with, prepack_lhs, prepack_rhs,
 };
@@ -75,6 +76,7 @@ pub use api::{gemm_cplx, gemm_cplx_unchecked, gemm_cplx_unchecked_with, gemm_cpl
 pub use api::{gemm_i8, gemm_i8_unchecked, gemm_i8_with};
 #[cfg(feature = "complex")]
 pub use dispatch::ComplexScalar;
+pub use dispatch::GemmProblem;
 pub use dispatch::GemmScalar;
 pub use parallel::Parallelism;
 #[cfg(feature = "complex")]

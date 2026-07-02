@@ -281,7 +281,7 @@ impl KernelFamily for IntGemmVnni {
     const DEPTH_MULTIPLE: usize = Self::Q;
 
     /// Pack the `mc × kc` LHS k-quad-interleaved (4 contiguous depth bytes per row, ready
-    /// for `vpdpbusd`) via the shared [`pack_kgroup_panels`]. The transform offsets every
+    /// for `vpdpbusd`) via the shared `pack_kgroup_panels`. The transform offsets every
     /// byte `+128`; the pad (rows past `mc` / depth past `kc`) is `xform(0) = 128`,
     /// contributing nothing after the bias correction.
     #[inline]
@@ -303,7 +303,7 @@ impl KernelFamily for IntGemmVnni {
     }
 
     /// Pack one `kc × nr` RHS panel k-quad-interleaved (4 contiguous depth bytes per column,
-    /// ready for an i32 broadcast), via the shared [`pack_kgroup_panels`]. Values stay
+    /// ready for an i32 broadcast), via the shared `pack_kgroup_panels`. Values stay
     /// *signed* (identity transform); columns past `nc` and depth past `kc` pad with `0`
     /// (excluded from the column sum).
     #[inline]

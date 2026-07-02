@@ -1776,6 +1776,74 @@ fn bench_small_mn(m: usize, n: usize, k: usize, row_major_a: bool, par: Parallel
     );
 }
 
+/// `perf_small_mn` row for **f16** (f32-accumulate mixed horizontal kernel): the horizontal path
+/// vs the register-tiling driver, plus the `gemm` crate (same f16-in-f32-acc convention), all
+/// GFLOP/s in the fast-path layout (row-major A, col-major B). Confirms the widen-load horizontal
+/// path beats the driver's padded microtile the same way f32 does.
+#[cfg(all(feature = "half", not(target_family = "wasm")))]
+fn bench_small_mn_f16(m: usize, n: usize, k: usize, par: Parallelism) {
+    use gemmkit::f16;
+    let to16 = |v: &[f32]| v.iter().map(|&x| f16::from_f32(x)).collect::<Vec<_>>();
+    let a = to16(&fill(m * k, 1));
+    let b = to16(&fill(k * n, 2));
+    let mut c = vec![f16::from_f32(0.0); m * n];
+    let mut run = || {
+        measure(m, k, n, || {
+            gemm(
+                f16::from_f32(1.0),
+                MatRef::from_row_major(&a, m, k),
+                MatRef::from_col_major(&b, k, n),
+                f16::from_f32(0.0),
+                MatMut::from_col_major(&mut c, m, n),
+                par,
+            );
+        })
+    };
+    let horiz = with_route(usize::MAX, 0, &mut run);
+    let driver = with_route(0, 0, &mut run);
+    let gpar = if matches!(par, Parallelism::Serial) {
+        gemm::Parallelism::None
+    } else {
+        gemm::Parallelism::Rayon(0)
+    };
+    let g = measure(m, k, n, || unsafe {
+        gemm::gemm(
+            m,
+            n,
+            k,
+            c.as_mut_ptr(),
+            m as isize,
+            1, // dst col-major
+            false,
+            a.as_ptr(),
+            1,
+            k as isize, // lhs row-major (col_stride 1, row_stride k)
+            b.as_ptr(),
+            k as isize,
+            1, // rhs col-major
+            f16::from_f32(0.0),
+            f16::from_f32(1.0),
+            false,
+            false,
+            false,
+            gpar,
+        );
+    });
+    let mode = if matches!(par, Parallelism::Serial) {
+        "ser"
+    } else {
+        "par"
+    };
+    println!(
+        "  {m:>2}×{n:<2} k={k:<5} {mode}  horiz={:7.1}  driver={:7.1} ({:.2}× h)  gemm={:6.1} ({:.2}× h)",
+        horiz.median,
+        driver.median,
+        horiz.median / driver.median.max(1e-9),
+        g.median,
+        horiz.median / g.median.max(1e-9),
+    );
+}
+
 /// Small-matrix horizontal (inner-product) route: small `m,n`, long `k`. Sweeps the output
 /// dimensions against the contraction, forcing each of the three gemmkit routes (horizontal /
 /// small_k / driver) plus the `gemm`-crate and `matrixmultiply` baselines. The crossover — where
@@ -1804,6 +1872,18 @@ fn perf_small_mn() {
     // The route needs A rows / B cols unit-stride along `k`; a col-major A (strided along `k`)
     // would force a scalar dot that loses to the driver's packed microkernel, so the dispatch
     // gate excludes it and those shapes stay on the driver.
+
+    #[cfg(feature = "half")]
+    {
+        println!("\n  f16 (f32-accumulate mixed horizontal kernel):");
+        for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
+            for &s in &[4usize, 8, 16] {
+                for &k in &[256usize, 4096] {
+                    bench_small_mn_f16(s, s, k, par);
+                }
+            }
+        }
+    }
 }
 
 // ---- batched GEMM: perf_batched ----

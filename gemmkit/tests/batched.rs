@@ -2,7 +2,10 @@
 //! bit-for-bit (same route per element), stay serial==parallel bit-identical, and reject the
 //! invalid batch layouts its new validation is responsible for.
 
-use gemmkit::{MatMut, MatRef, Parallelism, Workspace, gemm, gemm_batched, gemm_batched_with};
+use gemmkit::{
+    BatchProblem, GemmProblem, MatMut, MatRef, Parallelism, Workspace, gemm, gemm_batched,
+    gemm_batched_ptr_unchecked, gemm_batched_slice, gemm_batched_with,
+};
 
 /// Deterministic `f32` fill (xorshift, non-constant so reductions are non-trivial).
 fn fill(n: usize, seed: u64) -> Vec<f32> {
@@ -142,20 +145,19 @@ fn batched_dram_bound_few_large_correct() {
     }
 }
 
-/// `gemm_batched` must not panic when called from **inside** a rayon worker: the batch-parallel
-/// schedule runs its own `for_each` there, whose inline work executes on the calling worker. Its
-/// workers pack through a *separate* per-thread pool from the one the outer `with_thread_pool`
-/// holds, so the inline re-entry cannot hit a `BorrowMutError`.
+/// `gemm_batched` must not panic when called from **inside** a rayon worker. The batch-parallel
+/// schedule blocks the calling worker in its own `for_each`, and rayon may work-steal *another*
+/// nested `gemm_batched` onto that worker while it already holds the thread-local pool; the pool
+/// accessor is re-entrancy-safe (hands out a fresh scratch that one time) so this can't
+/// `BorrowMutError`. Enough outer tasks to queue past the core count and actually force the steal.
 #[cfg(all(feature = "parallel", not(miri)))]
 #[test]
 fn batched_from_inside_rayon_worker_does_not_panic() {
     use rayon::prelude::*;
-    let (batch, m, k, n) = (256usize, 12, 48, 9);
+    let (batch, m, k, n) = (256usize, 12, 48, 9); // total work selects the batch-parallel schedule
     let a = packed(batch, m, k, 41);
     let b = packed(batch, k, n, 42);
-    // Several outer tasks each invoke gemm_batched from a rayon worker, on a shape whose total
-    // work selects the batch-parallel schedule.
-    let sums: Vec<f32> = (0..8u32)
+    let sums: Vec<f32> = (0..256u32)
         .into_par_iter()
         .map(|_| {
             let mut c = vec![0.0f32; batch * m * n];
@@ -174,10 +176,11 @@ fn batched_from_inside_rayon_worker_does_not_panic() {
             c.iter().sum()
         })
         .collect();
-    // All outer tasks computed the same product, so their checksums agree.
-    for s in &sums {
+    // Every outer task computed the same product on the same batch-parallel schedule (each element
+    // driver-serial on one worker), so the results — and thus the checksums — are bit-identical.
+    for &s in &sums {
         assert_eq!(
-            *s, sums[0],
+            s, sums[0],
             "nested gemm_batched produced inconsistent results"
         );
     }
@@ -420,4 +423,177 @@ fn batched_rejects_shape_mismatch() {
         (m * n) as isize,
         Parallelism::Serial,
     );
+}
+
+// ---- heterogeneous pointer-array batched: gemm_batched_slice / gemm_batched_ptr_unchecked ----
+
+/// One heterogeneous element: `(m, k, n, alpha, beta, a, b, c_init)`, column-major.
+type HeteroElem = (usize, usize, usize, f32, f32, Vec<f32>, Vec<f32>, Vec<f32>);
+
+/// Three heterogeneous column-major elements (different shapes, alpha/beta).
+fn hetero_case(seed: u64) -> [HeteroElem; 3] {
+    let mk = |m, k, n, s| {
+        (
+            m,
+            k,
+            n,
+            fill(m * k, s),
+            fill(k * n, s + 1),
+            fill(m * n, s + 2),
+        )
+    };
+    let (m0, k0, n0, a0, b0, c0) = mk(5, 7, 3, seed);
+    let (m1, k1, n1, a1, b1, c1) = mk(8, 4, 6, seed + 10);
+    let (m2, k2, n2, a2, b2, c2) = mk(2, 9, 4, seed + 20);
+    [
+        (m0, k0, n0, 1.0, 0.0, a0, b0, c0),
+        (m1, k1, n1, 2.5, -0.5, a1, b1, c1),
+        (m2, k2, n2, -1.0, 1.0, a2, b2, c2),
+    ]
+}
+
+/// The checked pointer-array form (`gemm_batched_slice`) must equal a loop of single `gemm(par)`
+/// calls bit-for-bit — heterogeneous shapes, per-element alpha/beta, both Serial and Rayon.
+#[test]
+fn batched_slice_matches_loop() {
+    for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
+        let case = hetero_case(1);
+        // Reference: one gemm() per element (C seeded from the shared init).
+        let mut refs: Vec<Vec<f32>> = case.iter().map(|e| e.7.clone()).collect();
+        for (e, cref) in case.iter().zip(refs.iter_mut()) {
+            let (m, k, n, alpha, beta, a, b, _) = e;
+            gemm(
+                *alpha,
+                MatRef::from_col_major(a, *m, *k),
+                MatRef::from_col_major(b, *k, *n),
+                *beta,
+                MatMut::from_col_major(cref, *m, *n),
+                par,
+            );
+        }
+        // Batched: distinct MatMut per element (disjoint by construction).
+        let mut c: Vec<Vec<f32>> = case.iter().map(|e| e.7.clone()).collect();
+        {
+            let mut probs: Vec<BatchProblem<'_, f32>> = c
+                .iter_mut()
+                .zip(case.iter())
+                .map(|(ci, e)| {
+                    let (m, k, n, alpha, beta, a, b, _) = e;
+                    BatchProblem {
+                        alpha: *alpha,
+                        a: MatRef::from_col_major(a, *m, *k),
+                        b: MatRef::from_col_major(b, *k, *n),
+                        beta: *beta,
+                        c: MatMut::from_col_major(ci, *m, *n),
+                    }
+                })
+                .collect();
+            gemm_batched_slice(&mut probs, par);
+        }
+        for (ci, cref) in c.iter().zip(&refs) {
+            assert_eq!(ci, cref, "gemm_batched_slice != gemm() loop (par={par:?})");
+        }
+    }
+}
+
+/// The unchecked pointer-array form must equal a loop of single `gemm(par)` calls bit-for-bit.
+#[test]
+fn batched_ptr_unchecked_matches_loop() {
+    for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
+        let case = hetero_case(2);
+        let mut refs: Vec<Vec<f32>> = case.iter().map(|e| e.7.clone()).collect();
+        for (e, cref) in case.iter().zip(refs.iter_mut()) {
+            let (m, k, n, alpha, beta, a, b, _) = e;
+            gemm(
+                *alpha,
+                MatRef::from_col_major(a, *m, *k),
+                MatRef::from_col_major(b, *k, *n),
+                *beta,
+                MatMut::from_col_major(cref, *m, *n),
+                par,
+            );
+        }
+        let mut c: Vec<Vec<f32>> = case.iter().map(|e| e.7.clone()).collect();
+        let problems: Vec<GemmProblem<f32>> = c
+            .iter_mut()
+            .zip(case.iter())
+            .map(|(ci, e)| {
+                let (m, k, n, alpha, beta, a, b, _) = e;
+                GemmProblem {
+                    m: *m,
+                    k: *k,
+                    n: *n,
+                    alpha: *alpha,
+                    a: a.as_ptr(),
+                    rsa: 1,
+                    csa: *m as isize,
+                    b: b.as_ptr(),
+                    rsb: 1,
+                    csb: *k as isize,
+                    beta: *beta,
+                    c: ci.as_mut_ptr(),
+                    rsc: 1,
+                    csc: *m as isize,
+                }
+            })
+            .collect();
+        // SAFETY: each element's pointers are valid for its shape; the C buffers are distinct Vecs
+        // (pairwise disjoint) and don't alias the A/B inputs.
+        unsafe { gemm_batched_ptr_unchecked(&problems, par) };
+        for (ci, cref) in c.iter().zip(&refs) {
+            assert_eq!(
+                ci, cref,
+                "gemm_batched_ptr_unchecked != gemm() loop (par={par:?})"
+            );
+        }
+    }
+}
+
+/// The heterogeneous batch runs each element serially on one worker, so serial == parallel
+/// bit-for-bit. Enough elements/work to actually split.
+#[test]
+fn batched_slice_serial_equals_parallel() {
+    let run = |par| {
+        // 40 elements, each 16×64×9 (routes through the horizontal kernel — element-serial).
+        let (m, k, n) = (16usize, 64usize, 9usize);
+        let a: Vec<Vec<f32>> = (0..40).map(|s| fill(m * k, s as u64 + 1)).collect();
+        let b: Vec<Vec<f32>> = (0..40).map(|s| fill(k * n, s as u64 + 100)).collect();
+        let mut c: Vec<Vec<f32>> = (0..40).map(|_| vec![0.0f32; m * n]).collect();
+        {
+            let mut probs: Vec<BatchProblem<'_, f32>> = c
+                .iter_mut()
+                .enumerate()
+                .map(|(i, ci)| BatchProblem {
+                    alpha: 1.0,
+                    a: MatRef::from_col_major(&a[i], m, k),
+                    b: MatRef::from_col_major(&b[i], k, n),
+                    beta: 0.0,
+                    c: MatMut::from_col_major(ci, m, n),
+                })
+                .collect();
+            gemm_batched_slice(&mut probs, par);
+        }
+        c.concat()
+    };
+    assert_eq!(
+        run(Parallelism::Serial),
+        run(Parallelism::Rayon(0)),
+        "heterogeneous batch serial must equal parallel bit-for-bit"
+    );
+}
+
+#[test]
+#[should_panic(expected = "!= B.rows")]
+fn batched_slice_rejects_shape_mismatch() {
+    let a = fill(4 * 3, 1);
+    let b = fill(5 * 2, 2); // B.rows (5) != A.cols (3)
+    let mut c = vec![0.0f32; 4 * 2];
+    let mut probs = [BatchProblem {
+        alpha: 1.0,
+        a: MatRef::from_col_major(&a, 4, 3),
+        b: MatRef::from_col_major(&b, 5, 2),
+        beta: 0.0,
+        c: MatMut::from_col_major(&mut c, 4, 2),
+    }];
+    gemm_batched_slice(&mut probs, Parallelism::Serial);
 }
