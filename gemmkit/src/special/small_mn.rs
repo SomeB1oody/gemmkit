@@ -37,6 +37,12 @@ use crate::simd::SimdOps;
 /// path when A/B spill L1 into L2. Calibrated on Zen5 (AVX-512): `4×4` = 16 accumulators + 4
 /// A-vectors + 1 B-vector = 21 of 32 `zmm`. A 16-vector ISA (x86 FMA / wasm) would spill this
 /// tile and wants a smaller one; NEON's 32 vectors do not.
+///
+/// Confirmed on M4 (NEON): `4×4` is optimal there too. Enlarging the accumulator block
+/// regresses sharply — `4×6`/`6×4`/`5×5` (29-31 `MT·NT+MT+1` live vectors) all peak at
+/// 44-62 GFLOP/s vs `4×4`'s ~120, because LLVM spills the larger accumulator array on NEON.
+/// `4×4` is the same low-register-pressure regime (21 of 32, ~11 spare for the wide OoO
+/// window's rename headroom) the production NEON microkernel uses.
 const MT: usize = 4;
 const NT: usize = 4;
 

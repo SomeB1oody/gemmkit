@@ -230,15 +230,35 @@ impl Parallelism {
                     // Enough independent elements to keep every worker busy on its own.
                     return BatchPlan::BatchParallel(budget);
                 }
-                // Fewer elements than workers. A DRAM-bound element (working set spills L2) scales
-                // across cores, so hand it the whole machine in turn — but only for `m, n > 1`
-                // (whose route reduces each output within one worker, so splitting it across
-                // workers keeps the batch reproducible); a gemv-shaped element stays
-                // one-core-per-element.
-                let elem_bytes = (m.saturating_mul(k) + k.saturating_mul(n) + m.saturating_mul(n))
+                // Fewer elements than workers: split each element across the machine in turn
+                // (`SequentialInternal`) vs run `batch` elements one-per-worker, cache-hot
+                // (`BatchParallel`). Only `m, n > 1` shapes may split (their route reduces each
+                // output within one worker, so splitting stays reproducible); a gemv-shaped
+                // element stays one-core-per-element.
+                let elem_bytes = m
+                    .saturating_mul(k)
+                    .saturating_add(k.saturating_mul(n))
+                    .saturating_add(m.saturating_mul(n))
                     .saturating_mul(sizeof);
-                let l2 = crate::cache::topology().l2.effective_bytes().max(1);
-                if m > 1 && n > 1 && elem_bytes > l2 {
+                // x86 (private per-core L2): a cache-resident element does not scale internally,
+                // so the 1-D residency test holds — split only when it spills the per-core L2.
+                #[cfg(not(target_arch = "aarch64"))]
+                let split_wins = elem_bytes > crate::cache::topology().l2.effective_bytes().max(1);
+                // aarch64 (Apple shared cluster-L2 + high unified bandwidth): even an L2-resident
+                // element scales across the cluster's cores, so residency alone is the wrong test.
+                // The crossover is 2-D — `BatchParallel(batch)` wastes `budget - batch` cores, so
+                // it only wins once `batch` is large enough that the per-batch-worker share
+                // `elem_bytes / batch` drops below ~a few L1s (cache-hot one-per-worker beats
+                // spreading). Calibrated on M4 Max (loop_par ≈ SequentialInternal): SeqInternal
+                // wins 512³ b≤8, 384³ b≤4, 256³ b=2; BatchParallel the rest. The old
+                // `elem_bytes > l2.effective` (3.2 MiB) missed all of these, so 512³ ran
+                // BatchParallel(2) at 0.28× of the per-element split.
+                #[cfg(target_arch = "aarch64")]
+                let split_wins = {
+                    const SEQ_INTERNAL_BYTES_PER_WORKER: usize = 320 * 1024;
+                    elem_bytes > batch.saturating_mul(SEQ_INTERNAL_BYTES_PER_WORKER)
+                };
+                if m > 1 && n > 1 && split_wins {
                     BatchPlan::SequentialInternal
                 } else {
                     BatchPlan::BatchParallel(batch)
