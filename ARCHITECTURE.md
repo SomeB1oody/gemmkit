@@ -424,14 +424,24 @@ line each.
   outputs are disjoint and don't alias the inputs, leaving only shape/bounds validation; the
   unchecked form takes raw `GemmProblem` descriptors. Both drive the same batch-level parallelism
   (`special::batched::run_ptr`, `resolve_batch_flat` — each element serial on one worker).
-- **Unchecked** ([`gemm_unchecked`]): the raw pointer + `isize` stride engine for
-  advanced callers (e.g. the ndarray adapter) that validate their own inputs and
-  may use negative strides.
+- **Packed** ([`prepack_rhs`]/[`gemm_packed_b`], [`prepack_lhs`]/[`gemm_packed_a`]): pre-pack one
+  reused operand once into the micropanel layout, then skip the per-call repack across many products
+  (the fixed-weight inference pattern). RHS-packed needs column-major-ish C, LHS-packed
+  row-major-ish — the no-swap orientation the prepacked operand was laid out for.
+- **Unchecked** ([`gemm_unchecked`], plus a raw-pointer sibling for every safe entry:
+  `gemm_batched_unchecked`, `prepack_rhs_unchecked`/`gemm_packed_b_unchecked`,
+  `prepack_lhs_unchecked`/`gemm_packed_a_unchecked`, `gemm_i8_unchecked`, `gemm_cplx_unchecked` —
+  each with a `_with` caller-owned-`Workspace` form): the raw pointer + `isize` stride engine for
+  advanced callers (e.g. the ndarray adapter) that validate their own inputs and may use negative
+  strides. Each safe entry is exactly its bounds/alias/orientation checks followed by a forward to
+  the matching unchecked engine, so the checked and raw paths never diverge.
 
 `gemmkit-ndarray` is a thin adapter: it accepts `&ArrayBase<S, Ix2>` for any
 `S: Data` (both `ArrayView2` and `&Array2`), reads the pointer and strides, and
 forwards to the unchecked engine — so C-order, F-order, general-stride, and
 reversed views all work without copying. `dot` is the `.dot()`-style convenience.
+The same thin-wrapper treatment covers the batched (`gemm_batched`/`dot_batched` over an `Ix3`
+array, batch on axis 0) and packed (`prepack_rhs`/`prepack_lhs` + their consumers) raw entries.
 
 ## Cross-cutting
 

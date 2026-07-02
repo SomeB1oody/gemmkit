@@ -471,7 +471,8 @@ pub fn gemm_batched_with<T: GemmScalar>(
     // in bounds, the C outputs are pairwise disjoint and address uniquely, and C does not alias
     // A/B.
     unsafe {
-        crate::special::batched::run(
+        gemm_batched_unchecked_with(
+            ws,
             batch,
             a.rows,
             a.cols,
@@ -489,6 +490,123 @@ pub fn gemm_batched_with<T: GemmScalar>(
             c.data.as_mut_ptr(),
             c.rs,
             c.cs,
+            c_batch_stride,
+            par,
+        );
+    }
+}
+
+/// The raw strided-batched engine: [`gemm_batched`] over pointers and `isize` strides, with **no**
+/// bounds/alias/shape checks. Element `e` is based at `a + e·a_batch_stride` / `b + e·b_batch_stride`
+/// / `c + e·c_batch_stride`, all sharing the single-element shape `(m, k, n)` and element strides.
+/// The raw counterpart of [`gemm_batched`], for adapters (e.g. an ndarray `Array3`, batch on axis 0)
+/// and FFI callers that supply their own valid pointers / arbitrary strides. Uses the thread-local
+/// workspace pool.
+///
+/// # Safety
+/// For every element `e in 0..batch`: `a`/`b` are valid for reads and `c` for read+write over every
+/// `(i, j)` implied by `(m, k, n)` and the element strides at the batch-strided base; the `batch`
+/// `C` regions are pairwise disjoint and none aliases any `A`/`B`; and when `beta == 0`, `c` need not
+/// be initialized. A batch stride may be `0` (broadcast) only for the read-only `A`/`B`, never `C`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gemm_batched_unchecked<T: GemmScalar>(
+    batch: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    alpha: T,
+    a: *const T,
+    rsa: isize,
+    csa: isize,
+    a_batch_stride: isize,
+    b: *const T,
+    rsb: isize,
+    csb: isize,
+    b_batch_stride: isize,
+    beta: T,
+    c: *mut T,
+    rsc: isize,
+    csc: isize,
+    c_batch_stride: isize,
+    par: Parallelism,
+) {
+    // SAFETY: preconditions forwarded to the caller (see this fn's # Safety).
+    unsafe {
+        workspace::with_thread_pool(|ws| {
+            gemm_batched_unchecked_with(
+                ws,
+                batch,
+                m,
+                k,
+                n,
+                alpha,
+                a,
+                rsa,
+                csa,
+                a_batch_stride,
+                b,
+                rsb,
+                csb,
+                b_batch_stride,
+                beta,
+                c,
+                rsc,
+                csc,
+                c_batch_stride,
+                par,
+            );
+        });
+    }
+}
+
+/// As [`gemm_batched_unchecked`] but with a caller-owned [`Workspace`].
+///
+/// # Safety
+/// See [`gemm_batched_unchecked`].
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gemm_batched_unchecked_with<T: GemmScalar>(
+    ws: &mut Workspace,
+    batch: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    alpha: T,
+    a: *const T,
+    rsa: isize,
+    csa: isize,
+    a_batch_stride: isize,
+    b: *const T,
+    rsb: isize,
+    csb: isize,
+    b_batch_stride: isize,
+    beta: T,
+    c: *mut T,
+    rsc: isize,
+    csc: isize,
+    c_batch_stride: isize,
+    par: Parallelism,
+) {
+    // SAFETY: the caller guarantees per-element pointer validity, pairwise-disjoint `C` regions that
+    // don't alias `A`/`B`, and that `beta == 0` may leave `C` uninitialized (see # Safety).
+    unsafe {
+        crate::special::batched::run(
+            batch,
+            m,
+            k,
+            n,
+            alpha,
+            a,
+            rsa,
+            csa,
+            a_batch_stride,
+            b,
+            rsb,
+            csb,
+            b_batch_stride,
+            beta,
+            c,
+            rsc,
+            csc,
             c_batch_stride,
             par,
             ws,
@@ -687,7 +805,22 @@ impl<T> PackedRhs<T> {
 /// If `B`'s view addresses outside its slice (same bounds check as [`gemm`]).
 pub fn prepack_rhs<T: GemmScalar>(b: MatRef<'_, T>) -> PackedRhs<T> {
     check_view(b.data, b.rows, b.cols, b.rs, b.cs, "B");
-    let (k, n) = (b.rows, b.cols);
+    // SAFETY: `b` is validated in-bounds directly above.
+    unsafe { prepack_rhs_unchecked(b.data.as_ptr(), b.rs, b.cs, b.rows, b.cols) }
+}
+
+/// As [`prepack_rhs`] but over a raw `k × n` `B` pointer + strides, with **no** bounds check — the
+/// raw counterpart for adapters / FFI that validate their own inputs.
+///
+/// # Safety
+/// `b` must be valid for reads at every offset `i·rsb + j·csb`, for `i in 0..k` and `j in 0..n`.
+pub unsafe fn prepack_rhs_unchecked<T: GemmScalar>(
+    b: *const T,
+    rsb: isize,
+    csb: isize,
+    k: usize,
+    n: usize,
+) -> PackedRhs<T> {
     // Resolve the panel geometry through the same ISA tile the consuming call will
     // use; the `m = 65` sentinel dodges the tiny-matrix branch so the geometry is
     // `m`-independent (the consume reads it back verbatim). Block with the packed
@@ -710,21 +843,11 @@ pub fn prepack_rhs<T: GemmScalar>(b: MatRef<'_, T>) -> PackedRhs<T> {
     let mut buf = vec![T::ZERO; total];
     if total > 0 {
         // SAFETY: `buf` holds `ceil(n/nr)*nr*k_pad` elements (the exact layout size, with
-        // the depth padded to the dispatched family's `DEPTH_MULTIPLE`); `b` is validated
-        // in-bounds above; `pack_rhs_full` writes only that range.
+        // the depth padded to the dispatched family's `DEPTH_MULTIPLE`); `b` is caller-promised
+        // valid for the `(k, n)` strided reads; `pack_rhs_full` writes only that range.
         // `GemmScalar::pack_rhs_full` selects the right kernel family per type.
         unsafe {
-            T::pack_rhs_full(
-                buf.as_mut_ptr(),
-                b.data.as_ptr(),
-                b.rs,
-                b.cs,
-                k,
-                n,
-                kc,
-                nc,
-                nr,
-            );
+            T::pack_rhs_full(buf.as_mut_ptr(), b, rsb, csb, k, n, kc, nc, nr);
         }
     }
     PackedRhs {
@@ -810,37 +933,107 @@ pub fn gemm_packed_b_with<T: GemmScalar>(
         panic!("gemmkit: C aliases A");
     }
 
-    // A prepacked B is only valid for the no-swap orientation. The engine computes
-    // Cᵀ = Bᵀ·Aᵀ when C is row-major-ish (|csc| < |rsc|), which would make the
-    // prepacked operand play the LHS role — wrong layout. Require column-major-ish
-    // C and direct callers to plain `gemm` otherwise.
+    // SAFETY: A/C strides are in bounds and C does not alias A (checked above).
+    unsafe {
+        gemm_packed_b_unchecked_with(
+            ws,
+            alpha,
+            a.rows,
+            a.data.as_ptr(),
+            a.rs,
+            a.cs,
+            packed,
+            beta,
+            c.data.as_mut_ptr(),
+            c.rs,
+            c.cs,
+            par,
+        );
+    }
+}
+
+/// As [`gemm_packed_b`] but over raw `A`/`C` pointers + strides, with **no** bounds/alias checks.
+/// The shared `k` and output `n` come from `packed`; `m` is A's rows (= C's rows). Uses the
+/// thread-local workspace pool.
+///
+/// # Safety
+/// `a` valid for reads over `(m, packed.rows())` and `c` for read+write over `(m, packed.cols())`
+/// at the given strides; `c` does not alias `a`; and when `beta == 0`, `c` need not be initialized.
+///
+/// # Panics
+/// If `C` is not column-major-ish (`|csc| >= |rsc|`) — a prepacked RHS cannot serve a row-major C
+/// (use plain [`gemm`] for that layout).
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gemm_packed_b_unchecked<T: GemmScalar>(
+    alpha: T,
+    m: usize,
+    a: *const T,
+    rsa: isize,
+    csa: isize,
+    packed: &PackedRhs<T>,
+    beta: T,
+    c: *mut T,
+    rsc: isize,
+    csc: isize,
+    par: Parallelism,
+) {
+    // SAFETY: preconditions forwarded to the caller (see # Safety).
+    unsafe {
+        workspace::with_thread_pool(|ws| {
+            gemm_packed_b_unchecked_with(ws, alpha, m, a, rsa, csa, packed, beta, c, rsc, csc, par);
+        });
+    }
+}
+
+/// As [`gemm_packed_b_unchecked`] but with a caller-owned [`Workspace`].
+///
+/// # Safety
+/// See [`gemm_packed_b_unchecked`].
+///
+/// # Panics
+/// See [`gemm_packed_b_unchecked`].
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gemm_packed_b_unchecked_with<T: GemmScalar>(
+    ws: &mut Workspace,
+    alpha: T,
+    m: usize,
+    a: *const T,
+    rsa: isize,
+    csa: isize,
+    packed: &PackedRhs<T>,
+    beta: T,
+    c: *mut T,
+    rsc: isize,
+    csc: isize,
+    par: Parallelism,
+) {
+    // A prepacked B is only valid for the no-swap orientation
     assert!(
-        c.cs.unsigned_abs() >= c.rs.unsigned_abs(),
+        csc.unsigned_abs() >= rsc.unsigned_abs(),
         "gemmkit: gemm_packed_b requires column-major-ish C (|csc| >= |rsc|); a row-major C \
          would swap A/B and invalidate the prepacked RHS — use gemm() for that layout"
     );
-
-    // SAFETY: validated above — shapes agree, A/C strides are in bounds, C does not
-    // alias A, and the packed buffer (owned by `packed`, read-only) outlives the
-    // call and matches the recorded (nr, kc, nc) geometry.
+    // SAFETY: the caller guarantees A/C validity and that C does not alias A (see # Safety); the
+    // packed buffer (owned by `packed`, read-only) outlives the call and matches its recorded
+    // (nr, kc, nc) geometry.
     unsafe {
         dispatch::execute_packed(
             PackedConsume {
-                m: a.rows,
-                k: a.cols,
+                m,
+                k: packed.k,
                 n: packed.n,
                 alpha,
-                a: a.data.as_ptr(),
-                rsa: a.rs,
-                csa: a.cs,
+                a,
+                rsa,
+                csa,
                 packed: packed.buf.as_ptr(),
                 nr: packed.nr,
                 kc: packed.kc,
                 nc: packed.nc,
                 beta,
-                c: c.data.as_mut_ptr(),
-                rsc: c.rs,
-                csc: c.cs,
+                c,
+                rsc,
+                csc,
             },
             par,
             ws,
@@ -890,7 +1083,22 @@ impl<T> PackedLhs<T> {
 /// If `A`'s view addresses outside its slice (same bounds check as [`gemm`]).
 pub fn prepack_lhs<T: GemmScalar>(a: MatRef<'_, T>) -> PackedLhs<T> {
     check_view(a.data, a.rows, a.cols, a.rs, a.cs, "A");
-    let (m, k) = (a.rows, a.cols);
+    // SAFETY: `a` is validated in-bounds directly above.
+    unsafe { prepack_lhs_unchecked(a.data.as_ptr(), a.rs, a.cs, a.rows, a.cols) }
+}
+
+/// As [`prepack_lhs`] but over a raw `m × k` `A` pointer + strides, with **no** bounds check — the
+/// raw counterpart for adapters / FFI that validate their own inputs.
+///
+/// # Safety
+/// `a` must be valid for reads at every offset `i·rsa + j·csa`, for `i in 0..m` and `j in 0..k`.
+pub unsafe fn prepack_lhs_unchecked<T: GemmScalar>(
+    a: *const T,
+    rsa: isize,
+    csa: isize,
+    m: usize,
+    k: usize,
+) -> PackedLhs<T> {
     // Resolve the panel geometry through the consuming call's ISA tile, for the
     // *transposed* problem (whose RHS is this A): its `N` is the LHS's `m` rows, its
     // `K` is `k`. The `m = 65` sentinel for the transposed `M` (the unknown-here `n`)
@@ -913,21 +1121,11 @@ pub fn prepack_lhs<T: GemmScalar>(a: MatRef<'_, T>) -> PackedLhs<T> {
     let mut buf = vec![T::ZERO; total];
     if total > 0 {
         // SAFETY: `buf` holds `ceil(m/nr)*nr*k_pad` elements (the exact layout size, with
-        // the depth padded to the dispatched family's `DEPTH_MULTIPLE`); `a` is validated
-        // in-bounds above; `pack_lhs_full` writes only that range and selects the right
-        // kernel family per type.
+        // the depth padded to the dispatched family's `DEPTH_MULTIPLE`); `a` is caller-promised
+        // valid for the `(m, k)` strided reads; `pack_lhs_full` writes only that range and selects
+        // the right kernel family per type.
         unsafe {
-            T::pack_lhs_full(
-                buf.as_mut_ptr(),
-                a.data.as_ptr(),
-                a.rs,
-                a.cs,
-                m,
-                k,
-                kc,
-                nc,
-                nr,
-            );
+            T::pack_lhs_full(buf.as_mut_ptr(), a, rsa, csa, m, k, kc, nc, nr);
         }
     }
     PackedLhs {
@@ -1005,55 +1203,116 @@ pub fn gemm_packed_a_with<T: GemmScalar>(
         );
     }
 
-    // C must not alias B (it is written). The prepacked A is a separate owned
-    // buffer, so it cannot alias C.
+    // C must not alias B (it is written). The prepacked A is a separate owned buffer
     let cp = c.data.as_ptr();
     let cl = c.data.len();
     if overlaps(cp, cl, b.data.as_ptr(), b.data.len()) {
         panic!("gemmkit: C aliases B");
     }
 
-    // A prepacked A is only valid for the orientation in which A keeps the RHS role
-    // of the transposed product. The engine computes `Cᵀ = Bᵀ·Aᵀ` exactly when C is
-    // row-major-ish (`|csc| < |rsc|`); a column-major-ish C would leave A as the
-    // genuine LHS — the wrong role for a buffer packed as the transposed RHS.
-    // Require row-major-ish C and direct callers to plain `gemm` otherwise.
+    // SAFETY: B/C strides are in bounds and C does not alias B (checked above)
+    unsafe {
+        gemm_packed_a_unchecked_with(
+            ws,
+            alpha,
+            packed,
+            b.cols,
+            b.data.as_ptr(),
+            b.rs,
+            b.cs,
+            beta,
+            c.data.as_mut_ptr(),
+            c.rs,
+            c.cs,
+            par,
+        );
+    }
+}
+
+/// As [`gemm_packed_a`] but over raw `B`/`C` pointers + strides, with **no** bounds/alias checks.
+/// The shared `k` and output-row count `m` come from `packed`; `n` is B's cols (= C's cols). Uses
+/// the thread-local workspace pool.
+///
+/// # Safety
+/// `b` valid for reads over `(packed.cols(), n)` and `c` for read+write over `(packed.rows(), n)`
+/// at the given strides; `c` does not alias `b`; and when `beta == 0`, `c` need not be initialized.
+///
+/// # Panics
+/// If `C` is not row-major-ish (`|csc| <= |rsc|`) — a prepacked LHS cannot serve a column-major C
+/// (use plain [`gemm`] for that layout).
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gemm_packed_a_unchecked<T: GemmScalar>(
+    alpha: T,
+    packed: &PackedLhs<T>,
+    n: usize,
+    b: *const T,
+    rsb: isize,
+    csb: isize,
+    beta: T,
+    c: *mut T,
+    rsc: isize,
+    csc: isize,
+    par: Parallelism,
+) {
+    // SAFETY: preconditions forwarded to the caller (see # Safety).
+    unsafe {
+        workspace::with_thread_pool(|ws| {
+            gemm_packed_a_unchecked_with(ws, alpha, packed, n, b, rsb, csb, beta, c, rsc, csc, par);
+        });
+    }
+}
+
+/// As [`gemm_packed_a_unchecked`] but with a caller-owned [`Workspace`].
+///
+/// # Safety
+/// See [`gemm_packed_a_unchecked`].
+///
+/// # Panics
+/// See [`gemm_packed_a_unchecked`].
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gemm_packed_a_unchecked_with<T: GemmScalar>(
+    ws: &mut Workspace,
+    alpha: T,
+    packed: &PackedLhs<T>,
+    n: usize,
+    b: *const T,
+    rsb: isize,
+    csb: isize,
+    beta: T,
+    c: *mut T,
+    rsc: isize,
+    csc: isize,
+    par: Parallelism,
+) {
+    // A prepacked A is only valid for the orientation in which A keeps the RHS role of the
+    // transposed product
     assert!(
-        c.cs.unsigned_abs() <= c.rs.unsigned_abs(),
+        csc.unsigned_abs() <= rsc.unsigned_abs(),
         "gemmkit: gemm_packed_a requires row-major-ish C (|csc| <= |rsc|); a column-major C \
          would keep A in the LHS role and invalidate the prepacked LHS — use gemm() for that layout"
     );
 
-    // Reframe as the transposed product `Cᵀ = Bᵀ·(prepacked Aᵀ)` and reuse the
-    // existing prepacked-*RHS* engine — a prepacked LHS *is* the prepacked RHS of
-    // that transpose. So the genuine `B` becomes the in-place LHS (`a`) with its
-    // strides swapped (Bᵀ row/col = B col/row), the prepacked `A` stays the `packed`
-    // RHS, the dims swap (`m↔n`), and `C`'s strides swap so the driver writes Cᵀ down
-    // contiguous columns. The required row-major-ish C makes that transposed Cᵀ
-    // column-major-ish — the no-extra-swap orientation `execute_packed` expects, so
-    // no new dispatch path is needed.
-    //
-    // SAFETY: validated above — shapes agree, B/C strides are in bounds, C does not
-    // alias B, and the packed buffer (owned by `packed`, read-only) outlives the call
-    // and matches the recorded (nr, kc, nc) geometry.
+    // SAFETY: the caller guarantees B/C validity and that C does not alias B (see # Safety); the
+    // packed buffer (owned by `packed`, read-only) outlives the call and matches its recorded
+    // (nr, kc, nc) geometry.
     unsafe {
         dispatch::execute_packed(
             PackedConsume {
-                m: b.cols,
+                m: n,
                 k: packed.k,
                 n: packed.m,
                 alpha,
-                a: b.data.as_ptr(),
-                rsa: b.cs,
-                csa: b.rs,
+                a: b,
+                rsa: csb,
+                csa: rsb,
                 packed: packed.buf.as_ptr(),
                 nr: packed.nr,
                 kc: packed.kc,
                 nc: packed.nc,
                 beta,
-                c: c.data.as_mut_ptr(),
-                rsc: c.cs,
-                csc: c.rs,
+                c,
+                rsc: csc,
+                csc: rsc,
             },
             par,
             ws,
@@ -1430,6 +1689,56 @@ pub unsafe fn gemm_i8_unchecked(
                 ws,
             );
         });
+    }
+}
+
+/// As [`gemm_i8_unchecked`] but with a caller-owned [`Workspace`].
+///
+/// # Safety
+/// See [`gemm_i8_unchecked`].
+#[cfg(feature = "int8")]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gemm_i8_unchecked_with(
+    ws: &mut Workspace,
+    m: usize,
+    k: usize,
+    n: usize,
+    alpha: i32,
+    a: *const i8,
+    rsa: isize,
+    csa: isize,
+    b: *const i8,
+    rsb: isize,
+    csb: isize,
+    beta: i32,
+    c: *mut i32,
+    rsc: isize,
+    csc: isize,
+    par: Parallelism,
+) {
+    // SAFETY: the caller guarantees `a`/`b` valid for reads and `c` for read+write over the
+    // shape/strides, `c` not aliasing `a`/`b`, and `beta == 0` may leave `c` uninitialized.
+    unsafe {
+        dispatch::execute_int(
+            dispatch::IntTask {
+                m,
+                k,
+                n,
+                alpha,
+                a,
+                rsa,
+                csa,
+                b,
+                rsb,
+                csb,
+                beta,
+                c,
+                rsc,
+                csc,
+            },
+            par,
+            ws,
+        );
     }
 }
 
