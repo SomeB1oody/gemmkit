@@ -395,10 +395,9 @@ worker count.
   an element across workers, so it is used only for `m, n > 1` shapes (whose driver / small_k /
   small_mn route reduces each output within one worker, so serial and parallel agree under the
   current thread-independent blocking), never gemv; the serial and batch-parallel schedules run
-  each element serially, so they are **bit-identical across worker counts**. The
-  batch-parallel workers pack through a *second* per-thread pool (`workspace::BATCH_POOL`, reused
-  across calls) distinct from the plain thread-local pool, so a worker's inline inner work reuses a
-  real buffer while the outer `with_thread_pool` still holds the plain pool.
+  each element serially, so they are **bit-identical across worker counts**. Workers pack through
+  the re-entrancy-safe thread-local pool (see below), so a batch-parallel worker running an element
+  inline while `gemm_batched`'s outer `with_thread_pool` still holds the pool can't double-borrow.
 
 ## L7 — dispatch
 

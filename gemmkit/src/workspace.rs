@@ -131,34 +131,17 @@ pub(crate) struct Regions<T> {
 
 std::thread_local! {
     static POOL: core::cell::RefCell<Workspace> = const { core::cell::RefCell::new(Workspace::new()) };
-    // A second per-thread pool used only by the batched path's per-worker packing, *distinct* from
-    // `POOL` so a batch-parallel worker running inline under an outer `with_thread_pool` (holding
-    // `POOL`) reuses its own persistent scratch instead of falling back to a fresh one.
-    static BATCH_POOL: core::cell::RefCell<Workspace> = const { core::cell::RefCell::new(Workspace::new()) };
 }
 
-/// Run `f` with a pooled workspace from `pool`, **re-entrancy-safe**. Nested rayon can re-enter a
-/// GEMM on a thread that is already inside one (e.g. `gemm` called from a worker that, while blocked
-/// in its own `for_each`, work-steals another `gemm`): the pool is already borrowed on this thread,
-/// so this hands out a fresh scratch workspace *that one time* rather than panicking. Packing
-/// buffers hold no result state, so the fallback is transparent — only the reuse is skipped.
-fn with_pool<R>(
-    pool: &'static std::thread::LocalKey<core::cell::RefCell<Workspace>>,
-    f: impl FnOnce(&mut Workspace) -> R,
-) -> R {
-    pool.with(|p| match p.try_borrow_mut() {
+/// Run `f` with the current thread's pooled workspace, **re-entrancy-safe**. Nested rayon can
+/// re-enter a GEMM on a thread already inside one — a worker that, while blocked in its own
+/// `for_each`, work-steals another GEMM, or a batch-parallel worker running an element inline while
+/// the outer call still holds the pool. The pool is then already borrowed on this thread, so this
+/// hands out a fresh scratch workspace *that one time* rather than panicking. Packing buffers hold
+/// no result state, so the fallback is transparent — only the buffer reuse is skipped.
+pub(crate) fn with_thread_pool<R>(f: impl FnOnce(&mut Workspace) -> R) -> R {
+    POOL.with(|p| match p.try_borrow_mut() {
         Ok(mut ws) => f(&mut ws),
         Err(_) => f(&mut Workspace::new()),
     })
-}
-
-/// Run `f` with the current thread's pooled workspace.
-pub(crate) fn with_thread_pool<R>(f: impl FnOnce(&mut Workspace) -> R) -> R {
-    with_pool(&POOL, f)
-}
-
-/// Run `f` with the current thread's *batched* pool (see [`BATCH_POOL`]). Used by the batched
-/// path so each worker reuses persistent packing buffers across calls.
-pub(crate) fn with_batch_pool<R>(f: impl FnOnce(&mut Workspace) -> R) -> R {
-    with_pool(&BATCH_POOL, f)
 }
