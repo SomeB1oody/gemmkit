@@ -1844,6 +1844,44 @@ fn bench_small_mn_f16(m: usize, n: usize, k: usize, par: Parallelism) {
     );
 }
 
+/// `perf_small_mn` row for **bf16**. On x86 the driver takes the `vdpbf16ps` VNNI dot path while
+/// the horizontal route widens bf16→f32 like f16 does, so the `×h` ratio measures the widen
+/// route against the VNNI driver (a different, faster kernel than the f16 widen driver). No
+/// `gemm`-crate bf16 support, so it is horiz-vs-driver only.
+#[cfg(all(feature = "half", not(target_family = "wasm")))]
+fn bench_small_mn_bf16(m: usize, n: usize, k: usize, par: Parallelism) {
+    use gemmkit::bf16;
+    let to16 = |v: &[f32]| v.iter().map(|&x| bf16::from_f32(x)).collect::<Vec<_>>();
+    let a = to16(&fill(m * k, 1));
+    let b = to16(&fill(k * n, 2));
+    let mut c = vec![bf16::from_f32(0.0); m * n];
+    let mut run = || {
+        measure(m, k, n, || {
+            gemm(
+                bf16::from_f32(1.0),
+                MatRef::from_row_major(&a, m, k),
+                MatRef::from_col_major(&b, k, n),
+                bf16::from_f32(0.0),
+                MatMut::from_col_major(&mut c, m, n),
+                par,
+            );
+        })
+    };
+    let horiz = with_route(usize::MAX, 0, &mut run);
+    let driver = with_route(0, 0, &mut run);
+    let mode = if matches!(par, Parallelism::Serial) {
+        "ser"
+    } else {
+        "par"
+    };
+    println!(
+        "  {m:>2}×{n:<2} k={k:<5} {mode}  horiz={:7.1}  driver={:7.1} ({:.2}× h)",
+        horiz.median,
+        driver.median,
+        horiz.median / driver.median.max(1e-9),
+    );
+}
+
 /// Small-matrix horizontal (inner-product) route: small `m,n`, long `k`. Sweeps the output
 /// dimensions against the contraction, forcing each of the three gemmkit routes (horizontal /
 /// small_k / driver) plus the `gemm`-crate and `matrixmultiply` baselines. The crossover — where
@@ -1877,9 +1915,17 @@ fn perf_small_mn() {
     {
         println!("\n  f16 (f32-accumulate mixed horizontal kernel):");
         for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
-            for &s in &[4usize, 8, 16] {
+            for &s in &[4usize, 8, 16, 32] {
                 for &k in &[256usize, 4096] {
                     bench_small_mn_f16(s, s, k, par);
+                }
+            }
+        }
+        println!("\n  bf16 (widen horizontal path vs vdpbf16ps VNNI driver on x86):");
+        for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
+            for &s in &[4usize, 8, 16, 32] {
+                for &k in &[256usize, 4096] {
+                    bench_small_mn_bf16(s, s, k, par);
                 }
             }
         }

@@ -2570,6 +2570,25 @@ fn panic_out_of_bounds_view() {
 }
 
 #[test]
+#[should_panic(expected = "too large to address")]
+fn panic_extent_overflow_view() {
+    let a = vec![0.0f32; 1];
+    let b = vec![0.0f32; 1];
+    let mut c = vec![0.0f32; 1];
+    let half = isize::BITS / 2;
+    let rows = (1usize << (half + 1)) + 1;
+    let rs = 1isize << half; // (rows-1)*rs = 2^(2·half+1), overflows isize on the target
+    gemm(
+        1.0,
+        MatRef::new(&a, rows, 1, rs, 1),
+        MatRef::from_row_major(&b, 1, 1),
+        0.0,
+        MatMut::new(&mut c, rows, 1, rs, 1),
+        Parallelism::Serial,
+    );
+}
+
+#[test]
 #[should_panic(expected = "aliases itself")]
 fn panic_self_aliasing_c() {
     // rsc == 0 collapses all rows of C onto the same memory — accepted by the

@@ -108,8 +108,7 @@ static SMALL_K_THRESHOLD: Threshold =
 // each output element is a single SIMD-reduced dot over `k`, reading A/B in place with no
 // packing/blocking. The driver pads tiny row/col tiles to a full microtile, wasting most of its
 // work when both output dimensions are far below the microtile; this route computes exactly the
-// `m*n` outputs. `0` disables the route. Calibrated on Zen5 (AVX-512): the horizontal path wins
-// by 2-50× through `16×16`; by `32×32` the driver's packed microkernel catches up at small `k`.
+// `m*n` outputs
 static SMALL_MN_DIM: Threshold = Threshold::new("GEMMKIT_SMALL_MN_DIM", 16);
 
 // Byte floor below which a bandwidth-bound gemv/gevv stays single-threaded: below it the

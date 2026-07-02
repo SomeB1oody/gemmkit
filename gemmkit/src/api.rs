@@ -102,8 +102,8 @@ impl<'a, T> MatMut<'a, T> {
     }
 }
 
-/// Highest slice offset (exclusive) and lowest offset reached by a strided view,
-/// or `None` if the strides are negative (unsupported by the safe API).
+/// Highest slice offset (exclusive) reached by a strided view, or `None` if the strides are
+/// negative (unsupported by the safe API) or the view is too large to address
 fn extent(rows: usize, cols: usize, rs: isize, cs: isize) -> Option<usize> {
     if rows == 0 || cols == 0 {
         return Some(0);
@@ -111,17 +111,17 @@ fn extent(rows: usize, cols: usize, rs: isize, cs: isize) -> Option<usize> {
     let mut lo: isize = 0;
     let mut hi: isize = 0;
     for &(dim, s) in &[(rows, rs), (cols, cs)] {
-        let e = (dim as isize - 1) * s;
+        let e = isize::try_from(dim).ok()?.checked_sub(1)?.checked_mul(s)?;
         if e < 0 {
-            lo += e;
+            lo = lo.checked_add(e)?;
         } else {
-            hi += e;
+            hi = hi.checked_add(e)?;
         }
     }
     if lo < 0 {
         None // negative strides — not allowed in the safe API
     } else {
-        Some(hi as usize + 1)
+        (hi as usize).checked_add(1)
     }
 }
 
@@ -132,7 +132,9 @@ fn check_view<T>(data: &[T], rows: usize, cols: usize, rs: isize, cs: isize, nam
             "gemmkit: {name} view of {rows}x{cols} (strides {rs},{cs}) needs {need} elements but slice has {}",
             data.len()
         ),
-        None => panic!("gemmkit: {name} view has negative strides; use gemm_unchecked"),
+        None => panic!(
+            "gemmkit: {name} view has negative strides or is too large to address; use gemm_unchecked"
+        ),
     }
 }
 
@@ -154,7 +156,9 @@ fn check_batched_view<T>(
 ) -> usize {
     let e = match extent(rows, cols, rs, cs) {
         Some(e) => e,
-        None => panic!("gemmkit: {name} view has negative strides; use the unchecked API"),
+        None => panic!(
+            "gemmkit: {name} view has negative strides or is too large to address; use the unchecked API"
+        ),
     };
     // Only element 0 exists when batch <= 1, so the batch stride is irrelevant there.
     let last_base = if batch <= 1 {
