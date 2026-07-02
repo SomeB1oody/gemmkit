@@ -4,7 +4,7 @@
 
 use gemmkit::{
     BatchProblem, GemmProblem, MatMut, MatRef, Parallelism, Workspace, gemm, gemm_batched,
-    gemm_batched_ptr_unchecked, gemm_batched_slice, gemm_batched_with,
+    gemm_batched_ptr_unchecked, gemm_batched_slice, gemm_batched_unchecked, gemm_batched_with,
 };
 
 /// Deterministic `f32` fill (xorshift, non-constant so reductions are non-trivial).
@@ -84,6 +84,64 @@ fn batched_matches_gemm_loop_many_small() {
         assert_batched_matches_loop(101, 6, 40, 5, 2.5, -0.5, par);
         assert_batched_matches_loop(37, 16, 100, 4, -1.0, 1.0, par);
         assert_batched_matches_loop(1, 12, 12, 12, 1.0, 0.0, par); // degenerate single-element batch
+    }
+}
+
+/// The raw `gemm_batched_unchecked` (pointers + strides, no checks) must equal a loop of single
+/// `gemm(Serial)` calls bit-for-bit — the ndarray/FFI-facing entry, tested through its raw
+/// signature. Contiguously-packed column-major elements.
+#[test]
+fn batched_unchecked_matches_gemm_loop() {
+    let (batch, m, k, n) = (37usize, 16, 40, 5);
+    let (alpha, beta) = (2.5f32, -0.5);
+    let a = packed(batch, m, k, 1);
+    let b = packed(batch, k, n, 2);
+    let c_init = packed(batch, m, n, 3);
+
+    let mut c_ref = c_init.clone();
+    for bi in 0..batch {
+        let (ao, bo, co) = (bi * m * k, bi * k * n, bi * m * n);
+        gemm(
+            alpha,
+            MatRef::from_col_major(&a[ao..ao + m * k], m, k),
+            MatRef::from_col_major(&b[bo..bo + k * n], k, n),
+            beta,
+            MatMut::from_col_major(&mut c_ref[co..co + m * n], m, n),
+            Parallelism::Serial,
+        );
+    }
+
+    for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
+        let mut c = c_init.clone();
+        // SAFETY: contiguously-packed column-major elements — every element view is in bounds, the
+        // C regions are disjoint (batch stride m*n == element extent) and don't alias A/B.
+        unsafe {
+            gemm_batched_unchecked(
+                batch,
+                m,
+                k,
+                n,
+                alpha,
+                a.as_ptr(),
+                1,
+                m as isize,
+                (m * k) as isize,
+                b.as_ptr(),
+                1,
+                k as isize,
+                (k * n) as isize,
+                beta,
+                c.as_mut_ptr(),
+                1,
+                m as isize,
+                (m * n) as isize,
+                par,
+            );
+        }
+        assert_eq!(
+            c_ref, c,
+            "gemm_batched_unchecked != gemm() loop (par={par:?})"
+        );
     }
 }
 

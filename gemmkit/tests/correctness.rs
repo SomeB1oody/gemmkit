@@ -951,6 +951,103 @@ fn prepack_equals_gemm() {
     }
 }
 
+/// The raw packed entries — `prepack_rhs_unchecked` + `gemm_packed_b_unchecked`, and the LHS pair
+/// `prepack_lhs_unchecked` + `gemm_packed_a_unchecked` — must equal a plain `gemm()`. These are the
+/// adapter/FFI-facing signatures, exercised directly through raw pointers + strides (the safe
+/// packed path forwards through them, so the result is bit-identical to `gemm`).
+#[test]
+fn packed_unchecked_matches_gemm() {
+    for (m, k, n) in [(200usize, 130, 175), (65, 64, 64), (40, 200, 300)] {
+        for &(al, be) in &[(1.0f64, 0.0), (0.7, 1.3)] {
+            let a = Mat::<f32>::rand(m, k, 0x11 + (m + n) as u64);
+            let b = Mat::<f32>::rand(k, n, 0x22 + (k + n) as u64);
+            let c0 = Mat::<f32>::rand(m, n, 0x33 + (m + k) as u64);
+            let (abuf, rsa, csa) = build_view(&a, Layout::Col);
+            let (bbuf, rsb, csb) = build_view(&b, Layout::Col);
+
+            // RHS-packed: requires column-major-ish C.
+            {
+                let (cbase, rsc, csc) = build_view(&c0, Layout::Col);
+                let mut c_ref = cbase.clone();
+                gemm(
+                    al as f32,
+                    MatRef::new(&abuf, m, k, rsa, csa),
+                    MatRef::new(&bbuf, k, n, rsb, csb),
+                    be as f32,
+                    MatMut::new(&mut c_ref, m, n, rsc, csc),
+                    Parallelism::Serial,
+                );
+                // SAFETY: views are in bounds; B is a distinct buffer read through its strides.
+                let packed =
+                    unsafe { gemmkit::prepack_rhs_unchecked(bbuf.as_ptr(), rsb, csb, k, n) };
+                for par in [Parallelism::Serial, Parallelism::Rayon(4)] {
+                    let mut c = cbase.clone();
+                    // SAFETY: A/C in bounds, C column-major (packed_b orientation), distinct buffers.
+                    unsafe {
+                        gemmkit::gemm_packed_b_unchecked(
+                            al as f32,
+                            m,
+                            abuf.as_ptr(),
+                            rsa,
+                            csa,
+                            &packed,
+                            be as f32,
+                            c.as_mut_ptr(),
+                            rsc,
+                            csc,
+                            par,
+                        );
+                    }
+                    assert_eq!(
+                        c_ref, c,
+                        "packed_b_unchecked != gemm {m}x{k}x{n} a={al} b={be} par={par:?}"
+                    );
+                }
+            }
+
+            // LHS-packed: requires row-major-ish C.
+            {
+                let (cbase, rsc, csc) = build_view(&c0, Layout::Row);
+                let mut c_ref = cbase.clone();
+                gemm(
+                    al as f32,
+                    MatRef::new(&abuf, m, k, rsa, csa),
+                    MatRef::new(&bbuf, k, n, rsb, csb),
+                    be as f32,
+                    MatMut::new(&mut c_ref, m, n, rsc, csc),
+                    Parallelism::Serial,
+                );
+                // SAFETY: views are in bounds; A is a distinct buffer read through its strides.
+                let packed =
+                    unsafe { gemmkit::prepack_lhs_unchecked(abuf.as_ptr(), rsa, csa, m, k) };
+                for par in [Parallelism::Serial, Parallelism::Rayon(4)] {
+                    let mut c = cbase.clone();
+                    // SAFETY: B/C in bounds, C row-major (packed_a orientation), distinct buffers.
+                    unsafe {
+                        gemmkit::gemm_packed_a_unchecked(
+                            al as f32,
+                            &packed,
+                            n,
+                            bbuf.as_ptr(),
+                            rsb,
+                            csb,
+                            be as f32,
+                            c.as_mut_ptr(),
+                            rsc,
+                            csc,
+                            par,
+                        );
+                    }
+                    assert_eq!(
+                        c_ref, c,
+                        "packed_a_unchecked != gemm {m}x{k}x{n} a={al} b={be} par={par:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Mixed-precision prepacked-RHS must be **bit-identical** to plain `gemm()` for
 /// the narrow types too: the prepack blocks with the packed-input (`Lhs`) size and
 /// the same `kc = k` the driver uses, so packed and unpacked never diverge. Includes
@@ -1996,6 +2093,61 @@ fn correctness_i8() {
                 Parallelism::Serial,
             );
             assert_eq!(c, cref, "i8 mismatch {m}x{k}x{n} alpha={alpha} beta={beta}");
+        }
+    }
+}
+
+/// `gemm_i8_unchecked_with` (raw pointers + a caller-owned `Workspace`) must equal `gemm_i8` — the
+/// FFI/adapter-facing signature and the missing `_with` sibling for the reuse-workspace path.
+#[cfg(feature = "int8")]
+#[test]
+fn i8_unchecked_with_matches_gemm_i8() {
+    use gemmkit::{Workspace, gemm_i8_unchecked_with};
+    let mut ws = Workspace::new();
+    for (m, k, n) in [(3usize, 4, 5), (32, 32, 32), (65, 64, 64)] {
+        for &(alpha, beta) in &[(1i32, 0i32), (3, -2)] {
+            let a = rand_i8(m * k, 0x100 + (m * 7 + k) as u64);
+            let b = rand_i8(k * n, 0x200 + (n * 3 + k) as u64);
+            let c0: Vec<i32> = (0..m * n).map(|x| (x as i32 % 7) - 3).collect();
+            let cref = ref_i8(&a, &b, &c0, m, k, n, alpha, beta);
+
+            // Column-major B for the row-major-A / col-major-B / row-major-C layout.
+            let bcol: Vec<i8> = {
+                let mut v = vec![0i8; k * n];
+                for i in 0..k {
+                    for j in 0..n {
+                        v[j * k + i] = b[i * n + j];
+                    }
+                }
+                v
+            };
+            let mut c = c0.clone();
+            // SAFETY: A row-major (rsa=k, csa=1), B col-major (rsb=1, csb=k), C row-major
+            // (rsc=n, csc=1); all in bounds, distinct buffers, C doesn't alias A/B.
+            unsafe {
+                gemm_i8_unchecked_with(
+                    &mut ws,
+                    m,
+                    k,
+                    n,
+                    alpha,
+                    a.as_ptr(),
+                    k as isize,
+                    1,
+                    bcol.as_ptr(),
+                    1,
+                    k as isize,
+                    beta,
+                    c.as_mut_ptr(),
+                    n as isize,
+                    1,
+                    Parallelism::Serial,
+                );
+            }
+            assert_eq!(
+                c, cref,
+                "i8_unchecked_with mismatch {m}x{k}x{n} alpha={alpha} beta={beta}"
+            );
         }
     }
 }
