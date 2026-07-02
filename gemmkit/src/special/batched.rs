@@ -16,7 +16,7 @@
 //! workers and so is gated to `m, n > 1` shapes, whose route reduces each output within one worker
 //! (serial and parallel agree bit-for-bit under the current thread-independent blocking).
 
-use crate::dispatch::{self, GemmScalar, Task};
+use crate::dispatch::{self, GemmProblem, GemmScalar, Task};
 use crate::parallel::{self, BatchPlan, JobCursor, Parallelism, Ptr};
 use crate::workspace::{self, Workspace};
 
@@ -94,9 +94,10 @@ pub(crate) unsafe fn run<T: GemmScalar>(
             // and every element runs *serially* on one worker — so no element is split across
             // workers and the batch is bit-identical to the serial run for any worker count,
             // independent of whether a route is serial==parallel bit-identical. Each worker packs
-            // through its own persistent batched pool (reused across calls). That pool is distinct
-            // from the plain `with_thread_pool` one so a worker running inline while
-            // `gemm_batched`'s outer `with_thread_pool` holds the plain pool cannot re-borrow it.
+            // through its own persistent batched pool (reused across calls), distinct from the plain
+            // `with_thread_pool` one so a worker running its inline inner work while
+            // `gemm_batched`'s outer `with_thread_pool` holds the plain pool reuses a real buffer
+            // rather than the re-entrant fresh-scratch fallback.
             BatchPlan::BatchParallel(n_threads) => {
                 let (ap, bp, cp) = (Ptr(a as *mut T), Ptr(b as *mut T), Ptr(c));
                 let cur = JobCursor::new(batch, parallel::job_grain(batch, n_threads));
@@ -128,5 +129,58 @@ pub(crate) unsafe fn run<T: GemmScalar>(
                 });
             }
         }
+    }
+}
+
+/// Run a **heterogeneous** batch — a slice of independent GEMM problems, each with its own shape
+/// and pointers (the pointer-array / grouped form). Parallelizes across the problems: each runs
+/// serially on one worker, cache-hot, so the batch pays one fork/join and is bit-identical across
+/// worker counts. Elements vary in size, so it uses the flat [`Parallelism::resolve_batch_flat`]
+/// policy (no uniform cache-residency test) and never the per-element-internal split. Takes the
+/// public [`GemmProblem`] slice directly (no `Vec<Task>` copy) and derives each [`Task`] in place.
+///
+/// # Safety
+/// Each problem's pointers must be valid for its shape/strides; the `problems` output regions must
+/// be pairwise disjoint and none may alias any input (the safe API validates this; the unchecked
+/// one makes the caller promise it).
+pub(crate) unsafe fn run_ptr<T: GemmScalar>(
+    problems: &[GemmProblem<T>],
+    par: Parallelism,
+    ws: &mut Workspace,
+) {
+    unsafe {
+        if problems.is_empty() {
+            return;
+        }
+        // Saturating sum (each term is already clamped) so the parallelism gate can't overflow.
+        let total_mnk = problems.iter().fold(0usize, |acc, p| {
+            acc.saturating_add(p.m.saturating_mul(p.k).saturating_mul(p.n))
+        });
+        let n_threads = par.resolve_batch_flat(total_mnk, problems.len());
+        if n_threads <= 1 {
+            for p in problems {
+                dispatch::execute(p.task(), Parallelism::Serial, ws);
+            }
+            return;
+        }
+        // Workers pull disjoint problem ranges from a shared cursor; each output region is disjoint
+        // by validation, so the shared read-only problem list plus disjoint writes are race-free.
+        let base = Ptr(problems.as_ptr() as *mut GemmProblem<T>);
+        let cur = JobCursor::new(
+            problems.len(),
+            parallel::job_grain(problems.len(), n_threads),
+        );
+        parallel::for_each_worker(n_threads, |_tid| {
+            // Capture the whole `Ptr` (Send + Sync), not its raw-pointer field.
+            let bp = base;
+            workspace::with_batch_pool(|wsb| {
+                while let Some((s, e)) = cur.next_chunk() {
+                    for pi in s..e {
+                        let task = (*(bp.0 as *const GemmProblem<T>).add(pi)).task();
+                        dispatch::execute(task, Parallelism::Serial, wsb);
+                    }
+                }
+            });
+        });
     }
 }

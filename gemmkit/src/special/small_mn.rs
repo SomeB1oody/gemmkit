@@ -24,6 +24,10 @@
 
 use crate::parallel::{self, JobCursor, Parallelism, Ptr};
 use crate::scalar::Float;
+#[cfg(feature = "half")]
+use crate::scalar::NarrowFloat;
+#[cfg(feature = "half")]
+use crate::simd::KernelSimd;
 use crate::simd::SimdOps;
 
 /// Output register-block tile: `MT` rows × `NT` columns of accumulators. A full tile keeps
@@ -261,5 +265,231 @@ unsafe fn cell_dot<T, S>(
             beta * *cp
         };
         *cp = alpha.mul_add(dot, ov);
+    }
+}
+
+/// Mixed-precision (`f16`/`bf16` inputs, `f32` accumulate) sibling of [`run`]: same `MT×NT` tiling
+/// and output partition, but each A-row / B-col is **widen-loaded** `N → f32`
+/// ([`KernelSimd::load_lhs`]), accumulated in `f32`, and rounded to the narrow output once in the
+/// per-cell epilogue. `alpha`/`beta` arrive already widened to `f32`. Same reproducibility as [`run`].
+///
+/// # Safety
+/// As [`run`] (A rows / B cols unit-stride along `k`, `c` not aliasing `a`/`b`, CPU supports `S`).
+#[cfg(feature = "half")]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn run_mixed<N, S>(
+    simd: S,
+    m: usize,
+    k: usize,
+    n: usize,
+    par: Parallelism,
+    alpha: f32,
+    a: *const N,
+    rsa: isize,
+    csa: isize,
+    b: *const N,
+    rsb: isize,
+    csb: isize,
+    beta: f32,
+    c: *mut N,
+    rsc: isize,
+    csc: isize,
+) where
+    N: NarrowFloat,
+    S: KernelSimd<N, N, f32, N>,
+{
+    debug_assert!(
+        csa == 1 && rsb == 1,
+        "small_mn requires A rows / B cols unit-stride along k"
+    );
+    unsafe {
+        let n_row_tiles = m.div_ceil(MT);
+        let n_col_tiles = n.div_ceil(NT);
+        let n_tiles = n_row_tiles * n_col_tiles;
+
+        // Bandwidth-capped worker count: A read once, B once, C written once (narrow bytes).
+        let sizeof = core::mem::size_of::<N>();
+        let bytes = m
+            .saturating_mul(k)
+            .saturating_add(k.saturating_mul(n))
+            .saturating_add(m.saturating_mul(n))
+            .saturating_mul(sizeof);
+        let n_threads = par.resolve_bandwidth(bytes, n_tiles);
+
+        let a = Ptr(a as *mut N);
+        let b = Ptr(b as *mut N);
+        let c = Ptr(c);
+
+        let body = move |q_start: usize, q_end: usize| {
+            let (a, b, c) = (a, b, c);
+            let a = a.0 as *const N;
+            let b = b.0 as *const N;
+            let c = c.0;
+            simd.vectorize(|| {
+                for q in q_start..q_end {
+                    let it = q % n_row_tiles;
+                    let jt = q / n_row_tiles;
+                    let i0 = it * MT;
+                    let j0 = jt * NT;
+                    let mi = core::cmp::min(MT, m - i0);
+                    let nj = core::cmp::min(NT, n - j0);
+                    if mi == MT && nj == NT {
+                        full_tile_mixed::<N, S, MT, NT>(
+                            simd, k, i0, j0, alpha, a, rsa, b, csb, beta, c, rsc, csc,
+                        );
+                    } else {
+                        for cc in 0..nj {
+                            for ir in 0..mi {
+                                cell_dot_mixed::<N, S>(
+                                    simd,
+                                    k,
+                                    i0 + ir,
+                                    j0 + cc,
+                                    alpha,
+                                    a,
+                                    rsa,
+                                    b,
+                                    csb,
+                                    beta,
+                                    c,
+                                    rsc,
+                                    csc,
+                                );
+                            }
+                        }
+                    }
+                }
+            });
+        };
+
+        if n_threads <= 1 {
+            body(0, n_tiles);
+            return;
+        }
+        let cur = JobCursor::new(n_tiles, parallel::job_grain(n_tiles, n_threads));
+        parallel::for_each_worker(n_threads, |_tid| {
+            while let Some((s, e)) = cur.next_chunk() {
+                body(s, e);
+            }
+        });
+    }
+}
+
+/// Mixed sibling of [`full_tile`] (see [`run_mixed`]). The `f32` scalar tail and epilogue use plain
+/// `a·b + c` (not the fused intrinsic) so the route stays reproducible.
+///
+/// # Safety
+/// As [`full_tile`], with `N`/`f32` operands.
+#[cfg(feature = "half")]
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+unsafe fn full_tile_mixed<N, S, const MT: usize, const NT: usize>(
+    simd: S,
+    k: usize,
+    i0: usize,
+    j0: usize,
+    alpha: f32,
+    a: *const N,
+    rsa: isize,
+    b: *const N,
+    csb: isize,
+    beta: f32,
+    c: *mut N,
+    rsc: isize,
+    csc: isize,
+) where
+    N: NarrowFloat,
+    S: KernelSimd<N, N, f32, N>,
+{
+    unsafe {
+        let lanes = <S as SimdOps<f32>>::LANES;
+        let rows: [*const N; MT] = core::array::from_fn(|r| a.offset((i0 + r) as isize * rsa));
+        let cols: [*const N; NT] = core::array::from_fn(|cc| b.offset((j0 + cc) as isize * csb));
+
+        let mut acc: [[<S as SimdOps<f32>>::Reg; MT]; NT] = [[simd.zero(); MT]; NT];
+        let mut kk = 0;
+        while kk + lanes <= k {
+            let av: [<S as SimdOps<f32>>::Reg; MT] =
+                core::array::from_fn(|r| simd.load_lhs(rows[r].add(kk)));
+            for cc in 0..NT {
+                let bv = simd.load_lhs(cols[cc].add(kk));
+                for r in 0..MT {
+                    acc[cc][r] = simd.mul_add(av[r], bv, acc[cc][r]);
+                }
+            }
+            kk += lanes;
+        }
+        for cc in 0..NT {
+            for r in 0..MT {
+                let mut dot = simd.reduce_sum(acc[cc][r]);
+                let mut t = kk;
+                while t < k {
+                    dot += (*rows[r].add(t)).widen() * (*cols[cc].add(t)).widen();
+                    t += 1;
+                }
+                let cp = c.offset((i0 + r) as isize * rsc + (j0 + cc) as isize * csc);
+                let ov = if beta == 0.0 {
+                    0.0
+                } else if beta == 1.0 {
+                    (*cp).widen()
+                } else {
+                    beta * (*cp).widen()
+                };
+                *cp = N::narrow(alpha * dot + ov);
+            }
+        }
+    }
+}
+
+/// Mixed sibling of [`cell_dot`] (edge-tile path; see [`run_mixed`]): an `f32` widen-load dot,
+/// rounded to `N` once.
+///
+/// # Safety
+/// As [`cell_dot`], with `N`/`f32` operands.
+#[cfg(feature = "half")]
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+unsafe fn cell_dot_mixed<N, S>(
+    simd: S,
+    k: usize,
+    i: usize,
+    j: usize,
+    alpha: f32,
+    a: *const N,
+    rsa: isize,
+    b: *const N,
+    csb: isize,
+    beta: f32,
+    c: *mut N,
+    rsc: isize,
+    csc: isize,
+) where
+    N: NarrowFloat,
+    S: KernelSimd<N, N, f32, N>,
+{
+    unsafe {
+        let lanes = <S as SimdOps<f32>>::LANES;
+        let row = a.offset(i as isize * rsa);
+        let col = b.offset(j as isize * csb);
+        let mut acc = simd.zero();
+        let mut kk = 0;
+        while kk + lanes <= k {
+            acc = simd.mul_add(simd.load_lhs(row.add(kk)), simd.load_lhs(col.add(kk)), acc);
+            kk += lanes;
+        }
+        let mut dot = simd.reduce_sum(acc);
+        while kk < k {
+            dot += (*row.add(kk)).widen() * (*col.add(kk)).widen();
+            kk += 1;
+        }
+        let cp = c.offset(i as isize * rsc + j as isize * csc);
+        let ov = if beta == 0.0 {
+            0.0
+        } else if beta == 1.0 {
+            (*cp).widen()
+        } else {
+            beta * (*cp).widen()
+        };
+        *cp = N::narrow(alpha * dot + ov);
     }
 }

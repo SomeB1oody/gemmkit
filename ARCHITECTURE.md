@@ -375,7 +375,9 @@ few cores that saturate DRAM, more workers stop helping.
   A/B in place with the output register-blocked into `MT × NT` tiles. Gated to the
   contiguous-along-`k` layout (A rows unit-stride `csa == 1`, B cols unit-stride `rsb == 1`);
   a strided layout would need a scalar dot that loses to the driver, so it stays on the
-  driver. Float-only (`f32`/`f64`); mixed/int/complex would need widen-load variants.
+  driver. Covers `f32`/`f64` (`run`) and `f16`/`bf16` (`run_mixed`, which widen-loads `N → f32`,
+  accumulates in `f32`, and rounds once in the epilogue); `i8`/complex would need their own
+  widen/planar variants and stay on the driver.
 
 The special paths above are **bandwidth-bound**; each output element is one fixed-order
 reduction computed wholly by one worker, so they are bit-identical to the serial run for any
@@ -395,8 +397,8 @@ worker count.
   current thread-independent blocking), never gemv; the serial and batch-parallel schedules run
   each element serially, so they are **bit-identical across worker counts**. The
   batch-parallel workers pack through a *second* per-thread pool (`workspace::BATCH_POOL`, reused
-  across calls) distinct from the plain thread-local pool, so a worker running inline while
-  `gemm_batched`'s outer `with_thread_pool` holds the plain pool cannot re-borrow it.
+  across calls) distinct from the plain thread-local pool, so a worker's inline inner work reuses a
+  real buffer while the outer `with_thread_pool` still holds the plain pool.
 
 ## L7 — dispatch
 
@@ -417,6 +419,12 @@ line each.
   α·A_b·B_b + β·C_b`. One element shape + strides plus a per-operand batch stride;
   validation additionally checks every element (including the last) is in bounds and
   the `batch` C regions are pairwise disjoint.
+- **Pointer-array batched** ([`gemm_batched_slice`] / [`gemm_batched_ptr_unchecked`]): a slice of
+  independent, **heterogeneously-shaped** problems (each its own pointers). The checked form takes
+  safe views — a distinct `MatMut` per element, so the borrow checker already guarantees the
+  outputs are disjoint and don't alias the inputs, leaving only shape/bounds validation; the
+  unchecked form takes raw `GemmProblem` descriptors. Both drive the same batch-level parallelism
+  (`special::batched::run_ptr`, `resolve_batch_flat` — each element serial on one worker).
 - **Unchecked** ([`gemm_unchecked`]): the raw pointer + `isize` stride engine for
   advanced callers (e.g. the ndarray adapter) that validate their own inputs and
   may use negative strides.
@@ -432,7 +440,10 @@ reversed views all work without copying. `dot` is the `.dot()`-style convenience
   *per-call argument > setter > `GEMMKIT_*` env var > compile-time default*.
 - **Workspace** (`workspace.rs`): a 64-byte-aligned growable packing buffer. The
   default path uses a transparent thread-local pool; `gemm_with` accepts a
-  caller-owned `Workspace` whose second-and-later uses allocate nothing.
+  caller-owned `Workspace` whose second-and-later uses allocate nothing. The pool
+  accessor is **re-entrancy-safe**: if a GEMM is nested on a thread already inside
+  one (nested rayon work-stealing), it hands out a fresh scratch that once rather
+  than double-borrowing the `RefCell`.
 
 ## How this maps to the rigor criteria
 

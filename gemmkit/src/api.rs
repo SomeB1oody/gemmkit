@@ -14,7 +14,7 @@
 
 #[cfg(feature = "complex")]
 use crate::dispatch::ComplexScalar;
-use crate::dispatch::{self, GemmScalar, PackedConsume, Task};
+use crate::dispatch::{self, GemmProblem, GemmScalar, PackedConsume, Task};
 use crate::parallel::Parallelism;
 use crate::workspace::{self, Workspace};
 
@@ -490,6 +490,105 @@ pub fn gemm_batched_with<T: GemmScalar>(
             ws,
         );
     }
+}
+
+/// Run a **pointer-array batched** GEMM: every element in `problems` is an independent product with
+/// its own shape and pointers ([`GemmProblem`]), parallelized across the batch (whole GEMMs assigned
+/// to workers, each run serially and cache-hot). The raw counterpart of [`gemm_batched_slice`], for
+/// callers (FFI, adapters) that validate their own inputs and may use arbitrary pointers / negative
+/// strides. Deterministic across thread counts (each element runs wholly on one worker), and it
+/// takes the `problems` slice as-is — no per-call allocation.
+///
+/// # Safety
+/// For each problem: `a`/`b` valid for reads and `c` for read+write over the shape/strides; when
+/// `beta == 0`, `c` need not be initialized. Across the batch: the `c` regions must be pairwise
+/// disjoint and none may alias any `a`/`b` (concurrent writes).
+pub unsafe fn gemm_batched_ptr_unchecked<T: GemmScalar>(
+    problems: &[GemmProblem<T>],
+    par: Parallelism,
+) {
+    // SAFETY: the caller guarantees each problem's pointers are valid and the outputs are pairwise
+    // disjoint and don't alias inputs.
+    unsafe {
+        workspace::with_thread_pool(|ws| crate::special::batched::run_ptr(problems, par, ws));
+    }
+}
+
+/// One element of a checked pointer-array batched GEMM ([`gemm_batched_slice`]):
+/// `C <- alpha·A·B + beta·C` over safe views.
+pub struct BatchProblem<'a, T> {
+    /// Product scale.
+    pub alpha: T,
+    /// LHS view.
+    pub a: MatRef<'a, T>,
+    /// RHS view.
+    pub b: MatRef<'a, T>,
+    /// Accumulator scale.
+    pub beta: T,
+    /// Output view (a distinct `&mut` per element ⇒ the batch's outputs are disjoint).
+    pub c: MatMut<'a, T>,
+}
+
+/// Run a **checked pointer-array batched** GEMM: `problems[i].c <- α·A·B + β·C` for each element,
+/// each an independent product over safe views, parallelized across the batch. The safe counterpart
+/// of [`gemm_batched_ptr_unchecked`]: because every `c` is a distinct `MatMut`, the outputs are
+/// pairwise disjoint and don't alias the inputs *by construction*, so validation only covers
+/// per-element shape agreement and in-bounds strides. Deterministic across thread counts.
+///
+/// # Panics
+/// If any element's dimensions disagree (`A.cols != B.rows`, `A.rows != C.rows`, `B.cols != C.cols`),
+/// a view addresses outside its slice, or an element's `C` aliases itself.
+pub fn gemm_batched_slice<T: GemmScalar>(problems: &mut [BatchProblem<'_, T>], par: Parallelism) {
+    let raw: Vec<GemmProblem<T>> = problems
+        .iter_mut()
+        .enumerate()
+        .map(|(i, p)| {
+            assert_eq!(
+                p.a.cols, p.b.rows,
+                "gemmkit: batch element {i} A.cols ({}) != B.rows ({})",
+                p.a.cols, p.b.rows
+            );
+            assert_eq!(
+                p.a.rows, p.c.rows,
+                "gemmkit: batch element {i} A.rows ({}) != C.rows ({})",
+                p.a.rows, p.c.rows
+            );
+            assert_eq!(
+                p.b.cols, p.c.cols,
+                "gemmkit: batch element {i} B.cols ({}) != C.cols ({})",
+                p.b.cols, p.c.cols
+            );
+            check_view(p.a.data, p.a.rows, p.a.cols, p.a.rs, p.a.cs, "A");
+            check_view(p.b.data, p.b.rows, p.b.cols, p.b.rs, p.b.cs, "B");
+            check_view(p.c.data, p.c.rows, p.c.cols, p.c.rs, p.c.cs, "C");
+            if self_aliases(p.c.rows, p.c.cols, p.c.rs, p.c.cs) {
+                panic!(
+                    "gemmkit: batch element {i} C view aliases itself (strides {},{}); C must \
+                     address each (i,j) uniquely",
+                    p.c.rs, p.c.cs
+                );
+            }
+            GemmProblem {
+                m: p.a.rows,
+                k: p.a.cols,
+                n: p.b.cols,
+                alpha: p.alpha,
+                a: p.a.data.as_ptr(),
+                rsa: p.a.rs,
+                csa: p.a.cs,
+                b: p.b.data.as_ptr(),
+                rsb: p.b.rs,
+                csb: p.b.cs,
+                beta: p.beta,
+                c: p.c.data.as_mut_ptr(),
+                rsc: p.c.rs,
+                csc: p.c.cs,
+            }
+        })
+        .collect();
+    // SAFETY: each element validated above; the outputs are pairwise disjoint and don't alias the
+    // inputs by construction (distinct `&mut` C vs `&` A/B), so the parallel writes are race-free.
+    workspace::with_thread_pool(|ws| unsafe { crate::special::batched::run_ptr(&raw, par, ws) });
 }
 
 /// The raw engine: `C <- alpha·A·B + beta·C` over pointers and `isize` strides,
