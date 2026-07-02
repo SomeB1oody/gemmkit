@@ -197,17 +197,26 @@ pub(crate) fn lhs_pack_stride_bytes() -> usize {
 /// The gemv/gevv parallelism byte floor: below this much touched data the problem is
 /// LLC-resident and one core already gets the full LLC bandwidth, so splitting only adds
 /// fork/join and shared-cache contention with no DRAM to gain. `GEMMKIT_GEMV_PARALLEL_BYTES`
-/// overrides it; `0` (the default) derives a quarter of the LLC. Centralized here (like
-/// [`lhs_pack_stride_bytes`]) as the one home for the `0 => auto` derivation
+/// overrides it; `0` (the default) derives it from the last-level cache. Centralized here
+/// (like [`lhs_pack_stride_bytes`]) as the one home for the `0 => auto` derivation.
+///
+/// * **With an L3** (x86, Graviton): a quarter of the per-core L3 share (`effective_bytes`).
+/// * **No L3** (Apple's shared cluster-L2): *half the full shared L2* — not
+///   `effective_bytes`, which divides by the cluster size (`shared_by`) for the per-worker
+///   BLIS budget. For the serial-vs-parallel gemv question a single core streams from the
+///   *whole* cluster L2 but cannot saturate its bandwidth, so splitting across the cluster
+///   still gains once the matrix exceeds ~half of it. Calibrated on M4 Max (16 MiB P-cluster
+///   L2): parallel is 0.64× serial at a 4 MiB matrix and 1.12× at 8 MiB, so the ~8 MiB floor
+///   (`l2.bytes / 2`) keeps small gemv serial and parallelizes the DRAM-bound ones.
 #[cfg(feature = "parallel")]
 pub(crate) fn gemv_parallel_floor_bytes() -> usize {
     match crate::tuning::gemv_parallel_bytes() {
         0 => {
             let t = topology();
-            let llc =
-                t.l3.map(|l| l.effective_bytes())
-                    .unwrap_or(t.l2.effective_bytes());
-            (llc / 4).max(1)
+            match t.l3 {
+                Some(l3) => (l3.effective_bytes() / 4).max(1),
+                None => (t.l2.bytes / 2).max(1),
+            }
         }
         v => v,
     }

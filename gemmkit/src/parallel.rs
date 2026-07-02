@@ -277,17 +277,29 @@ impl Parallelism {
 
 /// Maximum worker count for a bandwidth-bound shape, from the `GEMMKIT_GEMV_THREAD_CAP`
 /// knob (`0` ⇒ this auto proxy; non-zero ⇒ verbatim). DRAM saturates at far fewer workers
-/// than the logical core count: SMT siblings share a core's load/store units and memory
-/// ports, and only a handful of physical cores saturate the memory controllers. No
-/// physical-core / memory-channel count is exposed (`l2.shared_by` is the GEMM-worker
-/// cluster size, `1` on x86/Neoverse), so quarter the logical count as a documented proxy
-/// (÷2 for SMT, ÷2 because roughly half the physical cores saturate DDR), floored at 2.
-/// Calibrated on Zen5, where a bandwidth-bound gemv plateaus around a quarter of the 32
-/// logical cores. A high-bandwidth shared-L2 part (Apple) wants more — raise the knob.
+/// than the logical core count: only a handful of physical cores saturate the memory
+/// controllers, and on an SMT part the siblings share a core's load/store units and memory
+/// ports. No physical-core / memory-channel count is exposed (`l2.shared_by` is the
+/// GEMM-worker cluster size, `1` on x86/Neoverse), so the proxy is a fraction of the logical
+/// count, floored at 2 — the fraction is arch-dependent:
+///
+/// * **x86**: a *quarter* (÷2 for SMT, ÷2 because roughly half the physical cores saturate
+///   DDR). Calibrated on Zen5, where a bandwidth-bound gemv plateaus around a quarter of the
+///   32 logical cores.
+/// * **aarch64** (Apple/ARM, no SMT): a *half* — drop the ÷2-for-SMT factor. Calibrated on M4
+///   Max (10P+4E, ~245 GB/s aggregate): a bandwidth-bound gemv climbs to ~8 of 14 workers and
+///   then *declines* (the E-cores add contention, not bandwidth), so half the logical count
+///   (7) sits on the broad t=4–8 plateau. A higher-bandwidth part wants more — raise the knob.
 #[cfg(feature = "parallel")]
 fn bandwidth_cap() -> usize {
     match tuning::gemv_thread_cap() {
-        0 => (auto_threads() / 4).max(2),
+        0 => {
+            #[cfg(target_arch = "aarch64")]
+            let auto = auto_threads() / 2;
+            #[cfg(not(target_arch = "aarch64"))]
+            let auto = auto_threads() / 4;
+            auto.max(2)
+        }
         v => v.max(1),
     }
 }
