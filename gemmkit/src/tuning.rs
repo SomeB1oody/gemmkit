@@ -89,10 +89,19 @@ static GEMV_THRESHOLD: Threshold = Threshold::new("GEMMKIT_GEMV_THRESHOLD", usiz
 // At or below this `k`, a (non-gemv) shape takes the generic small-`k` route — computing
 // the whole product in one depth panel over the microkernel, reading A/B in place, no
 // packing. Above it the register-tiling driver wins: packing A into contiguous panels pays
-// for the better microkernel depth-walk once `k` is large enough. Calibrated on Zen5 —
-// in-place stays ahead through `k = 16` (~120-140% of the driver on skinny GEMM) and falls
-// behind by `k = 32`, so the crossover sits between.
-static SMALL_K_THRESHOLD: Threshold = Threshold::new("GEMMKIT_SMALL_K_THRESHOLD", 16);
+// for the better microkernel depth-walk once `k` is large enough. The crossover is a
+// **machine** property (microkernel depth-walk vs pack cost), so it is arch-specific:
+// * **x86** (Zen5, AVX-512): in-place stays ahead through `k = 16` (~120-140% of the driver
+//   on skinny GEMM) and falls behind by `k = 32`, so the crossover sits between.
+// * **aarch64** (M4, NEON): the narrower 16×4 tile packs cheaply and its depth-walk wins
+//   sooner — in-place leads through `k = 8` (~115% of the driver) and the driver is ahead by
+//   `k = 16` (~76%), so the crossover is halved to 8.
+#[cfg(target_arch = "aarch64")]
+const SMALL_K_THRESHOLD_DEFAULT: usize = 8;
+#[cfg(not(target_arch = "aarch64"))]
+const SMALL_K_THRESHOLD_DEFAULT: usize = 16;
+static SMALL_K_THRESHOLD: Threshold =
+    Threshold::new("GEMMKIT_SMALL_K_THRESHOLD", SMALL_K_THRESHOLD_DEFAULT);
 
 // Largest `m` *and* `n` for which a shape (with the contraction `k` not itself tiny, and A/B
 // streaming contiguously along `k`) takes the small-matrix horizontal (inner-product) route:
