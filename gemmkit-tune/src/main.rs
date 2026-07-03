@@ -690,6 +690,26 @@ fn main() {
         )
     );
 
+    // --- No-L3 column-block cap (only consulted where the machine reports no L3) ---
+    // Gated on topology: dead on an L3 host, so it stays in `skipped` below. Large-`N` shapes make
+    // the cap bind — `NC` is `min(this*NR, N)`, so `N` must clear `default*NR` (2048 f32 cols) for a
+    // candidate to move it.
+    if gemmkit::topology().l3.is_none() {
+        knob!(
+            "GEMMKIT_NC_NO_L3_PANELS",
+            sweep_sgemm(
+                "GEMMKIT_NC_NO_L3_PANELS",
+                tuning::set_nc_no_l3_panels,
+                tuning::NC_NO_L3_PANELS_DEFAULT,
+                &[256, 1024, 2048, MAX],
+                &timing,
+                &[(2048, 1024, 16384), (1024, 2048, 16384)],
+                par,
+                false,
+            )
+        );
+    }
+
     // --- Parallel scheduling ---
     knob!(
         "GEMMKIT_PARALLEL_OVERSAMPLE",
@@ -931,19 +951,16 @@ fn main() {
             "GEMMKIT_SEQ_INTERNAL_BYTES_PER_WORKER",
             "aarch64-only effect (batched split plan); inert on x86 — tune on an M4".to_string(),
         ),
-        (
-            "GEMMKIT_NC_NO_L3_PANELS",
-            // Truthful on both host types: the cap only binds where the machine reports no L3.
-            if gemmkit::topology().l3.is_some() {
-                "inert here (this host has an L3); the no-L3 column-block cap is only consulted on \
-                 a no-L3 host"
-            } else {
-                "no-L3 column-block cap; consulted on this no-L3 host but not auto-tuned — \
-                 neutralized so a stale env value can't skew the sweep"
-            }
-            .to_string(),
-        ),
     ];
+    // NC_NO_L3_PANELS is swept above on a no-L3 host; on an L3 host the cap is dead, so skip it.
+    if gemmkit::topology().l3.is_some() {
+        skipped.push((
+            "GEMMKIT_NC_NO_L3_PANELS",
+            "inert here (this host has an L3); the no-L3 column-block cap is only consulted on a \
+             no-L3 host"
+                .to_string(),
+        ));
+    }
     // Heavy knobs skipped for want of `--large-matrices` / budget (see the match above).
     skipped.append(&mut large_skipped);
     for &env in &budget_skipped {
@@ -1019,10 +1036,10 @@ const NEUTRALIZE: &[(Setter, usize)] = &[
     // value cannot skew the baseline of the gemv / sgemm sweeps that read them.
     (tuning::set_k_stream_max, tuning::K_STREAM_MAX_DEFAULT),
     (tuning::set_shared_lhs_mnk, tuning::SHARED_LHS_MNK_DEFAULT),
-    // Skipped (never swept) but still READ by gemms during the other sweeps, so a stale env value
-    // for them would silently skew every baseline — neutralize them too. PARALLEL_THRESHOLD gates
-    // parallelism in every sgemm/gemv sweep; NC_NO_L3_PANELS caps the block on a no-L3 host (Apple);
-    // SEQ_INTERNAL_BYTES_PER_WORKER is read only by batched GEMM (no sweep runs one — defensive).
+    // Read by gemms during the other sweeps, so a stale env value would silently skew every
+    // baseline — neutralize them whether or not they are themselves swept. PARALLEL_THRESHOLD gates
+    // parallelism in every sgemm/gemv sweep; NC_NO_L3_PANELS caps the block on a no-L3 host (swept
+    // there, skipped on an L3 host); SEQ_INTERNAL_BYTES_PER_WORKER is read only by batched GEMM.
     (
         tuning::set_parallel_threshold,
         tuning::PARALLEL_THRESHOLD_DEFAULT,
