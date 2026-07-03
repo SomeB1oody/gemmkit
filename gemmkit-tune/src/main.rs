@@ -510,12 +510,10 @@ const MAX: usize = usize::MAX;
 
 /// Probe plan for the opt-in `K_STREAM_MAX` sweep. The gemv register-block gate engages past ~L3/2
 /// and only *wins* once the output is clearly DRAM-bound, so the probe fixes the output at ~2x the
-/// LLC; a 1x-LLC output sits on the cache boundary and measures nothing decisive (the inert-sweep
-/// failure the L3/2 gate fix removed). Returns the shared row count and the probe `k` set, or a
-/// reason string when the probe does not fit this target's address space, or when `budget_bytes`
-/// (bytes, passed as `u64` so a 32-bit `usize` cannot silently saturate the gate) cannot hold the
-/// whole probe at the largest `k`. The advised budget in that reason is rounded *up* to the printed
-/// precision, so re-running with the stated value actually clears the gate.
+/// LLC — a 1x-LLC output sits on the cache boundary and measures nothing decisive. Returns the
+/// shared row count and probe `k` set, or a reason string when the probe cannot fit this target's
+/// address space, or when `budget_bytes` cannot hold the whole probe at the largest `k`; that reason
+/// rounds the advised budget *up* to the printed precision, so re-running with it clears the gate.
 fn plan_k_stream(budget_bytes: u64, gib: f64) -> Result<(usize, Vec<usize>), String> {
     const MAX_PROBE_K: usize = 48; // straddles the candidate caps {16, 32, 48}
     let topo = gemmkit::topology();
@@ -526,8 +524,7 @@ fn plan_k_stream(budget_bytes: u64, gib: f64) -> Result<(usize, Vec<usize>), Str
     let out = llc.saturating_mul(2);
     // Peak live bytes of the largest (k = MAX_PROBE_K) col-major f32 probe, matching `sweep_gemv`'s
     // allocation exactly: matrix a (rows*k*4 = out*k) + output y (rows*4 = out) + input x (k*4).
-    // Computed in u64 so the comparison is exact even on a 32-bit target (where a multi-GB `need`
-    // and a saturating `usize` budget would otherwise both pin to MAX and defeat the gate).
+    // In u64 so a 32-bit `usize` can't saturate `need` (and the budget) and silently pass the gate.
     let need = (out as u64)
         .saturating_mul(MAX_PROBE_K as u64)
         .saturating_add(out as u64)
@@ -865,16 +862,15 @@ fn main() {
 
     // --- Large-matrix probes (opt-in: --large-matrices <GiB>) ---
     // Both knobs only bite in an expensive regime — K_STREAM_MAX once the gemv output spills the LLC
-    // (needs multi-GB matrices after the L3/2 engage gate), SHARED_LHS_MNK above its high-FLOP
-    // pre-pass crossover — so they run only when the user opts in with a memory budget.
+    // (needs multi-GB matrices), SHARED_LHS_MNK above its high-FLOP pre-pass crossover — so they run
+    // only when the user opts in with a memory budget.
     match cli.large_gib {
         None => {
             large_skipped.push((
                 "GEMMKIT_K_STREAM_MAX",
-                "gemv register-block cap; after the L3/2 engage gate it only bites in the \
-                 DRAM-bound huge-m regime (output spilling the LLC) — pass --large-matrices <GiB> \
-                 (needs multi-GB matrices) to probe it. The maintainer bench perf_k_stream also \
-                 covers this calibration"
+                "gemv register-block cap; only bites in the DRAM-bound huge-m regime (output \
+                 spilling the LLC) — pass --large-matrices <GiB> (needs multi-GB matrices) to probe \
+                 it. The maintainer bench perf_k_stream also covers this calibration"
                     .to_string(),
             ));
             large_skipped.push((
@@ -885,8 +881,8 @@ fn main() {
             ));
         }
         Some(gib) => {
-            // In u64 (not usize): a validated `gib` (<= 4096) never overflows u64, so the budget is
-            // exact on every target — a 32-bit usize would saturate and defeat plan_k_stream's gate.
+            // u64 (not usize): a validated `gib` (<= 4096) can't overflow u64, so the budget is exact
+            // on every target — a 32-bit usize would saturate and defeat plan_k_stream's gate.
             let budget = (gib * (1u64 << 30) as f64) as u64;
             match plan_k_stream(budget, gib) {
                 Ok((rows, ks)) => {
@@ -927,9 +923,8 @@ fn main() {
     let mut skipped: Vec<(&'static str, String)> = vec![
         (
             "GEMMKIT_PARALLEL_THRESHOLD",
-            "serial/parallel break-even is strongly shape-dependent (measured ~cubic 16M vs the \
-             skinny-shape-calibrated 590K default) — a single m*n*k scalar can't fit all aspect \
-             ratios, and the default is a deliberate cross-shape compromise, so it is not auto-tuned"
+            "serial/parallel break-even is strongly shape-dependent \
+             and the default is a deliberate cross-shape compromise"
                 .to_string(),
         ),
         (
