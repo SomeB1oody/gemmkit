@@ -740,18 +740,7 @@ fn main() {
     );
 
     // --- Bandwidth-bound gemv ---
-    knob!(
-        "GEMMKIT_K_STREAM_MAX",
-        sweep_gemv(
-            "GEMMKIT_K_STREAM_MAX",
-            tuning::set_k_stream_max,
-            32,
-            &[8, 16, 48, 64],
-            &timing,
-            &[(1 << 20, 32), (1 << 20, 16)],
-            ser,
-        )
-    );
+    // (GEMMKIT_K_STREAM_MAX is not swept — see the skipped list.)
     knob!(
         "GEMMKIT_GEMV_THREAD_CAP",
         sweep_gemv(
@@ -818,6 +807,12 @@ fn main() {
              ratios, and the default is a deliberate cross-shape compromise, so it is not auto-tuned",
         ),
         (
+            "GEMMKIT_K_STREAM_MAX",
+            "after the L3/2 register-block engage gate, the cap only bites in the DRAM-bound huge-m \
+             gemv regime (output spilling L3); probing it needs multi-GB matrices. The maintainer \
+             bench perf_k_stream covers this calibration",
+        ),
+        (
             "GEMMKIT_SHARED_LHS_MNK",
             "x86 default disables the shared-A pre-pass below ~8e9 m*n*k; probing needs very large shapes",
         ),
@@ -868,7 +863,6 @@ const NEUTRALIZE: &[(Setter, usize)] = &[
     (tuning::set_lhs_pack_stride, 0),
     (tuning::set_small_k_threshold, SMALL_K_DEFAULT),
     (tuning::set_small_mn_dim, 16),
-    (tuning::set_k_stream_max, 32),
     (tuning::set_gemv_thread_cap, 0),
     (tuning::set_gemv_parallel_bytes, 0),
     (tuning::set_i8_vnni_min_par_mnk, 768 * 768 * 768),
