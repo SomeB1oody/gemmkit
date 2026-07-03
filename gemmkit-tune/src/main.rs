@@ -337,6 +337,51 @@ fn sweep_i8(
     })
 }
 
+/// Batched-GEMM sweep (mirrors `sweep_sgemm`): score `gemm_batched` in whole-batch GFLOP/s
+/// (`batch * 2*m*k*n`) over a set of `(batch, m, k, n)` col-major probe shapes. aarch64-only — the
+/// only knob it backs (`SEQ_INTERNAL_BYTES_PER_WORKER`) is read solely by the aarch64 `resolve_batch`.
+#[cfg(target_arch = "aarch64")]
+fn sweep_batched(
+    env: &'static str,
+    set: fn(usize),
+    default: usize,
+    extras: &[usize],
+    t: &Timing,
+    shapes: &[(usize, usize, usize, usize)],
+    par: Parallelism,
+) -> KnobResult {
+    sweep(env, set, default, extras, "GFLOP/s", shapes.len(), || {
+        let stats: Vec<Stat> = shapes
+            .iter()
+            .map(|&(batch, m, k, n)| {
+                // One contiguous col-major element per batch index; `*_batch_stride` = element extent.
+                let a = fill(batch * m * k, 1);
+                let b = fill(batch * k * n, 2);
+                let mut c = vec![0.0f32; batch * m * n];
+                measure(
+                    t,
+                    || {
+                        gemmkit::gemm_batched(
+                            batch,
+                            1.0,
+                            MatRef::new(&a, m, k, 1, m as isize),
+                            (m * k) as isize,
+                            MatRef::new(&b, k, n, 1, k as isize),
+                            (k * n) as isize,
+                            0.0,
+                            MatMut::new(&mut c, m, n, 1, m as isize),
+                            (m * n) as isize,
+                            par,
+                        );
+                    },
+                    gflops(batch * m, k, n),
+                )
+            })
+            .collect();
+        geomean(&stats)
+    })
+}
+
 // ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
@@ -862,6 +907,26 @@ fn main() {
         )
     );
 
+    // --- aarch64 batched-GEMM split crossover ---
+    // SequentialInternal (split each element across the machine in turn) vs BatchParallel (run the
+    // `batch` elements one-per-worker) when `batch < workers`. Only the aarch64 `resolve_batch` reads
+    // this knob (x86 uses an L2-residency test), so it is skipped on x86. Probe shapes straddle the
+    // crossover: the per-batch-worker share `elem_bytes/batch` lands on both sides of the candidates
+    // so the chosen plan actually flips.
+    #[cfg(target_arch = "aarch64")]
+    knob!(
+        "GEMMKIT_SEQ_INTERNAL_BYTES_PER_WORKER",
+        sweep_batched(
+            "GEMMKIT_SEQ_INTERNAL_BYTES_PER_WORKER",
+            tuning::set_seq_internal_bytes_per_worker,
+            tuning::SEQ_INTERNAL_BYTES_PER_WORKER_DEFAULT,
+            &[128 * 1024, 640 * 1024, MAX],
+            &timing,
+            &[(8, 512, 512, 512), (4, 256, 256, 256), (4, 384, 384, 384)],
+            par,
+        )
+    );
+
     // --- gemv path vs general driver ---
     // Binary on/off: for a vector shape `min(m,n) == 1`, so the cap has no intermediate value — the
     // dedicated gemv path is either on (`MAX`, default) or off (`0`, general driver). Measured in
@@ -940,18 +1005,19 @@ fn main() {
 
     // Knobs deliberately not swept on this machine (with why). Owned reasons so the opt-in and
     // budget branches (whose reasons are dynamic) can append here uniformly.
-    let mut skipped: Vec<(&'static str, String)> = vec![
-        (
-            "GEMMKIT_PARALLEL_THRESHOLD",
-            "serial/parallel break-even is strongly shape-dependent \
+    let mut skipped: Vec<(&'static str, String)> = vec![(
+        "GEMMKIT_PARALLEL_THRESHOLD",
+        "serial/parallel break-even is strongly shape-dependent \
              and the default is a deliberate cross-shape compromise"
-                .to_string(),
-        ),
-        (
-            "GEMMKIT_SEQ_INTERNAL_BYTES_PER_WORKER",
-            "aarch64-only effect (batched split plan); inert on x86 — tune on an M4".to_string(),
-        ),
-    ];
+            .to_string(),
+    )];
+    // SEQ_INTERNAL_BYTES_PER_WORKER is swept above on aarch64 (the only arch whose resolve_batch
+    // reads it); on x86 it is inert, so skip it there.
+    #[cfg(not(target_arch = "aarch64"))]
+    skipped.push((
+        "GEMMKIT_SEQ_INTERNAL_BYTES_PER_WORKER",
+        "aarch64-only effect (batched split plan); inert on x86".to_string(),
+    ));
     // NC_NO_L3_PANELS is swept above on a no-L3 host; on an L3 host the cap is dead, so skip it.
     if gemmkit::topology().l3.is_some() {
         skipped.push((
@@ -1036,10 +1102,11 @@ const NEUTRALIZE: &[(Setter, usize)] = &[
     // value cannot skew the baseline of the gemv / sgemm sweeps that read them.
     (tuning::set_k_stream_max, tuning::K_STREAM_MAX_DEFAULT),
     (tuning::set_shared_lhs_mnk, tuning::SHARED_LHS_MNK_DEFAULT),
-    // Read by gemms during the other sweeps, so a stale env value would silently skew every
-    // baseline — neutralize them whether or not they are themselves swept. PARALLEL_THRESHOLD gates
-    // parallelism in every sgemm/gemv sweep; NC_NO_L3_PANELS caps the block on a no-L3 host (swept
-    // there, skipped on an L3 host); SEQ_INTERNAL_BYTES_PER_WORKER is read only by batched GEMM.
+    // Read by gemms during the sweeps, so a stale env value would silently skew a baseline —
+    // neutralize them whether or not they are themselves swept. PARALLEL_THRESHOLD gates parallelism
+    // in every sgemm/gemv sweep; NC_NO_L3_PANELS caps the block on a no-L3 host (swept there, skipped
+    // on an L3 host); SEQ_INTERNAL_BYTES_PER_WORKER drives the aarch64 batched split (swept there,
+    // skipped on x86).
     (
         tuning::set_parallel_threshold,
         tuning::PARALLEL_THRESHOLD_DEFAULT,
