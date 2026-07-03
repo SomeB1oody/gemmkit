@@ -5,6 +5,22 @@
 //! (`GEMMKIT_*`) > compile-time default** (calibrated on the Ryzen 9950X). The
 //! per-call layer is expressed elsewhere (e.g. the [`crate::Parallelism`]
 //! argument); this module owns the setter / env / default layers.
+//!
+//! ## Setter vs env precedence
+//!
+//! The **env var is the deployment layer**: set `GEMMKIT_*` (e.g. `source` a profile emitted by
+//! the `gemmkit-tune` autotuner) to retune an already-built binary for the host with no recompile.
+//! It is read once per knob, on the first access, then cached. A programmatic **`set_*` call wins
+//! over the env var** (a `set_*` stores the value unconditionally, so a later `get` never consults
+//! the env); this is deliberate — an application that tunes itself in code takes precedence over a
+//! deployment-supplied profile. Apps that want the env to apply simply don't call the setters.
+//!
+//! ## Malformed values
+//!
+//! A `GEMMKIT_*` var that is set but does not parse as a non-negative integer is a typo, not a
+//! silent no-op: `resolve_env` warns on stderr and falls back to the default (the value is then
+//! cached, so the warning fires once per knob after the first access). It never panics — a
+//! perf-knob typo must not crash the process.
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -34,7 +50,11 @@ impl Threshold {
         if v != UNSET {
             return v;
         }
-        let resolved = self.resolve_env().unwrap_or(self.default);
+        // Clamp to `UNSET - 1` so the cached value can never itself be the `UNSET` sentinel — a
+        // knob whose default is `usize::MAX` (e.g. the 32-bit `SHARED_LHS_MNK`) would otherwise
+        // never cache and re-resolve (re-warning) on every access. `MAX` and `MAX - 1` are
+        // interchangeable for every threshold that uses `MAX` to mean "effectively unbounded".
+        let resolved = self.resolve_env().unwrap_or(self.default).min(UNSET - 1);
         self.value.store(resolved, Ordering::Relaxed);
         resolved
     }
@@ -48,8 +68,23 @@ impl Threshold {
 
     #[cfg(feature = "std")]
     fn resolve_env(&self) -> Option<usize> {
-        let v: usize = std::env::var(self.env).ok()?.trim().parse().ok()?;
-        Some(v.min(UNSET - 1))
+        // A missing var is the normal case — fall through to the default silently. A var that
+        // *is* set but does not parse is almost always a typo in an autotuner-generated profile,
+        // so make it visible: warn and fall back to the default rather than panic — a perf-knob
+        // typo must not crash the process. `get` caches the resolved value, so the warning fires
+        // once per knob after the first access (a burst of concurrent first-accesses may repeat it).
+        let raw = std::env::var(self.env).ok()?;
+        match raw.trim().parse::<usize>() {
+            Ok(v) => Some(v.min(UNSET - 1)),
+            Err(_) => {
+                eprintln!(
+                    "gemmkit: ignoring malformed {}={raw:?} (expected a non-negative integer); \
+                     using default {}",
+                    self.env, self.default
+                );
+                None
+            }
+        }
     }
     #[cfg(not(feature = "std"))]
     fn resolve_env(&self) -> Option<usize> {

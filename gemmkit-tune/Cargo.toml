@@ -1,0 +1,18 @@
+[package]
+name = "gemmkit-tune"
+description = "Install-time autotuner for gemmkit: sweeps its runtime knobs on the target machine and emits a GEMMKIT_* env profile"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "gemmkit-tune"
+path = "src/main.rs"
+
+# All element-type families so the tuner can sweep every runtime knob (i8's VNNI gate,
+# etc.). `std` + `parallel` come in via gemmkit's defaults.
+[dependencies]
+gemmkit = { path = "../gemmkit", features = ["complex", "half", "int8"] }

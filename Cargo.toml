@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["gemmkit", "gemmkit-ndarray"]
+members = ["gemmkit", "gemmkit-ndarray", "gemmkit-tune"]
 
 [workspace.package]
 version = "0.1.0"
