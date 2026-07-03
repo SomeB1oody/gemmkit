@@ -254,10 +254,8 @@ impl Parallelism {
                 // `elem_bytes > l2.effective` (3.2 MiB) missed all of these, so 512³ ran
                 // BatchParallel(2) at 0.28× of the per-element split.
                 #[cfg(target_arch = "aarch64")]
-                let split_wins = {
-                    const SEQ_INTERNAL_BYTES_PER_WORKER: usize = 320 * 1024;
-                    elem_bytes > batch.saturating_mul(SEQ_INTERNAL_BYTES_PER_WORKER)
-                };
+                let split_wins =
+                    elem_bytes > batch.saturating_mul(tuning::seq_internal_bytes_per_worker());
                 if m > 1 && n > 1 && split_wins {
                     BatchPlan::SequentialInternal
                 } else {
@@ -391,19 +389,20 @@ pub(crate) fn job_grain(n_jobs: usize, n_threads: usize) -> usize {
 /// of `n_threads` the `ceil(n_mc / n_threads)` rounding imbalances the workers — some do
 /// an extra whole block while the rest idle at the join.
 ///
-/// We split each block into the fewest power-of-two column sub-chunks needed to exceed
-/// `2 * n_threads` chunks — but **only by a divisor of `n_nt`**, so a chunk never
-/// straddles a row-block boundary. (A non-power-of-two `n_nt` — a tail column panel, or
+/// We split each block into the fewest power-of-two column sub-chunks needed to reach
+/// `packed_oversample() * n_threads` chunks — but **only by a divisor of `n_nt`**, so a chunk
+/// never straddles a row-block boundary. (A non-power-of-two `n_nt` — a tail column panel, or
 /// an L3-derived `nc/nr` — would otherwise leave `n_nt % splits != 0`, and the
 /// demand-driven [`JobCursor`] would hand workers cross-block chunks that re-pack A; the
 /// back-off falls to whole-block grain there rather than straddle.) Each split block is
 /// then packed by up to `splits` workers — a bounded, deliberate trade of pack reuse for
-/// balance. The `2 *` split target is an empirically swept optimum; splitting harder
-/// re-packs too often and regresses.
+/// balance. The split target (`packed_oversample`, default 2) is an empirically swept optimum;
+/// splitting harder re-packs too often and regresses.
 #[inline]
 pub(crate) fn packed_block_grain(n_nt: usize, n_mc: usize, n_threads: usize) -> usize {
+    let target = crate::tuning::packed_oversample().saturating_mul(n_threads);
     let mut splits = 1usize;
-    while n_mc * splits < 2 * n_threads && n_nt / (splits * 2) >= 1 {
+    while n_mc * splits < target && n_nt / (splits * 2) >= 1 {
         splits *= 2;
     }
     while splits > 1 && !n_nt.is_multiple_of(splits) {

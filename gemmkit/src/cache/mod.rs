@@ -267,33 +267,6 @@ fn round_down(a: usize, b: usize) -> usize {
     (a / b) * b
 }
 
-/// MC cap, in microtile rows: the A macro-panel is bounded to `MC_REG_PANELS · MR`
-/// rows (BLIS keeps `MC` a small multiple of `MR`). This is a **per-cache-hierarchy
-/// calibration point, not an invariant**: it currently *binds* on every measured
-/// topology — Zen5 and Apple-class alike — so it overrides the L2-capacity-derived
-/// `MC`, which is why a larger (or cluster-shared) L2 does not actually move `MC`
-/// today. Revisit per hierarchy class and perf-validate on the target before
-/// changing the value.
-const MC_REG_PANELS: usize = 8;
-
-/// `NC` cap when the machine reports no L3 (e.g. Apple Silicon): the no-L3 column
-/// block is `min(NC_NO_L3_PANELS · NR, N)` — full-`N` up to this ceiling.
-/// **Calibration point** — it ignores L2 size entirely.
-///
-/// Per the BLIS model, with no L3 `NC` is redundant and should stay *large* (B streams
-/// from DRAM; the `MC·KC` A panel is what fits the last-level cache) — shrinking it to an
-/// L2 fit is the wrong direction (more jc panels = more barriers, measured slower).
-/// Full-`N` collapses to a single jc block, which lifts parallel throughput (no
-/// inter-block barriers) and leaves serial unchanged, so it is applied uniformly: serial
-/// and parallel keep identical blocking and stay bit-identical. The cap bounds that block
-/// so the shared packed-B macro-panel peaks at `NC_NO_L3_PANELS·NR·kc` rather than
-/// full-`N`'s `N·kc` (it bounds the `nc` factor only; `kc` is `k` for the
-/// `OUT_IS_ACC = false` families, so the unchecked `b_elems·sizeof` workspace product
-/// still scales with `k`). `512` (= 2048 cols at NR = 4) keeps the block full-`N` for
-/// typical widths while bounding the panel; revisit and re-validate per hierarchy class
-/// before changing.
-const NC_NO_L3_PANELS: usize = 512;
-
 impl CacheTopology {
     /// Compute `(MC, KC, NC)` analytically (BLIS model) for the given microtile
     /// geometry and problem size.
@@ -321,6 +294,13 @@ impl CacheTopology {
             };
         }
 
+        // Runtime blocking knobs, read once (never inside the model's arithmetic below).
+        let tiny_dim = crate::tuning::tiny_block_dim();
+        let kc_cap = crate::tuning::kc();
+        let kc_floor = crate::tuning::kc_min();
+        let mc_panels = crate::tuning::mc_reg_panels();
+        let nc_panels = crate::tuning::nc_no_l3_panels();
+
         let l1 = self.l1d.effective_bytes().max(32 * 1024);
         let l2 = self.l2.effective_bytes();
         let l3 = self.l3.map(|l| l.effective_bytes()).unwrap_or(0);
@@ -331,8 +311,8 @@ impl CacheTopology {
         let l1_n_sets = (l1 / (line * l1_assoc)).max(1);
 
         // Small-matrix shortcut: skip the full model, just keep panels in L2.
-        if m <= 64 && n <= 64 {
-            let kc = k.clamp(1, 512);
+        if m <= tiny_dim && n <= tiny_dim {
+            let kc = k.clamp(1, kc_cap);
             // Cap by the actual row count: there are only `m` rows, so a larger `mc`
             // never splits fewer blocks (`n_mc` stays 1)
             let mc = ((l2 / sizeof / kc) / mr * mr)
@@ -348,7 +328,7 @@ impl CacheTopology {
         let c_lhs = (mr * sizeof) / g;
         let c_rhs = (nr * kc_0 * sizeof) / (line * l1_n_sets);
         let kc_mult = (l1_assoc / (c_lhs + c_rhs).max(1)).max(1);
-        let mut kc = (kc_0 * kc_mult.next_power_of_two()).max(512).min(k);
+        let mut kc = (kc_0 * kc_mult.next_power_of_two()).max(kc_floor).min(k);
         let k_iter = k.div_ceil(kc).max(1);
         kc = k.div_ceil(k_iter).max(1); // rebalance so the last panel isn't tiny
 
@@ -360,13 +340,15 @@ impl CacheTopology {
         let mut mc = round_down(mc_from, mr).max(mr);
         let m_iter = m.div_ceil(mc).max(1);
         mc = (m.div_ceil(m_iter * mr) * mr).max(mr);
-        mc = mc.min(MC_REG_PANELS * mr); // BLIS hard cap (calibration point)
+        mc = mc.min(mc_panels.saturating_mul(mr)); // BLIS hard cap
 
         // --- NC: B macro-panel resides in L3 (reserve one way for A) ---
         let nc = if l3 == 0 {
-            // No L3: full-`N` up to the `NC_NO_L3_PANELS` cap (see its note). Dead where
-            // an L3 exists.
-            (NC_NO_L3_PANELS * nr).min(n.next_multiple_of(nr)).max(nr)
+            // No L3: full-`N` up to the panel-count cap. Dead where an L3 exists.
+            nc_panels
+                .saturating_mul(nr)
+                .min(n.next_multiple_of(nr))
+                .max(nr)
         } else {
             let rhs_l3_assoc = l3_assoc.saturating_sub(1).max(1);
             let rhs_macro_max = (rhs_l3_assoc * l3) / l3_assoc;

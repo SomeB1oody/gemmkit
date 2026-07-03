@@ -1873,10 +1873,11 @@ pub(crate) unsafe fn execute_int(t: IntTask, par: Parallelism, ws: &mut Workspac
         // Auto VNNI hands small multi-threaded problems to the widen kernel (the dot
         // kernel's pack barrier dominates there); `Rayon(1)`/`Serial` keep VNNI at any
         // size. `small_par_fallback` is `None` for every other kernel → `d.run` as-is.
+        let vnni_min_par_mnk = tuning::i8_vnni_min_par_mnk();
         let run = match d.small_par_fallback {
             Some(fallback)
                 if matches!(par, Parallelism::Rayon(n) if n != 1)
-                    && t.m.saturating_mul(t.n).saturating_mul(t.k) < I8_VNNI_MIN_PAR_MNK =>
+                    && t.m.saturating_mul(t.n).saturating_mul(t.k) < vnni_min_par_mnk =>
             {
                 fallback
             }
@@ -1998,15 +1999,6 @@ struct IntDispatched {
     run: IntFn,
     small_par_fallback: Option<IntFn>,
 }
-
-/// Below this `m·n·k`, an auto-selected VNNI kernel hands a *multi-threaded* problem to
-/// the widen fallback (see [`IntDispatched::small_par_fallback`]). Calibrated on a
-/// Ryzen 9950X (Zen5): VNNI wins serial at every size and parallel from `n ≈ 1024` up,
-/// but loses small parallel to the pack barrier. (Defined on every target so the
-/// `execute_int` gate reads it unconditionally; only the x86 VNNI auto path sets a
-/// fallback, so elsewhere the gate is inert.)
-#[cfg(feature = "int8")]
-const I8_VNNI_MIN_PAR_MNK: usize = 768 * 768 * 768;
 
 #[cfg(feature = "int8")]
 const DISP_I8_SCALAR: IntDispatched = IntDispatched {

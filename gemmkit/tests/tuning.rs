@@ -2,7 +2,9 @@
 //! process-global thresholds; each test touches a *different* knob so they do not
 //! interfere when the harness runs them concurrently.
 
-use gemmkit::{MatMut, MatRef, Parallelism, gemm, tuning};
+use gemmkit::{
+    MatMut, MatRef, Parallelism, gemm, gemm_batched, gemm_packed_b, prepack_rhs, tuning,
+};
 
 /// Serializes the tests that mutate **route-selecting** knobs (`small_k_threshold`,
 /// `small_mn_dim`). Every other test in this file touches a *different* knob, so it can run
@@ -585,6 +587,333 @@ fn small_mn_serial_parallel_bit_identical() {
     );
     tuning::set_small_mn_dim(pmn);
     tuning::set_gemv_parallel_bytes(pfloor);
+}
+
+// ---- Promoted calibration knobs: each forces an extreme + the default and checks correctness ----
+
+/// Assert `got` matches a naive reference to a tight relative tolerance, with a labelled message.
+fn assert_close(got: &[f64], expect: &[f64], label: &str) {
+    assert_eq!(got.len(), expect.len(), "{label}: length mismatch");
+    for (g, e) in got.iter().zip(expect) {
+        assert!(
+            (g - e).abs() <= 1e-10 * (1.0 + e.abs()),
+            "{label}: {g} vs {e}"
+        );
+    }
+}
+
+/// Deterministic column-major `f64` operands for a knob test.
+fn mkmats(m: usize, k: usize, n: usize) -> (Vec<f64>, Vec<f64>) {
+    let a: Vec<f64> = (0..m * k).map(|x| (x % 23) as f64 * 0.1 - 1.0).collect();
+    let b: Vec<f64> = (0..k * n).map(|x| (x % 19) as f64 * 0.2 - 1.5).collect();
+    (a, b)
+}
+
+/// `k_stream_max` gates the axpy-gemv output register-blocking strategy. Forcing it to `0` (never
+/// register-block) or `usize::MAX` (always, when the output spills L2) must both give the correct
+/// gemv result. `n == 1` selects the axpy gemv path.
+#[test]
+fn k_stream_max_route_correct() {
+    let prev = tuning::k_stream_max();
+    // A large output (spills L2 on typical machines, so the register-block path is actually taken
+    // for the non-zero setting) and a small `k` (register-block eligible). Correctness holds either
+    // way.
+    let (m, k, n) = (300_000usize, 5usize, 1usize);
+    let (a, b) = mkmats(m, k, n);
+    let cref = naive_col(&a, &b, m, k, n);
+    for &force in &[0usize, usize::MAX] {
+        tuning::set_k_stream_max(force);
+        let mut cc = vec![0.0f64; m * n];
+        gemm(
+            1.0,
+            MatRef::from_col_major(&a, m, k),
+            MatRef::from_col_major(&b, k, n),
+            0.0,
+            MatMut::from_col_major(&mut cc, m, n),
+            Parallelism::Serial,
+        );
+        assert_close(&cc, &cref, &format!("k_stream_max={force}"));
+    }
+    tuning::set_k_stream_max(prev);
+}
+
+/// `seq_internal_bytes_per_worker` selects the aarch64 batched-GEMM split plan (inert on other
+/// targets). Forcing it to `1` or `usize::MAX` must leave a batched GEMM correct against a naive
+/// per-element reference.
+#[test]
+fn seq_internal_bytes_batched_correct() {
+    let prev = tuning::seq_internal_bytes_per_worker();
+    let (batch, m, k, n) = (6usize, 40usize, 48usize, 40usize);
+    let a: Vec<f64> = (0..batch * m * k)
+        .map(|x| (x % 23) as f64 * 0.1 - 1.0)
+        .collect();
+    let b: Vec<f64> = (0..batch * k * n)
+        .map(|x| (x % 19) as f64 * 0.2 - 1.5)
+        .collect();
+    // Per-element naive reference (each element is an independent col-major product).
+    let mut cref = vec![0.0f64; batch * m * n];
+    for bi in 0..batch {
+        let (ao, bo, co) = (bi * m * k, bi * k * n, bi * m * n);
+        let e = naive_col(&a[ao..ao + m * k], &b[bo..bo + k * n], m, k, n);
+        cref[co..co + m * n].copy_from_slice(&e);
+    }
+    for &force in &[1usize, usize::MAX] {
+        tuning::set_seq_internal_bytes_per_worker(force);
+        let mut c = vec![0.0f64; batch * m * n];
+        gemm_batched(
+            batch,
+            1.0,
+            MatRef::new(&a, m, k, 1, m as isize),
+            (m * k) as isize,
+            MatRef::new(&b, k, n, 1, k as isize),
+            (k * n) as isize,
+            0.0,
+            MatMut::new(&mut c, m, n, 1, m as isize),
+            (m * n) as isize,
+            Parallelism::Rayon(0),
+        );
+        assert_close(&c, &cref, &format!("seq_internal_bytes={force}"));
+    }
+    tuning::set_seq_internal_bytes_per_worker(prev);
+}
+
+/// `packed_oversample` sets the packed-LHS dynamic-scheduling grain — a row-major A takes that
+/// path. Forcing it to `0` (→1), `1`, or a huge value must each give a correct parallel result.
+#[test]
+fn packed_oversample_extremes_stay_correct() {
+    let prev = tuning::packed_oversample();
+    // `m` large enough that the row-block count reaches the worker count on typical machines, so
+    // `packed_block_grain` is actually consulted; correctness holds regardless.
+    let (m, k, n) = (4096usize, 64usize, 96usize);
+    let (a, b) = mkmats(m, k, n); // A read row-major, B col-major -> col-major C
+    let cref = naive_rowa_colb(&a, &b, m, k, n);
+    for &ov in &[0usize, 1, usize::MAX] {
+        tuning::set_packed_oversample(ov);
+        let mut cc = vec![0.0f64; m * n];
+        gemm(
+            1.0,
+            MatRef::from_row_major(&a, m, k),
+            MatRef::from_col_major(&b, k, n),
+            0.0,
+            MatMut::from_col_major(&mut cc, m, n),
+            Parallelism::Rayon(0),
+        );
+        assert_close(&cc, &cref, &format!("packed_oversample={ov}"));
+    }
+    tuning::set_packed_oversample(prev);
+}
+
+/// `mc_reg_panels` caps the A macro-panel height. Forcing it to `1` (minimal MC) or a huge value
+/// (MC bounded only by `m`) must keep a general GEMM correct.
+#[test]
+fn mc_reg_panels_stays_correct() {
+    let prev = tuning::mc_reg_panels();
+    for &force in &[1usize, usize::MAX] {
+        tuning::set_mc_reg_panels(force);
+        for &(m, k, n) in &[(200usize, 96usize, 175usize), (160, 48, 133)] {
+            let (a, b) = mkmats(m, k, n);
+            let cref = naive_col(&a, &b, m, k, n);
+            let mut cc = vec![0.0f64; m * n];
+            gemm(
+                1.0,
+                MatRef::from_col_major(&a, m, k),
+                MatRef::from_col_major(&b, k, n),
+                0.0,
+                MatMut::from_col_major(&mut cc, m, n),
+                Parallelism::Rayon(0),
+            );
+            assert_close(&cc, &cref, &format!("mc_reg_panels={force} {m}x{k}x{n}"));
+        }
+    }
+    tuning::set_mc_reg_panels(prev);
+}
+
+/// `nc_no_l3_panels` caps the no-L3 column block (inert where an L3 exists). Forcing it to `1` or a
+/// huge value must keep a general GEMM correct on any machine.
+#[test]
+fn nc_no_l3_panels_stays_correct() {
+    let prev = tuning::nc_no_l3_panels();
+    for &force in &[1usize, usize::MAX] {
+        tuning::set_nc_no_l3_panels(force);
+        let (m, k, n) = (160usize, 64usize, 200usize);
+        let (a, b) = mkmats(m, k, n);
+        let cref = naive_col(&a, &b, m, k, n);
+        let mut cc = vec![0.0f64; m * n];
+        gemm(
+            1.0,
+            MatRef::from_col_major(&a, m, k),
+            MatRef::from_col_major(&b, k, n),
+            0.0,
+            MatMut::from_col_major(&mut cc, m, n),
+            Parallelism::Rayon(0),
+        );
+        assert_close(&cc, &cref, &format!("nc_no_l3_panels={force}"));
+    }
+    tuning::set_nc_no_l3_panels(prev);
+}
+
+/// `tiny_block_dim` gates the small-matrix blocking shortcut. Forcing every shape onto the tiny
+/// branch (`usize::MAX`) or off it (`0`) must keep a plain GEMM correct — and, because the prepack
+/// paths derive their branch-dodging sentinel from this knob, a prepacked-B GEMM must stay correct
+/// even when the knob would otherwise route the shape into the tiny branch.
+#[test]
+fn tiny_block_dim_route_correct() {
+    let prev = tuning::tiny_block_dim();
+    for &force in &[usize::MAX, 0usize] {
+        tuning::set_tiny_block_dim(force);
+        for &(m, k, n) in &[(40usize, 33usize, 28usize), (128, 65, 96)] {
+            let (a, b) = mkmats(m, k, n);
+            let cref = naive_col(&a, &b, m, k, n);
+            let mut cc = vec![0.0f64; m * n];
+            gemm(
+                1.0,
+                MatRef::from_col_major(&a, m, k),
+                MatRef::from_col_major(&b, k, n),
+                0.0,
+                MatMut::from_col_major(&mut cc, m, n),
+                Parallelism::Rayon(0),
+            );
+            assert_close(&cc, &cref, &format!("tiny_block_dim={force} {m}x{k}x{n}"));
+        }
+    }
+    // Prepack coupling: with the gate forced huge, a normal `gemm()` on this shape would take the
+    // tiny branch, but the prepack sentinel (`gate + 1`) still dodges it so the prepacked geometry
+    // is valid.
+    tuning::set_tiny_block_dim(usize::MAX);
+    let (m, k, n) = (32usize, 33usize, 28usize);
+    let (a, b) = mkmats(m, k, n);
+    let cref = naive_col(&a, &b, m, k, n);
+    let packed = prepack_rhs(MatRef::from_col_major(&b, k, n));
+    let mut cc = vec![0.0f64; m * n];
+    gemm_packed_b(
+        1.0,
+        MatRef::from_col_major(&a, m, k),
+        &packed,
+        0.0,
+        MatMut::from_col_major(&mut cc, m, n),
+        Parallelism::Rayon(0),
+    );
+    assert_close(&cc, &cref, "tiny_block_dim prepack coupling");
+    tuning::set_tiny_block_dim(prev);
+}
+
+/// `kc` caps the tiny-branch depth block. On a small-matrix shape (which takes the tiny branch),
+/// forcing it to `1` (many depth panels) or a huge value (`kc == k`) must both stay correct.
+#[test]
+fn kc_tiny_ceiling_stays_correct() {
+    let prev = tuning::kc();
+    let (m, k, n) = (40usize, 200usize, 40usize); // m,n <= default tiny gate -> tiny branch
+    let (a, b) = mkmats(m, k, n);
+    let cref = naive_col(&a, &b, m, k, n);
+    for &force in &[1usize, usize::MAX] {
+        tuning::set_kc(force);
+        let mut cc = vec![0.0f64; m * n];
+        gemm(
+            1.0,
+            MatRef::from_col_major(&a, m, k),
+            MatRef::from_col_major(&b, k, n),
+            0.0,
+            MatMut::from_col_major(&mut cc, m, n),
+            Parallelism::Rayon(0),
+        );
+        assert_close(&cc, &cref, &format!("kc={force}"));
+    }
+    tuning::set_kc(prev);
+}
+
+/// `kc_min` floors the main-model depth block. On a general shape, forcing it to `1` (the L1
+/// estimate stands) or a huge value (`kc == k`) must both stay correct.
+#[test]
+fn kc_min_floor_stays_correct() {
+    let prev = tuning::kc_min();
+    let (m, k, n) = (200usize, 300usize, 175usize);
+    let (a, b) = mkmats(m, k, n);
+    let cref = naive_col(&a, &b, m, k, n);
+    for &force in &[1usize, usize::MAX] {
+        tuning::set_kc_min(force);
+        let mut cc = vec![0.0f64; m * n];
+        gemm(
+            1.0,
+            MatRef::from_col_major(&a, m, k),
+            MatRef::from_col_major(&b, k, n),
+            0.0,
+            MatMut::from_col_major(&mut cc, m, n),
+            Parallelism::Rayon(0),
+        );
+        assert_close(&cc, &cref, &format!("kc_min={force}"));
+    }
+    tuning::set_kc_min(prev);
+}
+
+/// `pack_transpose_tile` sets the strip length of the cache-blocked transpose in the strided
+/// packing path — only the copy order changes, not the packed bytes. A prepacked-B GEMM (which
+/// always runs that packer for a column-major B) must be correct at `1`, the default, and a huge
+/// strip length.
+#[test]
+fn pack_transpose_tile_stays_correct() {
+    let prev = tuning::pack_transpose_tile();
+    let (m, k, n) = (200usize, 96usize, 128usize);
+    let (a, b) = mkmats(m, k, n);
+    let cref = naive_col(&a, &b, m, k, n);
+    for &tile in &[1usize, 16, usize::MAX] {
+        tuning::set_pack_transpose_tile(tile);
+        let packed = prepack_rhs(MatRef::from_col_major(&b, k, n));
+        let mut cc = vec![0.0f64; m * n];
+        gemm_packed_b(
+            1.0,
+            MatRef::from_col_major(&a, m, k),
+            &packed,
+            0.0,
+            MatMut::from_col_major(&mut cc, m, n),
+            Parallelism::Rayon(0),
+        );
+        assert_close(&cc, &cref, &format!("pack_transpose_tile={tile}"));
+    }
+    tuning::set_pack_transpose_tile(prev);
+}
+
+/// `i8_vnni_min_par_mnk` gates the VNNI→widen small-parallel fallback. Forcing it to `0` (always
+/// keep VNNI) or `usize::MAX` (always fall back to widen for a multi-threaded run) must both give
+/// the correct i32 product; the two kernels are exact, so they must also agree bit-for-bit.
+#[cfg(feature = "int8")]
+#[test]
+fn i8_vnni_min_par_mnk_route_correct() {
+    let prev = tuning::i8_vnni_min_par_mnk();
+    let (m, k, n) = (128usize, 128usize, 128usize); // above parallel gate, so `Rayon` truly splits
+    let a: Vec<i8> = (0..m * k).map(|x| ((x % 17) as i8) - 8).collect();
+    let b: Vec<i8> = (0..k * n).map(|x| ((x % 13) as i8) - 6).collect();
+    let mut cref = vec![0i32; m * n];
+    for j in 0..n {
+        for i in 0..m {
+            let mut s = 0i32;
+            for p in 0..k {
+                s = s.wrapping_add(a[p * m + i] as i32 * b[j * k + p] as i32);
+            }
+            cref[j * m + i] = s;
+        }
+    }
+    let run = |force: usize| {
+        tuning::set_i8_vnni_min_par_mnk(force);
+        let mut cc = vec![0i32; m * n];
+        gemmkit::gemm_i8(
+            1,
+            MatRef::from_col_major(&a, m, k),
+            MatRef::from_col_major(&b, k, n),
+            0,
+            MatMut::from_col_major(&mut cc, m, n),
+            Parallelism::Rayon(0),
+        );
+        cc
+    };
+    let vnni = run(0);
+    let widen = run(usize::MAX);
+    tuning::set_i8_vnni_min_par_mnk(prev);
+    assert_eq!(vnni, cref, "i8_vnni_min_par_mnk=0 (VNNI) wrong");
+    assert_eq!(widen, cref, "i8_vnni_min_par_mnk=MAX (widen) wrong");
+    assert_eq!(
+        vnni, widen,
+        "VNNI and widen i8 kernels must be bit-identical"
+    );
 }
 
 /// Assert a serial and a parallel result agree to a tight relative tolerance. Within one route

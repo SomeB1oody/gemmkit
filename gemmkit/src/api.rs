@@ -824,13 +824,14 @@ pub unsafe fn prepack_rhs_unchecked<T: GemmScalar>(
     n: usize,
 ) -> PackedRhs<T> {
     // Resolve the panel geometry through the same ISA tile the consuming call will
-    // use; the `m = 65` sentinel dodges the tiny-matrix branch so the geometry is
-    // `m`-independent (the consume reads it back verbatim). Block with the packed
-    // input (`Lhs` == `Rhs`) element size — the unit the panels are stored in, same
-    // as the driver
+    // use; the `tiny_block_dim() + 1` sentinel row count dodges the tiny-matrix branch
+    // so the geometry is `m`-independent (the consume reads it back verbatim). Block
+    // with the packed input (`Lhs` == `Rhs`) element size — the unit the panels are
+    // stored in, same as the driver.
     let (mr, nr) = <T as GemmScalar>::rhs_tile();
     let lhs_size = core::mem::size_of::<T>().max(1);
-    let blk = crate::cache::topology().blocking(mr, nr, lhs_size, 65, n, k);
+    let dodge_tiny = crate::tuning::tiny_block_dim().saturating_add(1);
+    let blk = crate::cache::topology().blocking(mr, nr, lhs_size, dodge_tiny, n, k);
     let kc = if T::OUT_IS_ACC {
         blk.kc.max(1)
     } else {
@@ -866,9 +867,9 @@ pub unsafe fn prepack_rhs_unchecked<T: GemmScalar>(
 /// thread-local workspace pool. Skips the per-call RHS repack.
 ///
 /// The result **reproduces** a plain [`gemm`] under the same config, except in two
-/// cases that stay correct but may differ in the last ULP: very small
-/// (`m <= 64 && n <= 64`) products and gemv-shaped (`m == 1` or `n == 1`) products.
-/// Output is deterministic across thread counts regardless.
+/// cases that stay correct but may differ in the last ULP: very small products (both
+/// `m` and `n` at or below [`crate::tuning::tiny_block_dim`], default 64) and gemv-shaped
+/// (`m == 1` or `n == 1`) products. Output is deterministic across thread counts regardless.
 ///
 /// # Panics
 /// If the dimensions disagree (`A.cols != B.rows`, `A.rows != C.rows`,
@@ -1103,13 +1104,14 @@ pub unsafe fn prepack_lhs_unchecked<T: GemmScalar>(
 ) -> PackedLhs<T> {
     // Resolve the panel geometry through the consuming call's ISA tile, for the
     // *transposed* problem (whose RHS is this A): its `N` is the LHS's `m` rows, its
-    // `K` is `k`. The `m = 65` sentinel for the transposed `M` (the unknown-here `n`)
-    // dodges the tiny-matrix branch so the geometry is `n`-independent.
+    // `K` is `k`. The `tiny_block_dim() + 1` sentinel for the transposed `M` (the
+    // unknown-here `n`) dodges the tiny-matrix branch so the geometry is `n`-independent.
     let (mr, nr) = <T as GemmScalar>::rhs_tile();
     // Packed input (`Lhs` == `Rhs`) element size — the unit the panels are stored in,
     // matching the driver (the prepacked buffer below is `T`-typed).
     let lhs_size = core::mem::size_of::<T>().max(1);
-    let blk = crate::cache::topology().blocking(mr, nr, lhs_size, 65, m, k);
+    let dodge_tiny = crate::tuning::tiny_block_dim().saturating_add(1);
+    let blk = crate::cache::topology().blocking(mr, nr, lhs_size, dodge_tiny, m, k);
     let kc = if T::OUT_IS_ACC {
         blk.kc.max(1)
     } else {
@@ -1144,9 +1146,9 @@ pub unsafe fn prepack_lhs_unchecked<T: GemmScalar>(
 /// thread-local workspace pool. Skips the per-call LHS repack.
 ///
 /// The result **reproduces** a plain [`gemm`] under the same config, except in two
-/// cases that stay correct but may differ in the last ULP: very small
-/// (`m <= 64 && n <= 64`) products and gemv-shaped (`m == 1` or `n == 1`) products.
-/// Output is deterministic across thread counts regardless.
+/// cases that stay correct but may differ in the last ULP: very small products (both
+/// `m` and `n` at or below [`crate::tuning::tiny_block_dim`], default 64) and gemv-shaped
+/// (`m == 1` or `n == 1`) products. Output is deterministic across thread counts regardless.
 ///
 /// # Panics
 /// If the dimensions disagree (`A.cols != B.rows`, `A.rows != C.rows`,

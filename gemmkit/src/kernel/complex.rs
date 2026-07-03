@@ -74,6 +74,7 @@ unsafe fn pack_planar<T: ComplexFloat>(
     conj: bool,
 ) {
     unsafe {
+        let tile = crate::tuning::pack_transpose_tile();
         let zero = <T::Real as Scalar>::ZERO;
         // conj = negate the imaginary plane (true `-im`, so `+0.0` maps to `-0.0`,
         // matching `num_complex`'s `.conj()`); else copy it through.
@@ -106,10 +107,9 @@ unsafe fn pack_planar<T: ComplexFloat>(
                 // dimension (stride 1 for a row-major LHS / column-major RHS) in short
                 // strips per leading row, scattering into the planar panel — rather than
                 // gathering `width` strided elements per depth step (a cache miss each).
-                const TILE: usize = 16;
                 let mut p0 = 0;
                 while p0 < depth_len {
-                    let pe = core::cmp::min(p0 + TILE, depth_len);
+                    let pe = core::cmp::min(p0 + tile, depth_len);
                     for i in 0..width {
                         if i < live {
                             let row = src.offset((base + i) as isize * lead);

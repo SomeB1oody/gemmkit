@@ -33,6 +33,7 @@ pub(crate) unsafe fn pack_panels<T: Scalar>(
     width: usize,
 ) {
     unsafe {
+        let tile = crate::tuning::pack_transpose_tile();
         let mut d = dst;
         let mut base = 0usize;
         while base < n_lead {
@@ -51,11 +52,10 @@ pub(crate) unsafe fn pack_panels<T: Scalar>(
                 // gathering `width` strided elements per depth step (a cache miss
                 // per element when `lead` is large). A pure reordered copy (packed
                 // bytes identical), but far cheaper for a strided source.
-                const TILE: usize = 16;
                 let panel = d;
                 let mut p0 = 0;
                 while p0 < depth_len {
-                    let pe = core::cmp::min(p0 + TILE, depth_len);
+                    let pe = core::cmp::min(p0 + tile, depth_len);
                     for i in 0..width {
                         // Address each slot directly (no running pointer past the
                         // panel end); LLVM strength-reduces the `p` loop. Every

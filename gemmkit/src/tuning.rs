@@ -162,6 +162,66 @@ const SHARED_LHS_MNK_DEFAULT: usize = 8_000_000_000;
 const SHARED_LHS_MNK_DEFAULT: usize = usize::MAX;
 static SHARED_LHS_MNK: Threshold = Threshold::new("GEMMKIT_SHARED_LHS_MNK", SHARED_LHS_MNK_DEFAULT);
 
+// Largest `k` for which an axpy-shape gemv register-blocks the output (holds the output panel in
+// registers across the whole k-sweep). Above it the many in-place matrix column-streams exceed the
+// hardware prefetcher window and the plain column-outer form wins. Calibrated on Zen5:
+// register-blocking wins by `k <= 16`, is a wash near `k = 32`, regresses by `k ~ 48`.
+static K_STREAM_MAX: Threshold = Threshold::new("GEMMKIT_K_STREAM_MAX", 32);
+
+// aarch64 batched-GEMM crossover: a batch element splits across the machine (`SequentialInternal`)
+// rather than running one-per-worker cache-hot once its per-batch-worker byte share
+// `elem_bytes / batch` exceeds this. Calibrated on M4 Max (shared cluster-L2 + high unified
+// bandwidth). Only the aarch64 `resolve_batch` reads it; defined unconditionally so the knob (and
+// its env var) exists on every target.
+static SEQ_INTERNAL_BYTES_PER_WORKER: Threshold =
+    Threshold::new("GEMMKIT_SEQ_INTERNAL_BYTES_PER_WORKER", 320 * 1024);
+
+// Packed-LHS dynamic-scheduling split target: `packed_block_grain` splits each row-block into
+// power-of-two column sub-chunks until there are at least `this * n_threads` chunks, trading pack
+// reuse for load balance. Distinct from `PARALLEL_OVERSAMPLE` (the general-path grain, default 8);
+// this is the packed path's swept optimum — splitting harder re-packs A too often and regresses.
+static PACKED_OVERSAMPLE: Threshold = Threshold::new("GEMMKIT_PACKED_OVERSAMPLE", 2);
+
+// MC cap, in microtile rows: the A macro-panel is bounded to `this * MR` rows (BLIS keeps MC a
+// small multiple of MR). A calibration point, not an invariant — it currently binds on every
+// measured topology, overriding the L2-capacity-derived MC, so a larger L2 does not move MC today.
+static MC_REG_PANELS: Threshold = Threshold::new("GEMMKIT_MC_REG_PANELS", 8);
+
+// NC cap, in microtile columns, when the machine reports no L3 (e.g. Apple Silicon): the no-L3
+// column block is `min(this * NR, N)` — full-`N` up to this ceiling. With no L3 the BLIS model
+// keeps NC large (B streams from DRAM; the A panel is what fits the last-level cache); the cap
+// bounds the shared packed-B panel. Dead where an L3 exists. `512` (= 2048 cols at NR = 4) keeps
+// typical widths full-`N`.
+static NC_NO_L3_PANELS: Threshold = Threshold::new("GEMMKIT_NC_NO_L3_PANELS", 512);
+
+// Small-matrix shortcut gate: a shape with both `m` and `n` at or below this skips the full BLIS
+// blocking model and just keeps A/B panels in L2. One knob bounds both dimensions. The prepack
+// paths derive their branch-dodging sentinel as `this + 1`, so raising the gate never makes a
+// prepack take the tiny branch.
+static TINY_BLOCK_DIM: Threshold = Threshold::new("GEMMKIT_TINY_BLOCK_DIM", 64);
+
+// Tiny-branch `kc` ceiling: in the small-matrix shortcut the depth block is `k` clamped to this.
+static KC: Threshold = Threshold::new("GEMMKIT_KC", 512);
+
+// Main-model `kc` floor: the L1-fit depth estimate is raised to at least this before the
+// last-panel rebalance, so a small L1 never starves the microkernel depth-walk.
+static KC_MIN: Threshold = Threshold::new("GEMMKIT_KC_MIN", 512);
+
+// Strip length for the cache-blocked transpose in the strided packing paths (real and complex):
+// the source is walked along its contiguous dimension in strips of this many depth steps and each
+// strip scattered into the panel, turning a per-element strided gather into blocked copies. One
+// knob backs both packers (identical strip geometry).
+static PACK_TRANSPOSE_TILE: Threshold = Threshold::new("GEMMKIT_PACK_TRANSPOSE_TILE", 16);
+
+// Below this `m*n*k`, an auto-selected VNNI i8 kernel hands a *multi-threaded* problem to the widen
+// fallback (VNNI's mandatory RHS-pack barrier outweighs its compute saving on a small parallel
+// problem). Bit-identical to VNNI (exact i32), so the swap never perturbs results. Calibrated on
+// Zen5: VNNI wins serial at every size and parallel from `n ~ 1024` up. Inert unless the x86 VNNI
+// auto path is selected.
+#[cfg(feature = "int8")]
+static I8_VNNI_MIN_PAR_MNK: Threshold =
+    Threshold::new("GEMMKIT_I8_VNNI_MIN_PAR_MNK", 768 * 768 * 768);
+
 /// Get the serial/parallel work gate (`m*n*k` threshold).
 pub fn parallel_threshold() -> usize {
     PARALLEL_THRESHOLD.get()
@@ -268,6 +328,105 @@ pub fn shared_lhs_mnk() -> usize {
 /// Override the shared-LHS A-pack workload gate (`m*n*k`).
 pub fn set_shared_lhs_mnk(v: usize) {
     SHARED_LHS_MNK.set(v);
+}
+
+/// Get the axpy-gemv output register-blocking `k` ceiling (register-block when `k <= this`).
+pub fn k_stream_max() -> usize {
+    K_STREAM_MAX.get()
+}
+/// Override the axpy-gemv output register-blocking `k` ceiling.
+pub fn set_k_stream_max(v: usize) {
+    K_STREAM_MAX.set(v);
+}
+
+/// Get the aarch64 batched-GEMM `SequentialInternal` byte crossover (per batch-worker share).
+pub fn seq_internal_bytes_per_worker() -> usize {
+    SEQ_INTERNAL_BYTES_PER_WORKER.get()
+}
+/// Override the aarch64 batched-GEMM `SequentialInternal` byte crossover.
+pub fn set_seq_internal_bytes_per_worker(v: usize) {
+    SEQ_INTERNAL_BYTES_PER_WORKER.set(v);
+}
+
+/// Get the packed-LHS dynamic-scheduling split target (chunks per worker). Always `>= 1` so the
+/// grain computation can never target zero chunks.
+pub fn packed_oversample() -> usize {
+    PACKED_OVERSAMPLE.get().max(1)
+}
+/// Override the packed-LHS dynamic-scheduling split target.
+pub fn set_packed_oversample(v: usize) {
+    PACKED_OVERSAMPLE.set(v);
+}
+
+/// Get the MC cap in microtile rows (the A macro-panel is bounded to `this * MR` rows). Always
+/// `>= 1` so `MC` stays a positive multiple of `MR`.
+pub fn mc_reg_panels() -> usize {
+    MC_REG_PANELS.get().max(1)
+}
+/// Override the MC cap in microtile rows.
+pub fn set_mc_reg_panels(v: usize) {
+    MC_REG_PANELS.set(v);
+}
+
+/// Get the no-L3 NC cap in microtile columns (`NC <= this * NR`; only consulted when the machine
+/// reports no L3).
+pub fn nc_no_l3_panels() -> usize {
+    NC_NO_L3_PANELS.get()
+}
+/// Override the no-L3 NC cap in microtile columns.
+pub fn set_nc_no_l3_panels(v: usize) {
+    NC_NO_L3_PANELS.set(v);
+}
+
+/// Get the small-matrix shortcut gate: a shape with both `m` and `n` at or below this skips the
+/// full blocking model. The prepack paths dodge this branch via a `this + 1` sentinel.
+pub fn tiny_block_dim() -> usize {
+    TINY_BLOCK_DIM.get()
+}
+/// Override the small-matrix shortcut gate.
+pub fn set_tiny_block_dim(v: usize) {
+    TINY_BLOCK_DIM.set(v);
+}
+
+/// Get the tiny-branch `kc` ceiling (small-matrix depth block = `k` clamped to this). Always `>= 1`
+/// so the clamp's upper bound never falls below its lower bound.
+pub fn kc() -> usize {
+    KC.get().max(1)
+}
+/// Override the tiny-branch `kc` ceiling.
+pub fn set_kc(v: usize) {
+    KC.set(v);
+}
+
+/// Get the main-model `kc` floor (the L1-fit depth block is raised to at least this).
+pub fn kc_min() -> usize {
+    KC_MIN.get()
+}
+/// Override the main-model `kc` floor.
+pub fn set_kc_min(v: usize) {
+    KC_MIN.set(v);
+}
+
+/// Get the cache-blocked-transpose strip length used by the strided packing paths. Always `>= 1`
+/// so the strip loop always advances.
+pub fn pack_transpose_tile() -> usize {
+    PACK_TRANSPOSE_TILE.get().max(1)
+}
+/// Override the cache-blocked-transpose strip length.
+pub fn set_pack_transpose_tile(v: usize) {
+    PACK_TRANSPOSE_TILE.set(v);
+}
+
+/// Get the i8 VNNI small-parallel fallback gate (`m*n*k`): below it an auto-selected VNNI kernel
+/// hands a multi-threaded problem to the widen fallback. Bit-identical to VNNI.
+#[cfg(feature = "int8")]
+pub fn i8_vnni_min_par_mnk() -> usize {
+    I8_VNNI_MIN_PAR_MNK.get()
+}
+/// Override the i8 VNNI small-parallel fallback gate.
+#[cfg(feature = "int8")]
+pub fn set_i8_vnni_min_par_mnk(v: usize) {
+    I8_VNNI_MIN_PAR_MNK.set(v);
 }
 
 /// Get the auto worker-count ramp granularity (units of linear problem dimension

@@ -174,17 +174,14 @@ unsafe fn core<T, S>(
 
 /// Register-block the output for an axpy-shape gemv when *both* hold: the output
 /// (`rows·sizeof` bytes) spills L2, so the plain column-outer form's per-column re-read of the
-/// output leaves the core's private cache; and `k` is small enough that the register-blocked
-/// form's `k` in-place matrix column-streams (one per depth step) stay within the hardware
-/// prefetcher's window. When the output fits L2 the plain form's re-reads are cheap and its
-/// single contiguous matrix stream wins; when `k` is large its many streams thrash the
-/// prefetcher. `K_STREAM_MAX = 32` is calibrated on Zen5: register-blocking wins by `k ≤ 16`,
-/// is a wash near `k = 32`, and regresses by `k ≈ 48` as the streams exceed the prefetcher.
-const K_STREAM_MAX: usize = 32;
-
+/// output leaves the core's private cache; and `k` is small enough (`<= k_stream_max`) that the
+/// register-blocked form's `k` in-place matrix column-streams (one per depth step) stay within the
+/// hardware prefetcher's window. When the output fits L2 the plain form's re-reads are cheap and
+/// its single contiguous matrix stream wins; when `k` is large its many streams thrash the
+/// prefetcher.
 #[inline]
 fn output_register_block(rows: usize, sizeof: usize, k: usize) -> bool {
-    k <= K_STREAM_MAX
+    k <= crate::tuning::k_stream_max()
         && rows.saturating_mul(sizeof) > crate::cache::topology().l2.effective_bytes().max(1)
 }
 
