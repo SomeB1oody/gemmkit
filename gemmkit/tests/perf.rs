@@ -1603,6 +1603,66 @@ fn perf_gemv_paths() {
     }
 }
 
+/// Register-block calibration for the axpy gemv: sweeps `K_STREAM_MAX` (the cap on `k` for which an
+/// *engaged* output register-block runs) over an `m × k` grid to map *where* register-blocking pays.
+/// The result is **output-size-dependent** — it loses while the output stays L3-resident (the
+/// matrix-stream prefetcher thrash dominates the cheap re-reads) and wins once the output spills
+/// toward DRAM — which is why the engage gate is a fraction of L3, not L2 (see
+/// `special::gemv::output_register_block`). With the L3/2 gate, moderate-`m` rows read the same at
+/// every cap (register-block gated off), and only the huge-`m` rows show the cap effect. Calibrated
+/// on Zen5; re-run on any new target (e.g. aarch64) before retuning the gate or the cap.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture"]
+fn perf_k_stream() {
+    let _guard = BENCH_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    println!("\nK_STREAM_MAX calibration — axpy gemv GB/s vs register-block cap (serial):");
+    // Restore K_STREAM_MAX on scope exit *including an unwinding panic* — it is a process-global
+    // that later benches in this binary read, so a trailing statement would leak the last cap if a
+    // large-shape iteration paniced (e.g. OOM). RAII, not a trailing `set`.
+    struct Restore(usize);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            gemmkit::tuning::set_k_stream_max(self.0);
+        }
+    }
+    let _restore = Restore(gemmkit::tuning::k_stream_max());
+    // Output spills L2 at every `m` below; `k` straddles the candidate caps. `cap >= k` => the
+    // output register-blocks; `cap < k` => the plain column-outer form. So (32 vs 16) changes only
+    // the k=24/32 rows, (16 vs 8) only the k=16 row; k=8 register-blocks under all three. The huge
+    // `m` rows are the regime the path exists for: output ∤ LLC (DRAM-bound), where holding it in
+    // registers avoids re-streaming it per column. `k` is bounded there to cap the matrix alloc.
+    for &(m, ks) in &[
+        (300_000usize, &[8usize, 16, 24, 32, 48][..]),
+        (1_048_576, &[8, 16, 24, 32, 48][..]),
+        (4_194_304, &[8, 16, 24, 32][..]),
+        (8_388_608, &[8, 16, 32][..]),
+        (16_777_216, &[8, 16][..]), // k bounded so the matrix stays <= ~1 GiB
+    ] {
+        for &k in ks {
+            let a = fill(m * k, 1);
+            let x = fill(k, 2);
+            let bytes = (m * k + k + m) * 4;
+            let mut row = format!("  m={m:<9} k={k:<3} ");
+            for &cap in &[32usize, 16, 8] {
+                gemmkit::tuning::set_k_stream_max(cap);
+                let mut y = vec![0.0f32; m];
+                let s = measure_gbps(bytes, || {
+                    gemm(
+                        1.0,
+                        MatRef::from_col_major(&a, m, k),
+                        MatRef::from_col_major(&x, k, 1),
+                        0.0,
+                        MatMut::from_col_major(&mut y, m, 1),
+                        Parallelism::Serial,
+                    );
+                });
+                row.push_str(&format!("cap={cap:<2}={:6.1}  ", s.median));
+            }
+            println!("{row}");
+        }
+    }
+}
+
 /// gevv / skinny GEMM `C(m×n) = A(m×k)·B(k×n)` at small `k`, reported as GB/s of the
 /// minimum traffic `(m*k + k*n + m*n)*4` (beta = 0, so C is write-only) against the STREAM
 /// `ceiling`, plus the `gemm`-crate / `matrixmultiply` GB/s on the same shape (`kit ×` is

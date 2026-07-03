@@ -222,6 +222,23 @@ pub(crate) fn gemv_parallel_floor_bytes() -> usize {
     }
 }
 
+/// Output-size gate for the axpy-gemv register-block strategy (see
+/// [`crate::special`]'s `output_register_block`): it engages only once the output is large enough
+/// that the plain column-outer form's per-column output re-reads spill toward DRAM. Register-block
+/// *loses* while the output is L3-resident (the many matrix-stream prefetches thrash while the
+/// re-reads stay cheap) and *wins* once the output approaches leaving L3. Calibrated on Zen5 (it
+/// loses up to a ~16 MiB output and wins from ~32 MiB), i.e. around half the per-core L3 share.
+/// No L3 (Apple): fall back to the L2 gate, pending on-device calibration. Sibling of
+/// [`gemv_parallel_floor_bytes`] — the one home for cache-derived byte thresholds. Not gated on
+/// `parallel`: the serial gemv path uses it too.
+pub(crate) fn gemv_regblock_engage_bytes() -> usize {
+    let t = topology();
+    match t.l3 {
+        Some(l3) => (l3.effective_bytes() / 2).max(1),
+        None => t.l2.effective_bytes().max(1),
+    }
+}
+
 /// Run the fallback chain once. Never panics: any backend that fails or returns
 /// implausible values is skipped.
 #[cfg(feature = "std")]

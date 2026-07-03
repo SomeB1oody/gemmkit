@@ -173,16 +173,17 @@ unsafe fn core<T, S>(
 }
 
 /// Register-block the output for an axpy-shape gemv when *both* hold: the output
-/// (`rows·sizeof` bytes) spills L2, so the plain column-outer form's per-column re-read of the
-/// output leaves the core's private cache; and `k` is small enough (`<= k_stream_max`) that the
-/// register-blocked form's `k` in-place matrix column-streams (one per depth step) stay within the
-/// hardware prefetcher's window. When the output fits L2 the plain form's re-reads are cheap and
-/// its single contiguous matrix stream wins; when `k` is large its many streams thrash the
-/// prefetcher.
+/// (`rows·sizeof` bytes) is large enough that the plain column-outer form's per-column re-read of
+/// the output spills toward DRAM (the size gate is a fraction of L3 — see
+/// [`crate::cache::gemv_regblock_engage_bytes`]); and `k` is small enough (`<= k_stream_max`) that
+/// the register-blocked form's `k` in-place matrix column-streams (one per depth step) stay within
+/// the hardware prefetcher's window. When the output stays cache-resident the plain form's re-reads
+/// are cheap and its single contiguous matrix stream wins; when `k` is large its many streams thrash
+/// the prefetcher.
 #[inline]
 fn output_register_block(rows: usize, sizeof: usize, k: usize) -> bool {
     k <= crate::tuning::k_stream_max()
-        && rows.saturating_mul(sizeof) > crate::cache::topology().l2.effective_bytes().max(1)
+        && rows.saturating_mul(sizeof) > crate::cache::gemv_regblock_engage_bytes()
 }
 
 /// Register-blocked axpy over output rows `[s, e)`: the output panel is held in SIMD
