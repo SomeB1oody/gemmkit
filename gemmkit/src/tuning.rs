@@ -94,14 +94,20 @@ impl Threshold {
 
 // Below the product `m*n*k`, work is forced onto a single thread. Default
 // 48*48*256, matching the empirical serial→parallel break-even.
-static PARALLEL_THRESHOLD: Threshold = Threshold::new("GEMMKIT_PARALLEL_THRESHOLD", 48 * 48 * 256);
+/// Compiled default for [`parallel_threshold`] (before any env/setter override).
+pub const PARALLEL_THRESHOLD_DEFAULT: usize = 48 * 48 * 256;
+static PARALLEL_THRESHOLD: Threshold =
+    Threshold::new("GEMMKIT_PARALLEL_THRESHOLD", PARALLEL_THRESHOLD_DEFAULT);
 
 // Pack the RHS macro-panel only when `m` (the number of rows, i.e. how many row
 // blocks reuse the packed B) exceeds this. Below it the RHS is read in place — it
 // is only ever broadcast, so any layout works unpacked, and skipping the copy is
 // a clear win for small/medium problems. The shared pack buffer has no
 // per-worker redundancy, so the gate is purely about copy-cost vs reuse.
-static RHS_PACK_THRESHOLD: Threshold = Threshold::new("GEMMKIT_RHS_PACK_THRESHOLD", 2048);
+/// Compiled default for [`rhs_pack_threshold`] (before any env/setter override).
+pub const RHS_PACK_THRESHOLD_DEFAULT: usize = 2048;
+static RHS_PACK_THRESHOLD: Threshold =
+    Threshold::new("GEMMKIT_RHS_PACK_THRESHOLD", RHS_PACK_THRESHOLD_DEFAULT);
 
 // Pack the LHS macro-panel only when each worker reuses it across more than this
 // many columns (per-worker reuse, which falls with the thread count). A non-unit
@@ -109,17 +115,25 @@ static RHS_PACK_THRESHOLD: Threshold = Threshold::new("GEMMKIT_RHS_PACK_THRESHOL
 // calibrated so column-major inputs stay unpacked through mid-size parallel runs
 // (where redundant per-worker packing would dominate) and pack only when reuse
 // is genuinely high.
-static LHS_PACK_THRESHOLD: Threshold = Threshold::new("GEMMKIT_LHS_PACK_THRESHOLD", 1024);
+/// Compiled default for [`lhs_pack_threshold`] (before any env/setter override).
+pub const LHS_PACK_THRESHOLD_DEFAULT: usize = 1024;
+static LHS_PACK_THRESHOLD: Threshold =
+    Threshold::new("GEMMKIT_LHS_PACK_THRESHOLD", LHS_PACK_THRESHOLD_DEFAULT);
 
 // Avoid a TLB/cache-hostile strided read, not amortize a copy.
 // A column-major A is walked down K in the microkernel with stride `csa`,
 // so when `csa * sizeof(Lhs)` reaches ~a memory page every depth
 // step lands on a fresh page and the in-place read collapses
-static LHS_PACK_STRIDE: Threshold = Threshold::new("GEMMKIT_LHS_PACK_STRIDE", 0);
+/// Compiled default for [`lhs_pack_stride`] (before any env/setter override); `0` = auto (page-derived).
+pub const LHS_PACK_STRIDE_DEFAULT: usize = 0;
+static LHS_PACK_STRIDE: Threshold =
+    Threshold::new("GEMMKIT_LHS_PACK_STRIDE", LHS_PACK_STRIDE_DEFAULT);
 
 // Maximum `min(m, n)` for which the dedicated gemv (matrix·vector) path is taken
 // when the other dimension is 1. (Shape, not size, decides; this only caps it.)
-static GEMV_THRESHOLD: Threshold = Threshold::new("GEMMKIT_GEMV_THRESHOLD", usize::MAX - 1);
+/// Compiled default for [`gemv_threshold`] (before any env/setter override); effectively unbounded.
+pub const GEMV_THRESHOLD_DEFAULT: usize = usize::MAX - 1;
+static GEMV_THRESHOLD: Threshold = Threshold::new("GEMMKIT_GEMV_THRESHOLD", GEMV_THRESHOLD_DEFAULT);
 
 // At or below this `k`, a (non-gemv) shape takes the generic small-`k` route — computing
 // the whole product in one depth panel over the microkernel, reading A/B in place, no
@@ -148,41 +162,58 @@ static SMALL_K_THRESHOLD: Threshold =
 // packing/blocking. The driver pads tiny row/col tiles to a full microtile, wasting most of its
 // work when both output dimensions are far below the microtile; this route computes exactly the
 // `m*n` outputs
-static SMALL_MN_DIM: Threshold = Threshold::new("GEMMKIT_SMALL_MN_DIM", 16);
+/// Compiled default for [`small_mn_dim`] (before any env/setter override).
+pub const SMALL_MN_DIM_DEFAULT: usize = 16;
+static SMALL_MN_DIM: Threshold = Threshold::new("GEMMKIT_SMALL_MN_DIM", SMALL_MN_DIM_DEFAULT);
 
 // Byte floor below which a bandwidth-bound gemv/gevv stays single-threaded: below it the
 // touched data (the matrix for gemv, the output for gevv) is LLC-resident and one core gets
 // the full LLC bandwidth, so splitting only loses (fork/join + shared-LLC contention, no DRAM
 // to gain). `0` (the default) derives the floor from the LLC size (see
 // `crate::cache::gemv_parallel_floor_bytes`); any non-zero value overrides it.
-static GEMV_PARALLEL_BYTES: Threshold = Threshold::new("GEMMKIT_GEMV_PARALLEL_BYTES", 0);
+/// Compiled default for [`gemv_parallel_bytes`] (before any env/setter override); `0` = auto (LLC-derived).
+pub const GEMV_PARALLEL_BYTES_DEFAULT: usize = 0;
+static GEMV_PARALLEL_BYTES: Threshold =
+    Threshold::new("GEMMKIT_GEMV_PARALLEL_BYTES", GEMV_PARALLEL_BYTES_DEFAULT);
 
 // Maximum workers a bandwidth-bound gemv/gevv may use. `0` (the default) derives a proxy
 // from the logical core count (see `parallel::bandwidth_cap`); any non-zero value is a hard
 // cap. This is the escape hatch for the fact that the memory-parallel width is a heuristic:
 // no physical-core / memory-channel count is exposed, and DRAM saturates at far fewer
 // workers than the logical core count. Raise it on a high-bandwidth shared-L2 part (Apple).
-static GEMV_THREAD_CAP: Threshold = Threshold::new("GEMMKIT_GEMV_THREAD_CAP", 0);
+/// Compiled default for [`gemv_thread_cap`] (before any env/setter override); `0` = auto (core-derived).
+pub const GEMV_THREAD_CAP_DEFAULT: usize = 0;
+static GEMV_THREAD_CAP: Threshold =
+    Threshold::new("GEMMKIT_GEMV_THREAD_CAP", GEMV_THREAD_CAP_DEFAULT);
 
 // Dynamic-scheduling granularity: the parallel driver aims for this many work
 // chunks *per worker*, handed out from a shared cursor on demand, so faster cores
 // (heterogeneous big.LITTLE P/E layouts) pull proportionally more. Higher = finer
 // load balance and a smaller tail, at the cost of more atomic claims (and, on the
 // rare packed-LHS path, more re-packing at chunk edges); lower = coarser
-static PARALLEL_OVERSAMPLE: Threshold = Threshold::new("GEMMKIT_PARALLEL_OVERSAMPLE", 8);
+/// Compiled default for [`parallel_oversample`] (before any env/setter override).
+pub const PARALLEL_OVERSAMPLE_DEFAULT: usize = 8;
+static PARALLEL_OVERSAMPLE: Threshold =
+    Threshold::new("GEMMKIT_PARALLEL_OVERSAMPLE", PARALLEL_OVERSAMPLE_DEFAULT);
 
 // Auto worker-count ramp granularity (units of linear problem dimension per
 // worker): the auto `Rayon(0)` path targets `cbrt(m*n*k).div_ceil(this)` workers.
 // `0` (the default) means *auto* — derive the stride from the core count (see
 // [`thread_dim_stride`]); any non-zero env/setter value overrides verbatim.
-static THREAD_DIM_STRIDE: Threshold = Threshold::new("GEMMKIT_THREAD_DIM_STRIDE", 0);
+/// Compiled default for [`thread_dim_stride`] (before any env/setter override); `0` = auto (core-derived).
+pub const THREAD_DIM_STRIDE_DEFAULT: usize = 0;
+static THREAD_DIM_STRIDE: Threshold =
+    Threshold::new("GEMMKIT_THREAD_DIM_STRIDE", THREAD_DIM_STRIDE_DEFAULT);
 
 // Worker count for a threaded wasm build (`wasm_threads` feature). wasm has no
 // `available_parallelism`, so the deployer sets the parallel width here instead — it caps
 // `auto_threads` and sizes gemmkit's wasm rayon pool. Off-target builds stay serial via the
 // `RAYON_USABLE` guard regardless.
+/// Compiled default for [`wasm_threads`] (before any env/setter override).
 #[cfg(all(target_arch = "wasm32", feature = "wasm_threads"))]
-static WASM_THREADS: Threshold = Threshold::new("GEMMKIT_WASM_THREADS", 8);
+pub const WASM_THREADS_DEFAULT: usize = 8;
+#[cfg(all(target_arch = "wasm32", feature = "wasm_threads"))]
+static WASM_THREADS: Threshold = Threshold::new("GEMMKIT_WASM_THREADS", WASM_THREADS_DEFAULT);
 
 // Minimum `m*n*k` for the shared-LHS A-pack to engage (on top of the runtime
 // `n_mc < n_threads` redundancy guard in the driver). The shared pre-pass removes
@@ -220,54 +251,78 @@ static K_STREAM_MAX: Threshold = Threshold::new("GEMMKIT_K_STREAM_MAX", K_STREAM
 // `elem_bytes / batch` exceeds this. Calibrated on M4 Max (shared cluster-L2 + high unified
 // bandwidth). Only the aarch64 `resolve_batch` reads it; defined unconditionally so the knob (and
 // its env var) exists on every target.
-static SEQ_INTERNAL_BYTES_PER_WORKER: Threshold =
-    Threshold::new("GEMMKIT_SEQ_INTERNAL_BYTES_PER_WORKER", 320 * 1024);
+/// Compiled default for [`seq_internal_bytes_per_worker`] (before any env/setter override).
+pub const SEQ_INTERNAL_BYTES_PER_WORKER_DEFAULT: usize = 320 * 1024;
+static SEQ_INTERNAL_BYTES_PER_WORKER: Threshold = Threshold::new(
+    "GEMMKIT_SEQ_INTERNAL_BYTES_PER_WORKER",
+    SEQ_INTERNAL_BYTES_PER_WORKER_DEFAULT,
+);
 
 // Packed-LHS dynamic-scheduling split target: `packed_block_grain` splits each row-block into
 // power-of-two column sub-chunks until there are at least `this * n_threads` chunks, trading pack
 // reuse for load balance. Distinct from `PARALLEL_OVERSAMPLE` (the general-path grain, default 8);
 // this is the packed path's swept optimum — splitting harder re-packs A too often and regresses.
-static PACKED_OVERSAMPLE: Threshold = Threshold::new("GEMMKIT_PACKED_OVERSAMPLE", 2);
+/// Compiled default for [`packed_oversample`] (before any env/setter override).
+pub const PACKED_OVERSAMPLE_DEFAULT: usize = 2;
+static PACKED_OVERSAMPLE: Threshold =
+    Threshold::new("GEMMKIT_PACKED_OVERSAMPLE", PACKED_OVERSAMPLE_DEFAULT);
 
 // MC cap, in microtile rows: the A macro-panel is bounded to `this * MR` rows (BLIS keeps MC a
 // small multiple of MR). A calibration point, not an invariant — it currently binds on every
 // measured topology, overriding the L2-capacity-derived MC, so a larger L2 does not move MC today.
-static MC_REG_PANELS: Threshold = Threshold::new("GEMMKIT_MC_REG_PANELS", 8);
+/// Compiled default for [`mc_reg_panels`] (before any env/setter override).
+pub const MC_REG_PANELS_DEFAULT: usize = 8;
+static MC_REG_PANELS: Threshold = Threshold::new("GEMMKIT_MC_REG_PANELS", MC_REG_PANELS_DEFAULT);
 
 // NC cap, in microtile columns, when the machine reports no L3 (e.g. Apple Silicon): the no-L3
 // column block is `min(this * NR, N)` — full-`N` up to this ceiling. With no L3 the BLIS model
 // keeps NC large (B streams from DRAM; the A panel is what fits the last-level cache); the cap
 // bounds the shared packed-B panel. Dead where an L3 exists. `512` (= 2048 cols at NR = 4) keeps
 // typical widths full-`N`.
-static NC_NO_L3_PANELS: Threshold = Threshold::new("GEMMKIT_NC_NO_L3_PANELS", 512);
+/// Compiled default for [`nc_no_l3_panels`] (before any env/setter override).
+pub const NC_NO_L3_PANELS_DEFAULT: usize = 512;
+static NC_NO_L3_PANELS: Threshold =
+    Threshold::new("GEMMKIT_NC_NO_L3_PANELS", NC_NO_L3_PANELS_DEFAULT);
 
 // Small-matrix shortcut gate: a shape with both `m` and `n` at or below this skips the full BLIS
 // blocking model and just keeps A/B panels in L2. One knob bounds both dimensions. The prepack
 // paths derive their branch-dodging sentinel as `this + 1`, so raising the gate never makes a
 // prepack take the tiny branch.
-static TINY_BLOCK_DIM: Threshold = Threshold::new("GEMMKIT_TINY_BLOCK_DIM", 64);
+/// Compiled default for [`tiny_block_dim`] (before any env/setter override).
+pub const TINY_BLOCK_DIM_DEFAULT: usize = 64;
+static TINY_BLOCK_DIM: Threshold = Threshold::new("GEMMKIT_TINY_BLOCK_DIM", TINY_BLOCK_DIM_DEFAULT);
 
 // Tiny-branch `kc` ceiling: in the small-matrix shortcut the depth block is `k` clamped to this.
-static KC: Threshold = Threshold::new("GEMMKIT_KC", 512);
+/// Compiled default for [`kc`] (before any env/setter override).
+pub const KC_DEFAULT: usize = 512;
+static KC: Threshold = Threshold::new("GEMMKIT_KC", KC_DEFAULT);
 
 // Main-model `kc` floor: the L1-fit depth estimate is raised to at least this before the
 // last-panel rebalance, so a small L1 never starves the microkernel depth-walk.
-static KC_MIN: Threshold = Threshold::new("GEMMKIT_KC_MIN", 512);
+/// Compiled default for [`kc_min`] (before any env/setter override).
+pub const KC_MIN_DEFAULT: usize = 512;
+static KC_MIN: Threshold = Threshold::new("GEMMKIT_KC_MIN", KC_MIN_DEFAULT);
 
 // Strip length for the cache-blocked transpose in the strided packing paths (real and complex):
 // the source is walked along its contiguous dimension in strips of this many depth steps and each
 // strip scattered into the panel, turning a per-element strided gather into blocked copies. One
 // knob backs both packers (identical strip geometry).
-static PACK_TRANSPOSE_TILE: Threshold = Threshold::new("GEMMKIT_PACK_TRANSPOSE_TILE", 16);
+/// Compiled default for [`pack_transpose_tile`] (before any env/setter override).
+pub const PACK_TRANSPOSE_TILE_DEFAULT: usize = 16;
+static PACK_TRANSPOSE_TILE: Threshold =
+    Threshold::new("GEMMKIT_PACK_TRANSPOSE_TILE", PACK_TRANSPOSE_TILE_DEFAULT);
 
 // Below this `m*n*k`, an auto-selected VNNI i8 kernel hands a *multi-threaded* problem to the widen
 // fallback (VNNI's mandatory RHS-pack barrier outweighs its compute saving on a small parallel
 // problem). Bit-identical to VNNI (exact i32), so the swap never perturbs results. Calibrated on
 // Zen5: VNNI wins serial at every size and parallel from `n ~ 1024` up. Inert unless the x86 VNNI
 // auto path is selected.
+/// Compiled default for [`i8_vnni_min_par_mnk`] (before any env/setter override).
+#[cfg(feature = "int8")]
+pub const I8_VNNI_MIN_PAR_MNK_DEFAULT: usize = 768 * 768 * 768;
 #[cfg(feature = "int8")]
 static I8_VNNI_MIN_PAR_MNK: Threshold =
-    Threshold::new("GEMMKIT_I8_VNNI_MIN_PAR_MNK", 768 * 768 * 768);
+    Threshold::new("GEMMKIT_I8_VNNI_MIN_PAR_MNK", I8_VNNI_MIN_PAR_MNK_DEFAULT);
 
 /// Get the serial/parallel work gate (`m*n*k` threshold).
 pub fn parallel_threshold() -> usize {

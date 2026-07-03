@@ -629,7 +629,7 @@ fn main() {
         sweep_sgemm(
             "GEMMKIT_MC_REG_PANELS",
             tuning::set_mc_reg_panels,
-            8,
+            tuning::MC_REG_PANELS_DEFAULT,
             &[4, 6, 12, 16],
             &timing,
             &[(512, 512, 512), (1024, 1024, 1024), (2048, 2048, 2048)],
@@ -642,7 +642,7 @@ fn main() {
         sweep_sgemm(
             "GEMMKIT_KC_MIN",
             tuning::set_kc_min,
-            512,
+            tuning::KC_MIN_DEFAULT,
             &[256, 384, 768, 1024],
             &timing,
             &[(768, 768, 768), (1024, 1024, 1024), (1536, 1536, 1536)],
@@ -655,7 +655,7 @@ fn main() {
         sweep_sgemm(
             "GEMMKIT_TINY_BLOCK_DIM",
             tuning::set_tiny_block_dim,
-            64,
+            tuning::TINY_BLOCK_DIM_DEFAULT,
             &[32, 48, 96, 128],
             &timing,
             &[(48, 512, 48), (64, 512, 64), (96, 512, 96)],
@@ -668,7 +668,7 @@ fn main() {
         sweep_sgemm(
             "GEMMKIT_KC",
             tuning::set_kc,
-            512,
+            tuning::KC_DEFAULT,
             &[128, 256, 1024],
             &timing,
             &[(48, 1024, 48), (40, 2048, 40)],
@@ -681,7 +681,7 @@ fn main() {
         sweep_sgemm(
             "GEMMKIT_PACK_TRANSPOSE_TILE",
             tuning::set_pack_transpose_tile,
-            16,
+            tuning::PACK_TRANSPOSE_TILE_DEFAULT,
             &[8, 32, 64],
             &timing,
             &[(1024, 512, 256), (768, 512, 512)],
@@ -696,7 +696,7 @@ fn main() {
         sweep_sgemm(
             "GEMMKIT_PARALLEL_OVERSAMPLE",
             tuning::set_parallel_oversample,
-            8,
+            tuning::PARALLEL_OVERSAMPLE_DEFAULT,
             &[2, 4, 16, 32],
             &timing,
             &[(256, 256, 256), (512, 512, 512), (1024, 1024, 1024)],
@@ -709,7 +709,7 @@ fn main() {
         sweep_sgemm(
             "GEMMKIT_PACKED_OVERSAMPLE",
             tuning::set_packed_oversample,
-            2,
+            tuning::PACKED_OVERSAMPLE_DEFAULT,
             &[1, 4, 8],
             &timing,
             &[(2048, 256, 256), (4096, 128, 512)],
@@ -722,7 +722,7 @@ fn main() {
         sweep_sgemm(
             "GEMMKIT_THREAD_DIM_STRIDE",
             tuning::set_thread_dim_stride,
-            0, // 0 = auto
+            tuning::THREAD_DIM_STRIDE_DEFAULT, // 0 = auto
             &[16, 24, 32, 48, 64],
             &timing,
             &[(256, 256, 256), (512, 512, 512), (1024, 1024, 1024)],
@@ -737,7 +737,7 @@ fn main() {
         sweep_sgemm(
             "GEMMKIT_RHS_PACK_THRESHOLD",
             tuning::set_rhs_pack_threshold,
-            2048,
+            tuning::RHS_PACK_THRESHOLD_DEFAULT,
             &[512, 1024, 4096, MAX],
             &timing,
             &[(2048, 256, 256), (3072, 192, 256)],
@@ -750,7 +750,7 @@ fn main() {
         sweep_sgemm(
             "GEMMKIT_LHS_PACK_THRESHOLD",
             tuning::set_lhs_pack_threshold,
-            1024,
+            tuning::LHS_PACK_THRESHOLD_DEFAULT,
             &[256, 512, 2048, MAX],
             &timing,
             &[(1024, 512, 512), (2048, 256, 256)],
@@ -763,7 +763,7 @@ fn main() {
         sweep_sgemm(
             "GEMMKIT_LHS_PACK_STRIDE",
             tuning::set_lhs_pack_stride,
-            0, // 0 = auto (page-derived)
+            tuning::LHS_PACK_STRIDE_DEFAULT, // 0 = auto (page-derived)
             &[2048, 4096, 8192, MAX],
             &timing,
             &[(1024, 512, 512), (1536, 384, 384)],
@@ -791,7 +791,7 @@ fn main() {
         sweep_sgemm(
             "GEMMKIT_SMALL_MN_DIM",
             tuning::set_small_mn_dim,
-            16,
+            tuning::SMALL_MN_DIM_DEFAULT,
             &[8, 24, 32],
             &timing,
             &[(16, 4096, 16), (12, 2048, 12)],
@@ -808,7 +808,7 @@ fn main() {
         sweep_gemv(
             "GEMMKIT_GEMV_THREAD_CAP",
             tuning::set_gemv_thread_cap,
-            0, // 0 = auto
+            tuning::GEMV_THREAD_CAP_DEFAULT, // 0 = auto
             &[2, 4, 8, 16],
             &timing,
             &[(1 << 20, 32), (1 << 21, 16)],
@@ -820,7 +820,7 @@ fn main() {
         sweep_gemv(
             "GEMMKIT_GEMV_PARALLEL_BYTES",
             tuning::set_gemv_parallel_bytes,
-            0, // 0 = auto (LLC-derived)
+            tuning::GEMV_PARALLEL_BYTES_DEFAULT, // 0 = auto (LLC-derived)
             &[1 << 20, 1 << 22, 1 << 24],
             &timing,
             &[(1 << 18, 8), (1 << 19, 4)],
@@ -834,7 +834,7 @@ fn main() {
         sweep_i8(
             "GEMMKIT_I8_VNNI_MIN_PAR_MNK",
             tuning::set_i8_vnni_min_par_mnk,
-            768 * 768 * 768,
+            tuning::I8_VNNI_MIN_PAR_MNK_DEFAULT,
             &[0, 256 * 256 * 256, 512 * 512 * 512, 1024 * 1024 * 1024, MAX],
             &timing,
             &[384, 512, 640],
@@ -852,7 +852,7 @@ fn main() {
         sweep_gemv(
             "GEMMKIT_GEMV_THRESHOLD",
             tuning::set_gemv_threshold,
-            MAX,
+            tuning::GEMV_THRESHOLD_DEFAULT,
             &[0],
             &timing,
             &[(4096, 64), (65536, 16), (1 << 20, 8), (1024, 256)],
@@ -933,7 +933,15 @@ fn main() {
         ),
         (
             "GEMMKIT_NC_NO_L3_PANELS",
-            "only consulted when the machine reports no L3; this host has an L3".to_string(),
+            // Truthful on both host types: the cap only binds where the machine reports no L3.
+            if gemmkit::topology().l3.is_some() {
+                "inert here (this host has an L3); the no-L3 column-block cap is only consulted on \
+                 a no-L3 host"
+            } else {
+                "no-L3 column-block cap; consulted on this no-L3 host but not auto-tuned — \
+                 neutralized so a stale env value can't skew the sweep"
+            }
+            .to_string(),
         ),
     ];
     // Heavy knobs skipped for want of `--large-matrices` / budget (see the match above).
@@ -963,30 +971,67 @@ type Setter = fn(usize);
 
 /// Every swept knob's (setter, default), used to neutralize pre-existing env before measuring.
 const NEUTRALIZE: &[(Setter, usize)] = &[
-    (tuning::set_mc_reg_panels, 8),
-    (tuning::set_kc_min, 512),
-    (tuning::set_tiny_block_dim, 64),
-    (tuning::set_kc, 512),
-    (tuning::set_pack_transpose_tile, 16),
-    (tuning::set_parallel_oversample, 8),
-    (tuning::set_packed_oversample, 2),
-    (tuning::set_thread_dim_stride, 0),
-    (tuning::set_rhs_pack_threshold, 2048),
-    (tuning::set_lhs_pack_threshold, 1024),
-    (tuning::set_lhs_pack_stride, 0),
+    (tuning::set_mc_reg_panels, tuning::MC_REG_PANELS_DEFAULT),
+    (tuning::set_kc_min, tuning::KC_MIN_DEFAULT),
+    (tuning::set_tiny_block_dim, tuning::TINY_BLOCK_DIM_DEFAULT),
+    (tuning::set_kc, tuning::KC_DEFAULT),
+    (
+        tuning::set_pack_transpose_tile,
+        tuning::PACK_TRANSPOSE_TILE_DEFAULT,
+    ),
+    (
+        tuning::set_parallel_oversample,
+        tuning::PARALLEL_OVERSAMPLE_DEFAULT,
+    ),
+    (
+        tuning::set_packed_oversample,
+        tuning::PACKED_OVERSAMPLE_DEFAULT,
+    ),
+    (
+        tuning::set_thread_dim_stride,
+        tuning::THREAD_DIM_STRIDE_DEFAULT,
+    ),
+    (
+        tuning::set_rhs_pack_threshold,
+        tuning::RHS_PACK_THRESHOLD_DEFAULT,
+    ),
+    (
+        tuning::set_lhs_pack_threshold,
+        tuning::LHS_PACK_THRESHOLD_DEFAULT,
+    ),
+    (tuning::set_lhs_pack_stride, tuning::LHS_PACK_STRIDE_DEFAULT),
     (
         tuning::set_small_k_threshold,
         tuning::SMALL_K_THRESHOLD_DEFAULT,
     ),
-    (tuning::set_small_mn_dim, 16),
-    (tuning::set_gemv_thread_cap, 0),
-    (tuning::set_gemv_parallel_bytes, 0),
-    (tuning::set_i8_vnni_min_par_mnk, 768 * 768 * 768),
-    (tuning::set_gemv_threshold, usize::MAX),
+    (tuning::set_small_mn_dim, tuning::SMALL_MN_DIM_DEFAULT),
+    (tuning::set_gemv_thread_cap, tuning::GEMV_THREAD_CAP_DEFAULT),
+    (
+        tuning::set_gemv_parallel_bytes,
+        tuning::GEMV_PARALLEL_BYTES_DEFAULT,
+    ),
+    (
+        tuning::set_i8_vnni_min_par_mnk,
+        tuning::I8_VNNI_MIN_PAR_MNK_DEFAULT,
+    ),
+    (tuning::set_gemv_threshold, tuning::GEMV_THRESHOLD_DEFAULT),
     // Heavy knobs (only swept under --large-matrices); neutralized unconditionally so a pre-set env
     // value cannot skew the baseline of the gemv / sgemm sweeps that read them.
     (tuning::set_k_stream_max, tuning::K_STREAM_MAX_DEFAULT),
     (tuning::set_shared_lhs_mnk, tuning::SHARED_LHS_MNK_DEFAULT),
+    // Skipped (never swept) but still READ by gemms during the other sweeps, so a stale env value
+    // for them would silently skew every baseline — neutralize them too. PARALLEL_THRESHOLD gates
+    // parallelism in every sgemm/gemv sweep; NC_NO_L3_PANELS caps the block on a no-L3 host (Apple);
+    // SEQ_INTERNAL_BYTES_PER_WORKER is read only by batched GEMM (no sweep runs one — defensive).
+    (
+        tuning::set_parallel_threshold,
+        tuning::PARALLEL_THRESHOLD_DEFAULT,
+    ),
+    (tuning::set_nc_no_l3_panels, tuning::NC_NO_L3_PANELS_DEFAULT),
+    (
+        tuning::set_seq_internal_bytes_per_worker,
+        tuning::SEQ_INTERNAL_BYTES_PER_WORKER_DEFAULT,
+    ),
 ];
 
 /// A compact, human-readable value (turns the `usize::MAX` sentinel into `MAX`).
