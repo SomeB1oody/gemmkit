@@ -131,10 +131,14 @@ static GEMV_THRESHOLD: Threshold = Threshold::new("GEMMKIT_GEMV_THRESHOLD", usiz
 // * **aarch64** (M4, NEON): the narrower 16×4 tile packs cheaply and its depth-walk wins
 //   sooner — in-place leads through `k = 8` (~115% of the driver) and the driver is ahead by
 //   `k = 16` (~76%), so the crossover is halved to 8.
+/// Compiled default for [`small_k_threshold`], ignoring any env override. Public so a calibration
+/// tool (gemmkit-tune) can neutralize the env and use the shipped default as its baseline without
+/// hand-copying this arch-split value (which could silently desync).
 #[cfg(target_arch = "aarch64")]
-const SMALL_K_THRESHOLD_DEFAULT: usize = 8;
+pub const SMALL_K_THRESHOLD_DEFAULT: usize = 8;
+/// See the aarch64 variant.
 #[cfg(not(target_arch = "aarch64"))]
-const SMALL_K_THRESHOLD_DEFAULT: usize = 16;
+pub const SMALL_K_THRESHOLD_DEFAULT: usize = 16;
 static SMALL_K_THRESHOLD: Threshold =
     Threshold::new("GEMMKIT_SMALL_K_THRESHOLD", SMALL_K_THRESHOLD_DEFAULT);
 
@@ -187,21 +191,29 @@ static WASM_THREADS: Threshold = Threshold::new("GEMMKIT_WASM_THREADS", 8);
 // sizes regress and it is gated above the crossover.
 //
 // The crossover is a **machine** property, not a tile property
+/// Compiled default for [`shared_lhs_mnk`], ignoring any env override. Public for the same reason as
+/// [`SMALL_K_THRESHOLD_DEFAULT`]: a calibration tool can read the shipped default directly instead of
+/// mirroring this arch-/width-split value.
 #[cfg(target_arch = "aarch64")]
-const SHARED_LHS_MNK_DEFAULT: usize = 50_000_000;
+pub const SHARED_LHS_MNK_DEFAULT: usize = 50_000_000;
+/// See the aarch64 variant.
 #[cfg(all(not(target_arch = "aarch64"), target_pointer_width = "64"))]
-const SHARED_LHS_MNK_DEFAULT: usize = 8_000_000_000;
+pub const SHARED_LHS_MNK_DEFAULT: usize = 8_000_000_000;
 // On a 32-bit target `usize` 8e9 literal above would not compile
 // So on 32-bit set the default to `usize::MAX` to disable the pre-pass
+/// See the aarch64 variant.
 #[cfg(all(not(target_arch = "aarch64"), not(target_pointer_width = "64")))]
-const SHARED_LHS_MNK_DEFAULT: usize = usize::MAX;
+pub const SHARED_LHS_MNK_DEFAULT: usize = usize::MAX;
 static SHARED_LHS_MNK: Threshold = Threshold::new("GEMMKIT_SHARED_LHS_MNK", SHARED_LHS_MNK_DEFAULT);
 
 // Largest `k` for which an axpy-shape gemv register-blocks the output (holds the output panel in
 // registers across the whole k-sweep). Above it the many in-place matrix column-streams exceed the
 // hardware prefetcher window and the plain column-outer form wins. Calibrated on Zen5:
 // register-blocking wins by `k <= 16`, is a wash near `k = 32`, regresses by `k ~ 48`.
-static K_STREAM_MAX: Threshold = Threshold::new("GEMMKIT_K_STREAM_MAX", 32);
+/// Compiled default for [`k_stream_max`], ignoring any env override. Public for the same reason as
+/// [`SMALL_K_THRESHOLD_DEFAULT`]: a calibration tool reads it directly instead of hard-coding `32`.
+pub const K_STREAM_MAX_DEFAULT: usize = 32;
+static K_STREAM_MAX: Threshold = Threshold::new("GEMMKIT_K_STREAM_MAX", K_STREAM_MAX_DEFAULT);
 
 // aarch64 batched-GEMM crossover: a batch element splits across the machine (`SequentialInternal`)
 // rather than running one-per-worker cache-hot once its per-batch-worker byte share

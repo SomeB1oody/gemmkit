@@ -346,6 +346,9 @@ struct Cli {
     budget_secs: Option<f64>,
     out: String,
     dry_run: bool,
+    /// `Some(gib)` when `--large-matrices <GiB>` was passed: opt into the memory-/FLOP-heavy probes
+    /// (`K_STREAM_MAX`, `SHARED_LHS_MNK`) with `gib` GiB as the peak-matrix budget for the giant ones.
+    large_gib: Option<f64>,
 }
 
 /// Parse a `--time-budget` like `30s`, `2m`, `1h`, or a bare number of seconds. Returns `None` for
@@ -383,6 +386,7 @@ fn parse_cli() -> Cli {
         budget_secs: None,
         out: "gemmkit-tune.env".to_string(),
         dry_run: false,
+        large_gib: None,
     };
     // `args_os` + lossy (not `args`): a non-UTF-8 argument must yield a clean usage error, not a
     // panic. A mangled arg simply fails to match a known flag and falls through to `die`.
@@ -409,6 +413,19 @@ fn parse_cli() -> Cli {
             }
             "--out" => cli.out = take(args.next(), "--out"),
             "--dry-run" => cli.dry_run = true,
+            "--large-matrices" => {
+                let v = take(args.next(), "--large-matrices");
+                // A positive, finite GiB budget. Reject 0/NaN/inf/negative/absurd so a giant probe
+                // matrix is never sized from garbage; the upper bound is a sanity cap, not a limit.
+                match v.parse::<f64>() {
+                    Ok(g) if g.is_finite() && (0.0..=4096.0).contains(&g) && g > 0.0 => {
+                        cli.large_gib = Some(g)
+                    }
+                    _ => die(&format!(
+                        "--large-matrices expects a positive GiB budget like 4 or 8, got {v:?}"
+                    )),
+                }
+            }
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -426,6 +443,8 @@ fn print_usage() {
          OPTIONS:\n    \
          --threads <n>        Tune for this worker count (default: available parallelism)\n    \
          --time-budget <dur>  Cap the sweep; coarsens to fit (e.g. 30s, 2m, 1h)\n    \
+         --large-matrices <G> Also probe the heavy knobs (K_STREAM_MAX, SHARED_LHS_MNK) using up\n    \
+         \x20                    to <G> GiB for the giant gemv matrices (off by default; needs GiB)\n    \
          --out <path>         Output profile path (default: gemmkit-tune.env)\n    \
          --dry-run            Print the report only; do not write the profile\n    \
          -h, --help           Show this help\n\n\
@@ -489,13 +508,55 @@ fn host_stamp(threads: usize) -> String {
 
 const MAX: usize = usize::MAX;
 
-// gemmkit's SMALL_K_THRESHOLD default is arch-specific (see `gemmkit::tuning`). Mirror it here as a
-// compile constant so the baseline is the shipped default via `set()`, never a pre-set
-// `GEMMKIT_SMALL_K_THRESHOLD` read back through the env-consulting getter.
-#[cfg(target_arch = "aarch64")]
-const SMALL_K_DEFAULT: usize = 8;
-#[cfg(not(target_arch = "aarch64"))]
-const SMALL_K_DEFAULT: usize = 16;
+/// Probe plan for the opt-in `K_STREAM_MAX` sweep. The gemv register-block gate engages past ~L3/2
+/// and only *wins* once the output is clearly DRAM-bound, so the probe fixes the output at ~2x the
+/// LLC; a 1x-LLC output sits on the cache boundary and measures nothing decisive (the inert-sweep
+/// failure the L3/2 gate fix removed). Returns the shared row count and the probe `k` set, or a
+/// reason string when the probe does not fit this target's address space, or when `budget_bytes`
+/// (bytes, passed as `u64` so a 32-bit `usize` cannot silently saturate the gate) cannot hold the
+/// whole probe at the largest `k`. The advised budget in that reason is rounded *up* to the printed
+/// precision, so re-running with the stated value actually clears the gate.
+fn plan_k_stream(budget_bytes: u64, gib: f64) -> Result<(usize, Vec<usize>), String> {
+    const MAX_PROBE_K: usize = 48; // straddles the candidate caps {16, 32, 48}
+    let topo = gemmkit::topology();
+    let llc = topo.l3.map(|l| l.bytes).unwrap_or(topo.l2.bytes).max(1);
+    // ~2x LLC so the plain form's per-column output re-reads clearly spill to DRAM (where register-
+    // blocking pays). This is a fixed target, not budget-scaled: reaching it or skipping is the
+    // whole point — a smaller output would run cache-resident and measure noise.
+    let out = llc.saturating_mul(2);
+    // Peak live bytes of the largest (k = MAX_PROBE_K) col-major f32 probe, matching `sweep_gemv`'s
+    // allocation exactly: matrix a (rows*k*4 = out*k) + output y (rows*4 = out) + input x (k*4).
+    // Computed in u64 so the comparison is exact even on a 32-bit target (where a multi-GB `need`
+    // and a saturating `usize` budget would otherwise both pin to MAX and defeat the gate).
+    let need = (out as u64)
+        .saturating_mul(MAX_PROBE_K as u64)
+        .saturating_add(out as u64)
+        .saturating_add(MAX_PROBE_K as u64 * 4);
+    // The probe must fit this target's address space at all: on 32-bit a multi-GB matrix cannot be
+    // allocated, so skip cleanly rather than let the Vec allocation abort the process.
+    if need > usize::MAX as u64 {
+        return Err(format!(
+            "a DRAM-bound ~2x-LLC ({} MiB) gemv probe needs multi-GB matrices that do not fit this \
+             target's address space — --large-matrices is only usable on 64-bit",
+            out / (1 << 20),
+        ));
+    }
+    if budget_bytes < need {
+        // Round the advised budget UP to the printed 0.1 GiB, so following it actually clears the
+        // `budget_bytes < need` gate (a truncated "1.5 GiB" that is really 1.53 would loop forever).
+        let need_gib = (need as f64 / (1u64 << 30) as f64 * 10.0).ceil() / 10.0;
+        return Err(format!(
+            "--large-matrices {gib} GiB cannot hold a DRAM-bound ~2x-LLC ({} MiB) gemv probe at \
+             k={} (need >= {:.1} GiB); the K_STREAM_MAX cap only bites on a DRAM-bound output, so \
+             a smaller probe would measure nothing",
+            out / (1 << 20),
+            MAX_PROBE_K,
+            need_gib,
+        ));
+    }
+    let rows = (out / 4).max(1); // f32 output vector
+    Ok((rows, vec![24, MAX_PROBE_K]))
+}
 
 fn main() {
     let cli = parse_cli();
@@ -550,6 +611,9 @@ fn main() {
 
     let mut results: Vec<KnobResult> = Vec::new();
     let mut budget_skipped: Vec<&str> = Vec::new();
+    // Opt-in heavy knobs that were not run: either `--large-matrices` was absent, or its budget was
+    // too small to reach the regime the knob controls. Owned reasons (the budget one is dynamic).
+    let mut large_skipped: Vec<(&'static str, String)> = Vec::new();
 
     macro_rules! knob {
         ($env:literal, $body:expr) => {{
@@ -717,7 +781,7 @@ fn main() {
         sweep_sgemm(
             "GEMMKIT_SMALL_K_THRESHOLD",
             tuning::set_small_k_threshold,
-            SMALL_K_DEFAULT,
+            tuning::SMALL_K_THRESHOLD_DEFAULT,
             &[4, 8, 24, 32],
             &timing,
             &[(4096, 16, 4096), (8192, 16, 2048)],
@@ -740,7 +804,8 @@ fn main() {
     );
 
     // --- Bandwidth-bound gemv ---
-    // (GEMMKIT_K_STREAM_MAX is not swept — see the skipped list.)
+    // (GEMMKIT_K_STREAM_MAX is a heavy opt-in knob — swept only under --large-matrices; see the
+    // "Large-matrix probes" block below.)
     knob!(
         "GEMMKIT_GEMV_THREAD_CAP",
         sweep_gemv(
@@ -798,35 +863,88 @@ fn main() {
         )
     );
 
-    // Knobs deliberately not swept on this machine (with why).
-    let mut skipped: Vec<(&str, &str)> = vec![
+    // --- Large-matrix probes (opt-in: --large-matrices <GiB>) ---
+    // Both knobs only bite in an expensive regime — K_STREAM_MAX once the gemv output spills the LLC
+    // (needs multi-GB matrices after the L3/2 engage gate), SHARED_LHS_MNK above its high-FLOP
+    // pre-pass crossover — so they run only when the user opts in with a memory budget.
+    match cli.large_gib {
+        None => {
+            large_skipped.push((
+                "GEMMKIT_K_STREAM_MAX",
+                "gemv register-block cap; after the L3/2 engage gate it only bites in the \
+                 DRAM-bound huge-m regime (output spilling the LLC) — pass --large-matrices <GiB> \
+                 (needs multi-GB matrices) to probe it. The maintainer bench perf_k_stream also \
+                 covers this calibration"
+                    .to_string(),
+            ));
+            large_skipped.push((
+                "GEMMKIT_SHARED_LHS_MNK",
+                "shared-A pre-pass crossover; the pre-pass engages only above a large m*n*k (~8e9 \
+                 on x86), so probing needs high-FLOP shapes — pass --large-matrices <GiB> to enable"
+                    .to_string(),
+            ));
+        }
+        Some(gib) => {
+            // In u64 (not usize): a validated `gib` (<= 4096) never overflows u64, so the budget is
+            // exact on every target — a 32-bit usize would saturate and defeat plan_k_stream's gate.
+            let budget = (gib * (1u64 << 30) as f64) as u64;
+            match plan_k_stream(budget, gib) {
+                Ok((rows, ks)) => {
+                    let shapes: Vec<(usize, usize)> = ks.iter().map(|&k| (rows, k)).collect();
+                    knob!(
+                        "GEMMKIT_K_STREAM_MAX",
+                        sweep_gemv(
+                            "GEMMKIT_K_STREAM_MAX",
+                            tuning::set_k_stream_max,
+                            tuning::K_STREAM_MAX_DEFAULT,
+                            &[16, 48],
+                            &timing,
+                            &shapes,
+                            par,
+                        )
+                    );
+                }
+                Err(reason) => large_skipped.push(("GEMMKIT_K_STREAM_MAX", reason)),
+            }
+            knob!(
+                "GEMMKIT_SHARED_LHS_MNK",
+                sweep_sgemm(
+                    "GEMMKIT_SHARED_LHS_MNK",
+                    tuning::set_shared_lhs_mnk,
+                    tuning::SHARED_LHS_MNK_DEFAULT,
+                    &[2_000_000_000, 4_000_000_000, MAX],
+                    &timing,
+                    &[(2048, 1024, 1024), (6144, 1024, 1024), (12288, 1024, 1024)],
+                    par,
+                    false,
+                )
+            );
+        }
+    }
+
+    // Knobs deliberately not swept on this machine (with why). Owned reasons so the opt-in and
+    // budget branches (whose reasons are dynamic) can append here uniformly.
+    let mut skipped: Vec<(&'static str, String)> = vec![
         (
             "GEMMKIT_PARALLEL_THRESHOLD",
             "serial/parallel break-even is strongly shape-dependent (measured ~cubic 16M vs the \
              skinny-shape-calibrated 590K default) — a single m*n*k scalar can't fit all aspect \
-             ratios, and the default is a deliberate cross-shape compromise, so it is not auto-tuned",
-        ),
-        (
-            "GEMMKIT_K_STREAM_MAX",
-            "after the L3/2 register-block engage gate, the cap only bites in the DRAM-bound huge-m \
-             gemv regime (output spilling L3); probing it needs multi-GB matrices. The maintainer \
-             bench perf_k_stream covers this calibration",
-        ),
-        (
-            "GEMMKIT_SHARED_LHS_MNK",
-            "x86 default disables the shared-A pre-pass below ~8e9 m*n*k; probing needs very large shapes",
+             ratios, and the default is a deliberate cross-shape compromise, so it is not auto-tuned"
+                .to_string(),
         ),
         (
             "GEMMKIT_SEQ_INTERNAL_BYTES_PER_WORKER",
-            "aarch64-only effect (batched split plan); inert on x86 — tune on an M4",
+            "aarch64-only effect (batched split plan); inert on x86 — tune on an M4".to_string(),
         ),
         (
             "GEMMKIT_NC_NO_L3_PANELS",
-            "only consulted when the machine reports no L3; this host has an L3",
+            "only consulted when the machine reports no L3; this host has an L3".to_string(),
         ),
     ];
-    for env in &budget_skipped {
-        skipped.push((env, "time budget exhausted"));
+    // Heavy knobs skipped for want of `--large-matrices` / budget (see the match above).
+    skipped.append(&mut large_skipped);
+    for &env in &budget_skipped {
+        skipped.push((env, "time budget exhausted".to_string()));
     }
 
     report(&results, &skipped, threads, start.elapsed());
@@ -861,12 +979,19 @@ const NEUTRALIZE: &[(Setter, usize)] = &[
     (tuning::set_rhs_pack_threshold, 2048),
     (tuning::set_lhs_pack_threshold, 1024),
     (tuning::set_lhs_pack_stride, 0),
-    (tuning::set_small_k_threshold, SMALL_K_DEFAULT),
+    (
+        tuning::set_small_k_threshold,
+        tuning::SMALL_K_THRESHOLD_DEFAULT,
+    ),
     (tuning::set_small_mn_dim, 16),
     (tuning::set_gemv_thread_cap, 0),
     (tuning::set_gemv_parallel_bytes, 0),
     (tuning::set_i8_vnni_min_par_mnk, 768 * 768 * 768),
     (tuning::set_gemv_threshold, usize::MAX),
+    // Heavy knobs (only swept under --large-matrices); neutralized unconditionally so a pre-set env
+    // value cannot skew the baseline of the gemv / sgemm sweeps that read them.
+    (tuning::set_k_stream_max, tuning::K_STREAM_MAX_DEFAULT),
+    (tuning::set_shared_lhs_mnk, tuning::SHARED_LHS_MNK_DEFAULT),
 ];
 
 /// A compact, human-readable value (turns the `usize::MAX` sentinel into `MAX`).
@@ -878,7 +1003,12 @@ fn show(v: usize) -> String {
     }
 }
 
-fn report(results: &[KnobResult], skipped: &[(&str, &str)], threads: usize, elapsed: Duration) {
+fn report(
+    results: &[KnobResult],
+    skipped: &[(&'static str, String)],
+    threads: usize,
+    elapsed: Duration,
+) {
     println!("\n=== gemmkit-tune report (tuned for {threads} worker(s)) ===");
     println!(
         "(each candidate score is the geometric-mean throughput over the knob's probe shapes)\n"
@@ -945,7 +1075,11 @@ fn report(results: &[KnobResult], skipped: &[(&str, &str)], threads: usize, elap
     }
 }
 
-fn build_profile(results: &[KnobResult], skipped: &[(&str, &str)], threads: usize) -> String {
+fn build_profile(
+    results: &[KnobResult],
+    skipped: &[(&'static str, String)],
+    threads: usize,
+) -> String {
     let mut s = host_stamp(threads);
     s.push('\n');
     for r in results {
