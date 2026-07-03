@@ -22,8 +22,12 @@
 //! re-discovers essentially the same values (overall speedup ≈ 1.0×) — that is the *correct*
 //! outcome and validates the tool; the payoff is on a *different* machine.
 //!
-//! Knobs whose probe shape is not meaningfully exercised on this machine (aarch64-only, no-L3-only,
-//! crossover-scan-only, wasm-only) are skipped and listed in the report and the profile footer.
+//! Knobs whose value cannot be safely tuned by this probe are skipped and listed (with a reason) in
+//! the report and the profile footer: ones inert on this machine (aarch64-only, no-L3-only,
+//! wasm-only), and `PARALLEL_THRESHOLD` — its serial/parallel break-even is strongly shape-dependent
+//! (a single `m*n*k` scalar can't fit all aspect ratios), so the calibrated cross-shape default is
+//! kept rather than auto-tuned. `GEMV_THRESHOLD`, by contrast, is a clean binary on/off decision and
+//! is swept.
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -787,15 +791,31 @@ fn main() {
         )
     );
 
+    // --- gemv path vs general driver ---
+    // Binary on/off: for a vector shape `min(m,n) == 1`, so the cap has no intermediate value — the
+    // dedicated gemv path is either on (`MAX`, default) or off (`0`, general driver). Measured in
+    // parallel over a range of `m`/`k` (the dedicated path's edge is largely its bandwidth-parallel
+    // behavior); default-biased, so it flips off only if the driver robustly wins across the shapes.
+    knob!(
+        "GEMMKIT_GEMV_THRESHOLD",
+        sweep_gemv(
+            "GEMMKIT_GEMV_THRESHOLD",
+            tuning::set_gemv_threshold,
+            MAX,
+            &[0],
+            &timing,
+            &[(4096, 64), (65536, 16), (1 << 20, 8), (1024, 256)],
+            par,
+        )
+    );
+
     // Knobs deliberately not swept on this machine (with why).
     let mut skipped: Vec<(&str, &str)> = vec![
         (
             "GEMMKIT_PARALLEL_THRESHOLD",
-            "serial/parallel break-even; needs a crossover scan across tiny sizes, not a single-shape value sweep",
-        ),
-        (
-            "GEMMKIT_GEMV_THRESHOLD",
-            "a shape cap (default ~unbounded, gemv effectively always on), not a throughput knob",
+            "serial/parallel break-even is strongly shape-dependent (measured ~cubic 16M vs the \
+             skinny-shape-calibrated 590K default) — a single m*n*k scalar can't fit all aspect \
+             ratios, and the default is a deliberate cross-shape compromise, so it is not auto-tuned",
         ),
         (
             "GEMMKIT_SHARED_LHS_MNK",
@@ -852,6 +872,7 @@ const NEUTRALIZE: &[(Setter, usize)] = &[
     (tuning::set_gemv_thread_cap, 0),
     (tuning::set_gemv_parallel_bytes, 0),
     (tuning::set_i8_vnni_min_par_mnk, 768 * 768 * 768),
+    (tuning::set_gemv_threshold, usize::MAX),
 ];
 
 /// A compact, human-readable value (turns the `usize::MAX` sentinel into `MAX`).
