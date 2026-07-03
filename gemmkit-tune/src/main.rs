@@ -675,9 +675,16 @@ fn main() {
             "GEMMKIT_MC_REG_PANELS",
             tuning::set_mc_reg_panels,
             tuning::MC_REG_PANELS_DEFAULT,
-            &[4, 6, 12, 16],
+            // Widened up to 32: on a large shared L2 a taller A macro-panel can stay resident, so the
+            // optimum may sit above the old top candidate. The 3072 tier stresses that residency.
+            &[4, 6, 12, 16, 24, 32],
             &timing,
-            &[(512, 512, 512), (1024, 1024, 1024), (2048, 2048, 2048)],
+            &[
+                (512, 512, 512),
+                (1024, 1024, 1024),
+                (2048, 2048, 2048),
+                (3072, 3072, 3072),
+            ],
             par,
             false,
         )
@@ -816,7 +823,10 @@ fn main() {
             "GEMMKIT_LHS_PACK_THRESHOLD",
             tuning::set_lhs_pack_threshold,
             tuning::LHS_PACK_THRESHOLD_DEFAULT,
-            &[256, 512, 2048, MAX],
+            // Widened down to 32: a low per-worker reuse gate (pack A more eagerly) can win where
+            // packing is cheap. The win plateaus across 32..256 then drops, so these low candidates
+            // bracket the plateau instead of chasing an ever-rising edge.
+            &[32, 64, 128, 256, 512, MAX],
             &timing,
             &[(1024, 512, 512), (2048, 256, 256)],
             par,
