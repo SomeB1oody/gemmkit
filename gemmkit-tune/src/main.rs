@@ -50,7 +50,9 @@ fn fill(n: usize, seed: u64) -> Vec<f32> {
         .collect()
 }
 
-/// Deterministic `i8` fill for the integer probe.
+/// Deterministic `i8` fill for the integer probe. Only the x86 VNNI-fallback knob is swept (see
+/// its sweep), so this and [`sweep_i8`] are x86-only.
+#[cfg(target_arch = "x86_64")]
 fn fill_i8(n: usize, seed: u64) -> Vec<i8> {
     let mut s = seed | 1;
     (0..n)
@@ -302,6 +304,7 @@ fn sweep_gemv(
     })
 }
 
+#[cfg(target_arch = "x86_64")]
 fn sweep_i8(
     env: &'static str,
     set: fn(usize),
@@ -910,6 +913,10 @@ fn main() {
     );
 
     // --- Integer (i8) ---
+    // Gates the VNNI->widen small-parallel fallback, which only exists for the x86 VNNI i8 kernel
+    // (`small_par_fallback` is `None` for every other kernel, so the knob is read but never acts).
+    // On a non-x86 target it is inert, so sweeping it would only measure noise — skip it there.
+    #[cfg(target_arch = "x86_64")]
     knob!(
         "GEMMKIT_I8_VNNI_MIN_PAR_MNK",
         sweep_i8(
@@ -1040,6 +1047,15 @@ fn main() {
     skipped.push((
         "GEMMKIT_SEQ_INTERNAL_BYTES_PER_WORKER",
         "aarch64-only effect (batched split plan); inert on x86".to_string(),
+    ));
+    // I8_VNNI_MIN_PAR_MNK is swept above on x86 (the only arch with a VNNI i8 small-parallel
+    // fallback); elsewhere no i8 kernel has a fallback, so the knob is inert — skip it there.
+    #[cfg(not(target_arch = "x86_64"))]
+    skipped.push((
+        "GEMMKIT_I8_VNNI_MIN_PAR_MNK",
+        "x86 VNNI-fallback knob; the i8 kernels on other targets have no small-parallel fallback, \
+         so it is inert"
+            .to_string(),
     ));
     // NC_NO_L3_PANELS is swept above on a no-L3 host; on an L3 host the cap is dead, so skip it.
     if gemmkit::topology().l3.is_some() {
