@@ -823,10 +823,10 @@ fn main() {
             "GEMMKIT_LHS_PACK_THRESHOLD",
             tuning::set_lhs_pack_threshold,
             tuning::LHS_PACK_THRESHOLD_DEFAULT,
-            // Widened down to 32: a low per-worker reuse gate (pack A more eagerly) can win where
-            // packing is cheap. The win plateaus across 32..256 then drops, so these low candidates
-            // bracket the plateau instead of chasing an ever-rising edge.
-            &[32, 64, 128, 256, 512, MAX],
+            // Spans 32..2048 so the grid brackets both arch optima: the cheap-packing aarch64 win
+            // is a flat 32..256 plateau then a drop (needs the low candidates), while the x86 default
+            // 1024 needs 2048 above it. The low end brackets the plateau, not an ever-rising edge.
+            &[32, 64, 128, 256, 512, 1024, 2048, MAX],
             &timing,
             &[(1024, 512, 512), (2048, 256, 256)],
             par,
@@ -920,9 +920,11 @@ fn main() {
     // --- aarch64 batched-GEMM split crossover ---
     // SequentialInternal (split each element across the machine in turn) vs BatchParallel (run the
     // `batch` elements one-per-worker) when `batch < workers`. Only the aarch64 `resolve_batch` reads
-    // this knob (x86 uses an L2-residency test), so it is skipped on x86. Probe shapes straddle the
-    // crossover: the per-batch-worker share `elem_bytes/batch` lands on both sides of the candidates
-    // so the chosen plan actually flips.
+    // this knob (x86 uses an L2-residency test), so it is skipped on x86. The probe shapes give
+    // per-batch-worker shares (`elem_bytes/batch`) of 96/192/384/432 KiB — straddling the ~128 KiB
+    // default on both sides, so the sweep is a two-sided validator: a lower candidate (64 KiB)
+    // wrongly splits the 96 KiB shape (256³ b8, where one-per-worker is faster) and a higher one
+    // (320 KiB) wrongly serializes the 192 KiB shape (256³ b4, where splitting is faster).
     #[cfg(target_arch = "aarch64")]
     knob!(
         "GEMMKIT_SEQ_INTERNAL_BYTES_PER_WORKER",
@@ -932,7 +934,12 @@ fn main() {
             tuning::SEQ_INTERNAL_BYTES_PER_WORKER_DEFAULT,
             &[64 * 1024, 320 * 1024, MAX],
             &timing,
-            &[(8, 512, 512, 512), (4, 256, 256, 256), (4, 384, 384, 384)],
+            &[
+                (8, 512, 512, 512),
+                (4, 256, 256, 256),
+                (4, 384, 384, 384),
+                (8, 256, 256, 256), // share 96 KiB — the sub-default point that brackets 128 KiB below
+            ],
             par,
         )
     );
