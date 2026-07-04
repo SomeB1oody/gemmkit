@@ -197,12 +197,13 @@ fn sweep(
     set(default); // restore: keep sweeps independent
 
     // Winner: start at the default row, upgrade only when a candidate beats the incumbent by more
-    // than the larger of the two spreads (so noise never decides, and ties keep the default).
+    // than the larger of the two spreads (so noise never decides, and ties keep the default)
+    let auto_margin = if default == 0 { 0.05 } else { 0.0 };
     let baseline = rows[0].stat.median;
     let mut best = 0usize;
     for i in 1..rows.len() {
         let noise = rows[best].stat.spread_pct().max(rows[i].stat.spread_pct()) / 100.0;
-        if rows[i].stat.median > rows[best].stat.median * (1.0 + noise) {
+        if rows[i].stat.median > rows[best].stat.median * (1.0 + noise + auto_margin) {
             best = i;
         }
     }
@@ -841,7 +842,12 @@ fn main() {
             tuning::LHS_PACK_STRIDE_DEFAULT, // 0 = auto (page-derived)
             &[2048, 4096, 8192, MAX],
             &timing,
-            &[(1024, 512, 512), (1536, 384, 384)],
+            &[
+                (1024, 512, 512),
+                (1536, 384, 384),
+                (4096, 1024, 1024),
+                (8192, 512, 512),
+            ],
             par,
             false,
         )
@@ -898,7 +904,7 @@ fn main() {
             tuning::GEMV_PARALLEL_BYTES_DEFAULT, // 0 = auto (LLC-derived)
             &[1 << 20, 1 << 22, 1 << 24],
             &timing,
-            &[(1 << 18, 8), (1 << 19, 4)],
+            &[(1 << 16, 8), (1 << 19, 4), (1 << 22, 8)],
             par,
         )
     );

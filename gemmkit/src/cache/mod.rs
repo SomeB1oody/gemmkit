@@ -356,7 +356,7 @@ impl CacheTopology {
         let mc_from = (lhs_l2_assoc * l2) / (l2_assoc * sizeof * kc).max(1);
         let mut mc = round_down(mc_from, mr).max(mr);
         let m_iter = m.div_ceil(mc).max(1);
-        mc = (m.div_ceil(m_iter * mr) * mr).max(mr);
+        mc = (m.div_ceil(m_iter.saturating_mul(mr).max(1)) * mr).max(mr);
         mc = mc.min(mc_panels.saturating_mul(mr)); // BLIS hard cap
 
         // --- NC: B macro-panel resides in L3 (reserve one way for A) ---
