@@ -109,13 +109,22 @@ pub const RHS_PACK_THRESHOLD_DEFAULT: usize = 2048;
 static RHS_PACK_THRESHOLD: Threshold =
     Threshold::new("GEMMKIT_RHS_PACK_THRESHOLD", RHS_PACK_THRESHOLD_DEFAULT);
 
-// Pack the LHS macro-panel only when each worker reuses it across more than this
-// many columns (per-worker reuse, which falls with the thread count). A non-unit
-// row stride or a partial panel always forces packing regardless. The default is
-// calibrated so column-major inputs stay unpacked through mid-size parallel runs
-// (where redundant per-worker packing would dominate) and pack only when reuse
-// is genuinely high.
-/// Compiled default for [`lhs_pack_threshold`] (before any env/setter override).
+// Pack the LHS macro-panel only when each worker reuses it across more than this many columns
+// (per-worker reuse, which falls with the thread count). A non-unit row stride or a partial panel
+// always forces packing. The crossover is a **machine** property (per-worker pack cost vs reuse),
+// so it is arch-specific:
+// * **x86** (Zen5): redundant per-worker packing dominates through mid-size parallel runs, so keep
+//   column-major inputs unpacked until reuse is genuinely high (1024).
+// * **aarch64** (M4 Max): packing is cheap, so it pays from much lower reuse — 256 (the top of a
+//   flat 32..256 plateau) packs high-reuse shapes (n >= 512 gains ~30%) without over-packing the
+//   low-reuse ones (which are unaffected either way).
+/// Compiled default for [`lhs_pack_threshold`], ignoring any env override. Public so a calibration
+/// tool (gemmkit-tune) can use the shipped default as its baseline without mirroring this arch-split
+/// value.
+#[cfg(target_arch = "aarch64")]
+pub const LHS_PACK_THRESHOLD_DEFAULT: usize = 256;
+/// See the aarch64 variant.
+#[cfg(not(target_arch = "aarch64"))]
 pub const LHS_PACK_THRESHOLD_DEFAULT: usize = 1024;
 static LHS_PACK_THRESHOLD: Threshold =
     Threshold::new("GEMMKIT_LHS_PACK_THRESHOLD", LHS_PACK_THRESHOLD_DEFAULT);
@@ -248,10 +257,16 @@ static K_STREAM_MAX: Threshold = Threshold::new("GEMMKIT_K_STREAM_MAX", K_STREAM
 
 // aarch64 batched-GEMM crossover: a batch element splits across the machine (`SequentialInternal`)
 // rather than running one-per-worker cache-hot once its per-batch-worker byte share
-// `elem_bytes / batch` exceeds this. Calibrated on M4 Max (shared cluster-L2 + high unified
-// bandwidth). Only the aarch64 `resolve_batch` reads it; defined unconditionally so the knob (and
-// its env var) exists on every target.
-/// Compiled default for [`seq_internal_bytes_per_worker`] (before any env/setter override).
+// `elem_bytes / batch` exceeds this. Only the aarch64 `resolve_batch` reads it; the non-aarch64
+// value is inert (the knob and its env var still exist there, but nothing consults them). Calibrated
+// on M4 Max (shared cluster-L2 + high unified bandwidth): ~128 KiB separates the DRAM/L2-bandwidth-
+// scaling elements (split across the cluster) from the small cache-hot ones (one-per-worker).
+/// Compiled default for [`seq_internal_bytes_per_worker`], ignoring any env override. Public so a
+/// calibration tool can read the shipped default as its baseline.
+#[cfg(target_arch = "aarch64")]
+pub const SEQ_INTERNAL_BYTES_PER_WORKER_DEFAULT: usize = 128 * 1024;
+/// See the aarch64 variant (inert on other targets).
+#[cfg(not(target_arch = "aarch64"))]
 pub const SEQ_INTERNAL_BYTES_PER_WORKER_DEFAULT: usize = 320 * 1024;
 static SEQ_INTERNAL_BYTES_PER_WORKER: Threshold = Threshold::new(
     "GEMMKIT_SEQ_INTERNAL_BYTES_PER_WORKER",

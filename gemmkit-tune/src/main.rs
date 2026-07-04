@@ -930,7 +930,7 @@ fn main() {
             "GEMMKIT_SEQ_INTERNAL_BYTES_PER_WORKER",
             tuning::set_seq_internal_bytes_per_worker,
             tuning::SEQ_INTERNAL_BYTES_PER_WORKER_DEFAULT,
-            &[128 * 1024, 640 * 1024, MAX],
+            &[64 * 1024, 320 * 1024, MAX],
             &timing,
             &[(8, 512, 512, 512), (4, 256, 256, 256), (4, 384, 384, 384)],
             par,

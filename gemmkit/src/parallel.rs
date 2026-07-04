@@ -248,11 +248,12 @@ impl Parallelism {
                 // element scales across the cluster's cores, so residency alone is the wrong test.
                 // The crossover is 2-D — `BatchParallel(batch)` wastes `budget - batch` cores, so
                 // it only wins once `batch` is large enough that the per-batch-worker share
-                // `elem_bytes / batch` drops below ~a few L1s (cache-hot one-per-worker beats
-                // spreading). Calibrated on M4 Max (loop_par ≈ SequentialInternal): SeqInternal
-                // wins 512³ b≤8, 384³ b≤4, 256³ b=2; BatchParallel the rest. The old
-                // `elem_bytes > l2.effective` (3.2 MiB) missed all of these, so 512³ ran
-                // BatchParallel(2) at 0.28× of the per-element split.
+                // `elem_bytes / batch` drops below a small threshold (cache-hot one-per-worker beats
+                // spreading). Calibrated on M4 Max to split above a ~128 KiB share: SeqInternal is
+                // faster for 512³ b≤8, 384³ b≤4, 256³ b≤4, and one-per-worker for the small rest
+                // (256³ b=8). The 1-D share rule is approximate — it also splits 384³ b8 (a ~1.06×
+                // miss) — but the old `elem_bytes > l2.effective` (3.2 MiB) missed *all* the wins, so
+                // 512³ ran BatchParallel(2) at 0.28× of the per-element split.
                 #[cfg(target_arch = "aarch64")]
                 let split_wins =
                     elem_bytes > batch.saturating_mul(tuning::seq_internal_bytes_per_worker());
