@@ -12,7 +12,7 @@ authors.workspace = true
 name = "gemmkit-tune"
 path = "src/main.rs"
 
-# All element-type families so the tuner can sweep every runtime knob (i8's VNNI gate,
-# etc.). `std` + `parallel` come in via gemmkit's defaults.
 [dependencies]
 gemmkit = { path = "../gemmkit", features = ["complex", "half", "int8"] }
+indicatif = "0.17"
+console = "0.15"

@@ -31,7 +31,9 @@
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use console::style;
 use gemmkit::{MatMut, MatRef, Parallelism, gemm, tuning};
+use indicatif::{ProgressBar, ProgressStyle};
 
 // ---------------------------------------------------------------------------
 // Timing harness (a lean local copy of the private one in gemmkit/tests/perf.rs).
@@ -657,18 +659,38 @@ fn main() {
 
     let mut results: Vec<KnobResult> = Vec::new();
     let mut budget_skipped: Vec<&str> = Vec::new();
-    // Opt-in heavy knobs that were not run: either `--large-matrices` was absent, or its budget was
-    // too small to reach the regime the knob controls. Owned reasons (the budget one is dynamic).
     let mut large_skipped: Vec<(&'static str, String)> = Vec::new();
+
+    let sweep_total: u64 = {
+        let mut n: u64 = 16;
+        n += u64::from(gemmkit::topology().l3.is_none());
+        n += u64::from(cfg!(target_arch = "x86_64"));
+        n += u64::from(cfg!(target_arch = "aarch64"));
+        if let Some(g) = cli.large_gib {
+            n += 1; // SHARED_LHS_MNK always sweeps under --large-matrices
+            n += u64::from(plan_k_stream((g * (1u64 << 30) as f64) as u64, g).is_ok());
+        }
+        n
+    };
+    let bar = ProgressBar::new(sweep_total);
+    bar.set_style(
+        ProgressStyle::with_template(
+            "  {spinner:.green} [{elapsed_precise}] [{bar:28.cyan/blue}] {pos:>2}/{len:<2}  {msg}",
+        )
+        .unwrap()
+        .progress_chars("=>-"),
+    );
+    bar.enable_steady_tick(Duration::from_millis(120));
 
     macro_rules! knob {
         ($env:literal, $body:expr) => {{
+            bar.set_message($env.strip_prefix("GEMMKIT_").unwrap_or($env));
             if deadline.is_some_and(|d| Instant::now() >= d) {
                 budget_skipped.push($env);
             } else {
-                eprintln!("  {} ...", $env);
                 results.push($body);
             }
+            bar.inc(1);
         }};
     }
 
@@ -1033,6 +1055,8 @@ fn main() {
         }
     }
 
+    bar.finish_and_clear();
+
     // Knobs deliberately not swept on this machine (with why). Owned reasons so the opt-in and
     // budget branches (whose reasons are dynamic) can append here uniformly.
     let mut skipped: Vec<(&'static str, String)> = vec![(
@@ -1172,68 +1196,152 @@ fn report(
     threads: usize,
     elapsed: Duration,
 ) {
-    println!("\n=== gemmkit-tune report (tuned for {threads} worker(s)) ===");
+    let secs = elapsed.as_secs_f64();
     println!(
-        "(each candidate score is the geometric-mean throughput over the knob's probe shapes)\n"
+        "\n{}",
+        style(format!(
+            "── gemmkit-tune · {threads} worker(s) · {secs:.1}s ──"
+        ))
+        .bold()
     );
-    let mut moved = 0;
-    for r in results {
-        println!(
-            "{} (default {}) [{}, {} shapes]:",
-            r.env,
-            show(r.default),
-            r.unit,
-            r.shapes
-        );
-        let mut line = String::from("    ");
-        for row in &r.rows {
-            let mark = if row.value == r.default { "*" } else { " " };
-            let win = if row.value == r.winner { "<" } else { " " };
-            line.push_str(&format!(
-                "{}{}={:>7.1}{}  ",
-                mark,
-                show(row.value),
-                row.stat.median,
-                win
+
+    let mut moved = 0usize;
+
+    if !results.is_empty() {
+        // --- summary table (one row per swept knob) ---
+        const RIGHT: [bool; 7] = [false, false, true, true, true, true, false];
+        let headers = [
+            "knob", "unit", "shapes", "default", "winner", "speedup", "result",
+        ];
+        let mut rows: Vec<(Vec<String>, bool)> = Vec::with_capacity(results.len());
+        for r in results {
+            let changed = r.winner != r.default;
+            moved += usize::from(changed);
+            let knob = r.env.strip_prefix("GEMMKIT_").unwrap_or(r.env).to_string();
+            let result = if changed {
+                format!("→ {}", show(r.winner))
+            } else {
+                "keeps default".to_string()
+            };
+            rows.push((
+                vec![
+                    knob,
+                    r.unit.to_string(),
+                    r.shapes.to_string(),
+                    show(r.default),
+                    show(r.winner),
+                    format!("{:.2}×", r.speedup()),
+                    result,
+                ],
+                changed,
             ));
         }
-        println!("{line}");
-        let sp = r.speedup();
-        let note = if r.winner == r.default {
-            "keeps default".to_string()
-        } else {
-            moved += 1;
-            format!("CHANGED {} -> {}", show(r.default), show(r.winner))
+        // Column widths from plain text (colour is applied to whole padded lines, so it never
+        // perturbs alignment).
+        let mut w: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
+        for (cells, _) in &rows {
+            for (c, cell) in cells.iter().enumerate() {
+                w[c] = w[c].max(cell.chars().count());
+            }
+        }
+        let fmt = |cells: &[String]| -> String {
+            let mut s = String::from("  ");
+            for (c, cell) in cells.iter().enumerate() {
+                let pad = " ".repeat(w[c].saturating_sub(cell.chars().count()));
+                if RIGHT[c] {
+                    s.push_str(&pad);
+                    s.push_str(cell);
+                } else {
+                    s.push_str(cell);
+                    s.push_str(&pad);
+                }
+                s.push_str("   ");
+            }
+            s.trim_end().to_string()
         };
+        println!();
+        let hdr: Vec<String> = headers.iter().map(|h| h.to_string()).collect();
+        println!("{}", style(fmt(&hdr)).bold());
+        let sep: Vec<String> = w.iter().map(|&x| "─".repeat(x)).collect();
+        println!("{}", style(fmt(&sep)).dim());
+        for (cells, changed) in &rows {
+            let line = fmt(cells);
+            if *changed {
+                println!("{}", style(line).yellow());
+            } else {
+                println!("{line}");
+            }
+        }
+
+        // --- candidate detail (the sweep landscape behind each winner) ---
         println!(
-            "    winner {} ({sp:.2}x vs default) — {note}\n",
-            show(r.winner)
+            "\n{}",
+            style("  candidates · geomean over probe shapes · * default  ‹ winner").dim()
         );
+        let kw = results
+            .iter()
+            .map(|r| {
+                r.env
+                    .strip_prefix("GEMMKIT_")
+                    .unwrap_or(r.env)
+                    .chars()
+                    .count()
+            })
+            .max()
+            .unwrap_or(0);
+        for r in results {
+            let knob = r.env.strip_prefix("GEMMKIT_").unwrap_or(r.env);
+            let mut line = format!("  {knob:<kw$}  ");
+            for row in &r.rows {
+                let mark = if row.value == r.default { "*" } else { "" };
+                let win = if row.value == r.winner { "‹" } else { "" };
+                line.push_str(&format!(
+                    "{mark}{}={:.1}{win}  ",
+                    show(row.value),
+                    row.stat.median
+                ));
+            }
+            println!("{}", line.trim_end());
+        }
     }
 
+    // --- skipped ---
     if !skipped.is_empty() {
-        println!("skipped:");
+        println!("\n{}", style("  skipped").bold());
+        let kw = skipped
+            .iter()
+            .map(|(e, _)| e.strip_prefix("GEMMKIT_").unwrap_or(e).chars().count())
+            .max()
+            .unwrap_or(0);
         for (env, why) in skipped {
-            println!("    {env}: {why}");
+            let knob = env.strip_prefix("GEMMKIT_").unwrap_or(env);
+            println!(
+                "  {}  {}",
+                style(format!("{knob:<kw$}")).dim(),
+                style(why).dim()
+            );
         }
-        println!();
     }
+
+    // --- footer ---
     println!(
-        "{} knob(s) swept, {moved} moved off default, {} skipped; {:.1}s.",
-        results.len(),
-        skipped.len(),
-        elapsed.as_secs_f64()
+        "\n  {}",
+        style(format!(
+            "{} swept · {moved} moved off default · {} skipped · {secs:.1}s",
+            results.len(),
+            skipped.len(),
+        ))
+        .bold()
     );
     if results.is_empty() {
         println!(
-            "No knobs were swept — the time budget was too small to measure even one. The profile \
-             contains no tuned values; raise --time-budget."
+            "  {}",
+            style("no knobs swept — the time budget was too small to measure even one; raise --time-budget").dim()
         );
     } else if moved == 0 {
         println!(
-            "All swept knobs kept their defaults — expected on the Zen5 box the defaults were \
-             calibrated on. The profile reproduces them; run gemmkit-tune on a different machine \
-             to specialize."
+            "  {}",
+            style("all knobs kept their defaults — expected on the machine the defaults were calibrated on; the profile reproduces them").dim()
         );
     }
 }
