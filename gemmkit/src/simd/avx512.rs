@@ -304,6 +304,78 @@ impl KernelSimd<i8, i8, i32, i32> for Avx512 {
     }
 }
 
+/// Emit a `SimdOps<$t>` impl for a **superset AVX-512 token** ([`Avx512Vnni`] / [`Avx512Bf16`])
+/// that forwards `Reg`/`LANES`/`ALIGN` and every method to [`Avx512`]'s impl. Each token is a
+/// distinct type only because `#[target_feature]` is per-token; the numeric ops are identical.
+/// Every method is an `#[inline(always)]` one-line forward through `<Avx512 as SimdOps<$t>>`,
+/// so — inlined inside the token's superset `vectorize` context — codegen is the same intrinsic
+/// as writing it inline (the pattern the `KernelSimd` blocks below already use). Delegating is
+/// one source of truth: e.g. `f32`'s `max`/`min` come along for free instead of drifting.
+// Only the VNNI (`int8`) and BF16 (`half`) tokens use it.
+#[cfg(any(feature = "int8", feature = "half"))]
+macro_rules! delegate_simdops {
+    ($tok:ty => $src:ty, $t:ty) => {
+        impl SimdOps<$t> for $tok {
+            type Reg = <$src as SimdOps<$t>>::Reg;
+            const LANES: usize = <$src as SimdOps<$t>>::LANES;
+            const ALIGN: usize = <$src as SimdOps<$t>>::ALIGN;
+
+            #[inline(always)]
+            unsafe fn zero(self) -> Self::Reg {
+                unsafe { <$src as SimdOps<$t>>::zero(<$src as Default>::default()) }
+            }
+            #[inline(always)]
+            unsafe fn splat(self, v: $t) -> Self::Reg {
+                unsafe { <$src as SimdOps<$t>>::splat(<$src as Default>::default(), v) }
+            }
+            #[inline(always)]
+            unsafe fn load(self, p: *const $t) -> Self::Reg {
+                unsafe { <$src as SimdOps<$t>>::load(<$src as Default>::default(), p) }
+            }
+            #[inline(always)]
+            unsafe fn loadu(self, p: *const $t) -> Self::Reg {
+                unsafe { <$src as SimdOps<$t>>::loadu(<$src as Default>::default(), p) }
+            }
+            #[inline(always)]
+            unsafe fn store(self, p: *mut $t, v: Self::Reg) {
+                unsafe { <$src as SimdOps<$t>>::store(<$src as Default>::default(), p, v) }
+            }
+            #[inline(always)]
+            unsafe fn storeu(self, p: *mut $t, v: Self::Reg) {
+                unsafe { <$src as SimdOps<$t>>::storeu(<$src as Default>::default(), p, v) }
+            }
+            #[inline(always)]
+            unsafe fn mul(self, a: Self::Reg, b: Self::Reg) -> Self::Reg {
+                unsafe { <$src as SimdOps<$t>>::mul(<$src as Default>::default(), a, b) }
+            }
+            #[inline(always)]
+            unsafe fn add(self, a: Self::Reg, b: Self::Reg) -> Self::Reg {
+                unsafe { <$src as SimdOps<$t>>::add(<$src as Default>::default(), a, b) }
+            }
+            #[inline(always)]
+            unsafe fn mul_add(self, a: Self::Reg, b: Self::Reg, c: Self::Reg) -> Self::Reg {
+                unsafe { <$src as SimdOps<$t>>::mul_add(<$src as Default>::default(), a, b, c) }
+            }
+            #[inline(always)]
+            unsafe fn fnma(self, a: Self::Reg, b: Self::Reg, c: Self::Reg) -> Self::Reg {
+                unsafe { <$src as SimdOps<$t>>::fnma(<$src as Default>::default(), a, b, c) }
+            }
+            #[inline(always)]
+            unsafe fn max(self, a: Self::Reg, b: Self::Reg) -> Self::Reg {
+                unsafe { <$src as SimdOps<$t>>::max(<$src as Default>::default(), a, b) }
+            }
+            #[inline(always)]
+            unsafe fn min(self, a: Self::Reg, b: Self::Reg) -> Self::Reg {
+                unsafe { <$src as SimdOps<$t>>::min(<$src as Default>::default(), a, b) }
+            }
+            #[inline(always)]
+            unsafe fn reduce_sum(self, v: Self::Reg) -> $t {
+                unsafe { <$src as SimdOps<$t>>::reduce_sum(<$src as Default>::default(), v) }
+            }
+        }
+    };
+}
+
 // ---- AVX-512 VNNI: i8 -> i32 dot kernel via `vpdpbusd` (4 depth steps / instr) ----
 
 /// AVX-512 VNNI ISA token: the integer dot kernel. A **distinct token** from [`Avx512`]
@@ -332,57 +404,11 @@ impl Simd for Avx512Vnni {
     }
 }
 
+// The numeric `i32` ops are [`Avx512`]'s exactly (a distinct token only for `vpdpbusd`'s
+// per-token `#[target_feature]`); `max`/`min` fall to the shared `unreachable!` default —
+// the integer epilogue never clamps.
 #[cfg(feature = "int8")]
-impl SimdOps<i32> for Avx512Vnni {
-    type Reg = __m512i;
-    const LANES: usize = 16;
-    const ALIGN: usize = 64;
-
-    #[inline(always)]
-    unsafe fn zero(self) -> __m512i {
-        unsafe { _mm512_setzero_si512() }
-    }
-    #[inline(always)]
-    unsafe fn splat(self, v: i32) -> __m512i {
-        unsafe { _mm512_set1_epi32(v) }
-    }
-    #[inline(always)]
-    unsafe fn load(self, p: *const i32) -> __m512i {
-        unsafe { _mm512_load_si512(p as *const __m512i) }
-    }
-    #[inline(always)]
-    unsafe fn loadu(self, p: *const i32) -> __m512i {
-        unsafe { _mm512_loadu_si512(p as *const __m512i) }
-    }
-    #[inline(always)]
-    unsafe fn store(self, p: *mut i32, v: __m512i) {
-        unsafe { _mm512_store_si512(p as *mut __m512i, v) }
-    }
-    #[inline(always)]
-    unsafe fn storeu(self, p: *mut i32, v: __m512i) {
-        unsafe { _mm512_storeu_si512(p as *mut __m512i, v) }
-    }
-    #[inline(always)]
-    unsafe fn mul(self, a: __m512i, b: __m512i) -> __m512i {
-        unsafe { _mm512_mullo_epi32(a, b) }
-    }
-    #[inline(always)]
-    unsafe fn add(self, a: __m512i, b: __m512i) -> __m512i {
-        unsafe { _mm512_add_epi32(a, b) }
-    }
-    #[inline(always)]
-    unsafe fn mul_add(self, a: __m512i, b: __m512i, c: __m512i) -> __m512i {
-        unsafe { _mm512_add_epi32(_mm512_mullo_epi32(a, b), c) }
-    }
-    #[inline(always)]
-    unsafe fn fnma(self, a: __m512i, b: __m512i, c: __m512i) -> __m512i {
-        unsafe { _mm512_sub_epi32(c, _mm512_mullo_epi32(a, b)) }
-    }
-    #[inline(always)]
-    unsafe fn reduce_sum(self, v: __m512i) -> i32 {
-        unsafe { _mm512_reduce_add_epi32(v) }
-    }
-}
+delegate_simdops!(Avx512Vnni => Avx512, i32);
 
 /// `i8 -> i32` via VNNI. The load/store seam matches [`Avx512`] (plain `i32` epilogue;
 /// `load_lhs`/`splat_rhs` are required by the trait but unused — the hot loop runs
@@ -392,19 +418,19 @@ impl SimdOps<i32> for Avx512Vnni {
 impl KernelSimd<i8, i8, i32, i32> for Avx512Vnni {
     #[inline(always)]
     unsafe fn load_lhs(self, p: *const i8) -> __m512i {
-        unsafe { _mm512_cvtepi8_epi32(_mm_loadu_si128(p as *const __m128i)) }
+        unsafe { <Avx512 as KernelSimd<i8, i8, i32, i32>>::load_lhs(Avx512, p) }
     }
     #[inline(always)]
     unsafe fn splat_rhs(self, v: i8) -> __m512i {
-        unsafe { _mm512_set1_epi32(v as i32) }
+        unsafe { <Avx512 as KernelSimd<i8, i8, i32, i32>>::splat_rhs(Avx512, v) }
     }
     #[inline(always)]
     unsafe fn load_out(self, p: *const i32) -> __m512i {
-        unsafe { _mm512_loadu_si512(p as *const __m512i) }
+        unsafe { <Avx512 as KernelSimd<i8, i8, i32, i32>>::load_out(Avx512, p) }
     }
     #[inline(always)]
     unsafe fn store_out(self, p: *mut i32, v: __m512i) {
-        unsafe { _mm512_storeu_si512(p as *mut __m512i, v) }
+        unsafe { <Avx512 as KernelSimd<i8, i8, i32, i32>>::store_out(Avx512, p, v) }
     }
 
     #[allow(clippy::needless_range_loop)]
@@ -459,10 +485,11 @@ impl KernelSimd<i8, i8, i32, i32> for Avx512Vnni {
                 }
             }
 
-            // Subtract the per-column bias `128·colsum[j]` (identical in every lane) to
-            // recover the true signed `Σ_k A·B`.
+            // Subtract the per-column bias `VNNI_A_BIAS·colsum[j]` (identical in every lane)
+            // to recover the true signed `Σ_k A·B`. Same bias the LHS pack offsets by.
             for j in 0..NR {
-                let corr = _mm512_set1_epi32(128i32.wrapping_mul(colsum[j]));
+                let corr =
+                    _mm512_set1_epi32(crate::kernel::int::VNNI_A_BIAS.wrapping_mul(colsum[j]));
                 for i in 0..MR_REG {
                     acc[j][i] = _mm512_sub_epi32(acc[j][i], corr);
                 }
@@ -496,57 +523,11 @@ impl Simd for Avx512Bf16 {
     }
 }
 
+// The `f32` accumulator ops are [`Avx512`]'s exactly (a distinct token only for `vdpbf16ps`'s
+// per-token `#[target_feature]`); delegating carries `max`/`min` along too (a future fused bf16
+// path would clamp through them).
 #[cfg(feature = "half")]
-impl SimdOps<f32> for Avx512Bf16 {
-    type Reg = __m512;
-    const LANES: usize = 16;
-    const ALIGN: usize = 64;
-
-    #[inline(always)]
-    unsafe fn zero(self) -> __m512 {
-        unsafe { _mm512_setzero_ps() }
-    }
-    #[inline(always)]
-    unsafe fn splat(self, v: f32) -> __m512 {
-        unsafe { _mm512_set1_ps(v) }
-    }
-    #[inline(always)]
-    unsafe fn load(self, p: *const f32) -> __m512 {
-        unsafe { _mm512_load_ps(p) }
-    }
-    #[inline(always)]
-    unsafe fn loadu(self, p: *const f32) -> __m512 {
-        unsafe { _mm512_loadu_ps(p) }
-    }
-    #[inline(always)]
-    unsafe fn store(self, p: *mut f32, v: __m512) {
-        unsafe { _mm512_store_ps(p, v) }
-    }
-    #[inline(always)]
-    unsafe fn storeu(self, p: *mut f32, v: __m512) {
-        unsafe { _mm512_storeu_ps(p, v) }
-    }
-    #[inline(always)]
-    unsafe fn mul(self, a: __m512, b: __m512) -> __m512 {
-        unsafe { _mm512_mul_ps(a, b) }
-    }
-    #[inline(always)]
-    unsafe fn add(self, a: __m512, b: __m512) -> __m512 {
-        unsafe { _mm512_add_ps(a, b) }
-    }
-    #[inline(always)]
-    unsafe fn mul_add(self, a: __m512, b: __m512, c: __m512) -> __m512 {
-        unsafe { _mm512_fmadd_ps(a, b, c) }
-    }
-    #[inline(always)]
-    unsafe fn fnma(self, a: __m512, b: __m512, c: __m512) -> __m512 {
-        unsafe { _mm512_fnmadd_ps(a, b, c) }
-    }
-    #[inline(always)]
-    unsafe fn reduce_sum(self, v: __m512) -> f32 {
-        unsafe { _mm512_reduce_add_ps(v) }
-    }
-}
+delegate_simdops!(Avx512Bf16 => Avx512, f32);
 
 /// `bf16 -> f32` via `vdpbf16ps`. The widen-load / narrow-store seam **delegates to
 /// [`Avx512`]'s `bf16` impl** — one source of truth for the RNE-bias + `half`-NaN

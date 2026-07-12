@@ -59,7 +59,7 @@ use crate::kernel::IntGemmQ;
 use crate::kernel::IntGemmVnni;
 #[cfg(all(feature = "int8", any(target_arch = "x86", target_arch = "x86_64")))]
 use crate::kernel::IntGemmVnniQ;
-#[cfg(feature = "int8")]
+#[cfg(any(feature = "int8", feature = "half"))]
 use crate::kernel::KernelFamily;
 #[cfg(feature = "half")]
 use crate::kernel::MixedGemm;
@@ -408,24 +408,58 @@ pub(crate) unsafe fn execute_packed<T: GemmScalar>(
     }
 }
 
-/// Orientation normalization for the float / mixed [`Task`] paths: if `C` is
-/// row-major-ish (`|csc| < |rsc|`), compute `Cᵀ = Bᵀ·Aᵀ` so the kernel writes columns
-/// contiguously (`rsc == 1`), swapping `m↔n`, the `A`/`B` pointers/strides, and
-/// `rsc↔csc`. (The integer [`IntTask`] is a distinct struct that inlines the same swap.)
+/// Orientation normalization shared by every dispatch path (float / mixed [`Task`],
+/// integer [`IntTask`], requantizing [`RequantTask`]): if `C` is row-major-ish
+/// (`|csc| < |rsc|`), compute `Cᵀ = Bᵀ·Aᵀ` so the kernel writes columns contiguously
+/// (`rsc == 1`), swapping `m↔n`, the `A`/`B` pointers/strides, and `rsc↔csc`. Returns
+/// `true` if it swapped, so callers can flip any co-varying policy (bias axis, conj
+/// flags). Generic over the element pointer type `L` (the three tasks differ only there).
 #[inline]
-fn orient_transpose<T>(t: &mut Task<T>) {
-    if t.csc.unsigned_abs() < t.rsc.unsigned_abs() {
-        let (oa, orsa, ocsa) = (t.a, t.rsa, t.csa);
-        let (ob, orsb, ocsb) = (t.b, t.rsb, t.csb);
-        core::mem::swap(&mut t.m, &mut t.n);
-        t.a = ob;
-        t.rsa = ocsb;
-        t.csa = orsb;
-        t.b = oa;
-        t.rsb = ocsa;
-        t.csb = orsa;
-        core::mem::swap(&mut t.rsc, &mut t.csc);
+#[allow(clippy::too_many_arguments)]
+fn orient_swap<L>(
+    m: &mut usize,
+    n: &mut usize,
+    a: &mut *const L,
+    rsa: &mut isize,
+    csa: &mut isize,
+    b: &mut *const L,
+    rsb: &mut isize,
+    csb: &mut isize,
+    rsc: &mut isize,
+    csc: &mut isize,
+) -> bool {
+    if csc.unsigned_abs() < rsc.unsigned_abs() {
+        core::mem::swap(m, n);
+        core::mem::swap(a, b); // new A = old B (same element type L)
+        core::mem::swap(rsa, csb); // new rsa = old csb, new csb = old rsa
+        core::mem::swap(csa, rsb); // new csa = old rsb, new rsb = old csa
+        core::mem::swap(rsc, csc);
+        true
+    } else {
+        false
     }
+}
+
+/// Orientation swap for the homogeneous float / mixed [`Task`] path (see [`orient_swap`]).
+#[inline]
+fn orient_transpose<T>(t: &mut Task<T>) -> bool {
+    orient_swap(
+        &mut t.m, &mut t.n, &mut t.a, &mut t.rsa, &mut t.csa, &mut t.b, &mut t.rsb, &mut t.csb,
+        &mut t.rsc, &mut t.csc,
+    )
+}
+
+/// `true` when a post-swap [`Task`] should take the horizontal `small_mn` path: small `m,n`
+/// with a long contraction and both operands streaming contiguously along `k` (A rows
+/// unit-stride `csa == 1`, B columns unit-stride `rsb == 1`). Shared by the float / mixed /
+/// bf16-dot entries — the gate has been re-tuned as one unit, so it lives in one place.
+#[inline]
+fn small_mn_eligible<T>(t: &Task<T>) -> bool {
+    t.m <= tuning::small_mn_dim()
+        && t.n <= tuning::small_mn_dim()
+        && t.k > tuning::small_k_threshold()
+        && t.csa == 1
+        && t.rsb == 1
 }
 
 /// `C <- beta·C` for a **homogeneous float** type (`f32`/`f64`): in-place scale,
@@ -501,18 +535,12 @@ unsafe fn run_typed<T, S, const MR_REG: usize, const NR: usize>(
 
         orient_transpose(&mut t);
         // Small `m,n` with a long contraction, and both operands streaming contiguously along
-        // `k` (A rows unit-stride `csa == 1`, B columns unit-stride `rsb == 1`): the driver would
-        // pad the tiny row/col tiles up to a full microtile and pack mostly padding, whereas the
-        // horizontal path computes each output as a direct SIMD dot over `k`, reading A/B in
-        // place. (At small `k` the small_k route below is already the right in-place tool, so this
-        // only claims the long-`k` regime; a strided layout would force a scalar dot that loses to
-        // the driver, so it stays on the driver.)
-        if t.m <= tuning::small_mn_dim()
-            && t.n <= tuning::small_mn_dim()
-            && t.k > tuning::small_k_threshold()
-            && t.csa == 1
-            && t.rsb == 1
-        {
+        // `k`: the driver would pad the tiny row/col tiles up to a full microtile and pack mostly
+        // padding, whereas the horizontal path computes each output as a direct SIMD dot over `k`,
+        // reading A/B in place. (At small `k` the small_k route below is already the right in-place
+        // tool, so this only claims the long-`k` regime; a strided layout would force a scalar dot
+        // that loses to the driver, so it stays on the driver.)
+        if small_mn_eligible(&t) {
             small_mn::run::<T, S>(
                 simd, t.m, t.k, t.n, par, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb, t.beta,
                 t.c, t.rsc, t.csc,
@@ -556,8 +584,7 @@ unsafe fn run_typed_fused<T, S, const MR_REG: usize, const NR: usize>(
     S: SimdOps<T>,
 {
     unsafe {
-        let swap = t.csc.unsigned_abs() < t.rsc.unsigned_abs();
-        orient_transpose(&mut t);
+        let swap = orient_transpose(&mut t);
         if swap {
             epi.bias = match epi.bias {
                 BiasSpec::None => BiasSpec::None,
@@ -600,34 +627,34 @@ unsafe fn run_packed_typed<T, S, const MR_REG: usize, const NR: usize>(
     }
 }
 
-/// Mixed-precision driver entry for a concrete `(narrow type, ISA, tile)`. Mirror
-/// of [`run_typed`] driving [`MixedGemm`]: no gemv special path (the general driver
-/// handles those shapes), the same orientation swap, and `alpha`/`beta` **widened to
-/// the `f32` accumulator** before the driver call.
+/// Mixed-precision driver entry for a concrete `(narrow type, family, ISA, tile)`. Mirror
+/// of [`run_typed`] driving a narrow-in / `f32`-accumulate family: no gemv special path (the
+/// general driver handles those shapes), the same orientation swap, and `alpha`/`beta`
+/// **widened to the `f32` accumulator** before the driver call. `Fam` selects the general-
+/// driver kernel — `MixedGemm<N>` for the widen path, `Bf16DotGemm` for the `vdpbf16ps` dot
+/// path — while the `small_mn` / small-`k` reroutes deliberately stay on `MixedGemm<N>`
+/// (both special paths bypass any dot kernel: a tiny output folds nothing and the dot pack's
+/// `DEPTH_MULTIPLE` is pure loss there).
 ///
 /// # Safety
 /// As [`run_typed`].
 #[cfg(feature = "half")]
 #[inline]
-unsafe fn run_typed_mixed<N, S, const MR_REG: usize, const NR: usize>(
+unsafe fn run_typed_mixed<N, Fam, S, const MR_REG: usize, const NR: usize>(
     simd: S,
     mut t: Task<N>,
     par: Parallelism,
     ws: &mut Workspace,
 ) where
     N: NarrowFloat,
+    Fam: KernelFamily<Lhs = N, Rhs = N, Acc = f32, Out = N>,
     S: KernelSimd<N, N, f32, N>,
 {
     unsafe {
         orient_transpose(&mut t);
         // Small `m,n` + long `k` + contiguous-along-`k` layout: the horizontal path, widening
         // `N → f32` on load and accumulating in `f32` (see [`run_typed`]'s float gate).
-        if t.m <= tuning::small_mn_dim()
-            && t.n <= tuning::small_mn_dim()
-            && t.k > tuning::small_k_threshold()
-            && t.csa == 1
-            && t.rsb == 1
-        {
+        if small_mn_eligible(&t) {
             small_mn::run_mixed::<N, S>(
                 simd,
                 t.m,
@@ -671,7 +698,7 @@ unsafe fn run_typed_mixed<N, S, const MR_REG: usize, const NR: usize>(
             );
             return;
         }
-        driver::run::<MixedGemm<N>, S, MR_REG, NR>(
+        driver::run::<Fam, S, MR_REG, NR>(
             simd,
             t.m,
             t.k,
@@ -693,158 +720,26 @@ unsafe fn run_typed_mixed<N, S, const MR_REG: usize, const NR: usize>(
     }
 }
 
-/// Prepacked-RHS mixed-precision entry (mirror of [`run_packed_typed`] for
-/// [`MixedGemm`]); no swap, `alpha`/`beta` widened to `f32`.
+/// Prepacked-RHS mixed-precision entry (mirror of [`run_packed_typed`] for a narrow-in /
+/// `f32`-accumulate family `Fam`); no swap, `alpha`/`beta` widened to `f32`.
 ///
 /// # Safety
 /// As [`run_packed_typed`].
 #[cfg(feature = "half")]
 #[inline]
-unsafe fn run_packed_typed_mixed<N, S, const MR_REG: usize, const NR: usize>(
+unsafe fn run_packed_typed_mixed<N, Fam, S, const MR_REG: usize, const NR: usize>(
     simd: S,
     req: PackedConsume<N>,
     par: Parallelism,
     ws: &mut Workspace,
 ) where
     N: NarrowFloat,
+    Fam: KernelFamily<Lhs = N, Rhs = N, Acc = f32, Out = N>,
     S: KernelSimd<N, N, f32, N>,
 {
     unsafe {
         debug_assert_eq!(NR, req.nr, "prepacked RHS panel width != kernel NR");
-        driver::run_packed_rhs::<MixedGemm<N>, S, MR_REG, NR>(
-            simd,
-            req.m,
-            req.k,
-            req.n,
-            req.alpha.widen(),
-            req.a,
-            req.rsa,
-            req.csa,
-            req.packed,
-            req.kc,
-            req.nc,
-            req.beta.widen(),
-            req.c,
-            req.rsc,
-            req.csc,
-            par,
-            ws,
-        );
-    }
-}
-
-/// bf16 dot-kernel driver entry (mirror of [`run_typed_mixed`] driving [`Bf16DotGemm`]
-/// instead of `MixedGemm<bf16>`): same orientation swap and `f32`-widened `alpha`/`beta`,
-/// but the k-pair-interleaved pack + `vdpbf16ps` inner loop.
-///
-/// # Safety
-/// As [`run_typed_mixed`].
-#[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
-#[inline]
-unsafe fn run_typed_bf16_dot<S, const MR_REG: usize, const NR: usize>(
-    simd: S,
-    mut t: Task<bf16>,
-    par: Parallelism,
-    ws: &mut Workspace,
-) where
-    S: KernelSimd<bf16, bf16, f32, bf16>,
-{
-    unsafe {
-        orient_transpose(&mut t);
-        // Small `m,n` + long `k` + contiguous layout: the horizontal widen path. Like the small-`k`
-        // case below it bypasses the dot kernel — a tiny `m,n` output folds nothing under
-        // `vdpbf16ps` and its `DEPTH_MULTIPLE = 2` pack is pure loss.
-        if t.m <= tuning::small_mn_dim()
-            && t.n <= tuning::small_mn_dim()
-            && t.k > tuning::small_k_threshold()
-            && t.csa == 1
-            && t.rsb == 1
-        {
-            small_mn::run_mixed::<bf16, S>(
-                simd,
-                t.m,
-                t.k,
-                t.n,
-                par,
-                t.alpha.widen(),
-                t.a,
-                t.rsa,
-                t.csa,
-                t.b,
-                t.rsb,
-                t.csb,
-                t.beta.widen(),
-                t.c,
-                t.rsc,
-                t.csc,
-            );
-            return;
-        }
-        // Skinny / low-depth shape: route through the widen sibling `MixedGemm<bf16>`, not
-        // the dot kernel — at `k <= threshold` `vdpbf16ps` folds nothing and its
-        // `DEPTH_MULTIPLE = 2` pack is pure loss.
-        if t.k <= tuning::small_k_threshold() {
-            small_k::run::<MixedGemm<bf16>, S, MR_REG, NR>(
-                simd,
-                t.m,
-                t.k,
-                t.n,
-                t.alpha.widen(),
-                t.a,
-                t.rsa,
-                t.csa,
-                t.b,
-                t.rsb,
-                t.csb,
-                t.beta.widen(),
-                t.c,
-                t.rsc,
-                t.csc,
-                par,
-                ws,
-            );
-            return;
-        }
-        driver::run::<Bf16DotGemm, S, MR_REG, NR>(
-            simd,
-            t.m,
-            t.k,
-            t.n,
-            t.alpha.widen(),
-            t.a,
-            t.rsa,
-            t.csa,
-            t.b,
-            t.rsb,
-            t.csb,
-            t.beta.widen(),
-            t.c,
-            t.rsc,
-            t.csc,
-            par,
-            ws,
-        );
-    }
-}
-
-/// Prepacked-RHS bf16 dot entry (mirror of [`run_packed_typed_mixed`] for
-/// [`Bf16DotGemm`]); no swap, `alpha`/`beta` widened to `f32`.
-///
-/// # Safety
-/// As [`run_packed_typed_mixed`].
-#[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
-#[inline]
-unsafe fn run_packed_typed_bf16_dot<S, const MR_REG: usize, const NR: usize>(
-    simd: S,
-    req: PackedConsume<bf16>,
-    par: Parallelism,
-    ws: &mut Workspace,
-) where
-    S: KernelSimd<bf16, bf16, f32, bf16>,
-{
-    unsafe {
-        debug_assert_eq!(NR, req.nr, "prepacked RHS panel width != kernel NR");
-        driver::run_packed_rhs::<Bf16DotGemm, S, MR_REG, NR>(
+        driver::run_packed_rhs::<Fam, S, MR_REG, NR>(
             simd,
             req.m,
             req.k,
@@ -1130,58 +1025,62 @@ unsafe fn fused_degenerate<T: FusedScalar>(t: &Task<T>, epi: &FusedEpi<T>) {
 
 #[cfg(feature = "half")]
 unsafe fn gemm_f16_scalar(t: Task<f16>, par: Parallelism, ws: &mut Workspace) {
-    unsafe { run_typed_mixed::<f16, ScalarTok, 4, 4>(ScalarTok, t, par, ws) }
+    unsafe { run_typed_mixed::<f16, MixedGemm<f16>, ScalarTok, 4, 4>(ScalarTok, t, par, ws) }
 }
 #[cfg(feature = "half")]
 unsafe fn gemm_bf16_scalar(t: Task<bf16>, par: Parallelism, ws: &mut Workspace) {
-    unsafe { run_typed_mixed::<bf16, ScalarTok, 4, 4>(ScalarTok, t, par, ws) }
+    unsafe { run_typed_mixed::<bf16, MixedGemm<bf16>, ScalarTok, 4, 4>(ScalarTok, t, par, ws) }
 }
 #[cfg(feature = "half")]
 unsafe fn gemm_f16_scalar_packed(r: PackedConsume<f16>, par: Parallelism, ws: &mut Workspace) {
-    unsafe { run_packed_typed_mixed::<f16, ScalarTok, 4, 4>(ScalarTok, r, par, ws) }
+    unsafe { run_packed_typed_mixed::<f16, MixedGemm<f16>, ScalarTok, 4, 4>(ScalarTok, r, par, ws) }
 }
 #[cfg(feature = "half")]
 unsafe fn gemm_bf16_scalar_packed(r: PackedConsume<bf16>, par: Parallelism, ws: &mut Workspace) {
-    unsafe { run_packed_typed_mixed::<bf16, ScalarTok, 4, 4>(ScalarTok, r, par, ws) }
+    unsafe {
+        run_packed_typed_mixed::<bf16, MixedGemm<bf16>, ScalarTok, 4, 4>(ScalarTok, r, par, ws)
+    }
 }
 #[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
 unsafe fn gemm_f16_fma(t: Task<f16>, par: Parallelism, ws: &mut Workspace) {
     // f32 accumulator → MR = 2*8 = 16, NR = 6 (the f32 FMA tile).
-    unsafe { run_typed_mixed::<f16, Fma, 2, 6>(Fma, t, par, ws) }
+    unsafe { run_typed_mixed::<f16, MixedGemm<f16>, Fma, 2, 6>(Fma, t, par, ws) }
 }
 #[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
 unsafe fn gemm_bf16_fma(t: Task<bf16>, par: Parallelism, ws: &mut Workspace) {
-    unsafe { run_typed_mixed::<bf16, Fma, 2, 6>(Fma, t, par, ws) }
+    unsafe { run_typed_mixed::<bf16, MixedGemm<bf16>, Fma, 2, 6>(Fma, t, par, ws) }
 }
 #[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
 unsafe fn gemm_f16_fma_packed(r: PackedConsume<f16>, par: Parallelism, ws: &mut Workspace) {
-    unsafe { run_packed_typed_mixed::<f16, Fma, 2, 6>(Fma, r, par, ws) }
+    unsafe { run_packed_typed_mixed::<f16, MixedGemm<f16>, Fma, 2, 6>(Fma, r, par, ws) }
 }
 #[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
 unsafe fn gemm_bf16_fma_packed(r: PackedConsume<bf16>, par: Parallelism, ws: &mut Workspace) {
-    unsafe { run_packed_typed_mixed::<bf16, Fma, 2, 6>(Fma, r, par, ws) }
+    unsafe { run_packed_typed_mixed::<bf16, MixedGemm<bf16>, Fma, 2, 6>(Fma, r, par, ws) }
 }
 #[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
 unsafe fn gemm_f16_avx512(t: Task<f16>, par: Parallelism, ws: &mut Workspace) {
     // f32 accumulator → MR = 2*16 = 32, NR = 12 (the f32 AVX-512 tile).
-    unsafe { run_typed_mixed::<f16, Avx512, 2, 12>(Avx512, t, par, ws) }
+    unsafe { run_typed_mixed::<f16, MixedGemm<f16>, Avx512, 2, 12>(Avx512, t, par, ws) }
 }
 #[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
 unsafe fn gemm_bf16_avx512(t: Task<bf16>, par: Parallelism, ws: &mut Workspace) {
-    unsafe { run_typed_mixed::<bf16, Avx512, 2, 12>(Avx512, t, par, ws) }
+    unsafe { run_typed_mixed::<bf16, MixedGemm<bf16>, Avx512, 2, 12>(Avx512, t, par, ws) }
 }
 #[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
 unsafe fn gemm_f16_avx512_packed(r: PackedConsume<f16>, par: Parallelism, ws: &mut Workspace) {
-    unsafe { run_packed_typed_mixed::<f16, Avx512, 2, 12>(Avx512, r, par, ws) }
+    unsafe { run_packed_typed_mixed::<f16, MixedGemm<f16>, Avx512, 2, 12>(Avx512, r, par, ws) }
 }
 #[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
 unsafe fn gemm_bf16_avx512_packed(r: PackedConsume<bf16>, par: Parallelism, ws: &mut Workspace) {
-    unsafe { run_packed_typed_mixed::<bf16, Avx512, 2, 12>(Avx512, r, par, ws) }
+    unsafe { run_packed_typed_mixed::<bf16, MixedGemm<bf16>, Avx512, 2, 12>(Avx512, r, par, ws) }
 }
 #[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
 unsafe fn gemm_bf16_avx512_dot(t: Task<bf16>, par: Parallelism, ws: &mut Workspace) {
-    // bf16 dot: f32 accumulator → MR = 2*16 = 32, NR = 12 (the f32 AVX-512 tile).
-    unsafe { run_typed_bf16_dot::<Avx512Bf16, 2, 12>(Avx512Bf16, t, par, ws) }
+    // bf16 dot: f32 accumulator → MR = 2*16 = 32, NR = 12 (the f32 AVX-512 tile). The
+    // `Bf16DotGemm` family swaps in the `vdpbf16ps` pack + inner loop; the shared
+    // `run_typed_mixed` routes small_mn / small_k through `MixedGemm<bf16>` as before.
+    unsafe { run_typed_mixed::<bf16, Bf16DotGemm, Avx512Bf16, 2, 12>(Avx512Bf16, t, par, ws) }
 }
 #[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
 unsafe fn gemm_bf16_avx512_dot_packed(
@@ -1189,39 +1088,41 @@ unsafe fn gemm_bf16_avx512_dot_packed(
     par: Parallelism,
     ws: &mut Workspace,
 ) {
-    unsafe { run_packed_typed_bf16_dot::<Avx512Bf16, 2, 12>(Avx512Bf16, r, par, ws) }
+    unsafe {
+        run_packed_typed_mixed::<bf16, Bf16DotGemm, Avx512Bf16, 2, 12>(Avx512Bf16, r, par, ws)
+    }
 }
 #[cfg(all(feature = "half", target_arch = "aarch64"))]
 unsafe fn gemm_f16_neon(t: Task<f16>, par: Parallelism, ws: &mut Workspace) {
-    unsafe { run_typed_mixed::<f16, Neon, 4, 4>(Neon, t, par, ws) }
+    unsafe { run_typed_mixed::<f16, MixedGemm<f16>, Neon, 4, 4>(Neon, t, par, ws) }
 }
 #[cfg(all(feature = "half", target_arch = "aarch64"))]
 unsafe fn gemm_bf16_neon(t: Task<bf16>, par: Parallelism, ws: &mut Workspace) {
-    unsafe { run_typed_mixed::<bf16, Neon, 4, 4>(Neon, t, par, ws) }
+    unsafe { run_typed_mixed::<bf16, MixedGemm<bf16>, Neon, 4, 4>(Neon, t, par, ws) }
 }
 #[cfg(all(feature = "half", target_arch = "aarch64"))]
 unsafe fn gemm_f16_neon_packed(r: PackedConsume<f16>, par: Parallelism, ws: &mut Workspace) {
-    unsafe { run_packed_typed_mixed::<f16, Neon, 4, 4>(Neon, r, par, ws) }
+    unsafe { run_packed_typed_mixed::<f16, MixedGemm<f16>, Neon, 4, 4>(Neon, r, par, ws) }
 }
 #[cfg(all(feature = "half", target_arch = "aarch64"))]
 unsafe fn gemm_bf16_neon_packed(r: PackedConsume<bf16>, par: Parallelism, ws: &mut Workspace) {
-    unsafe { run_packed_typed_mixed::<bf16, Neon, 4, 4>(Neon, r, par, ws) }
+    unsafe { run_packed_typed_mixed::<bf16, MixedGemm<bf16>, Neon, 4, 4>(Neon, r, par, ws) }
 }
 #[cfg(all(feature = "half", target_arch = "wasm32", target_feature = "simd128"))]
 unsafe fn gemm_f16_simd128(t: Task<f16>, par: Parallelism, ws: &mut Workspace) {
-    unsafe { run_typed_mixed::<f16, Simd128, 2, 4>(Simd128, t, par, ws) }
+    unsafe { run_typed_mixed::<f16, MixedGemm<f16>, Simd128, 2, 4>(Simd128, t, par, ws) }
 }
 #[cfg(all(feature = "half", target_arch = "wasm32", target_feature = "simd128"))]
 unsafe fn gemm_bf16_simd128(t: Task<bf16>, par: Parallelism, ws: &mut Workspace) {
-    unsafe { run_typed_mixed::<bf16, Simd128, 2, 4>(Simd128, t, par, ws) }
+    unsafe { run_typed_mixed::<bf16, MixedGemm<bf16>, Simd128, 2, 4>(Simd128, t, par, ws) }
 }
 #[cfg(all(feature = "half", target_arch = "wasm32", target_feature = "simd128"))]
 unsafe fn gemm_f16_simd128_packed(r: PackedConsume<f16>, par: Parallelism, ws: &mut Workspace) {
-    unsafe { run_packed_typed_mixed::<f16, Simd128, 2, 4>(Simd128, r, par, ws) }
+    unsafe { run_packed_typed_mixed::<f16, MixedGemm<f16>, Simd128, 2, 4>(Simd128, r, par, ws) }
 }
 #[cfg(all(feature = "half", target_arch = "wasm32", target_feature = "simd128"))]
 unsafe fn gemm_bf16_simd128_packed(r: PackedConsume<bf16>, par: Parallelism, ws: &mut Workspace) {
-    unsafe { run_packed_typed_mixed::<bf16, Simd128, 2, 4>(Simd128, r, par, ws) }
+    unsafe { run_packed_typed_mixed::<bf16, MixedGemm<bf16>, Simd128, 2, 4>(Simd128, r, par, ws) }
 }
 
 type GemmFn<T> = unsafe fn(Task<T>, Parallelism, &mut Workspace);
@@ -1813,192 +1714,162 @@ fn select_bf16() -> Dispatched<bf16> {
     }
 }
 
-#[cfg(feature = "std")]
-static GEMM_F32: OnceLock<Dispatched<f32>> = OnceLock::new();
-#[cfg(feature = "std")]
-static GEMM_F64: OnceLock<Dispatched<f64>> = OnceLock::new();
-#[cfg(all(feature = "std", feature = "half"))]
-static GEMM_F16: OnceLock<Dispatched<f16>> = OnceLock::new();
-#[cfg(all(feature = "std", feature = "half"))]
-static GEMM_BF16: OnceLock<Dispatched<bf16>> = OnceLock::new();
-
-/// The memoized dispatch descriptor for `f32` (selection runs once).
-#[inline]
-fn dispatched_f32() -> Dispatched<f32> {
-    #[cfg(feature = "std")]
-    {
-        *GEMM_F32.get_or_init(select_f32)
-    }
-    #[cfg(not(feature = "std"))]
-    {
-        select_f32()
-    }
-}
-
-/// The memoized dispatch descriptor for `f64` (selection runs once).
-#[inline]
-fn dispatched_f64() -> Dispatched<f64> {
-    #[cfg(feature = "std")]
-    {
-        *GEMM_F64.get_or_init(select_f64)
-    }
-    #[cfg(not(feature = "std"))]
-    {
-        select_f64()
-    }
-}
-
-/// The memoized dispatch descriptor for `f16` (selection runs once).
-#[cfg(feature = "half")]
-#[inline]
-fn dispatched_f16() -> Dispatched<f16> {
-    #[cfg(feature = "std")]
-    {
-        *GEMM_F16.get_or_init(select_f16)
-    }
-    #[cfg(not(feature = "std"))]
-    {
-        select_f16()
-    }
-}
-
-/// The memoized dispatch descriptor for `bf16` (selection runs once).
-#[cfg(feature = "half")]
-#[inline]
-fn dispatched_bf16() -> Dispatched<bf16> {
-    #[cfg(feature = "std")]
-    {
-        *GEMM_BF16.get_or_init(select_bf16)
-    }
-    #[cfg(not(feature = "std"))]
-    {
-        select_bf16()
-    }
-}
-
-impl GemmScalar for f32 {
-    const OUT_IS_ACC: bool = true;
-    #[inline]
-    unsafe fn scale_c(beta: f32, c: *mut f32, m: usize, n: usize, rsc: isize, csc: isize) {
-        unsafe { scale_c_float(beta, c, m, n, rsc, csc) }
-    }
-    #[inline]
-    unsafe fn pack_rhs_full(
-        dst: *mut f32,
-        b: *const f32,
-        rsb: isize,
-        csb: isize,
-        k: usize,
-        n: usize,
-        kc: usize,
-        nc: usize,
-        nr: usize,
-    ) {
-        unsafe { driver::pack_rhs_full::<FloatGemm<f32>>(dst, b, rsb, csb, k, n, kc, nc, nr) }
-    }
-    #[inline]
-    unsafe fn pack_lhs_full(
-        dst: *mut f32,
-        a: *const f32,
-        rsa: isize,
-        csa: isize,
-        m: usize,
-        k: usize,
-        kc: usize,
-        nc: usize,
-        nr: usize,
-    ) {
-        unsafe { driver::pack_lhs_full::<FloatGemm<f32>>(dst, a, rsa, csa, m, k, kc, nc, nr) }
-    }
-    #[inline]
-    unsafe fn dispatch(task: Task<f32>, par: Parallelism, ws: &mut Workspace) {
-        unsafe { (dispatched_f32().run)(task, par, ws) }
-    }
-    #[inline]
-    unsafe fn dispatch_packed(req: PackedConsume<f32>, par: Parallelism, ws: &mut Workspace) {
-        unsafe { (dispatched_f32().run_packed)(req, par, ws) }
-    }
-    #[inline]
-    unsafe fn dispatch_fused(
-        t: Task<f32>,
-        epi: FusedEpi<f32>,
-        par: Parallelism,
-        ws: &mut Workspace,
-    ) {
-        unsafe {
-            (dispatched_f32()
-                .run_fused
-                .expect("f32 fused kernel is always present"))(t, epi, par, ws)
+/// Emit the memoized dispatch accessor for one element type: a `#[cfg(std)]`
+/// `OnceLock<$ty>` plus a `fn $accessor() -> $ty` that runs `$select` **once** under `std`
+/// (feature detection is memoized) and directly on each call without `std`. The optional
+/// trailing `$feat` additionally gates the accessor and the `OnceLock` on that feature (the
+/// static is always further gated by `std`). Every `dispatched_*` slot shares this shape.
+macro_rules! memoized_select {
+    ($static:ident, $accessor:ident, $ty:ty, $select:ident, $doc:literal) => {
+        #[cfg(feature = "std")]
+        static $static: OnceLock<$ty> = OnceLock::new();
+        #[doc = $doc]
+        #[inline]
+        fn $accessor() -> $ty {
+            #[cfg(feature = "std")]
+            {
+                *$static.get_or_init($select)
+            }
+            #[cfg(not(feature = "std"))]
+            {
+                $select()
+            }
         }
-    }
-    #[inline]
-    fn rhs_tile() -> (usize, usize) {
-        let d = dispatched_f32();
-        (d.mr, d.nr)
-    }
+    };
+    ($static:ident, $accessor:ident, $ty:ty, $select:ident, $doc:literal, $feat:literal) => {
+        #[cfg(all(feature = "std", feature = $feat))]
+        static $static: OnceLock<$ty> = OnceLock::new();
+        #[doc = $doc]
+        #[cfg(feature = $feat)]
+        #[inline]
+        fn $accessor() -> $ty {
+            #[cfg(feature = "std")]
+            {
+                *$static.get_or_init($select)
+            }
+            #[cfg(not(feature = "std"))]
+            {
+                $select()
+            }
+        }
+    };
 }
 
-impl GemmScalar for f64 {
-    const OUT_IS_ACC: bool = true;
-    #[inline]
-    unsafe fn scale_c(beta: f64, c: *mut f64, m: usize, n: usize, rsc: isize, csc: isize) {
-        unsafe { scale_c_float(beta, c, m, n, rsc, csc) }
-    }
-    #[inline]
-    unsafe fn pack_rhs_full(
-        dst: *mut f64,
-        b: *const f64,
-        rsb: isize,
-        csb: isize,
-        k: usize,
-        n: usize,
-        kc: usize,
-        nc: usize,
-        nr: usize,
-    ) {
-        unsafe { driver::pack_rhs_full::<FloatGemm<f64>>(dst, b, rsb, csb, k, n, kc, nc, nr) }
-    }
-    #[inline]
-    unsafe fn pack_lhs_full(
-        dst: *mut f64,
-        a: *const f64,
-        rsa: isize,
-        csa: isize,
-        m: usize,
-        k: usize,
-        kc: usize,
-        nc: usize,
-        nr: usize,
-    ) {
-        unsafe { driver::pack_lhs_full::<FloatGemm<f64>>(dst, a, rsa, csa, m, k, kc, nc, nr) }
-    }
-    #[inline]
-    unsafe fn dispatch(task: Task<f64>, par: Parallelism, ws: &mut Workspace) {
-        unsafe { (dispatched_f64().run)(task, par, ws) }
-    }
-    #[inline]
-    unsafe fn dispatch_packed(req: PackedConsume<f64>, par: Parallelism, ws: &mut Workspace) {
-        unsafe { (dispatched_f64().run_packed)(req, par, ws) }
-    }
-    #[inline]
-    unsafe fn dispatch_fused(
-        t: Task<f64>,
-        epi: FusedEpi<f64>,
-        par: Parallelism,
-        ws: &mut Workspace,
-    ) {
-        unsafe {
-            (dispatched_f64()
-                .run_fused
-                .expect("f64 fused kernel is always present"))(t, epi, par, ws)
+memoized_select!(
+    GEMM_F32,
+    dispatched_f32,
+    Dispatched<f32>,
+    select_f32,
+    "The memoized dispatch descriptor for `f32` (selection runs once)."
+);
+memoized_select!(
+    GEMM_F64,
+    dispatched_f64,
+    Dispatched<f64>,
+    select_f64,
+    "The memoized dispatch descriptor for `f64` (selection runs once)."
+);
+memoized_select!(
+    GEMM_F16,
+    dispatched_f16,
+    Dispatched<f16>,
+    select_f16,
+    "The memoized dispatch descriptor for `f16` (selection runs once).",
+    "half"
+);
+memoized_select!(
+    GEMM_BF16,
+    dispatched_bf16,
+    Dispatched<bf16>,
+    select_bf16,
+    "The memoized dispatch descriptor for `bf16` (selection runs once).",
+    "half"
+);
+
+/// Emit the `GemmScalar` impl for a **homogeneous float** type (`f32` / `f64`): `Out == Acc`
+/// (`OUT_IS_ACC = true`), in-place `scale_c`, packing through `FloatGemm<$t>`, and the
+/// always-present fused path. `$disp` is the memoized dispatch accessor; `$name` names the
+/// type in the fused-kernel assert. The two float impls are pure type substitutions, so this
+/// keeps them from drifting. (Narrow `f16`/`bf16` differ — narrow scale, `MixedGemm`, no
+/// fused, bf16's depth-multiple pack switch — and stay manual below.)
+macro_rules! float_gemm_scalar {
+    ($t:ty, $disp:ident, $name:literal) => {
+        impl GemmScalar for $t {
+            const OUT_IS_ACC: bool = true;
+            #[inline]
+            unsafe fn scale_c(beta: $t, c: *mut $t, m: usize, n: usize, rsc: isize, csc: isize) {
+                unsafe { scale_c_float(beta, c, m, n, rsc, csc) }
+            }
+            #[inline]
+            unsafe fn pack_rhs_full(
+                dst: *mut $t,
+                b: *const $t,
+                rsb: isize,
+                csb: isize,
+                k: usize,
+                n: usize,
+                kc: usize,
+                nc: usize,
+                nr: usize,
+            ) {
+                unsafe {
+                    driver::pack_rhs_full::<FloatGemm<$t>>(dst, b, rsb, csb, k, n, kc, nc, nr)
+                }
+            }
+            #[inline]
+            unsafe fn pack_lhs_full(
+                dst: *mut $t,
+                a: *const $t,
+                rsa: isize,
+                csa: isize,
+                m: usize,
+                k: usize,
+                kc: usize,
+                nc: usize,
+                nr: usize,
+            ) {
+                unsafe {
+                    driver::pack_lhs_full::<FloatGemm<$t>>(dst, a, rsa, csa, m, k, kc, nc, nr)
+                }
+            }
+            #[inline]
+            unsafe fn dispatch(task: Task<$t>, par: Parallelism, ws: &mut Workspace) {
+                unsafe { ($disp().run)(task, par, ws) }
+            }
+            #[inline]
+            unsafe fn dispatch_packed(
+                req: PackedConsume<$t>,
+                par: Parallelism,
+                ws: &mut Workspace,
+            ) {
+                unsafe { ($disp().run_packed)(req, par, ws) }
+            }
+            #[inline]
+            unsafe fn dispatch_fused(
+                t: Task<$t>,
+                epi: FusedEpi<$t>,
+                par: Parallelism,
+                ws: &mut Workspace,
+            ) {
+                unsafe {
+                    ($disp()
+                        .run_fused
+                        .expect(concat!($name, " fused kernel is always present")))(
+                        t, epi, par, ws
+                    )
+                }
+            }
+            #[inline]
+            fn rhs_tile() -> (usize, usize) {
+                let d = $disp();
+                (d.mr, d.nr)
+            }
         }
-    }
-    #[inline]
-    fn rhs_tile() -> (usize, usize) {
-        let d = dispatched_f64();
-        (d.mr, d.nr)
-    }
+    };
 }
+
+float_gemm_scalar!(f32, dispatched_f32, "f32");
+float_gemm_scalar!(f64, dispatched_f64, "f64");
 
 #[cfg(feature = "half")]
 impl GemmScalar for f16 {
@@ -2126,6 +1997,31 @@ impl GemmScalar for bf16 {
 // homogeneous `GemmScalar` cannot express `Out != Lhs`.
 // ===========================================================================
 
+/// Pick the integer kernel fn for this problem, shared by the plain and requantizing
+/// entries (`F` is `IntFn` / `RequantFn`, both `Copy` fn pointers). Auto VNNI hands *small
+/// multi-threaded* problems to the widen fallback — the dot kernel's mandatory pack barrier
+/// dominates there — while `Rayon(1)`/`Serial` keep VNNI at any size; `small_par_fallback`
+/// is `None` for every non-VNNI kernel, so `run` is returned unchanged. Centralizing the
+/// `I8_VNNI_MIN_PAR_MNK` gate keeps the two paths' calibration from drifting apart.
+#[cfg(feature = "int8")]
+#[inline]
+fn pick_int_kernel<F: Copy>(
+    par: Parallelism,
+    mnk: usize,
+    run: F,
+    small_par_fallback: Option<F>,
+) -> F {
+    match small_par_fallback {
+        Some(fallback)
+            if matches!(par, Parallelism::Rayon(n) if n != 1)
+                && mnk < tuning::i8_vnni_min_par_mnk() =>
+        {
+            fallback
+        }
+        _ => run,
+    }
+}
+
 /// Top-level integer entry: degenerate cases (`C <- beta·C` when the `A·B` term
 /// vanishes) then the ISA-dispatched integer kernel.
 ///
@@ -2142,19 +2038,8 @@ pub(crate) unsafe fn execute_int(t: IntTask, par: Parallelism, ws: &mut Workspac
             return;
         }
         let d = dispatched_i8();
-        // Auto VNNI hands small multi-threaded problems to the widen kernel (the dot
-        // kernel's pack barrier dominates there); `Rayon(1)`/`Serial` keep VNNI at any
-        // size. `small_par_fallback` is `None` for every other kernel → `d.run` as-is.
-        let vnni_min_par_mnk = tuning::i8_vnni_min_par_mnk();
-        let run = match d.small_par_fallback {
-            Some(fallback)
-                if matches!(par, Parallelism::Rayon(n) if n != 1)
-                    && t.m.saturating_mul(t.n).saturating_mul(t.k) < vnni_min_par_mnk =>
-            {
-                fallback
-            }
-            _ => d.run,
-        };
+        let mnk = t.m.saturating_mul(t.n).saturating_mul(t.k);
+        let run = pick_int_kernel(par, mnk, d.run, d.small_par_fallback);
         run(t, par, ws);
     }
 }
@@ -2194,18 +2079,10 @@ unsafe fn run_typed_int<Fam, S, const MR_REG: usize, const NR: usize>(
     S: KernelSimd<i8, i8, i32, i32>,
 {
     unsafe {
-        if t.csc.unsigned_abs() < t.rsc.unsigned_abs() {
-            let (oa, orsa, ocsa) = (t.a, t.rsa, t.csa);
-            let (ob, orsb, ocsb) = (t.b, t.rsb, t.csb);
-            core::mem::swap(&mut t.m, &mut t.n);
-            t.a = ob;
-            t.rsa = ocsb;
-            t.csa = orsb;
-            t.b = oa;
-            t.rsb = ocsa;
-            t.csb = orsa;
-            core::mem::swap(&mut t.rsc, &mut t.csc);
-        }
+        orient_swap(
+            &mut t.m, &mut t.n, &mut t.a, &mut t.rsa, &mut t.csa, &mut t.b, &mut t.rsb, &mut t.csb,
+            &mut t.rsc, &mut t.csc,
+        );
         // Skinny / low-depth shape: route through the widen `IntGemm` (never `IntGemmVnni`) —
         // at tiny `k` VNNI's mandatory quad-pack barrier never amortizes. Stays bit-exact
         // (i32 modular), so it reproduces the widen and VNNI results alike.
@@ -2394,21 +2271,14 @@ fn select_i8() -> IntDispatched {
     }
 }
 
-#[cfg(all(feature = "std", feature = "int8"))]
-static GEMM_I8: OnceLock<IntDispatched> = OnceLock::new();
-
-#[cfg(feature = "int8")]
-#[inline]
-fn dispatched_i8() -> IntDispatched {
-    #[cfg(feature = "std")]
-    {
-        *GEMM_I8.get_or_init(select_i8)
-    }
-    #[cfg(not(feature = "std"))]
-    {
-        select_i8()
-    }
-}
+memoized_select!(
+    GEMM_I8,
+    dispatched_i8,
+    IntDispatched,
+    select_i8,
+    "The memoized integer dispatch descriptor (selection runs once).",
+    "int8"
+);
 
 // ===========================================================================
 // Integer requantizing GEMM (i8 · i8 -> i8): the `IntGemmQ` / `IntGemmVnniQ` families
@@ -2463,16 +2333,8 @@ pub(crate) unsafe fn execute_int_requant(t: RequantTask, par: Parallelism, ws: &
         let d = dispatched_i8_requant();
         // Mirror `execute_int`: an auto-VNNI *small parallel* problem hands off to the widen
         // `IntGemmQ` fallback (bit-identical, VNNI's pack barrier dominates there).
-        let vnni_min_par_mnk = tuning::i8_vnni_min_par_mnk();
-        let run = match d.small_par_fallback {
-            Some(fallback)
-                if matches!(par, Parallelism::Rayon(n) if n != 1)
-                    && t.m.saturating_mul(t.n).saturating_mul(t.k) < vnni_min_par_mnk =>
-            {
-                fallback
-            }
-            _ => d.run,
-        };
+        let mnk = t.m.saturating_mul(t.n).saturating_mul(t.k);
+        let run = pick_int_kernel(par, mnk, d.run, d.small_par_fallback);
         run(t, par, ws);
     }
 }
@@ -2520,17 +2382,12 @@ unsafe fn run_typed_int_requant<Fam, S, const MR_REG: usize, const NR: usize>(
     S: KernelSimd<i8, i8, i32, i8>,
 {
     unsafe {
-        if t.csc.unsigned_abs() < t.rsc.unsigned_abs() {
-            let (oa, orsa, ocsa) = (t.a, t.rsa, t.csa);
-            let (ob, orsb, ocsb) = (t.b, t.rsb, t.csb);
-            core::mem::swap(&mut t.m, &mut t.n);
-            t.a = ob;
-            t.rsa = ocsb;
-            t.csa = orsb;
-            t.b = oa;
-            t.rsb = ocsa;
-            t.csb = orsa;
-            core::mem::swap(&mut t.rsc, &mut t.csc);
+        let swap = orient_swap(
+            &mut t.m, &mut t.n, &mut t.a, &mut t.rsa, &mut t.csa, &mut t.b, &mut t.rsb, &mut t.csb,
+            &mut t.rsc, &mut t.csc,
+        );
+        if swap {
+            // Cᵀ = Bᵀ·Aᵀ makes a per-row bias per-col in the driver frame (and vice versa).
             t.bias_dim = match t.bias_dim {
                 BiasDim::PerRow => BiasDim::PerCol,
                 BiasDim::PerCol => BiasDim::PerRow,
@@ -2707,21 +2564,14 @@ fn select_i8_requant() -> IntRequantDispatched {
     }
 }
 
-#[cfg(all(feature = "std", feature = "int8"))]
-static GEMM_I8_REQUANT: OnceLock<IntRequantDispatched> = OnceLock::new();
-
-#[cfg(feature = "int8")]
-#[inline]
-fn dispatched_i8_requant() -> IntRequantDispatched {
-    #[cfg(feature = "std")]
-    {
-        *GEMM_I8_REQUANT.get_or_init(select_i8_requant)
-    }
-    #[cfg(not(feature = "std"))]
-    {
-        select_i8_requant()
-    }
-}
+memoized_select!(
+    GEMM_I8_REQUANT,
+    dispatched_i8_requant,
+    IntRequantDispatched,
+    select_i8_requant,
+    "The memoized requantizing-integer dispatch descriptor (selection runs once).",
+    "int8"
+);
 
 // ===========================================================================
 // Complex GEMM (c32 / c64, with optional conjA / conjB).
@@ -2751,8 +2601,7 @@ unsafe fn run_complex<T, S, const MR_REG: usize, const NR: usize>(
     use crate::kernel::ComplexGemm;
     unsafe {
         let (mut ca, mut cb) = (conj_a, conj_b);
-        if t.csc.unsigned_abs() < t.rsc.unsigned_abs() {
-            orient_transpose(&mut t);
+        if orient_transpose(&mut t) {
             core::mem::swap(&mut ca, &mut cb);
         }
         match (ca, cb) {
@@ -3073,10 +2922,22 @@ fn select_c64() -> CplxDispatched<C64> {
     }
 }
 
-#[cfg(all(feature = "std", feature = "complex"))]
-static GEMM_C32: OnceLock<CplxDispatched<C32>> = OnceLock::new();
-#[cfg(all(feature = "std", feature = "complex"))]
-static GEMM_C64: OnceLock<CplxDispatched<C64>> = OnceLock::new();
+memoized_select!(
+    GEMM_C32,
+    dispatched_c32,
+    CplxDispatched<C32>,
+    select_c32,
+    "The memoized `Complex<f32>` dispatch descriptor (selection runs once).",
+    "complex"
+);
+memoized_select!(
+    GEMM_C64,
+    dispatched_c64,
+    CplxDispatched<C64>,
+    select_c64,
+    "The memoized `Complex<f64>` dispatch descriptor (selection runs once).",
+    "complex"
+);
 
 #[cfg(feature = "complex")]
 impl ComplexScalar for C32 {
@@ -3088,10 +2949,7 @@ impl ComplexScalar for C32 {
         par: Parallelism,
         ws: &mut Workspace,
     ) {
-        #[cfg(feature = "std")]
-        let d = *GEMM_C32.get_or_init(select_c32);
-        #[cfg(not(feature = "std"))]
-        let d = select_c32();
+        let d = dispatched_c32();
         unsafe { (d.run)(ca, cb, t, par, ws) }
     }
 }
@@ -3105,10 +2963,7 @@ impl ComplexScalar for C64 {
         par: Parallelism,
         ws: &mut Workspace,
     ) {
-        #[cfg(feature = "std")]
-        let d = *GEMM_C64.get_or_init(select_c64);
-        #[cfg(not(feature = "std"))]
-        let d = select_c64();
+        let d = dispatched_c64();
         unsafe { (d.run)(ca, cb, t, par, ws) }
     }
 }

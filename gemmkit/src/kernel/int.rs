@@ -228,14 +228,8 @@ unsafe fn requant_scratch_epilogue<F, S, E, const MR_REG: usize, const NR: usize
 }
 
 /// The integer GEMM family: `Lhs = Rhs = i8`, `Acc = Out = i32`.
+#[derive(Clone, Copy)]
 pub struct IntGemm(PhantomData<()>);
-
-impl Clone for IntGemm {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-impl Copy for IntGemm {}
 
 impl KernelFamily for IntGemm {
     type Lhs = i8;
@@ -328,6 +322,22 @@ impl KernelFamily for IntGemm {
     }
 }
 
+/// The `+128` unsigned bias the VNNI families offset the LHS by: `vpdpbusd` computes
+/// *unsigned* A × *signed* B, so A is packed as `A + 128` and the
+/// [`crate::simd::KernelSimd::dot_accumulate`] override subtracts `VNNI_A_BIAS · Σ_k B`
+/// to recover the true signed product. The pack transform ([`vnni_a_xform`]) and that
+/// correction MUST use the same constant, so it lives here once.
+pub(crate) const VNNI_A_BIAS: i32 = 128;
+
+/// The LHS pack transform shared by the VNNI families ([`IntGemmVnni`], and — via
+/// delegation — [`IntGemmVnniQ`]): offset each `i8` by [`VNNI_A_BIAS`] into the unsigned
+/// domain `vpdpbusd` reads. `vnni_a_xform(0) = 128`, so the LHS pad contributes a constant
+/// the colsum correction cancels.
+#[inline(always)]
+pub(crate) fn vnni_a_xform(v: i8) -> i8 {
+    ((v as i32 + VNNI_A_BIAS) as u8) as i8
+}
+
 /// The VNNI integer GEMM family: `Lhs = Rhs = i8`, `Acc = Out = i32`, driven by
 /// `vpdpbusd` (4 depth steps × 16 lanes per instruction) instead of widen-and-multiply.
 ///
@@ -345,14 +355,8 @@ impl KernelFamily for IntGemm {
 /// Accumulation stays exact: i32 add is associative under wrapping, so the 4-way grouping
 /// plus the bias correction equals the ascending-`k` widen sum **bit-for-bit** — VNNI and
 /// [`IntGemm`] produce identical output. Alpha fold and `i32` epilogue are shared.
+#[derive(Clone, Copy)]
 pub struct IntGemmVnni(PhantomData<()>);
-
-impl Clone for IntGemmVnni {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-impl Copy for IntGemmVnni {}
 
 impl IntGemmVnni {
     /// Depth steps folded per `vpdpbusd`.
@@ -385,9 +389,7 @@ impl KernelFamily for IntGemmVnni {
     ) {
         // lead = rows (`rs`), depth = cols (`cs`).
         unsafe {
-            pack_kgroup_panels::<i8, { Self::Q }, _>(dst, src, rs, cs, mc, kc, mr, |v| {
-                ((v as i32 + 128) as u8) as i8
-            })
+            pack_kgroup_panels::<i8, { Self::Q }, _>(dst, src, rs, cs, mc, kc, mr, vnni_a_xform)
         }
     }
 
@@ -472,14 +474,8 @@ impl KernelFamily for IntGemmVnni {
 /// folded into `scale` and `beta` is disallowed (accumulating into a quantized C is
 /// ill-defined), which the epilogue call site enforces (`AlphaStatus::One`,
 /// `BetaStatus::Zero`).
+#[derive(Clone, Copy)]
 pub struct IntGemmQ(PhantomData<()>);
-
-impl Clone for IntGemmQ {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-impl Copy for IntGemmQ {}
 
 impl KernelFamily for IntGemmQ {
     type Lhs = i8;
@@ -489,6 +485,7 @@ impl KernelFamily for IntGemmQ {
 
     const OUT_IS_ACC: bool = false; // driver forces kc = k => fire-once, structurally
 
+    /// Identical to [`IntGemm::pack_lhs`] (plain micropanel copy) — delegate to it.
     #[inline]
     unsafe fn pack_lhs(
         dst: *mut i8,
@@ -499,10 +496,10 @@ impl KernelFamily for IntGemmQ {
         kc: usize,
         mr: usize,
     ) {
-        // Plain micropanel copy, identical to `IntGemm` (sign-extension happens on load).
-        unsafe { pack_panels(dst, src, rs, cs, mc, kc, mr) }
+        unsafe { <IntGemm as KernelFamily>::pack_lhs(dst, src, rs, cs, mc, kc, mr) }
     }
 
+    /// Identical to [`IntGemm::pack_rhs`] — delegate to it.
     #[inline]
     unsafe fn pack_rhs(
         dst: *mut i8,
@@ -513,7 +510,7 @@ impl KernelFamily for IntGemmQ {
         nc: usize,
         nr: usize,
     ) {
-        unsafe { pack_panels(dst, src, cs, rs, nc, kc, nr) }
+        unsafe { <IntGemm as KernelFamily>::pack_rhs(dst, src, rs, cs, kc, nc, nr) }
     }
 
     unsafe fn microkernel<S, const MR_REG: usize, const NR: usize>(
@@ -585,14 +582,8 @@ impl KernelFamily for IntGemmQ {
 /// `FORCE_PACK_* = true`, `DEPTH_MULTIPLE = 4`, the k-quad-interleaved `+128`/identity pack.
 /// VNNI's grouped sum is bit-equal to the widen sum (int.rs modular associativity + bias
 /// correction), so `IntGemmVnniQ` and `IntGemmQ` requantize to identical `i8` output.
+#[derive(Clone, Copy)]
 pub struct IntGemmVnniQ(PhantomData<()>);
-
-impl Clone for IntGemmVnniQ {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-impl Copy for IntGemmVnniQ {}
 
 impl IntGemmVnniQ {
     /// Depth steps folded per `vpdpbusd`.
@@ -610,7 +601,8 @@ impl KernelFamily for IntGemmVnniQ {
     const FORCE_PACK_RHS: bool = true;
     const DEPTH_MULTIPLE: usize = Self::Q;
 
-    /// Identical to [`IntGemmVnni::pack_lhs`]: k-quad-interleaved with the `+128` bias.
+    /// Identical to [`IntGemmVnni::pack_lhs`] (k-quad-interleaved with the `+128` bias) —
+    /// delegate to it.
     #[inline]
     unsafe fn pack_lhs(
         dst: *mut i8,
@@ -621,14 +613,11 @@ impl KernelFamily for IntGemmVnniQ {
         kc: usize,
         mr: usize,
     ) {
-        unsafe {
-            pack_kgroup_panels::<i8, { Self::Q }, _>(dst, src, rs, cs, mc, kc, mr, |v| {
-                ((v as i32 + 128) as u8) as i8
-            })
-        }
+        unsafe { <IntGemmVnni as KernelFamily>::pack_lhs(dst, src, rs, cs, mc, kc, mr) }
     }
 
-    /// Identical to [`IntGemmVnni::pack_rhs`]: k-quad-interleaved, values stay signed.
+    /// Identical to [`IntGemmVnni::pack_rhs`] (k-quad-interleaved, values stay signed) —
+    /// delegate to it.
     #[inline]
     unsafe fn pack_rhs(
         dst: *mut i8,
@@ -639,7 +628,7 @@ impl KernelFamily for IntGemmVnniQ {
         nc: usize,
         nr: usize,
     ) {
-        unsafe { pack_kgroup_panels::<i8, { Self::Q }, _>(dst, src, cs, rs, nc, kc, nr, |v| v) }
+        unsafe { <IntGemmVnni as KernelFamily>::pack_rhs(dst, src, rs, cs, kc, nc, nr) }
     }
 
     unsafe fn microkernel<S, const MR_REG: usize, const NR: usize>(

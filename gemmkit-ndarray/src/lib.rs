@@ -63,36 +63,7 @@ pub fn gemm<T, S1, S2, SC>(
     S2: Data<Elem = T>,
     SC: DataMut<Elem = T>,
 {
-    let (m, k, rsa, csa) = dims_strides(a);
-    let (kb, n, rsb, csb) = dims_strides(b);
-    let (cm, cn) = c.dim();
-    assert_eq!(k, kb, "gemmkit-ndarray: A.cols ({k}) != B.rows ({kb})");
-    assert_eq!(m, cm, "gemmkit-ndarray: A.rows ({m}) != C.rows ({cm})");
-    assert_eq!(n, cn, "gemmkit-ndarray: B.cols ({n}) != C.cols ({cn})");
-    let cs = c.strides();
-    let (rsc, csc) = (cs[0], cs[1]);
-
-    // SAFETY: dims validated; ndarray guarantees the pointer/strides describe a
-    // valid in-bounds layout, and `c` (a `&mut` borrow) cannot alias `a`/`b`.
-    unsafe {
-        gemm_unchecked(
-            m,
-            k,
-            n,
-            alpha,
-            a.as_ptr(),
-            rsa,
-            csa,
-            b.as_ptr(),
-            rsb,
-            csb,
-            beta,
-            c.as_mut_ptr(),
-            rsc,
-            csc,
-            par,
-        );
-    }
+    gemm_common(None, alpha, a, b, beta, c, par);
 }
 
 /// Like [`gemm`] but reuses a caller-owned [`Workspace`].
@@ -114,6 +85,24 @@ pub fn gemm_with<T, S1, S2, SC>(
     S2: Data<Elem = T>,
     SC: DataMut<Elem = T>,
 {
+    gemm_common(Some(ws), alpha, a, b, beta, c, par);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gemm_common<T, S1, S2, SC>(
+    ws: Option<&mut Workspace>,
+    alpha: T,
+    a: &ArrayBase<S1, Ix2>,
+    b: &ArrayBase<S2, Ix2>,
+    beta: T,
+    c: &mut ArrayBase<SC, Ix2>,
+    par: Parallelism,
+) where
+    T: GemmScalar,
+    S1: Data<Elem = T>,
+    S2: Data<Elem = T>,
+    SC: DataMut<Elem = T>,
+{
     let (m, k, rsa, csa) = dims_strides(a);
     let (kb, n, rsb, csb) = dims_strides(b);
     let (cm, cn) = c.dim();
@@ -122,27 +111,48 @@ pub fn gemm_with<T, S1, S2, SC>(
     assert_eq!(n, cn, "gemmkit-ndarray: B.cols ({n}) != C.cols ({cn})");
     let cs = c.strides();
     let (rsc, csc) = (cs[0], cs[1]);
+    let cp = c.as_mut_ptr();
 
-    // SAFETY: see `gemm`.
+    // SAFETY: dims validated; ndarray guarantees the pointer/strides describe a
+    // valid in-bounds layout, and `c` (a `&mut` borrow) cannot alias `a`/`b`.
     unsafe {
-        gemm_unchecked_with(
-            ws,
-            m,
-            k,
-            n,
-            alpha,
-            a.as_ptr(),
-            rsa,
-            csa,
-            b.as_ptr(),
-            rsb,
-            csb,
-            beta,
-            c.as_mut_ptr(),
-            rsc,
-            csc,
-            par,
-        );
+        match ws {
+            Some(ws) => gemm_unchecked_with(
+                ws,
+                m,
+                k,
+                n,
+                alpha,
+                a.as_ptr(),
+                rsa,
+                csa,
+                b.as_ptr(),
+                rsb,
+                csb,
+                beta,
+                cp,
+                rsc,
+                csc,
+                par,
+            ),
+            None => gemm_unchecked(
+                m,
+                k,
+                n,
+                alpha,
+                a.as_ptr(),
+                rsa,
+                csa,
+                b.as_ptr(),
+                rsb,
+                csb,
+                beta,
+                cp,
+                rsc,
+                csc,
+                par,
+            ),
+        }
     }
 }
 
@@ -191,47 +201,7 @@ pub fn gemm_batched<T, S1, S2, SC>(
     S2: Data<Elem = T>,
     SC: DataMut<Elem = T>,
 {
-    let (batch, m, k, as0, as1, as2) = dims_strides3(a);
-    let (bb, kb, n, bs0, bs1, bs2) = dims_strides3(b);
-    let (cb, cm, cn, cs0, cs1, cs2) = dims_strides3(c);
-    assert_eq!(
-        batch, bb,
-        "gemmkit-ndarray: A batch ({batch}) != B batch ({bb})"
-    );
-    assert_eq!(
-        batch, cb,
-        "gemmkit-ndarray: A batch ({batch}) != C batch ({cb})"
-    );
-    assert_eq!(k, kb, "gemmkit-ndarray: A.cols ({k}) != B.rows ({kb})");
-    assert_eq!(m, cm, "gemmkit-ndarray: A.rows ({m}) != C.rows ({cm})");
-    assert_eq!(n, cn, "gemmkit-ndarray: B.cols ({n}) != C.cols ({cn})");
-
-    // SAFETY: ndarray guarantees each element's pointer/strides describe a valid in-bounds layout;
-    // `c` (a `&mut` borrow) can't alias `a`/`b`, and its batch elements — distinct axis-0 slices of
-    // a real array — are pairwise disjoint.
-    unsafe {
-        gemm_batched_unchecked(
-            batch,
-            m,
-            k,
-            n,
-            alpha,
-            a.as_ptr(),
-            as1,
-            as2,
-            as0,
-            b.as_ptr(),
-            bs1,
-            bs2,
-            bs0,
-            beta,
-            c.as_mut_ptr(),
-            cs1,
-            cs2,
-            cs0,
-            par,
-        );
-    }
+    gemm_batched_common(None, alpha, a, b, beta, c, par);
 }
 
 /// Like [`gemm_batched`] but reuses a caller-owned [`Workspace`] — zero heap allocation after the
@@ -242,6 +212,24 @@ pub fn gemm_batched<T, S1, S2, SC>(
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_batched_with<T, S1, S2, SC>(
     ws: &mut Workspace,
+    alpha: T,
+    a: &ArrayBase<S1, Ix3>,
+    b: &ArrayBase<S2, Ix3>,
+    beta: T,
+    c: &mut ArrayBase<SC, Ix3>,
+    par: Parallelism,
+) where
+    T: GemmScalar,
+    S1: Data<Elem = T>,
+    S2: Data<Elem = T>,
+    SC: DataMut<Elem = T>,
+{
+    gemm_batched_common(Some(ws), alpha, a, b, beta, c, par);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gemm_batched_common<T, S1, S2, SC>(
+    ws: Option<&mut Workspace>,
     alpha: T,
     a: &ArrayBase<S1, Ix3>,
     b: &ArrayBase<S2, Ix3>,
@@ -268,31 +256,57 @@ pub fn gemm_batched_with<T, S1, S2, SC>(
     assert_eq!(k, kb, "gemmkit-ndarray: A.cols ({k}) != B.rows ({kb})");
     assert_eq!(m, cm, "gemmkit-ndarray: A.rows ({m}) != C.rows ({cm})");
     assert_eq!(n, cn, "gemmkit-ndarray: B.cols ({n}) != C.cols ({cn})");
+    let cp = c.as_mut_ptr();
 
-    // SAFETY: see `gemm_batched`.
+    // SAFETY: ndarray guarantees each element's pointer/strides describe a valid in-bounds layout;
+    // `c` (a `&mut` borrow) can't alias `a`/`b`, and its batch elements — distinct axis-0 slices of
+    // a real array — are pairwise disjoint.
     unsafe {
-        gemm_batched_unchecked_with(
-            ws,
-            batch,
-            m,
-            k,
-            n,
-            alpha,
-            a.as_ptr(),
-            as1,
-            as2,
-            as0,
-            b.as_ptr(),
-            bs1,
-            bs2,
-            bs0,
-            beta,
-            c.as_mut_ptr(),
-            cs1,
-            cs2,
-            cs0,
-            par,
-        );
+        match ws {
+            Some(ws) => gemm_batched_unchecked_with(
+                ws,
+                batch,
+                m,
+                k,
+                n,
+                alpha,
+                a.as_ptr(),
+                as1,
+                as2,
+                as0,
+                b.as_ptr(),
+                bs1,
+                bs2,
+                bs0,
+                beta,
+                cp,
+                cs1,
+                cs2,
+                cs0,
+                par,
+            ),
+            None => gemm_batched_unchecked(
+                batch,
+                m,
+                k,
+                n,
+                alpha,
+                a.as_ptr(),
+                as1,
+                as2,
+                as0,
+                b.as_ptr(),
+                bs1,
+                bs2,
+                bs0,
+                beta,
+                cp,
+                cs1,
+                cs2,
+                cs0,
+                par,
+            ),
+        }
     }
 }
 
@@ -575,35 +589,7 @@ pub fn gemm_i8<S1, S2, SC>(
     S2: Data<Elem = i8>,
     SC: DataMut<Elem = i32>,
 {
-    let (m, k, rsa, csa) = dims_strides(a);
-    let (kb, n, rsb, csb) = dims_strides(b);
-    let (cm, cn) = c.dim();
-    assert_eq!(k, kb, "gemmkit-ndarray: A.cols ({k}) != B.rows ({kb})");
-    assert_eq!(m, cm, "gemmkit-ndarray: A.rows ({m}) != C.rows ({cm})");
-    assert_eq!(n, cn, "gemmkit-ndarray: B.cols ({n}) != C.cols ({cn})");
-    let cs = c.strides();
-    let (rsc, csc) = (cs[0], cs[1]);
-    // SAFETY: dims validated; ndarray guarantees valid in-bounds layouts; `c` (a `&mut i32` borrow)
-    // can't alias `a`/`b` (`&i8`) — different element types over distinct storage.
-    unsafe {
-        gemm_i8_unchecked(
-            m,
-            k,
-            n,
-            alpha,
-            a.as_ptr(),
-            rsa,
-            csa,
-            b.as_ptr(),
-            rsb,
-            csb,
-            beta,
-            c.as_mut_ptr(),
-            rsc,
-            csc,
-            par,
-        );
-    }
+    gemm_i8_common(None, alpha, a, b, beta, c, par);
 }
 
 /// Like [`gemm_i8`] but reuses a caller-owned [`Workspace`] — the fixed-cost quantized-inference
@@ -626,6 +612,24 @@ pub fn gemm_i8_with<S1, S2, SC>(
     S2: Data<Elem = i8>,
     SC: DataMut<Elem = i32>,
 {
+    gemm_i8_common(Some(ws), alpha, a, b, beta, c, par);
+}
+
+#[cfg(feature = "int8")]
+#[allow(clippy::too_many_arguments)]
+fn gemm_i8_common<S1, S2, SC>(
+    ws: Option<&mut Workspace>,
+    alpha: i32,
+    a: &ArrayBase<S1, Ix2>,
+    b: &ArrayBase<S2, Ix2>,
+    beta: i32,
+    c: &mut ArrayBase<SC, Ix2>,
+    par: Parallelism,
+) where
+    S1: Data<Elem = i8>,
+    S2: Data<Elem = i8>,
+    SC: DataMut<Elem = i32>,
+{
     let (m, k, rsa, csa) = dims_strides(a);
     let (kb, n, rsb, csb) = dims_strides(b);
     let (cm, cn) = c.dim();
@@ -634,26 +638,47 @@ pub fn gemm_i8_with<S1, S2, SC>(
     assert_eq!(n, cn, "gemmkit-ndarray: B.cols ({n}) != C.cols ({cn})");
     let cs = c.strides();
     let (rsc, csc) = (cs[0], cs[1]);
-    // SAFETY: see `gemm_i8`.
+    let cp = c.as_mut_ptr();
+    // SAFETY: dims validated; ndarray guarantees valid in-bounds layouts; `c` (a `&mut i32` borrow)
+    // can't alias `a`/`b` (`&i8`) — different element types over distinct storage.
     unsafe {
-        gemm_i8_unchecked_with(
-            ws,
-            m,
-            k,
-            n,
-            alpha,
-            a.as_ptr(),
-            rsa,
-            csa,
-            b.as_ptr(),
-            rsb,
-            csb,
-            beta,
-            c.as_mut_ptr(),
-            rsc,
-            csc,
-            par,
-        );
+        match ws {
+            Some(ws) => gemm_i8_unchecked_with(
+                ws,
+                m,
+                k,
+                n,
+                alpha,
+                a.as_ptr(),
+                rsa,
+                csa,
+                b.as_ptr(),
+                rsb,
+                csb,
+                beta,
+                cp,
+                rsc,
+                csc,
+                par,
+            ),
+            None => gemm_i8_unchecked(
+                m,
+                k,
+                n,
+                alpha,
+                a.as_ptr(),
+                rsa,
+                csa,
+                b.as_ptr(),
+                rsb,
+                csb,
+                beta,
+                cp,
+                rsc,
+                csc,
+                par,
+            ),
+        }
     }
 }
 
@@ -696,38 +721,7 @@ pub fn gemm_cplx<T, S1, S2, SC>(
     S2: Data<Elem = T>,
     SC: DataMut<Elem = T>,
 {
-    let (m, k, rsa, csa) = dims_strides(a);
-    let (kb, n, rsb, csb) = dims_strides(b);
-    let (cm, cn) = c.dim();
-    assert_eq!(k, kb, "gemmkit-ndarray: A.cols ({k}) != B.rows ({kb})");
-    assert_eq!(m, cm, "gemmkit-ndarray: A.rows ({m}) != C.rows ({cm})");
-    assert_eq!(n, cn, "gemmkit-ndarray: B.cols ({n}) != C.cols ({cn})");
-    let cs = c.strides();
-    let (rsc, csc) = (cs[0], cs[1]);
-
-    // SAFETY: dims validated; ndarray guarantees the pointer/strides describe a
-    // valid in-bounds layout, and `c` (a `&mut` borrow) cannot alias `a`/`b`.
-    unsafe {
-        gemm_cplx_unchecked(
-            m,
-            k,
-            n,
-            alpha,
-            a.as_ptr(),
-            rsa,
-            csa,
-            conj_a,
-            b.as_ptr(),
-            rsb,
-            csb,
-            conj_b,
-            beta,
-            c.as_mut_ptr(),
-            rsc,
-            csc,
-            par,
-        );
-    }
+    gemm_cplx_common(None, alpha, a, conj_a, b, conj_b, beta, c, par);
 }
 
 /// Like [`gemm_cplx`] but reuses a caller-owned [`Workspace`].
@@ -752,6 +746,27 @@ pub fn gemm_cplx_with<T, S1, S2, SC>(
     S2: Data<Elem = T>,
     SC: DataMut<Elem = T>,
 {
+    gemm_cplx_common(Some(ws), alpha, a, conj_a, b, conj_b, beta, c, par);
+}
+
+#[cfg(feature = "complex")]
+#[allow(clippy::too_many_arguments)]
+fn gemm_cplx_common<T, S1, S2, SC>(
+    ws: Option<&mut Workspace>,
+    alpha: T,
+    a: &ArrayBase<S1, Ix2>,
+    conj_a: bool,
+    b: &ArrayBase<S2, Ix2>,
+    conj_b: bool,
+    beta: T,
+    c: &mut ArrayBase<SC, Ix2>,
+    par: Parallelism,
+) where
+    T: ComplexScalar,
+    S1: Data<Elem = T>,
+    S2: Data<Elem = T>,
+    SC: DataMut<Elem = T>,
+{
     let (m, k, rsa, csa) = dims_strides(a);
     let (kb, n, rsb, csb) = dims_strides(b);
     let (cm, cn) = c.dim();
@@ -760,29 +775,52 @@ pub fn gemm_cplx_with<T, S1, S2, SC>(
     assert_eq!(n, cn, "gemmkit-ndarray: B.cols ({n}) != C.cols ({cn})");
     let cs = c.strides();
     let (rsc, csc) = (cs[0], cs[1]);
+    let cp = c.as_mut_ptr();
 
-    // SAFETY: see `gemm_cplx`.
+    // SAFETY: dims validated; ndarray guarantees the pointer/strides describe a
+    // valid in-bounds layout, and `c` (a `&mut` borrow) cannot alias `a`/`b`.
     unsafe {
-        gemm_cplx_unchecked_with(
-            ws,
-            m,
-            k,
-            n,
-            alpha,
-            a.as_ptr(),
-            rsa,
-            csa,
-            conj_a,
-            b.as_ptr(),
-            rsb,
-            csb,
-            conj_b,
-            beta,
-            c.as_mut_ptr(),
-            rsc,
-            csc,
-            par,
-        );
+        match ws {
+            Some(ws) => gemm_cplx_unchecked_with(
+                ws,
+                m,
+                k,
+                n,
+                alpha,
+                a.as_ptr(),
+                rsa,
+                csa,
+                conj_a,
+                b.as_ptr(),
+                rsb,
+                csb,
+                conj_b,
+                beta,
+                cp,
+                rsc,
+                csc,
+                par,
+            ),
+            None => gemm_cplx_unchecked(
+                m,
+                k,
+                n,
+                alpha,
+                a.as_ptr(),
+                rsa,
+                csa,
+                conj_a,
+                b.as_ptr(),
+                rsb,
+                csb,
+                conj_b,
+                beta,
+                cp,
+                rsc,
+                csc,
+                par,
+            ),
+        }
     }
 }
 

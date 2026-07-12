@@ -214,40 +214,14 @@ fn overlaps<T>(pa: *const T, na: usize, pb: *const T, nb: usize) -> bool {
     overlaps_bytes(pa as *const u8, na, s, pb as *const u8, nb, s)
 }
 
-/// `C <- alpha·A·B + beta·C` over safe slice views, using the thread-local
-/// workspace pool.
-///
-/// # Panics
-/// If the inner dimensions disagree (`A.cols != B.rows`, `A.rows != C.rows`,
-/// `B.cols != C.cols`), if any view addresses outside its slice, if `C`'s
-/// storage overlaps `A`'s or `B`'s, or if the problem is so large (broadcast
-/// strides allow logical dimensions up to `isize::MAX`) that an internal pack
-/// buffer size overflows `usize`.
-pub fn gemm<T: GemmScalar>(
-    alpha: T,
-    a: MatRef<'_, T>,
-    b: MatRef<'_, T>,
-    beta: T,
-    c: MatMut<'_, T>,
-    par: Parallelism,
-) {
-    workspace::with_thread_pool(|ws| gemm_with(ws, alpha, a, b, beta, c, par));
-}
-
-/// Like [`gemm`] but reuses a caller-owned [`Workspace`] — zero heap allocation
-/// after the first sufficiently large call.
-///
-/// # Panics
-/// Same conditions as [`gemm`].
-pub fn gemm_with<T: GemmScalar>(
-    ws: &mut Workspace,
-    alpha: T,
-    a: MatRef<'_, T>,
-    b: MatRef<'_, T>,
-    beta: T,
-    c: MatMut<'_, T>,
-    par: Parallelism,
-) {
+/// The shared checked-API validation prologue for the full `(A, B, C)` trio: matching
+/// inner dimensions, every view in bounds, `C` addressing each element uniquely, and `C`
+/// not overlapping `A`/`B`. Generic over the input element type `TI` and output element
+/// type `TO` (so the homogeneous, `i8 -> i32`, and requantizing `i8 -> i8` entries all
+/// share it), comparing byte ranges via [`overlaps_bytes`]. Panic messages are worded
+/// identically to the historic per-entry blocks (tests match the substrings). Callers add
+/// any entry-specific checks (fused bias / requant scale) after this returns.
+fn validate_gemm_views<TI, TO>(a: &MatRef<'_, TI>, b: &MatRef<'_, TI>, c: &MatMut<'_, TO>) {
     assert_eq!(
         a.cols, b.rows,
         "gemmkit: A.cols ({}) != B.rows ({})",
@@ -282,13 +256,53 @@ pub fn gemm_with<T: GemmScalar>(
 
     // C must not alias A or B (it is written). In safe Rust the borrow checker
     // already forbids overlapping &mut/& slices; this is a defensive guarantee.
-    let cp = c.data.as_ptr();
+    // Byte ranges (not element counts) so heterogeneous element sizes are exact.
+    let cp = c.data.as_ptr() as *const u8;
     let cl = c.data.len();
-    if overlaps(cp, cl, a.data.as_ptr(), a.data.len())
-        || overlaps(cp, cl, b.data.as_ptr(), b.data.len())
+    let si = core::mem::size_of::<TI>();
+    let so = core::mem::size_of::<TO>();
+    if overlaps_bytes(cp, cl, so, a.data.as_ptr() as *const u8, a.data.len(), si)
+        || overlaps_bytes(cp, cl, so, b.data.as_ptr() as *const u8, b.data.len(), si)
     {
         panic!("gemmkit: C aliases A or B");
     }
+}
+
+/// `C <- alpha·A·B + beta·C` over safe slice views, using the thread-local
+/// workspace pool.
+///
+/// # Panics
+/// If the inner dimensions disagree (`A.cols != B.rows`, `A.rows != C.rows`,
+/// `B.cols != C.cols`), if any view addresses outside its slice, if `C`'s
+/// storage overlaps `A`'s or `B`'s, or if the problem is so large (broadcast
+/// strides allow logical dimensions up to `isize::MAX`) that an internal pack
+/// buffer size overflows `usize`.
+pub fn gemm<T: GemmScalar>(
+    alpha: T,
+    a: MatRef<'_, T>,
+    b: MatRef<'_, T>,
+    beta: T,
+    c: MatMut<'_, T>,
+    par: Parallelism,
+) {
+    workspace::with_thread_pool(|ws| gemm_with(ws, alpha, a, b, beta, c, par));
+}
+
+/// Like [`gemm`] but reuses a caller-owned [`Workspace`] — zero heap allocation
+/// after the first sufficiently large call.
+///
+/// # Panics
+/// Same conditions as [`gemm`].
+pub fn gemm_with<T: GemmScalar>(
+    ws: &mut Workspace,
+    alpha: T,
+    a: MatRef<'_, T>,
+    b: MatRef<'_, T>,
+    beta: T,
+    c: MatMut<'_, T>,
+    par: Parallelism,
+) {
+    validate_gemm_views(&a, &b, &c);
 
     let m = a.rows;
     let k = a.cols;
@@ -1433,42 +1447,7 @@ pub fn gemm_i8_with(
     c: MatMut<'_, i32>,
     par: Parallelism,
 ) {
-    assert_eq!(
-        a.cols, b.rows,
-        "gemmkit: A.cols ({}) != B.rows ({})",
-        a.cols, b.rows
-    );
-    assert_eq!(
-        a.rows, c.rows,
-        "gemmkit: A.rows ({}) != C.rows ({})",
-        a.rows, c.rows
-    );
-    assert_eq!(
-        b.cols, c.cols,
-        "gemmkit: B.cols ({}) != C.cols ({})",
-        b.cols, c.cols
-    );
-
-    check_view(a.data, a.rows, a.cols, a.rs, a.cs, "A");
-    check_view(b.data, b.rows, b.cols, b.rs, b.cs, "B");
-    check_view(c.data, c.rows, c.cols, c.rs, c.cs, "C");
-
-    if self_aliases(c.rows, c.cols, c.rs, c.cs) {
-        panic!(
-            "gemmkit: C view aliases itself (strides {},{} map distinct elements to the same \
-             memory); C must address each (i,j) uniquely",
-            c.rs, c.cs
-        );
-    }
-
-    // C (i32) must not alias A or B (i8) — heterogeneous element sizes.
-    let cp = c.data.as_ptr() as *const u8;
-    let cl = c.data.len();
-    if overlaps_bytes(cp, cl, 4, a.data.as_ptr() as *const u8, a.data.len(), 1)
-        || overlaps_bytes(cp, cl, 4, b.data.as_ptr() as *const u8, b.data.len(), 1)
-    {
-        panic!("gemmkit: C aliases A or B");
-    }
+    validate_gemm_views(&a, &b, &c);
 
     // SAFETY: validated above — shapes agree, every stride in bounds, C addresses
     // each (i,j) uniquely and does not overlap A/B.
@@ -1539,38 +1518,7 @@ pub fn gemm_cplx_with<T: ComplexScalar>(
     c: MatMut<'_, T>,
     par: Parallelism,
 ) {
-    assert_eq!(
-        a.cols, b.rows,
-        "gemmkit: A.cols ({}) != B.rows ({})",
-        a.cols, b.rows
-    );
-    assert_eq!(
-        a.rows, c.rows,
-        "gemmkit: A.rows ({}) != C.rows ({})",
-        a.rows, c.rows
-    );
-    assert_eq!(
-        b.cols, c.cols,
-        "gemmkit: B.cols ({}) != C.cols ({})",
-        b.cols, c.cols
-    );
-    check_view(a.data, a.rows, a.cols, a.rs, a.cs, "A");
-    check_view(b.data, b.rows, b.cols, b.rs, b.cs, "B");
-    check_view(c.data, c.rows, c.cols, c.rs, c.cs, "C");
-    if self_aliases(c.rows, c.cols, c.rs, c.cs) {
-        panic!(
-            "gemmkit: C view aliases itself (strides {},{} map distinct elements to the same \
-             memory); C must address each (i,j) uniquely",
-            c.rs, c.cs
-        );
-    }
-    let cp = c.data.as_ptr();
-    let cl = c.data.len();
-    if overlaps(cp, cl, a.data.as_ptr(), a.data.len())
-        || overlaps(cp, cl, b.data.as_ptr(), b.data.len())
-    {
-        panic!("gemmkit: C aliases A or B");
-    }
+    validate_gemm_views(&a, &b, &c);
 
     // SAFETY: validated above — shapes agree, strides in bounds, C unique and not
     // aliasing A/B.
@@ -1893,42 +1841,7 @@ pub fn gemm_i8_requant_with(
     c: MatMut<'_, i8>,
     par: Parallelism,
 ) {
-    assert_eq!(
-        a.cols, b.rows,
-        "gemmkit: A.cols ({}) != B.rows ({})",
-        a.cols, b.rows
-    );
-    assert_eq!(
-        a.rows, c.rows,
-        "gemmkit: A.rows ({}) != C.rows ({})",
-        a.rows, c.rows
-    );
-    assert_eq!(
-        b.cols, c.cols,
-        "gemmkit: B.cols ({}) != C.cols ({})",
-        b.cols, c.cols
-    );
-
-    check_view(a.data, a.rows, a.cols, a.rs, a.cs, "A");
-    check_view(b.data, b.rows, b.cols, b.rs, b.cs, "B");
-    check_view(c.data, c.rows, c.cols, c.rs, c.cs, "C");
-
-    if self_aliases(c.rows, c.cols, c.rs, c.cs) {
-        panic!(
-            "gemmkit: C view aliases itself (strides {},{} map distinct elements to the same \
-             memory); C must address each (i,j) uniquely",
-            c.rs, c.cs
-        );
-    }
-
-    // C (i8) must not alias A or B (i8).
-    let cp = c.data.as_ptr() as *const u8;
-    let cl = c.data.len();
-    if overlaps_bytes(cp, cl, 1, a.data.as_ptr() as *const u8, a.data.len(), 1)
-        || overlaps_bytes(cp, cl, 1, b.data.as_ptr() as *const u8, b.data.len(), 1)
-    {
-        panic!("gemmkit: C aliases A or B");
-    }
+    validate_gemm_views(&a, &b, &c);
 
     assert!(
         req.scale.is_finite() && req.scale > 0.0,
@@ -1951,7 +1864,14 @@ pub fn gemm_i8_requant_with(
                 a.rows
             );
             // bias (i32) must not overlap C (i8).
-            if overlaps_bytes(cp, cl, 1, bias.as_ptr() as *const u8, bias.len(), 4) {
+            if overlaps_bytes(
+                c.data.as_ptr() as *const u8,
+                c.data.len(),
+                1,
+                bias.as_ptr() as *const u8,
+                bias.len(),
+                4,
+            ) {
                 panic!("gemmkit: requantize bias overlaps C");
             }
             (bias.as_ptr(), true)
@@ -2124,41 +2044,7 @@ pub fn gemm_fused_with<T: FusedScalar>(
     act: Option<Activation<T>>,
     par: Parallelism,
 ) {
-    assert_eq!(
-        a.cols, b.rows,
-        "gemmkit: A.cols ({}) != B.rows ({})",
-        a.cols, b.rows
-    );
-    assert_eq!(
-        a.rows, c.rows,
-        "gemmkit: A.rows ({}) != C.rows ({})",
-        a.rows, c.rows
-    );
-    assert_eq!(
-        b.cols, c.cols,
-        "gemmkit: B.cols ({}) != C.cols ({})",
-        b.cols, c.cols
-    );
-
-    check_view(a.data, a.rows, a.cols, a.rs, a.cs, "A");
-    check_view(b.data, b.rows, b.cols, b.rs, b.cs, "B");
-    check_view(c.data, c.rows, c.cols, c.rs, c.cs, "C");
-
-    if self_aliases(c.rows, c.cols, c.rs, c.cs) {
-        panic!(
-            "gemmkit: C view aliases itself (strides {},{} map distinct elements to the same \
-             memory); C must address each (i,j) uniquely",
-            c.rs, c.cs
-        );
-    }
-
-    let cp = c.data.as_ptr();
-    let cl = c.data.len();
-    if overlaps(cp, cl, a.data.as_ptr(), a.data.len())
-        || overlaps(cp, cl, b.data.as_ptr(), b.data.len())
-    {
-        panic!("gemmkit: C aliases A or B");
-    }
+    validate_gemm_views(&a, &b, &c);
 
     // Fused-epilogue validation: bias length matches its axis and does not overlap C.
     if let Some(bd) = &bias {
@@ -2184,7 +2070,7 @@ pub fn gemm_fused_with<T: FusedScalar>(
                 (s.as_ptr(), s.len())
             }
         };
-        if overlaps(cp, cl, bp, bl) {
+        if overlaps(c.data.as_ptr(), c.data.len(), bp, bl) {
             panic!("gemmkit: bias slice overlaps C");
         }
     }

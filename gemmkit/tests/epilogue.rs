@@ -689,6 +689,95 @@ mod validation {
     }
 }
 
+// ---------------------------------------------------------------------------
+// checked/unchecked twin equivalence
+// ---------------------------------------------------------------------------
+
+/// `gemm_fused` and `gemm_fused_unchecked` are **parallel** entry points — the checked twin
+/// does not delegate to the unchecked one, so a divergence in the `Bias`/`Act` translation
+/// would go silently undetected. Exercise the unchecked fn against the checked twin on a
+/// driver-shaped problem (m,n,k > 16), bit-for-bit, across both `BiasDim` arms, `has_bias =
+/// false`, and every activation arm.
+#[test]
+fn fused_unchecked_matches_checked() {
+    use gemmkit::{BiasDim, gemm_fused, gemm_fused_unchecked};
+
+    let mut rng = Rng::new(0x0F05_ED12);
+    let (m, k, n) = (33usize, 24usize, 40usize);
+    let a = make::<f32>(&mut rng, m, k); // col-major m×k
+    let b = make::<f32>(&mut rng, k, n); // col-major k×n
+    let c0 = make::<f32>(&mut rng, m * n, 1); // col-major m×n C
+    let bias_row: Vec<f32> = (0..m).map(|_| (rng.unit() * 3.0) as f32).collect();
+    let bias_col: Vec<f32> = (0..n).map(|_| (rng.unit() * 3.0) as f32).collect();
+    let (alpha, beta) = (0.9f32, 0.7f32);
+    let par = Parallelism::Serial;
+
+    let mk_act = |kind: u8| match kind {
+        1 => Some(Activation::Relu),
+        2 => Some(Activation::LeakyRelu(0.1f32)),
+        _ => None,
+    };
+
+    // 0 none, 1 per-row, 2 per-col.
+    for bias_kind in 0u8..=2 {
+        for act_kind in 0u8..=2 {
+            let bias_checked = match bias_kind {
+                1 => Some(Bias::PerRow(&bias_row)),
+                2 => Some(Bias::PerCol(&bias_col)),
+                _ => None,
+            };
+            let (bptr, bdim, has_bias) = match bias_kind {
+                1 => (bias_row.as_ptr(), BiasDim::PerRow, true),
+                2 => (bias_col.as_ptr(), BiasDim::PerCol, true),
+                _ => (core::ptr::null(), BiasDim::PerRow, false),
+            };
+
+            let mut c_checked = c0.clone();
+            {
+                let ar = MatRef::new(&a, m, k, 1, m as isize);
+                let br = MatRef::new(&b, k, n, 1, k as isize);
+                let cm = MatMut::new(&mut c_checked, m, n, 1, m as isize);
+                gemm_fused(alpha, ar, br, beta, cm, bias_checked, mk_act(act_kind), par);
+            }
+
+            let mut c_unchecked = c0.clone();
+            // SAFETY: every view is a valid in-bounds col-major layout, C aliases neither A/B
+            // nor the bias, and the bias slice (when present) is the right length for its axis.
+            unsafe {
+                gemm_fused_unchecked(
+                    m,
+                    k,
+                    n,
+                    alpha,
+                    a.as_ptr(),
+                    1,
+                    m as isize,
+                    b.as_ptr(),
+                    1,
+                    k as isize,
+                    beta,
+                    c_unchecked.as_mut_ptr(),
+                    1,
+                    m as isize,
+                    bptr,
+                    bdim,
+                    has_bias,
+                    mk_act(act_kind),
+                    par,
+                );
+            }
+
+            for idx in 0..m * n {
+                assert_eq!(
+                    c_checked[idx].to_bits(),
+                    c_unchecked[idx].to_bits(),
+                    "fused unchecked != checked at {idx} [bias_kind={bias_kind} act_kind={act_kind}]",
+                );
+            }
+        }
+    }
+}
+
 // ===========================================================================
 // Requantize (i8 -> i8) — bitwise vs gemm_i8-then-map, ties, saturation, bias.
 // ===========================================================================
@@ -799,6 +888,68 @@ mod requant {
                 }
             }
         }
+    }
+
+    /// `gemm_i8_requant` and `gemm_i8_requant_unchecked` are **parallel** entry points (the
+    /// checked twin does not delegate to the unchecked one), so exercise the unchecked fn
+    /// against the checked twin bit-for-bit on a driver-shaped case (m,n,k > 16, with bias).
+    #[test]
+    fn requant_unchecked_matches_checked() {
+        use gemmkit::gemm_i8_requant_unchecked;
+
+        let mut rng = Rng::new(0x5EED_1234);
+        let (m, k, n) = (32usize, 40usize, 24usize);
+        let a = make_i8(&mut rng, m * k);
+        let b = make_i8(&mut rng, k * n);
+        let bias: Vec<i32> = (0..m)
+            .map(|_| (rng.next_u64() % 2001) as i64 as i32 - 1000)
+            .collect();
+        let (scale, zp) = (0.5f32, 13i32);
+        let (rsc, csc) = (1isize, m as isize);
+        let par = Parallelism::Serial;
+
+        let mut c_checked = vec![0i8; m * n];
+        {
+            let ar = MatRef::new(&a, m, k, 1, m as isize);
+            let br = MatRef::new(&b, k, n, 1, k as isize);
+            let cm = MatMut::new(&mut c_checked, m, n, rsc, csc);
+            let req = Requantize {
+                scale,
+                zero_point: zp,
+                bias: Some(&bias),
+            };
+            gemm_i8_requant(ar, br, req, cm, par);
+        }
+
+        let mut c_unchecked = vec![0i8; m * n];
+        // SAFETY: valid in-bounds col-major layouts; C aliases neither A/B nor the (per-row,
+        // length-m) bias.
+        unsafe {
+            gemm_i8_requant_unchecked(
+                m,
+                k,
+                n,
+                a.as_ptr(),
+                1,
+                m as isize,
+                b.as_ptr(),
+                1,
+                k as isize,
+                scale,
+                zp,
+                bias.as_ptr(),
+                true,
+                c_unchecked.as_mut_ptr(),
+                rsc,
+                csc,
+                par,
+            );
+        }
+
+        assert_eq!(
+            c_checked, c_unchecked,
+            "requant unchecked != checked [m={m} k={k} n={n}]"
+        );
     }
 
     /// Hardcoded round-half-to-even ties, independent of any reference function: each row is a

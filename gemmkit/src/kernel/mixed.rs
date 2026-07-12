@@ -275,14 +275,8 @@ where
 /// only tolerance-equal, not bitwise. It is still fully deterministic, and
 /// serial/parallel/prepacked all share this kernel and layout, so they reproduce each
 /// other bit-for-bit.
+#[derive(Clone, Copy)]
 pub struct Bf16DotGemm(PhantomData<()>);
-
-impl Clone for Bf16DotGemm {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-impl Copy for Bf16DotGemm {}
 
 impl Bf16DotGemm {
     /// Depth steps folded per `vdpbf16ps`.
