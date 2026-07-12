@@ -640,6 +640,79 @@ fn batched_slice_serial_equals_parallel() {
     );
 }
 
+/// A heterogeneous batch whose *total* work clears `GEMMKIT_PARALLEL_THRESHOLD` with `Rayon(4)`
+/// exercises `run_ptr`'s parallel branch (and `resolve_batch_flat`'s budget grant) — the small
+/// cases above stay under the gate and never fork. Every element still runs wholly on one worker,
+/// so the batch must be bit-identical to the serial run and to a per-element `gemm()` loop.
+#[test]
+fn batched_slice_parallel_matches_serial_bit_for_bit() {
+    // Four ~128³ elements: total m·k·n ≈ 8.4M, well above the 48·48·256 threshold.
+    let shapes = [
+        (128usize, 128usize, 128usize, 1.0f32, 0.0f32),
+        (130, 120, 140, 2.5, -0.5),
+        (150, 110, 128, -1.0, 1.0),
+        (128, 140, 120, 0.75, 0.25),
+    ];
+    let a: Vec<Vec<f32>> = shapes
+        .iter()
+        .enumerate()
+        .map(|(i, &(m, k, _, _, _))| fill(m * k, 100 + i as u64))
+        .collect();
+    let b: Vec<Vec<f32>> = shapes
+        .iter()
+        .enumerate()
+        .map(|(i, &(_, k, n, _, _))| fill(k * n, 200 + i as u64))
+        .collect();
+    let c0: Vec<Vec<f32>> = shapes
+        .iter()
+        .enumerate()
+        .map(|(i, &(m, _, n, _, _))| fill(m * n, 300 + i as u64))
+        .collect();
+
+    let run = |par: Parallelism| -> Vec<Vec<f32>> {
+        let mut c: Vec<Vec<f32>> = c0.clone();
+        {
+            let mut probs: Vec<BatchProblem<'_, f32>> = c
+                .iter_mut()
+                .enumerate()
+                .map(|(i, ci)| {
+                    let (m, k, n, alpha, beta) = shapes[i];
+                    BatchProblem {
+                        alpha,
+                        a: MatRef::from_col_major(&a[i], m, k),
+                        b: MatRef::from_col_major(&b[i], k, n),
+                        beta,
+                        c: MatMut::from_col_major(ci, m, n),
+                    }
+                })
+                .collect();
+            gemm_batched_slice(&mut probs, par);
+        }
+        c
+    };
+
+    let serial = run(Parallelism::Serial);
+    let parallel = run(Parallelism::Rayon(4));
+    assert_eq!(
+        serial, parallel,
+        "heterogeneous parallel batch must equal the serial batch bit-for-bit"
+    );
+
+    // Correctness: each element equals a standalone gemm() on the same inputs.
+    for (i, &(m, k, n, alpha, beta)) in shapes.iter().enumerate() {
+        let mut cref = c0[i].clone();
+        gemm(
+            alpha,
+            MatRef::from_col_major(&a[i], m, k),
+            MatRef::from_col_major(&b[i], k, n),
+            beta,
+            MatMut::from_col_major(&mut cref, m, n),
+            Parallelism::Serial,
+        );
+        assert_eq!(parallel[i], cref, "element {i} != standalone gemm()");
+    }
+}
+
 #[test]
 #[should_panic(expected = "!= B.rows")]
 fn batched_slice_rejects_shape_mismatch() {

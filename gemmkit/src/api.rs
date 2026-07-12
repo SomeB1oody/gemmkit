@@ -218,8 +218,10 @@ fn overlaps<T>(pa: *const T, na: usize, pb: *const T, nb: usize) -> bool {
 ///
 /// # Panics
 /// If the inner dimensions disagree (`A.cols != B.rows`, `A.rows != C.rows`,
-/// `B.cols != C.cols`), if any view addresses outside its slice, or if `C`'s
-/// storage overlaps `A`'s or `B`'s.
+/// `B.cols != C.cols`), if any view addresses outside its slice, if `C`'s
+/// storage overlaps `A`'s or `B`'s, or if the problem is so large (broadcast
+/// strides allow logical dimensions up to `isize::MAX`) that an internal pack
+/// buffer size overflows `usize`.
 pub fn gemm<T: GemmScalar>(
     alpha: T,
     a: MatRef<'_, T>,
@@ -804,7 +806,9 @@ impl<T> PackedRhs<T> {
 /// `C` is column-major-ish (`|csc| >= |rsc|`); [`gemm_packed_b`] enforces both.
 ///
 /// # Panics
-/// If `B`'s view addresses outside its slice (same bounds check as [`gemm`]).
+/// If `B`'s view addresses outside its slice (same bounds check as [`gemm`]),
+/// or if `B` is so large (broadcast strides allow logical dimensions up to
+/// `isize::MAX`) that the pack buffer size overflows `usize`.
 pub fn prepack_rhs<T: GemmScalar>(b: MatRef<'_, T>) -> PackedRhs<T> {
     check_view(b.data, b.rows, b.cols, b.rs, b.cs, "B");
     // SAFETY: `b` is validated in-bounds directly above.
@@ -829,6 +833,22 @@ pub unsafe fn prepack_rhs_unchecked<T: GemmScalar>(
     // with the packed input (`Lhs` == `Rhs`) element size — the unit the panels are
     // stored in, same as the driver.
     let (mr, nr) = <T as GemmScalar>::rhs_tile();
+    // An empty operand packs to nothing. Short-circuit before the geometry/size
+    // arithmetic, which would otherwise overflow for a huge free dimension — an
+    // empty view's extent is 0, so `check_view` accepts e.g. a `0 x usize::MAX` B.
+    // The consume path never reads the buffer for a `k == 0`/`n == 0` problem
+    // (it only beta-scales C), so an empty pack round-trips. Mirrors the
+    // zero-batch early return in `gemm_batched`.
+    if k == 0 || n == 0 {
+        return PackedRhs {
+            buf: Vec::new(),
+            k,
+            n,
+            nr,
+            kc: 1,
+            nc: nr,
+        };
+    }
     let lhs_size = core::mem::size_of::<T>().max(1);
     let dodge_tiny = crate::tuning::tiny_block_dim().saturating_add(1);
     let blk = crate::cache::topology().blocking(mr, nr, lhs_size, dodge_tiny, n, k);
@@ -842,7 +862,16 @@ pub unsafe fn prepack_rhs_unchecked<T: GemmScalar>(
     // A dot kernel (bf16 `vdpbf16ps`) packs depth in groups, so the panel depth is rounded
     // up to its `DEPTH_MULTIPLE`; `1` (every other kernel) leaves this unchanged.
     let k_pad = k.next_multiple_of(<T as GemmScalar>::rhs_depth_multiple());
-    let total = n.div_ceil(nr) * nr * k_pad;
+    // Checked: a broadcast (zero-stride) view passes `check_view` with a tiny
+    // backing slice, so a logically huge `n`/`k` can reach this product; a wrapped
+    // size would under-allocate the buffer the pack then writes past.
+    let total = n
+        .div_ceil(nr)
+        .checked_mul(nr)
+        .and_then(|v| v.checked_mul(k_pad))
+        .unwrap_or_else(|| {
+            panic!("gemmkit: prepacked RHS of {k}x{n} is too large; the pack buffer size overflows usize")
+        });
     let mut buf = vec![T::ZERO; total];
     if total > 0 {
         // SAFETY: `buf` holds `ceil(n/nr)*nr*k_pad` elements (the exact layout size, with
@@ -1083,7 +1112,9 @@ impl<T> PackedLhs<T> {
 /// `C` is row-major-ish (`|csc| <= |rsc|`); [`gemm_packed_a`] enforces both.
 ///
 /// # Panics
-/// If `A`'s view addresses outside its slice (same bounds check as [`gemm`]).
+/// If `A`'s view addresses outside its slice (same bounds check as [`gemm`]),
+/// or if `A` is so large (broadcast strides allow logical dimensions up to
+/// `isize::MAX`) that the pack buffer size overflows `usize`.
 pub fn prepack_lhs<T: GemmScalar>(a: MatRef<'_, T>) -> PackedLhs<T> {
     check_view(a.data, a.rows, a.cols, a.rs, a.cs, "A");
     // SAFETY: `a` is validated in-bounds directly above.
@@ -1107,6 +1138,19 @@ pub unsafe fn prepack_lhs_unchecked<T: GemmScalar>(
     // `K` is `k`. The `tiny_block_dim() + 1` sentinel for the transposed `M` (the
     // unknown-here `n`) dodges the tiny-matrix branch so the geometry is `n`-independent.
     let (mr, nr) = <T as GemmScalar>::rhs_tile();
+    // Empty operand: short-circuit before the geometry/size arithmetic (see
+    // `prepack_rhs` — same overflow hazard for a huge `m` on an empty view, same
+    // safe round-trip through the consume path).
+    if k == 0 || m == 0 {
+        return PackedLhs {
+            buf: Vec::new(),
+            m,
+            k,
+            nr,
+            kc: 1,
+            nc: nr,
+        };
+    }
     // Packed input (`Lhs` == `Rhs`) element size — the unit the panels are stored in,
     // matching the driver (the prepacked buffer below is `T`-typed).
     let lhs_size = core::mem::size_of::<T>().max(1);
@@ -1121,7 +1165,14 @@ pub unsafe fn prepack_lhs_unchecked<T: GemmScalar>(
 
     // Depth-padded for a dot kernel (see `prepack_rhs`); identity for `DEPTH_MULTIPLE == 1`.
     let k_pad = k.next_multiple_of(<T as GemmScalar>::rhs_depth_multiple());
-    let total = m.div_ceil(nr) * nr * k_pad;
+    // Checked for the same broadcast-view reason as `prepack_rhs`.
+    let total = m
+        .div_ceil(nr)
+        .checked_mul(nr)
+        .and_then(|v| v.checked_mul(k_pad))
+        .unwrap_or_else(|| {
+            panic!("gemmkit: prepacked LHS of {m}x{k} is too large; the pack buffer size overflows usize")
+        });
     let mut buf = vec![T::ZERO; total];
     if total > 0 {
         // SAFETY: `buf` holds `ceil(m/nr)*nr*k_pad` elements (the exact layout size, with

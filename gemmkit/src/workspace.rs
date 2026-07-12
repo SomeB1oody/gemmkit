@@ -12,9 +12,20 @@ use core::alloc::Layout;
 /// All packed buffers are aligned to this many bytes (covers AVX-512).
 const ALIGN: usize = 64;
 
-#[inline]
-fn round_up(x: usize, a: usize) -> usize {
-    x.div_ceil(a) * a
+/// `elems` elements of `esize` bytes each, rounded up to [`ALIGN`] — or a
+/// fail-closed panic if that product/round-up overflows `usize` (see the
+/// overflow note in [`Workspace::regions`]).
+fn region_bytes(elems: usize, esize: usize) -> usize {
+    elems
+        .checked_mul(esize)
+        .and_then(|b| b.checked_next_multiple_of(ALIGN))
+        .unwrap_or_else(|| workspace_too_large())
+}
+
+#[cold]
+#[inline(never)]
+fn workspace_too_large() -> ! {
+    panic!("gemmkit: GEMM is too large; the pack workspace size overflows usize")
 }
 
 /// A growable, 64-byte-aligned scratch buffer for packing A and B.
@@ -88,10 +99,22 @@ impl Workspace {
         b_elems: usize,
     ) -> Regions<T> {
         let esize = core::mem::size_of::<T>().max(1);
-        let a_bytes_per_region = round_up(a_elems_per_region * esize, ALIGN);
-        let a_total = a_bytes_per_region * a_regions.max(1);
-        let b_bytes = round_up(b_elems * esize, ALIGN);
-        self.ensure(a_total + b_bytes);
+        // Fail closed on overflow: a broadcast (zero-stride) operand can present a
+        // logical dimension up to `isize::MAX`, so the element→byte conversion and
+        // the region/total sums can wrap `usize`. A wrapped (too-small) size would
+        // under-allocate the buffer the pack then writes past — memory-unsafe — so
+        // this panics with the same "too large" contract as the checked driver
+        // sizing that feeds it.
+        let a_bytes_per_region = region_bytes(a_elems_per_region, esize);
+        let a_total = a_bytes_per_region
+            .checked_mul(a_regions.max(1))
+            .unwrap_or_else(|| workspace_too_large());
+        let b_bytes = region_bytes(b_elems, esize);
+        self.ensure(
+            a_total
+                .checked_add(b_bytes)
+                .unwrap_or_else(|| workspace_too_large()),
+        );
 
         let base = self.ptr;
         // SAFETY: `base` is 64-aligned and the offsets stay within `cap`.

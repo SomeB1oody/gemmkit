@@ -90,6 +90,8 @@ jobs:
           # Emulate a CPU with avx512f (Sapphire Rapids)
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: "sde64 -spr --"
           GEMMKIT_REQUIRE_ISA: avx512
+          # Bound the props_* proptest binaries under SDE emulation; native runs use full case counts
+          PROPTEST_CASES: "16"
 
   # i8 VNNI (`vpdpbusd`) dot kernel
   avx512vnni_test:
@@ -117,6 +119,7 @@ jobs:
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: "sde64 -spr --"
           GEMMKIT_REQUIRE_ISA: avx512vnni
+          PROPTEST_CASES: "16"
 
   # bf16 (`vdpbf16ps`) dot kernel
   avx512bf16_test:
@@ -144,6 +147,7 @@ jobs:
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: "sde64 -spr --"
           GEMMKIT_REQUIRE_ISA: avx512bf16
+          PROPTEST_CASES: "16"
 
   # 32-bit x86 `cargo check` only (no runner)
   i686_check:
@@ -306,7 +310,7 @@ jobs:
         env:
           RUSTFLAGS: -C target-feature=+simd128
           CARGO_TARGET_WASM32_WASIP1_RUNNER: wasmtime --env GEMMKIT_REQUIRE_ISA=simd128
-        run: cargo test -p gemmkit --target wasm32-wasip1 --no-default-features --features std,half,int8,complex --test correctness --no-fail-fast
+        run: cargo test -p gemmkit --target wasm32-wasip1 --no-default-features --features std,half,int8,complex --test correctness --test simd_conformance --no-fail-fast
       - name: Guarded parallel — builds + degrades to serial under wasmtime (baseline wasip1 has no threads)
         env:
           RUSTFLAGS: -C target-feature=+simd128 -D warnings
@@ -345,3 +349,39 @@ jobs:
           RUSTFLAGS: -C target-feature=+simd128
           CARGO_TARGET_WASM32_WASIP1_THREADS_RUNNER: "wasmtime -W threads=y -W shared-memory=y -S threads=y --env GEMMKIT_REQUIRE_ISA=simd128"
         run: cargo test -p gemmkit --target wasm32-wasip1-threads --no-default-features --features std,parallel,wasm_threads,half,int8,complex --test correctness --no-fail-fast
+
+  # Code coverage (cargo-llvm-cov, scripts/coverage.sh). Report-only: no lines% floor
+  # until the first triage (scripts/COVERAGE.md) establishes the coverable baseline.
+  coverage:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rust: stable
+            target: x86_64-unknown-linux-gnu
+    name: coverage/${{ matrix.target }}/${{ matrix.rust }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust }}
+          targets: ${{ matrix.target }}
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+      # Pinned ISA list: the ubuntu-latest pool is heterogeneous (some machines expose
+      # avx512f, most don't), so probing cpuinfo would make the coverage % swing
+      # run-to-run. avx512/vnni/bf16 coverage comes from local runs of the same script.
+      - name: Coverage (scalar + fma, report-only)
+        env:
+          COVERAGE_ISAS: scalar fma
+        run: scripts/coverage.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-x86_64
+          path: |
+            coverage/lcov-x86_64.info
+            coverage/meta-x86_64.txt
+            coverage/html-x86_64

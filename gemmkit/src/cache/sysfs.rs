@@ -174,4 +174,39 @@ mod tests {
             assert_eq!(s3.shared_by, 1, "L3 shared_by must be 1");
         }
     }
+
+    /// `parse_size` over every suffix arm (K/M/G, both cases, and the bare-byte fall-through)
+    /// plus the empty / non-numeric / overflow rejections. This host's sysfs only ever emits
+    /// `K` sizes, so the `M`/`G`/bare arms need a synthetic input to be exercised.
+    #[test]
+    fn parse_size_all_arms() {
+        assert_eq!(super::parse_size("48K"), Some(48 * 1024));
+        assert_eq!(super::parse_size("1024k"), Some(1024 * 1024));
+        assert_eq!(super::parse_size("32M"), Some(32 * 1024 * 1024));
+        assert_eq!(super::parse_size("8m"), Some(8 * 1024 * 1024));
+        assert_eq!(super::parse_size("2G"), Some(2 * 1024 * 1024 * 1024));
+        assert_eq!(super::parse_size("1g"), Some(1024 * 1024 * 1024));
+        assert_eq!(super::parse_size("123"), Some(123)); // bare byte count
+        assert_eq!(super::parse_size("  64K  "), Some(64 * 1024)); // trimmed
+        assert_eq!(super::parse_size(""), None); // empty -> None
+        assert_eq!(super::parse_size("K"), None); // no digits
+        assert_eq!(super::parse_size("notanumber"), None);
+        // Overflow on the multiply is rejected (returns None, never panics/wraps).
+        assert_eq!(super::parse_size(&format!("{}G", usize::MAX)), None);
+    }
+
+    /// `count_cpu_list` over single ids, `a-b` ranges, multiple comma-separated parts, and the
+    /// empty / malformed inputs that must clamp to at least `1`. This host's `shared_cpu_list`
+    /// is a single private-core id, so the multi-range arms need synthetic inputs.
+    #[test]
+    fn count_cpu_list_all_arms() {
+        assert_eq!(super::count_cpu_list("0-7,16-23"), 16); // two ranges
+        assert_eq!(super::count_cpu_list("0-7"), 8); // one range
+        assert_eq!(super::count_cpu_list("0,16"), 2); // two singles
+        assert_eq!(super::count_cpu_list("3"), 1); // one single
+        assert_eq!(super::count_cpu_list(""), 1); // empty -> clamp to 1
+        assert_eq!(super::count_cpu_list("  "), 1); // whitespace -> clamp to 1
+        assert_eq!(super::count_cpu_list("5-2"), 1); // reversed range ignored -> clamp to 1
+        assert_eq!(super::count_cpu_list("0-3,,8"), 5); // empty part skipped: 4 + 1
+    }
 }

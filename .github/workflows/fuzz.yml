@@ -1,0 +1,51 @@
+name: Fuzz smoke
+
+# Non-mandatory harness-breadth check: the fuzz crate needs nightly (-Z build-std +
+# AddressSanitizer), which the stable-only mandatory gate keeps out, and GitHub's
+# standard runners have no AVX-512, so this covers the scalar/FMA dispatch routes only.
+# The full per-ISA soak runs locally (see gemmkit/fuzz/README.md).
+on:
+  schedule:
+    - cron: "0 5 * * *"
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz_smoke:
+    runs-on: ubuntu-latest
+    name: fuzz-smoke/x86_64-unknown-linux-gnu/nightly
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: gemmkit/fuzz
+      # Persist the corpus across runs so each nightly smoke starts deeper than the last
+      # (the harness's coverage leans on accumulation). run_id key + prefix restore-keys
+      # means every run restores the latest corpus and saves a fresh, larger one.
+      - uses: actions/cache@v4
+        with:
+          path: gemmkit/fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: fuzz-corpus-
+      - run: cargo install cargo-fuzz --locked
+      - name: 60s smoke per target
+        working-directory: gemmkit/fuzz
+        run: |
+          # Accumulate failures so one crashing target doesn't skip the rest of the sweep.
+          fail=0
+          for t in fuzz_gemm fuzz_knobs fuzz_api_validation fuzz_batched fuzz_prepack; do
+            cargo fuzz run "$t" -- \
+              -max_total_time=60 -max_len=512 -timeout=60 -malloc_limit_mb=1024 || fail=1
+          done
+          exit "$fail"
+      - name: Upload crash artifacts (if any)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: gemmkit/fuzz/artifacts/

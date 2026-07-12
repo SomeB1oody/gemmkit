@@ -34,6 +34,7 @@ raw-cpuid = { version = "11", optional = true }
 criterion = { version = "0.5", features = ["html_reports"] }
 gemm = "0.18"
 matrixmultiply = "0.3"
+proptest = "1"
 
 # rayon (already a runtime dep behind `parallel`) is a dev-dep too so a test can call
 # `gemm_batched` from *inside* a rayon worker — the nested-workspace case the batched path guards.

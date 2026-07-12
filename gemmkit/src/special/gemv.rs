@@ -457,3 +457,113 @@ unsafe fn strided_rows<T, S>(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::MB_REG;
+    use crate::simd::{ScalarTok, SimdOps};
+
+    /// Generate a per-float-type checker for [`super::axpy_regblocked`]. It picks a row count
+    /// that spans all three regimes — a wide `MB_REG·lanes` register-blocked panel, one
+    /// single-register `lanes`-wide tail, and a sub-lane scalar remainder — and sweeps
+    /// `beta ∈ {0, 1, other}` so every accumulator-init branch runs. The result is compared
+    /// against a straightforward column-major axpy reference at a per-type tolerance (the
+    /// kernel fuses `a·b + c`, so the match is not bitwise).
+    macro_rules! axpy_regblock_check {
+        ($fn:ident, $t:ty, $tol:expr) => {
+            fn $fn<S: SimdOps<$t>>(simd: S, label: &str) {
+                let lanes = <S as SimdOps<$t>>::LANES;
+                // wide panel + one single-register row-group + a sub-lane scalar remainder.
+                let rows = MB_REG * lanes + lanes + lanes.saturating_sub(1);
+                let k = 37usize;
+
+                // Index arithmetic in u64 so the multipliers don't overflow a 32-bit usize.
+                let mat: Vec<$t> = (0..rows * k)
+                    .map(|i| (((i as u64 * 1103515245 + 12345) % 251) as $t) * 0.008 - 1.0)
+                    .collect();
+                let vec: Vec<$t> = (0..k)
+                    .map(|i| (((i as u64 * 2654435761) % 193) as $t) * 0.01 - 0.9)
+                    .collect();
+                let out0: Vec<$t> = (0..rows)
+                    .map(|i| (((i as u64 * 40503) % 131) as $t) * 0.05 - 3.0)
+                    .collect();
+
+                for &(alpha, beta) in &[
+                    (1.3 as $t, 0.0 as $t),
+                    (0.7 as $t, 1.0 as $t),
+                    (1.1 as $t, 2.5 as $t),
+                ] {
+                    let mut out = out0.clone();
+                    // Column-major matrix (`mat_cs == rows`), unit-stride vector and output.
+                    unsafe {
+                        simd.vectorize(|| {
+                            super::axpy_regblocked::<$t, S>(
+                                simd,
+                                0,
+                                rows,
+                                k,
+                                alpha,
+                                mat.as_ptr(),
+                                rows as isize,
+                                vec.as_ptr(),
+                                1,
+                                beta,
+                                out.as_mut_ptr(),
+                            );
+                        });
+                    }
+                    for i in 0..rows {
+                        let mut acc = if beta == 0.0 {
+                            0.0 as $t
+                        } else {
+                            beta * out0[i]
+                        };
+                        for kk in 0..k {
+                            acc += mat[kk * rows + i] * (alpha * vec[kk]);
+                        }
+                        let tol = $tol * (1.0 as $t + acc.abs());
+                        assert!(
+                            (out[i] - acc).abs() <= tol,
+                            "{label} lanes={lanes} beta={beta} row {i}: got {} want {}",
+                            out[i],
+                            acc
+                        );
+                    }
+                }
+            }
+        };
+    }
+
+    axpy_regblock_check!(check_f32, f32, 1e-4);
+    axpy_regblock_check!(check_f64, f64, 1e-10);
+
+    /// The scalar token (`LANES == 1`) always runs, covering the wide-panel and
+    /// single-register regimes platform-independently; the SIMD tokens (guarded by runtime
+    /// detection) additionally exercise the sub-lane scalar remainder.
+    #[test]
+    fn axpy_regblocked_spans_all_regimes() {
+        check_f32(ScalarTok, "scalar/f32");
+        check_f64(ScalarTok, "scalar/f64");
+
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            use crate::simd::{Avx512, Fma};
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                check_f32(Fma, "fma/f32");
+                check_f64(Fma, "fma/f64");
+            }
+            if is_x86_feature_detected!("avx512f") {
+                check_f32(Avx512, "avx512/f32");
+                check_f64(Avx512, "avx512/f64");
+            }
+        }
+
+        // Neon is baseline on aarch64 (the platform whose gemv dispatch uses it), so it
+        // needs no runtime probe; its `LANES > 1` also exercises the sub-lane remainder.
+        #[cfg(target_arch = "aarch64")]
+        {
+            check_f32(crate::simd::Neon, "neon/f32");
+            check_f64(crate::simd::Neon, "neon/f64");
+        }
+    }
+}

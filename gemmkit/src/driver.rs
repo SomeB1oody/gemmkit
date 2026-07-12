@@ -377,10 +377,23 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize>(
         // slot per row-block, written once by the pre-pass) or `n_threads` when
         // per-worker (each worker owns a private scratch slot). For square parallel
         // problems `n_mc < n_threads`, so shared-A uses *fewer* slots, not more.
-        let a_per_region = mc.next_multiple_of(mr) * kc_pad_block;
+        // Checked: on the mixed-precision path `kc == k`, and a broadcast
+        // (zero-stride) operand passes validation with a logically huge `k`, so
+        // these products can overflow; a wrapped size would under-allocate the
+        // workspace the pack then writes past.
+        let a_per_region = mc
+            .next_multiple_of(mr)
+            .checked_mul(kc_pad_block)
+            .unwrap_or_else(|| {
+                panic!("gemmkit: GEMM {m}x{k}x{n} is too large; the LHS pack region size overflows usize")
+            });
         let a_regions = if shared_a { n_mc } else { n_threads };
         let b_elems = if pack_b {
-            nc.next_multiple_of(nr) * kc_pad_block
+            nc.next_multiple_of(nr)
+                .checked_mul(kc_pad_block)
+                .unwrap_or_else(|| {
+                    panic!("gemmkit: GEMM {m}x{k}x{n} is too large; the RHS pack region size overflows usize")
+                })
         } else {
             0
         };

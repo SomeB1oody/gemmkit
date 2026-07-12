@@ -431,4 +431,59 @@ mod tests {
         // Restore the default so concurrent/later tests see auto.
         crate::tuning::set_lhs_pack_stride(0);
     }
+
+    /// A degenerate dimension (`m`, `n`, or `k` == 0) short-circuits the BLIS model: the
+    /// gemm driver early-outs zero-dim problems before reaching `blocking`, so this is the
+    /// only way to exercise the guard. Each block dim clamps to its microtile floor / `1`,
+    /// independent of the detected cache (no knobs are read on this path).
+    #[test]
+    fn blocking_zero_dim_early_return() {
+        let t = topology();
+        let (mr, nr) = (16usize, 4usize);
+        // m == 0
+        let b = t.blocking(mr, nr, 4, 0, 8, 8);
+        assert_eq!((b.mc, b.kc, b.nc), (mr, 8, 8));
+        // n == 0
+        let b = t.blocking(mr, nr, 4, 8, 0, 8);
+        assert_eq!((b.mc, b.kc, b.nc), (16, 8, nr));
+        // k == 0
+        let b = t.blocking(mr, nr, 4, 8, 8, 0);
+        assert_eq!((b.mc, b.kc, b.nc), (16, 1, 8));
+    }
+
+    /// The no-L3 `NC` arm (full-`N` up to the panel cap) is dead where an L3 exists, so on an
+    /// x86 host it only runs against a synthetic `l3: None` topology. `CacheTopology`/`Level`
+    /// fields are public, so this covers the branch platform-independently (the aarch64 run
+    /// hits it live on Apple's L3-less parts).
+    #[test]
+    fn blocking_no_l3_nc_arm() {
+        let topo = CacheTopology {
+            l1d: Level {
+                bytes: 48 * 1024,
+                assoc: 12,
+                line: 64,
+                shared_by: 1,
+            },
+            l2: Level {
+                bytes: 1024 * 1024,
+                assoc: 16,
+                line: 64,
+                shared_by: 1,
+            },
+            l3: None,
+        };
+        let (mr, nr) = (16usize, 4usize);
+        let (m, n, k) = (512usize, 512usize, 512usize); // > tiny_block_dim, so the full model runs
+        let b = topo.blocking(mr, nr, 4, m, n, k);
+        // No L3: NC is `nc_no_l3_panels · nr` capped by the rounded-up `N`.
+        let expect_nc = (crate::tuning::nc_no_l3_panels() * nr)
+            .min(n.next_multiple_of(nr))
+            .max(nr);
+        assert_eq!(b.nc, expect_nc, "no-L3 NC must use the panel-count cap");
+        assert!(
+            b.mc >= mr && b.mc.is_multiple_of(mr),
+            "mc must be a positive mr multiple"
+        );
+        assert!(b.kc >= 1 && b.kc <= k, "kc must be within [1, k]");
+    }
 }
