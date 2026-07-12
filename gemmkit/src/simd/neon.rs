@@ -90,6 +90,17 @@ impl SimdOps<f32> for Neon {
         unsafe { vfmsq_f32(c, a, b) }
     }
     #[inline(always)]
+    unsafe fn max(self, a: Self::Reg, b: Self::Reg) -> Self::Reg {
+        // FMAXNM (not FMAX): returns the non-NaN operand on an unordered compare, so a
+        // `NaN` `a` returns `b` — the `max`/`min` NaN-in-`a` contract. FMAX would
+        // propagate the NaN and break the fast-vs-scalar epilogue agreement.
+        unsafe { vmaxnmq_f32(a, b) }
+    }
+    #[inline(always)]
+    unsafe fn min(self, a: Self::Reg, b: Self::Reg) -> Self::Reg {
+        unsafe { vminnmq_f32(a, b) }
+    }
+    #[inline(always)]
     unsafe fn reduce_sum(self, v: Self::Reg) -> f32 {
         unsafe { vaddvq_f32(v) }
     }
@@ -170,6 +181,15 @@ impl SimdOps<f64> for Neon {
     unsafe fn fnma(self, a: Self::Reg, b: Self::Reg, c: Self::Reg) -> Self::Reg {
         // `vfmsq_f64(c, a, b)` == `c - a*b` == our `fnma(a, b, c)`.
         unsafe { vfmsq_f64(c, a, b) }
+    }
+    #[inline(always)]
+    unsafe fn max(self, a: Self::Reg, b: Self::Reg) -> Self::Reg {
+        // FMAXNM: non-NaN operand on unordered compare (NaN `a` -> `b`).
+        unsafe { vmaxnmq_f64(a, b) }
+    }
+    #[inline(always)]
+    unsafe fn min(self, a: Self::Reg, b: Self::Reg) -> Self::Reg {
+        unsafe { vminnmq_f64(a, b) }
     }
     #[inline(always)]
     unsafe fn reduce_sum(self, v: Self::Reg) -> f64 {

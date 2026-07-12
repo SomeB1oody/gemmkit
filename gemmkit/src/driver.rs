@@ -17,6 +17,7 @@
 use core::mem::MaybeUninit;
 
 use crate::cache;
+use crate::kernel::epilogue::{Epilogue, Identity};
 use crate::kernel::{AlphaStatus, BetaStatus, KernelFamily, SCRATCH_LEN};
 use crate::parallel::{self, Parallelism, Ptr};
 use crate::scalar::Scalar;
@@ -92,10 +93,53 @@ pub unsafe fn run<Fam, S, const MR_REG: usize, const NR: usize>(
     Fam: KernelFamily,
     S: KernelSimd<Fam::Lhs, Fam::Rhs, Fam::Acc, Fam::Out>,
 {
-    // SAFETY: forwarded to `run_inner` with no prepacked RHS (the standard path).
+    // SAFETY: forwarded to `run_inner` with no prepacked RHS (the standard path) and the
+    // zero-cost `Identity` epilogue — the exact code path this driver has always run.
     unsafe {
-        run_inner::<Fam, S, MR_REG, NR>(
+        run_inner::<Fam, S, MR_REG, NR, Identity>(
             simd, m, k, n, alpha, a, rsa, csa, b, rsb, csb, beta, c, rsc, csc, par, ws, None,
+            &Identity,
+        )
+    }
+}
+
+/// Run a GEMM applying the fused [`Epilogue`] `E` to each output element as it is stored,
+/// instead of materializing the raw product and mapping it afterward. The plain-GEMM
+/// forwarder ([`run`]) is exactly this with `E = Identity`; with a non-identity `E` the
+/// engine (blocking, packing, scheduling) is unchanged, so the pre-epilogue bits are
+/// identical to plain `gemm` and the fused result equals `gemm()` then a scalar map.
+///
+/// # Safety
+/// As [`run`], plus `epi`'s interior pointers must be valid for the problem's `m`/`n`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn run_epilogue<Fam, S, E, const MR_REG: usize, const NR: usize>(
+    simd: S,
+    m: usize,
+    k: usize,
+    n: usize,
+    alpha: Fam::Acc,
+    a: *const Fam::Lhs,
+    rsa: isize,
+    csa: isize,
+    b: *const Fam::Rhs,
+    rsb: isize,
+    csb: isize,
+    beta: Fam::Acc,
+    c: *mut Fam::Out,
+    rsc: isize,
+    csc: isize,
+    epi: &E,
+    par: Parallelism,
+    ws: &mut Workspace,
+) where
+    Fam: KernelFamily,
+    S: KernelSimd<Fam::Lhs, Fam::Rhs, Fam::Acc, Fam::Out>,
+    E: Epilogue<Fam>,
+{
+    // SAFETY: forwarded to `run_inner` with no prepacked RHS and the caller's epilogue.
+    unsafe {
+        run_inner::<Fam, S, MR_REG, NR, E>(
+            simd, m, k, n, alpha, a, rsa, csa, b, rsb, csb, beta, c, rsc, csc, par, ws, None, epi,
         )
     }
 }
@@ -136,7 +180,7 @@ pub unsafe fn run_packed_rhs<Fam, S, const MR_REG: usize, const NR: usize>(
     // SAFETY: forwarded with the prepacked buffer and its packed (kc, nc); `rsb`/
     // `csb` are unused on the prepacked path (the panel layout is baked in).
     unsafe {
-        run_inner::<Fam, S, MR_REG, NR>(
+        run_inner::<Fam, S, MR_REG, NR, Identity>(
             simd,
             m,
             k,
@@ -155,6 +199,7 @@ pub unsafe fn run_packed_rhs<Fam, S, const MR_REG: usize, const NR: usize>(
             par,
             ws,
             Some((packed_b, kc, nc)),
+            &Identity,
         )
     }
 }
@@ -245,7 +290,7 @@ pub unsafe fn pack_lhs_full<Fam: KernelFamily>(
 /// (`packed_b = Some(..)`). When prepacked, the per-call B-pack region is skipped
 /// and the compute region reads panels from the prepacked buffer instead.
 #[allow(clippy::too_many_arguments)]
-unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize>(
+unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize, E>(
     simd: S,
     m: usize,
     k: usize,
@@ -266,10 +311,15 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize>(
     // `Some((buffer, kc, nc))` on the prepacked-RHS path: the buffer base plus the
     // blocking sizes it was packed for (used verbatim so panel addresses match).
     packed: Option<(*const Fam::Rhs, usize, usize)>,
+    // The fused epilogue (zero-cost `Identity` on the plain/prepacked paths). Copied into
+    // each worker closure (`E: Copy + Send + Sync`), the same capture discipline as `Ptr`.
+    epi: &E,
 ) where
     Fam: KernelFamily,
     S: KernelSimd<Fam::Lhs, Fam::Rhs, Fam::Acc, Fam::Out>,
+    E: Epilogue<Fam>,
 {
+    let epi = *epi;
     unsafe {
         // `mr` is in *accumulator* lanes: the microkernel widens narrow inputs into
         // `Acc` registers, so a panel row maps to an `Acc` lane. Homogeneous float
@@ -441,6 +491,10 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize>(
                 // Depth-padded panel stride for dot families (identity when `q_depth == 1`).
                 let kc_eff_pad = kc_eff.next_multiple_of(q_depth);
                 let first = pc == 0;
+                // Whether this is the final depth slice: the fused epilogue applies only on
+                // the last panel (raw `Acc` partials store on the earlier ones). For an
+                // `OUT_IS_ACC = false` family (`kc = k`) this is always the single slice.
+                let last = pc + kc_eff >= k;
                 let beta_eff = if first { beta } else { Fam::Acc::ONE };
                 let bst = if first {
                     beta_status(beta)
@@ -501,7 +555,7 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize>(
                     // edition-2024 (RFC 2229) closures otherwise capture the inner
                     // `*mut` fields disjointly, which are not `Sync`, so the closure
                     // would fail the bound needed to move into the rayon workers.
-                    let (a, b, c, a_base, b_base) = (a, b, c, a_base, b_base);
+                    let (a, b, c, a_base, b_base, epi) = (a, b, c, a_base, b_base, epi);
                     // Per-worker scratch slot (per-worker path only). On the shared-A
                     // path `tid` may exceed `n_mc`, so `a_base + tid*a_stride` would be
                     // out-of-bounds pointer arithmetic even though it is never read —
@@ -602,7 +656,10 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize>(
                                     };
                                     let cptr =
                                         c.0.offset((ic + ir) as isize * rsc + col as isize * csc);
-                                    Fam::microkernel::<S, MR_REG, NR>(
+                                    // `ic + ir` and `col` are the tile's origin in the
+                                    // oriented frame, so a per-row/per-col bias resolves its
+                                    // absolute base; `last` gates the once-per-element apply.
+                                    Fam::microkernel_epi::<S, E, MR_REG, NR>(
                                         simd,
                                         kc_eff,
                                         alpha,
@@ -619,6 +676,10 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize>(
                                         csc,
                                         mr_eff,
                                         nr_eff,
+                                        ic + ir,
+                                        col,
+                                        last,
+                                        &epi,
                                         scratch_ptr,
                                     );
                                     ir += mr;

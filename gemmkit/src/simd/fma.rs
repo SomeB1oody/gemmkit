@@ -87,6 +87,16 @@ impl SimdOps<f32> for Fma {
         unsafe { _mm256_fnmadd_ps(a, b, c) }
     }
     #[inline(always)]
+    unsafe fn max(self, a: Self::Reg, b: Self::Reg) -> Self::Reg {
+        // x86 MAXPS returns the second operand on an unordered compare, so a `NaN` `a`
+        // returns `b` — the `max`/`min` NaN-in-`a` contract.
+        unsafe { _mm256_max_ps(a, b) }
+    }
+    #[inline(always)]
+    unsafe fn min(self, a: Self::Reg, b: Self::Reg) -> Self::Reg {
+        unsafe { _mm256_min_ps(a, b) }
+    }
+    #[inline(always)]
     unsafe fn reduce_sum(self, v: Self::Reg) -> f32 {
         unsafe {
             let hi = _mm256_extractf128_ps(v, 1);
@@ -146,6 +156,15 @@ impl SimdOps<f64> for Fma {
     unsafe fn fnma(self, a: Self::Reg, b: Self::Reg, c: Self::Reg) -> Self::Reg {
         // `_mm256_fnmadd_pd(a, b, c)` == `c - a*b`.
         unsafe { _mm256_fnmadd_pd(a, b, c) }
+    }
+    #[inline(always)]
+    unsafe fn max(self, a: Self::Reg, b: Self::Reg) -> Self::Reg {
+        // x86 MAXPD returns the second operand when unordered (NaN `a` -> `b`).
+        unsafe { _mm256_max_pd(a, b) }
+    }
+    #[inline(always)]
+    unsafe fn min(self, a: Self::Reg, b: Self::Reg) -> Self::Reg {
+        unsafe { _mm256_min_pd(a, b) }
     }
     #[inline(always)]
     unsafe fn reduce_sum(self, v: Self::Reg) -> f64 {

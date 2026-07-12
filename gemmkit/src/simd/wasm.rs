@@ -102,6 +102,18 @@ impl SimdOps<f32> for Simd128 {
         f32x4_sub(c, f32x4_mul(a, b))
     }
     #[inline(always)]
+    unsafe fn max(self, a: Self::Reg, b: Self::Reg) -> Self::Reg {
+        // `f32x4_pmax(a, b)` is `b < a ? a : b`: a `NaN` `a` makes `b < a` false, so it
+        // returns `b` — the `max`/`min` NaN-in-`a` contract. NOT `f32x4_max`, which
+        // propagates NaN and would break the fast-vs-scalar epilogue agreement.
+        f32x4_pmax(a, b)
+    }
+    #[inline(always)]
+    unsafe fn min(self, a: Self::Reg, b: Self::Reg) -> Self::Reg {
+        // `f32x4_pmin(a, b)` is `a < b ? a : b`: NaN `a` -> `b`.
+        f32x4_pmin(a, b)
+    }
+    #[inline(always)]
     unsafe fn reduce_sum(self, v: Self::Reg) -> f32 {
         // Fixed lane order (0,1,2,3) → reproducible. Used only by the gemv path.
         f32x4_extract_lane::<0>(v)
@@ -156,6 +168,15 @@ impl SimdOps<f64> for Simd128 {
     #[inline(always)]
     unsafe fn fnma(self, a: Self::Reg, b: Self::Reg, c: Self::Reg) -> Self::Reg {
         f64x2_sub(c, f64x2_mul(a, b))
+    }
+    #[inline(always)]
+    unsafe fn max(self, a: Self::Reg, b: Self::Reg) -> Self::Reg {
+        // `f64x2_pmax(a, b)` is `b < a ? a : b` (NaN `a` -> `b`); see the `f32` impl.
+        f64x2_pmax(a, b)
+    }
+    #[inline(always)]
+    unsafe fn min(self, a: Self::Reg, b: Self::Reg) -> Self::Reg {
+        f64x2_pmin(a, b)
     }
     #[inline(always)]
     unsafe fn reduce_sum(self, v: Self::Reg) -> f64 {

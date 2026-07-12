@@ -18,6 +18,7 @@ use crate::simd::KernelSimd;
 
 #[cfg(feature = "complex")]
 pub mod complex;
+pub mod epilogue;
 pub mod float;
 #[cfg(feature = "int8")]
 pub mod int;
@@ -26,9 +27,10 @@ pub mod mixed;
 
 #[cfg(feature = "complex")]
 pub use complex::ComplexGemm;
+pub use epilogue::{Epilogue, Identity};
 pub use float::FloatGemm;
 #[cfg(feature = "int8")]
-pub use int::{IntGemm, IntGemmVnni};
+pub use int::{IntGemm, IntGemmQ, IntGemmVnni, IntGemmVnniQ};
 #[cfg(feature = "half")]
 pub use mixed::{Bf16DotGemm, MixedGemm};
 
@@ -187,4 +189,80 @@ pub trait KernelFamily: Copy + Send + Sync + 'static {
         scratch: *mut Self::Acc,
     ) where
         S: KernelSimd<Self::Lhs, Self::Rhs, Self::Acc, Self::Out>;
+
+    /// Compute one `MR × NR` tile and apply the fused [`Epilogue`] `E` to each stored
+    /// element. `row0`/`col0` are the tile's origin in the **oriented** problem frame (so
+    /// a per-row/per-col bias resolves its absolute base), and `last_k` is whether this is
+    /// the final depth panel — the epilogue applies only then for `OUT_IS_ACC` families
+    /// (intermediate panels store raw `Acc` partials; see [`KernelFamily`]).
+    ///
+    /// The **default** forwards to [`KernelFamily::microkernel`], ignoring the epilogue
+    /// arguments: it is correct only for `E = Identity` (a `debug_assert` enforces this),
+    /// which is exactly what the driver passes on every non-fused path — so `mixed`,
+    /// `complex`, and the `i32`-out integer families need no edit and stay byte-for-byte
+    /// unchanged. A family that supports fusion (the float family and the requantizing
+    /// integer families) overrides this to thread `E` through its store.
+    ///
+    /// # Safety
+    /// As [`KernelFamily::microkernel`]; `epi`'s interior pointers must be valid for the
+    /// problem's `m`/`n`.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    unsafe fn microkernel_epi<S, E, const MR_REG: usize, const NR: usize>(
+        simd: S,
+        kc: usize,
+        alpha: Self::Acc,
+        beta: Self::Acc,
+        alpha_status: AlphaStatus,
+        beta_status: BetaStatus,
+        a: *const Self::Lhs,
+        a_cs: isize,
+        b: *const Self::Rhs,
+        b_rs: isize,
+        b_cs: isize,
+        c: *mut Self::Out,
+        rsc: isize,
+        csc: isize,
+        mr_eff: usize,
+        nr_eff: usize,
+        row0: usize,
+        col0: usize,
+        last_k: bool,
+        epi: &E,
+        scratch: *mut Self::Acc,
+    ) where
+        S: KernelSimd<Self::Lhs, Self::Rhs, Self::Acc, Self::Out>,
+        E: Epilogue<Self>,
+    {
+        // Fail closed in every build: a family that does not override this must never
+        // silently drop a real epilogue. `E::IS_IDENTITY` is a const, so this folds away
+        // entirely for `Identity` (the only in-crate caller) and becomes an unconditional
+        // panic for any non-identity `E` reaching a non-overriding family.
+        assert!(
+            E::IS_IDENTITY,
+            "this family does not implement fused epilogues"
+        );
+        let _ = (row0, col0, last_k, epi);
+        unsafe {
+            Self::microkernel::<S, MR_REG, NR>(
+                simd,
+                kc,
+                alpha,
+                beta,
+                alpha_status,
+                beta_status,
+                a,
+                a_cs,
+                b,
+                b_rs,
+                b_cs,
+                c,
+                rsc,
+                csc,
+                mr_eff,
+                nr_eff,
+                scratch,
+            )
+        }
+    }
 }

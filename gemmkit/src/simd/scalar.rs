@@ -80,6 +80,15 @@ macro_rules! impl_scalar_ops {
             unsafe fn reduce_sum(self, v: Self::Reg) -> $t {
                 v
             }
+            #[inline(always)]
+            unsafe fn max(self, a: Self::Reg, b: Self::Reg) -> Self::Reg {
+                // `NaN > b` is false, so a `NaN` `a` returns `b` (the contract).
+                if a > b { a } else { b }
+            }
+            #[inline(always)]
+            unsafe fn min(self, a: Self::Reg, b: Self::Reg) -> Self::Reg {
+                if a < b { a } else { b }
+            }
         }
     };
 }

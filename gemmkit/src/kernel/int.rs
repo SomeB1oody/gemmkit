@@ -12,8 +12,10 @@
 
 use core::marker::PhantomData;
 
+use super::epilogue::Epilogue;
 use super::{AlphaStatus, BetaStatus, KernelFamily};
 use crate::pack::{pack_kgroup_panels, pack_panels};
+use crate::scalar::Scalar;
 use crate::simd::{KernelSimd, SimdOps};
 
 /// Fold `alpha` into the register-resident `acc` and apply the `i32` epilogue
@@ -112,6 +114,119 @@ unsafe fn int32_epilogue<S, const MR_REG: usize, const NR: usize>(
     }
 }
 
+/// Widen-and-multiply accumulation of one `MR_REG × NR` `i32` microtile: sign-extend the
+/// `i8` A/B inputs to `i32` on load and fold in ascending `k`. Factored out of
+/// [`IntGemm::microkernel`] so the requantizing family [`IntGemmQ`] shares the exact same
+/// accumulation. The two differ only in the output type `O`, which selects the (bit-
+/// identical) widen load: the `<i8,i8,i32,i8>` blanket delegates its `load_lhs`/`splat_rhs`
+/// straight to the `<i8,i8,i32,i32>` impl, so `O = i8` and `O = i32` accumulate identically.
+/// The `load_lhs`/`splat_rhs` calls are fully qualified because a requant token carries both
+/// `KernelSimd` impls, which would otherwise make the plain method call ambiguous.
+///
+/// # Safety
+/// As [`KernelFamily::microkernel`]; run inside `S`'s [`crate::simd::Simd::vectorize`].
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+#[inline(always)]
+unsafe fn i32_accumulate<S, O, const MR_REG: usize, const NR: usize>(
+    simd: S,
+    kc: usize,
+    a: *const i8,
+    a_cs: isize,
+    b: *const i8,
+    b_rs: isize,
+    b_cs: isize,
+    nr_eff: usize,
+    acc: &mut [[<S as SimdOps<i32>>::Reg; MR_REG]; NR],
+) where
+    O: Scalar,
+    S: KernelSimd<i8, i8, i32, O>,
+{
+    unsafe {
+        let lanes = <S as SimdOps<i32>>::LANES;
+        if nr_eff == NR {
+            for p in 0..kc {
+                let pa = a.offset(p as isize * a_cs);
+                let a_regs: [<S as SimdOps<i32>>::Reg; MR_REG] = core::array::from_fn(|i| {
+                    <S as KernelSimd<i8, i8, i32, O>>::load_lhs(simd, pa.add(i * lanes))
+                });
+                let pb = b.offset(p as isize * b_rs);
+                for j in 0..NR {
+                    let bj = <S as KernelSimd<i8, i8, i32, O>>::splat_rhs(
+                        simd,
+                        *pb.offset(j as isize * b_cs),
+                    );
+                    for i in 0..MR_REG {
+                        acc[j][i] = simd.mul_add(a_regs[i], bj, acc[j][i]);
+                    }
+                }
+            }
+        } else {
+            for p in 0..kc {
+                let pa = a.offset(p as isize * a_cs);
+                let a_regs: [<S as SimdOps<i32>>::Reg; MR_REG] = core::array::from_fn(|i| {
+                    <S as KernelSimd<i8, i8, i32, O>>::load_lhs(simd, pa.add(i * lanes))
+                });
+                let pb = b.offset(p as isize * b_rs);
+                for j in 0..nr_eff {
+                    let bj = <S as KernelSimd<i8, i8, i32, O>>::splat_rhs(
+                        simd,
+                        *pb.offset(j as isize * b_cs),
+                    );
+                    for i in 0..MR_REG {
+                        acc[j][i] = simd.mul_add(a_regs[i], bj, acc[j][i]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Requantize a computed `i32` microtile to `i8`: drain `acc` to `i32` scratch (vectorized),
+/// then map each live element through the scalar epilogue `E`, which writes the `Out = i8`
+/// directly (strided). Shared by both requantizing families. The epilogue always applies —
+/// these families are `OUT_IS_ACC = false`, so `kc = k` and this is the single final panel,
+/// so there is no `last_k` gate.
+///
+/// # Safety
+/// As [`KernelFamily::microkernel_epi`]; `scratch` holds at least [`super::SCRATCH_LEN`]
+/// `i32` elements.
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+#[inline(always)]
+unsafe fn requant_scratch_epilogue<F, S, E, const MR_REG: usize, const NR: usize>(
+    simd: S,
+    acc: &[[<S as SimdOps<i32>>::Reg; MR_REG]; NR],
+    c: *mut i8,
+    rsc: isize,
+    csc: isize,
+    mr_eff: usize,
+    nr_eff: usize,
+    row0: usize,
+    col0: usize,
+    epi: &E,
+    scratch: *mut i32,
+) where
+    F: KernelFamily<Acc = i32, Out = i8>,
+    S: SimdOps<i32>,
+    E: Epilogue<F>,
+{
+    unsafe {
+        let lanes = <S as SimdOps<i32>>::LANES;
+        let mr = MR_REG * lanes;
+        for j in 0..NR {
+            for i in 0..MR_REG {
+                simd.storeu(scratch.add(j * mr + i * lanes), acc[j][i]);
+            }
+        }
+        for j in 0..nr_eff {
+            for i in 0..mr_eff {
+                let v = *scratch.add(j * mr + i);
+                let cp = c.offset(i as isize * rsc + j as isize * csc);
+                *cp = epi.apply(v, row0 + i, col0 + j);
+            }
+        }
+    }
+}
+
 /// The integer GEMM family: `Lhs = Rhs = i8`, `Acc = Out = i32`.
 pub struct IntGemm(PhantomData<()>);
 
@@ -188,37 +303,11 @@ impl KernelFamily for IntGemm {
         S: KernelSimd<i8, i8, i32, i32>,
     {
         unsafe {
-            let lanes = <S as SimdOps<i32>>::LANES;
-
             // --- accumulate in i32: sign-extend A/B to i32, multiply-add ---
             let mut acc: [[<S as SimdOps<i32>>::Reg; MR_REG]; NR] = [[simd.zero(); MR_REG]; NR];
-            if nr_eff == NR {
-                for p in 0..kc {
-                    let pa = a.offset(p as isize * a_cs);
-                    let a_regs: [<S as SimdOps<i32>>::Reg; MR_REG] =
-                        core::array::from_fn(|i| simd.load_lhs(pa.add(i * lanes)));
-                    let pb = b.offset(p as isize * b_rs);
-                    for j in 0..NR {
-                        let bj = simd.splat_rhs(*pb.offset(j as isize * b_cs));
-                        for i in 0..MR_REG {
-                            acc[j][i] = simd.mul_add(a_regs[i], bj, acc[j][i]);
-                        }
-                    }
-                }
-            } else {
-                for p in 0..kc {
-                    let pa = a.offset(p as isize * a_cs);
-                    let a_regs: [<S as SimdOps<i32>>::Reg; MR_REG] =
-                        core::array::from_fn(|i| simd.load_lhs(pa.add(i * lanes)));
-                    let pb = b.offset(p as isize * b_rs);
-                    for j in 0..nr_eff {
-                        let bj = simd.splat_rhs(*pb.offset(j as isize * b_cs));
-                        for i in 0..MR_REG {
-                            acc[j][i] = simd.mul_add(a_regs[i], bj, acc[j][i]);
-                        }
-                    }
-                }
-            }
+            i32_accumulate::<S, i32, MR_REG, NR>(
+                simd, kc, a, a_cs, b, b_rs, b_cs, nr_eff, &mut acc,
+            );
 
             // alpha fold + exact i32 epilogue (shared with `IntGemmVnni`).
             int32_epilogue::<S, MR_REG, NR>(
@@ -348,7 +437,11 @@ impl KernelFamily for IntGemmVnni {
             // full `NR` is always processed: `FORCE_PACK_RHS` zero-pads tail columns
             // (contributing 0, column sum 0); the epilogue copies only the live sub-tile.
             let mut acc: [[<S as SimdOps<i32>>::Reg; MR_REG]; NR] = [[simd.zero(); MR_REG]; NR];
-            simd.dot_accumulate::<MR_REG, NR>(kc, a, b, &mut acc);
+            // Fully qualified: a VNNI token carries both `<i8,i8,i32,i32>` (concrete) and
+            // `<i8,i8,i32,i8>` (blanket) `dot_accumulate`, which the plain call cannot pick.
+            <S as KernelSimd<i8, i8, i32, i32>>::dot_accumulate::<MR_REG, NR>(
+                simd, kc, a, b, &mut acc,
+            );
 
             // alpha fold + exact i32 epilogue (shared with `IntGemm`).
             int32_epilogue::<S, MR_REG, NR>(
@@ -364,6 +457,254 @@ impl KernelFamily for IntGemmVnni {
                 mr_eff,
                 nr_eff,
                 scratch,
+            );
+        }
+    }
+}
+
+/// The `i8 -> i8` **requantizing** integer family (widen-and-multiply): accumulate in `i32`
+/// exactly like [`IntGemm`], then apply an `i32 -> i8` requantize [`Epilogue`] (per-tensor
+/// scale + zero-point + optional integer bias) as the tile is stored.
+///
+/// `OUT_IS_ACC = false`, so the driver forces `kc = k` — a single depth panel. That makes
+/// the requantize fire **exactly once** per output element *structurally* (no `last_k` gate
+/// needed), and an `i32` partial never has to round-trip through the `i8` output. `alpha` is
+/// folded into `scale` and `beta` is disallowed (accumulating into a quantized C is
+/// ill-defined), which the epilogue call site enforces (`AlphaStatus::One`,
+/// `BetaStatus::Zero`).
+pub struct IntGemmQ(PhantomData<()>);
+
+impl Clone for IntGemmQ {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl Copy for IntGemmQ {}
+
+impl KernelFamily for IntGemmQ {
+    type Lhs = i8;
+    type Rhs = i8;
+    type Acc = i32;
+    type Out = i8;
+
+    const OUT_IS_ACC: bool = false; // driver forces kc = k => fire-once, structurally
+
+    #[inline]
+    unsafe fn pack_lhs(
+        dst: *mut i8,
+        src: *const i8,
+        rs: isize,
+        cs: isize,
+        mc: usize,
+        kc: usize,
+        mr: usize,
+    ) {
+        // Plain micropanel copy, identical to `IntGemm` (sign-extension happens on load).
+        unsafe { pack_panels(dst, src, rs, cs, mc, kc, mr) }
+    }
+
+    #[inline]
+    unsafe fn pack_rhs(
+        dst: *mut i8,
+        src: *const i8,
+        rs: isize,
+        cs: isize,
+        kc: usize,
+        nc: usize,
+        nr: usize,
+    ) {
+        unsafe { pack_panels(dst, src, cs, rs, nc, kc, nr) }
+    }
+
+    unsafe fn microkernel<S, const MR_REG: usize, const NR: usize>(
+        _simd: S,
+        _kc: usize,
+        _alpha: i32,
+        _beta: i32,
+        _alpha_status: AlphaStatus,
+        _beta_status: BetaStatus,
+        _a: *const i8,
+        _a_cs: isize,
+        _b: *const i8,
+        _b_rs: isize,
+        _b_cs: isize,
+        _c: *mut i8,
+        _rsc: isize,
+        _csc: isize,
+        _mr_eff: usize,
+        _nr_eff: usize,
+        _scratch: *mut i32,
+    ) where
+        S: KernelSimd<i8, i8, i32, i8>,
+    {
+        unreachable!("requant families run only via microkernel_epi")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    unsafe fn microkernel_epi<S, E, const MR_REG: usize, const NR: usize>(
+        simd: S,
+        kc: usize,
+        _alpha: i32,
+        _beta: i32,
+        alpha_status: AlphaStatus,
+        beta_status: BetaStatus,
+        a: *const i8,
+        a_cs: isize,
+        b: *const i8,
+        b_rs: isize,
+        b_cs: isize,
+        c: *mut i8,
+        rsc: isize,
+        csc: isize,
+        mr_eff: usize,
+        nr_eff: usize,
+        row0: usize,
+        col0: usize,
+        _last_k: bool,
+        epi: &E,
+        scratch: *mut i32,
+    ) where
+        S: KernelSimd<i8, i8, i32, i8>,
+        E: Epilogue<Self>,
+    {
+        debug_assert!(matches!(beta_status, BetaStatus::Zero));
+        debug_assert!(matches!(alpha_status, AlphaStatus::One));
+        unsafe {
+            let mut acc: [[<S as SimdOps<i32>>::Reg; MR_REG]; NR] = [[simd.zero(); MR_REG]; NR];
+            i32_accumulate::<S, i8, MR_REG, NR>(simd, kc, a, a_cs, b, b_rs, b_cs, nr_eff, &mut acc);
+            requant_scratch_epilogue::<Self, S, E, MR_REG, NR>(
+                simd, &acc, c, rsc, csc, mr_eff, nr_eff, row0, col0, epi, scratch,
+            );
+        }
+    }
+}
+
+/// The VNNI requantizing family: the same `i8 -> i8` requantize as [`IntGemmQ`], but the
+/// exact `i32` accumulation is produced by `vpdpbusd` (mirror of [`IntGemmVnni`]) —
+/// `FORCE_PACK_* = true`, `DEPTH_MULTIPLE = 4`, the k-quad-interleaved `+128`/identity pack.
+/// VNNI's grouped sum is bit-equal to the widen sum (int.rs modular associativity + bias
+/// correction), so `IntGemmVnniQ` and `IntGemmQ` requantize to identical `i8` output.
+pub struct IntGemmVnniQ(PhantomData<()>);
+
+impl Clone for IntGemmVnniQ {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl Copy for IntGemmVnniQ {}
+
+impl IntGemmVnniQ {
+    /// Depth steps folded per `vpdpbusd`.
+    const Q: usize = 4;
+}
+
+impl KernelFamily for IntGemmVnniQ {
+    type Lhs = i8;
+    type Rhs = i8;
+    type Acc = i32;
+    type Out = i8;
+
+    const OUT_IS_ACC: bool = false;
+    const FORCE_PACK_LHS: bool = true;
+    const FORCE_PACK_RHS: bool = true;
+    const DEPTH_MULTIPLE: usize = Self::Q;
+
+    /// Identical to [`IntGemmVnni::pack_lhs`]: k-quad-interleaved with the `+128` bias.
+    #[inline]
+    unsafe fn pack_lhs(
+        dst: *mut i8,
+        src: *const i8,
+        rs: isize,
+        cs: isize,
+        mc: usize,
+        kc: usize,
+        mr: usize,
+    ) {
+        unsafe {
+            pack_kgroup_panels::<i8, { Self::Q }, _>(dst, src, rs, cs, mc, kc, mr, |v| {
+                ((v as i32 + 128) as u8) as i8
+            })
+        }
+    }
+
+    /// Identical to [`IntGemmVnni::pack_rhs`]: k-quad-interleaved, values stay signed.
+    #[inline]
+    unsafe fn pack_rhs(
+        dst: *mut i8,
+        src: *const i8,
+        rs: isize,
+        cs: isize,
+        kc: usize,
+        nc: usize,
+        nr: usize,
+    ) {
+        unsafe { pack_kgroup_panels::<i8, { Self::Q }, _>(dst, src, cs, rs, nc, kc, nr, |v| v) }
+    }
+
+    unsafe fn microkernel<S, const MR_REG: usize, const NR: usize>(
+        _simd: S,
+        _kc: usize,
+        _alpha: i32,
+        _beta: i32,
+        _alpha_status: AlphaStatus,
+        _beta_status: BetaStatus,
+        _a: *const i8,
+        _a_cs: isize,
+        _b: *const i8,
+        _b_rs: isize,
+        _b_cs: isize,
+        _c: *mut i8,
+        _rsc: isize,
+        _csc: isize,
+        _mr_eff: usize,
+        _nr_eff: usize,
+        _scratch: *mut i32,
+    ) where
+        S: KernelSimd<i8, i8, i32, i8>,
+    {
+        unreachable!("requant families run only via microkernel_epi")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    unsafe fn microkernel_epi<S, E, const MR_REG: usize, const NR: usize>(
+        simd: S,
+        kc: usize,
+        _alpha: i32,
+        _beta: i32,
+        alpha_status: AlphaStatus,
+        beta_status: BetaStatus,
+        a: *const i8,
+        _a_cs: isize,
+        b: *const i8,
+        _b_rs: isize,
+        _b_cs: isize,
+        c: *mut i8,
+        rsc: isize,
+        csc: isize,
+        mr_eff: usize,
+        nr_eff: usize,
+        row0: usize,
+        col0: usize,
+        _last_k: bool,
+        epi: &E,
+        scratch: *mut i32,
+    ) where
+        S: KernelSimd<i8, i8, i32, i8>,
+        E: Epilogue<Self>,
+    {
+        debug_assert!(matches!(beta_status, BetaStatus::Zero));
+        debug_assert!(matches!(alpha_status, AlphaStatus::One));
+        unsafe {
+            let mut acc: [[<S as SimdOps<i32>>::Reg; MR_REG]; NR] = [[simd.zero(); MR_REG]; NR];
+            // Fully qualified: a VNNI token carries both `<i8,i8,i32,i32>` and the blanket
+            // `<i8,i8,i32,i8>` `dot_accumulate`; the blanket delegates to the former.
+            <S as KernelSimd<i8, i8, i32, i8>>::dot_accumulate::<MR_REG, NR>(
+                simd, kc, a, b, &mut acc,
+            );
+            requant_scratch_epilogue::<Self, S, E, MR_REG, NR>(
+                simd, &acc, c, rsc, csc, mr_eff, nr_eff, row0, col0, epi, scratch,
             );
         }
     }

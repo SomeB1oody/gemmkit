@@ -53,13 +53,22 @@ use crate::kernel::Bf16DotGemm;
 use crate::kernel::FloatGemm;
 #[cfg(feature = "int8")]
 use crate::kernel::IntGemm;
+#[cfg(feature = "int8")]
+use crate::kernel::IntGemmQ;
 #[cfg(all(feature = "int8", any(target_arch = "x86", target_arch = "x86_64")))]
 use crate::kernel::IntGemmVnni;
+#[cfg(all(feature = "int8", any(target_arch = "x86", target_arch = "x86_64")))]
+use crate::kernel::IntGemmVnniQ;
 #[cfg(feature = "int8")]
 use crate::kernel::KernelFamily;
 #[cfg(feature = "half")]
 use crate::kernel::MixedGemm;
+#[cfg(feature = "int8")]
+use crate::kernel::epilogue::{BiasDim, KRequantize};
+use crate::kernel::epilogue::{BiasSpec, Epilogue, FusedEpi};
 use crate::parallel::Parallelism;
+#[cfg(feature = "int8")]
+use crate::parallel::Ptr;
 #[cfg(feature = "half")]
 use crate::scalar::NarrowFloat;
 use crate::scalar::{Float, Scalar};
@@ -335,6 +344,24 @@ pub trait GemmScalar: Scalar {
     fn rhs_depth_multiple() -> usize {
         1
     }
+
+    /// Run the ISA-dispatched **fused-epilogue** kernel for this type. The default is
+    /// unreachable — only the real floats (`f32`/`f64`, the sealed [`FusedScalar`] set) have
+    /// a fused path; `f16`/`bf16` keep the default and never reach it (the public API bound
+    /// forbids them).
+    ///
+    /// # Safety
+    /// `task`'s pointers valid and `c` not aliasing `a`/`b`; `epi`'s bias valid and disjoint
+    /// from `c` (validated by the API layer).
+    #[doc(hidden)]
+    unsafe fn dispatch_fused(
+        _task: Task<Self>,
+        _epi: FusedEpi<Self>,
+        _par: Parallelism,
+        _ws: &mut Workspace,
+    ) {
+        unreachable!("fused epilogue is dispatched only for f32/f64 (the FusedScalar bound)")
+    }
 }
 
 /// Top-level entry used by the API layer: handle the degenerate cases (here,
@@ -504,6 +531,43 @@ unsafe fn run_typed<T, S, const MR_REG: usize, const NR: usize>(
         driver::run::<FloatGemm<T>, S, MR_REG, NR>(
             simd, t.m, t.k, t.n, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb, t.beta, t.c, t.rsc,
             t.csc, par, ws,
+        );
+    }
+}
+
+/// **Fused-epilogue** driver entry for a concrete `(type, ISA, tile)`: mirror of [`run_typed`]
+/// but with the special-path routing **deleted**. gemv / small_mn / small_k have no epilogue
+/// hook — routing there would silently drop the epilogue — so every fused shape goes through
+/// the general driver (correct for any shape). The orientation swap flips the bias axis: a
+/// row-major-ish C makes the engine compute `Cᵀ = Bᵀ·Aᵀ`, swapping `m↔n`, so a user per-row
+/// bias becomes per-col in the driver frame (a field write, not a new monomorphization).
+///
+/// # Safety
+/// As [`run_typed`], plus `epi`'s interior pointers valid for the (pre-swap) problem's `m`/`n`.
+#[inline]
+unsafe fn run_typed_fused<T, S, const MR_REG: usize, const NR: usize>(
+    simd: S,
+    mut t: Task<T>,
+    mut epi: FusedEpi<T>,
+    par: Parallelism,
+    ws: &mut Workspace,
+) where
+    T: FusedScalar,
+    S: SimdOps<T>,
+{
+    unsafe {
+        let swap = t.csc.unsigned_abs() < t.rsc.unsigned_abs();
+        orient_transpose(&mut t);
+        if swap {
+            epi.bias = match epi.bias {
+                BiasSpec::None => BiasSpec::None,
+                BiasSpec::Row(p) => BiasSpec::Col(p),
+                BiasSpec::Col(p) => BiasSpec::Row(p),
+            };
+        }
+        driver::run_epilogue::<FloatGemm<T>, S, FusedEpi<T>, MR_REG, NR>(
+            simd, t.m, t.k, t.n, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb, t.beta, t.c, t.rsc,
+            t.csc, &epi, par, ws,
         );
     }
 }
@@ -906,6 +970,161 @@ unsafe fn gemm_f64_simd128_packed(r: PackedConsume<f64>, par: Parallelism, ws: &
     unsafe { run_packed_typed::<f64, Simd128, 2, 4>(Simd128, r, par, ws) }
 }
 
+// ---- fused-epilogue entry points: one per (f32/f64, ISA), same tiles as the plain
+// wrappers (the epilogue is tile-local, so the register budget is unchanged) ----
+
+unsafe fn gemm_f32_scalar_fused(
+    t: Task<f32>,
+    epi: FusedEpi<f32>,
+    par: Parallelism,
+    ws: &mut Workspace,
+) {
+    unsafe { run_typed_fused::<f32, ScalarTok, 4, 4>(ScalarTok, t, epi, par, ws) }
+}
+unsafe fn gemm_f64_scalar_fused(
+    t: Task<f64>,
+    epi: FusedEpi<f64>,
+    par: Parallelism,
+    ws: &mut Workspace,
+) {
+    unsafe { run_typed_fused::<f64, ScalarTok, 4, 4>(ScalarTok, t, epi, par, ws) }
+}
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+unsafe fn gemm_f32_fma_fused(
+    t: Task<f32>,
+    epi: FusedEpi<f32>,
+    par: Parallelism,
+    ws: &mut Workspace,
+) {
+    unsafe { run_typed_fused::<f32, Fma, 2, 6>(Fma, t, epi, par, ws) }
+}
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+unsafe fn gemm_f64_fma_fused(
+    t: Task<f64>,
+    epi: FusedEpi<f64>,
+    par: Parallelism,
+    ws: &mut Workspace,
+) {
+    unsafe { run_typed_fused::<f64, Fma, 2, 6>(Fma, t, epi, par, ws) }
+}
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+unsafe fn gemm_f32_avx512_fused(
+    t: Task<f32>,
+    epi: FusedEpi<f32>,
+    par: Parallelism,
+    ws: &mut Workspace,
+) {
+    unsafe { run_typed_fused::<f32, Avx512, 2, 12>(Avx512, t, epi, par, ws) }
+}
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+unsafe fn gemm_f64_avx512_fused(
+    t: Task<f64>,
+    epi: FusedEpi<f64>,
+    par: Parallelism,
+    ws: &mut Workspace,
+) {
+    unsafe { run_typed_fused::<f64, Avx512, 2, 12>(Avx512, t, epi, par, ws) }
+}
+#[cfg(target_arch = "aarch64")]
+unsafe fn gemm_f32_neon_fused(
+    t: Task<f32>,
+    epi: FusedEpi<f32>,
+    par: Parallelism,
+    ws: &mut Workspace,
+) {
+    unsafe { run_typed_fused::<f32, Neon, 4, 4>(Neon, t, epi, par, ws) }
+}
+#[cfg(target_arch = "aarch64")]
+unsafe fn gemm_f64_neon_fused(
+    t: Task<f64>,
+    epi: FusedEpi<f64>,
+    par: Parallelism,
+    ws: &mut Workspace,
+) {
+    unsafe { run_typed_fused::<f64, Neon, 4, 4>(Neon, t, epi, par, ws) }
+}
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+unsafe fn gemm_f32_simd128_fused(
+    t: Task<f32>,
+    epi: FusedEpi<f32>,
+    par: Parallelism,
+    ws: &mut Workspace,
+) {
+    unsafe { run_typed_fused::<f32, Simd128, 2, 4>(Simd128, t, epi, par, ws) }
+}
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+unsafe fn gemm_f64_simd128_fused(
+    t: Task<f64>,
+    epi: FusedEpi<f64>,
+    par: Parallelism,
+    ws: &mut Workspace,
+) {
+    unsafe { run_typed_fused::<f64, Simd128, 2, 4>(Simd128, t, epi, par, ws) }
+}
+
+/// The sealed element-type bound for the fused-epilogue public API: exactly the real floats
+/// `f32`/`f64`. It is a superset of [`GemmScalar`] (for dispatch) plus `Float<Acc = Self>`
+/// and `PartialOrd` (for the [`FusedEpi`] arithmetic and the `ReLU` comparisons), and it is
+/// sealed (a private supertrait) so downstream crates cannot widen the fused surface.
+pub trait FusedScalar: GemmScalar + Float<Acc = Self> + PartialOrd + sealed::Sealed {}
+
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for f32 {}
+    impl Sealed for f64 {}
+}
+
+impl FusedScalar for f32 {}
+impl FusedScalar for f64 {}
+
+/// Top-level fused entry (called by the API layer): handle the degenerate cases in the
+/// **user** frame (before orientation), then run the ISA-dispatched fused kernel.
+///
+/// # Safety
+/// `task`'s pointers must be valid; `c` must not alias `a`/`b`, and `epi`'s bias slice must
+/// not overlap `c` (the API validates this).
+pub(crate) unsafe fn execute_fused<T: FusedScalar>(
+    task: Task<T>,
+    epi: FusedEpi<T>,
+    par: Parallelism,
+    ws: &mut Workspace,
+) {
+    unsafe {
+        if task.m == 0 || task.n == 0 {
+            return;
+        }
+        // The A·B term vanishes (`k == 0` or `alpha == 0`): `C <- act(beta·C + bias)`,
+        // element-wise in the user frame (bias axes as the caller specified).
+        if task.k == 0 || task.alpha == T::ZERO {
+            fused_degenerate(&task, &epi);
+            return;
+        }
+        T::dispatch_fused(task, epi, par, ws);
+    }
+}
+
+/// The degenerate fused epilogue `C[i,j] <- apply(beta·C[i,j], i, j)` in the user frame.
+///
+/// # Safety
+/// `c` valid for the `m × n` region; `epi`'s bias valid for the problem's `m`/`n`.
+unsafe fn fused_degenerate<T: FusedScalar>(t: &Task<T>, epi: &FusedEpi<T>) {
+    unsafe {
+        for j in 0..t.n {
+            for i in 0..t.m {
+                let p = t.c.offset(i as isize * t.rsc + j as isize * t.csc);
+                let base = if t.beta == T::ZERO {
+                    T::ZERO
+                } else if t.beta == T::ONE {
+                    *p
+                } else {
+                    t.beta * *p
+                };
+                *p = epi.apply(base, i, j);
+            }
+        }
+    }
+}
+
 // ---- mixed-precision (f16 / bf16) entry points: same tiles as f32 (the
 // accumulator is f32, so the register budget matches) ----
 
@@ -1007,16 +1226,22 @@ unsafe fn gemm_bf16_simd128_packed(r: PackedConsume<bf16>, par: Parallelism, ws:
 
 type GemmFn<T> = unsafe fn(Task<T>, Parallelism, &mut Workspace);
 type PackedFn<T> = unsafe fn(PackedConsume<T>, Parallelism, &mut Workspace);
+/// The fused-epilogue kernel entry: a plain [`Task`] plus the runtime-composed
+/// [`FusedEpi`]. `Some` only for the real floats (`f32`/`f64`); the sealed
+/// [`FusedScalar`] bound makes the `None` (`f16`/`bf16`) case unreachable.
+type FusedFn<T> = unsafe fn(Task<T>, FusedEpi<T>, Parallelism, &mut Workspace);
 
 /// The memoized dispatch slot for one element type: the standard kernel, the
-/// prepacked-RHS kernel, and the microtile `(mr, nr)` they share. Bundling them
-/// keeps adding an ISA a single `select_*` ladder arm. `mr`/`nr` mirror the tile
-/// constants in the wrappers above and feed `prepack_rhs` (via `rhs_tile`) so the
-/// buffer and the consume path agree on the blocking geometry.
+/// prepacked-RHS kernel, the fused-epilogue kernel, and the microtile `(mr, nr)` they
+/// share. Bundling them keeps adding an ISA a single `select_*` ladder arm. `mr`/`nr`
+/// mirror the tile constants in the wrappers above and feed `prepack_rhs` (via `rhs_tile`)
+/// so the buffer and the consume path agree on the blocking geometry.
 #[derive(Copy, Clone)]
 struct Dispatched<T> {
     run: GemmFn<T>,
     run_packed: PackedFn<T>,
+    /// Fused-epilogue entry (`bias`/activation), or `None` for a type with no fused path.
+    run_fused: Option<FusedFn<T>>,
     mr: usize,
     nr: usize,
     /// The dispatched kernel family's [`crate::kernel::KernelFamily::DEPTH_MULTIPLE`].
@@ -1033,6 +1258,7 @@ struct Dispatched<T> {
 const DISP_F32_SCALAR: Dispatched<f32> = Dispatched {
     run: gemm_f32_scalar,
     run_packed: gemm_f32_scalar_packed,
+    run_fused: Some(gemm_f32_scalar_fused),
     mr: 4,
     nr: 4,
     depth_multiple: 1,
@@ -1040,6 +1266,7 @@ const DISP_F32_SCALAR: Dispatched<f32> = Dispatched {
 const DISP_F64_SCALAR: Dispatched<f64> = Dispatched {
     run: gemm_f64_scalar,
     run_packed: gemm_f64_scalar_packed,
+    run_fused: Some(gemm_f64_scalar_fused),
     mr: 4,
     nr: 4,
     depth_multiple: 1,
@@ -1049,6 +1276,7 @@ const DISP_F64_SCALAR: Dispatched<f64> = Dispatched {
 const DISP_F32_FMA: Dispatched<f32> = Dispatched {
     run: gemm_f32_fma,
     run_packed: gemm_f32_fma_packed,
+    run_fused: Some(gemm_f32_fma_fused),
     mr: 16,
     nr: 6,
     depth_multiple: 1,
@@ -1057,6 +1285,7 @@ const DISP_F32_FMA: Dispatched<f32> = Dispatched {
 const DISP_F64_FMA: Dispatched<f64> = Dispatched {
     run: gemm_f64_fma,
     run_packed: gemm_f64_fma_packed,
+    run_fused: Some(gemm_f64_fma_fused),
     mr: 8,
     nr: 6,
     depth_multiple: 1,
@@ -1066,6 +1295,7 @@ const DISP_F64_FMA: Dispatched<f64> = Dispatched {
 const DISP_F32_AVX512: Dispatched<f32> = Dispatched {
     run: gemm_f32_avx512,
     run_packed: gemm_f32_avx512_packed,
+    run_fused: Some(gemm_f32_avx512_fused),
     mr: 32,
     nr: 12,
     depth_multiple: 1,
@@ -1074,6 +1304,7 @@ const DISP_F32_AVX512: Dispatched<f32> = Dispatched {
 const DISP_F64_AVX512: Dispatched<f64> = Dispatched {
     run: gemm_f64_avx512,
     run_packed: gemm_f64_avx512_packed,
+    run_fused: Some(gemm_f64_avx512_fused),
     mr: 16,
     nr: 12,
     depth_multiple: 1,
@@ -1083,6 +1314,7 @@ const DISP_F64_AVX512: Dispatched<f64> = Dispatched {
 const DISP_F32_NEON: Dispatched<f32> = Dispatched {
     run: gemm_f32_neon,
     run_packed: gemm_f32_neon_packed,
+    run_fused: Some(gemm_f32_neon_fused),
     mr: 16,
     nr: 4,
     depth_multiple: 1,
@@ -1091,6 +1323,7 @@ const DISP_F32_NEON: Dispatched<f32> = Dispatched {
 const DISP_F64_NEON: Dispatched<f64> = Dispatched {
     run: gemm_f64_neon,
     run_packed: gemm_f64_neon_packed,
+    run_fused: Some(gemm_f64_neon_fused),
     mr: 8,
     nr: 4,
     depth_multiple: 1,
@@ -1100,6 +1333,7 @@ const DISP_F64_NEON: Dispatched<f64> = Dispatched {
 const DISP_F32_SIMD128: Dispatched<f32> = Dispatched {
     run: gemm_f32_simd128,
     run_packed: gemm_f32_simd128_packed,
+    run_fused: Some(gemm_f32_simd128_fused),
     mr: 8,
     nr: 4,
     depth_multiple: 1,
@@ -1108,6 +1342,7 @@ const DISP_F32_SIMD128: Dispatched<f32> = Dispatched {
 const DISP_F64_SIMD128: Dispatched<f64> = Dispatched {
     run: gemm_f64_simd128,
     run_packed: gemm_f64_simd128_packed,
+    run_fused: Some(gemm_f64_simd128_fused),
     mr: 4,
     nr: 4,
     depth_multiple: 1,
@@ -1117,6 +1352,7 @@ const DISP_F64_SIMD128: Dispatched<f64> = Dispatched {
 const DISP_F16_SCALAR: Dispatched<f16> = Dispatched {
     run: gemm_f16_scalar,
     run_packed: gemm_f16_scalar_packed,
+    run_fused: None,
     mr: 4,
     nr: 4,
     depth_multiple: 1,
@@ -1125,6 +1361,7 @@ const DISP_F16_SCALAR: Dispatched<f16> = Dispatched {
 const DISP_BF16_SCALAR: Dispatched<bf16> = Dispatched {
     run: gemm_bf16_scalar,
     run_packed: gemm_bf16_scalar_packed,
+    run_fused: None,
     mr: 4,
     nr: 4,
     depth_multiple: 1,
@@ -1134,6 +1371,7 @@ const DISP_BF16_SCALAR: Dispatched<bf16> = Dispatched {
 const DISP_F16_FMA: Dispatched<f16> = Dispatched {
     run: gemm_f16_fma,
     run_packed: gemm_f16_fma_packed,
+    run_fused: None,
     mr: 16,
     nr: 6,
     depth_multiple: 1,
@@ -1142,6 +1380,7 @@ const DISP_F16_FMA: Dispatched<f16> = Dispatched {
 const DISP_BF16_FMA: Dispatched<bf16> = Dispatched {
     run: gemm_bf16_fma,
     run_packed: gemm_bf16_fma_packed,
+    run_fused: None,
     mr: 16,
     nr: 6,
     depth_multiple: 1,
@@ -1151,6 +1390,7 @@ const DISP_BF16_FMA: Dispatched<bf16> = Dispatched {
 const DISP_F16_AVX512: Dispatched<f16> = Dispatched {
     run: gemm_f16_avx512,
     run_packed: gemm_f16_avx512_packed,
+    run_fused: None,
     mr: 32,
     nr: 12,
     depth_multiple: 1,
@@ -1159,6 +1399,7 @@ const DISP_F16_AVX512: Dispatched<f16> = Dispatched {
 const DISP_BF16_AVX512: Dispatched<bf16> = Dispatched {
     run: gemm_bf16_avx512,
     run_packed: gemm_bf16_avx512_packed,
+    run_fused: None,
     mr: 32,
     nr: 12,
     depth_multiple: 1,
@@ -1167,6 +1408,7 @@ const DISP_BF16_AVX512: Dispatched<bf16> = Dispatched {
 const DISP_BF16_AVX512_DOT: Dispatched<bf16> = Dispatched {
     run: gemm_bf16_avx512_dot,
     run_packed: gemm_bf16_avx512_dot_packed,
+    run_fused: None,
     mr: 32,
     nr: 12,
     // k-pair-interleaved pack → the prepack buffer rounds its depth up to 2.
@@ -1177,6 +1419,7 @@ const DISP_BF16_AVX512_DOT: Dispatched<bf16> = Dispatched {
 const DISP_F16_NEON: Dispatched<f16> = Dispatched {
     run: gemm_f16_neon,
     run_packed: gemm_f16_neon_packed,
+    run_fused: None,
     mr: 16,
     nr: 4,
     depth_multiple: 1,
@@ -1185,6 +1428,7 @@ const DISP_F16_NEON: Dispatched<f16> = Dispatched {
 const DISP_BF16_NEON: Dispatched<bf16> = Dispatched {
     run: gemm_bf16_neon,
     run_packed: gemm_bf16_neon_packed,
+    run_fused: None,
     mr: 16,
     nr: 4,
     depth_multiple: 1,
@@ -1194,6 +1438,7 @@ const DISP_BF16_NEON: Dispatched<bf16> = Dispatched {
 const DISP_F16_SIMD128: Dispatched<f16> = Dispatched {
     run: gemm_f16_simd128,
     run_packed: gemm_f16_simd128_packed,
+    run_fused: None,
     mr: 8,
     nr: 4,
     depth_multiple: 1,
@@ -1202,6 +1447,7 @@ const DISP_F16_SIMD128: Dispatched<f16> = Dispatched {
 const DISP_BF16_SIMD128: Dispatched<bf16> = Dispatched {
     run: gemm_bf16_simd128,
     run_packed: gemm_bf16_simd128_packed,
+    run_fused: None,
     mr: 8,
     nr: 4,
     depth_multiple: 1,
@@ -1673,6 +1919,19 @@ impl GemmScalar for f32 {
         unsafe { (dispatched_f32().run_packed)(req, par, ws) }
     }
     #[inline]
+    unsafe fn dispatch_fused(
+        t: Task<f32>,
+        epi: FusedEpi<f32>,
+        par: Parallelism,
+        ws: &mut Workspace,
+    ) {
+        unsafe {
+            (dispatched_f32()
+                .run_fused
+                .expect("f32 fused kernel is always present"))(t, epi, par, ws)
+        }
+    }
+    #[inline]
     fn rhs_tile() -> (usize, usize) {
         let d = dispatched_f32();
         (d.mr, d.nr)
@@ -1720,6 +1979,19 @@ impl GemmScalar for f64 {
     #[inline]
     unsafe fn dispatch_packed(req: PackedConsume<f64>, par: Parallelism, ws: &mut Workspace) {
         unsafe { (dispatched_f64().run_packed)(req, par, ws) }
+    }
+    #[inline]
+    unsafe fn dispatch_fused(
+        t: Task<f64>,
+        epi: FusedEpi<f64>,
+        par: Parallelism,
+        ws: &mut Workspace,
+    ) {
+        unsafe {
+            (dispatched_f64()
+                .run_fused
+                .expect("f64 fused kernel is always present"))(t, epi, par, ws)
+        }
     }
     #[inline]
     fn rhs_tile() -> (usize, usize) {
@@ -2135,6 +2407,319 @@ fn dispatched_i8() -> IntDispatched {
     #[cfg(not(feature = "std"))]
     {
         select_i8()
+    }
+}
+
+// ===========================================================================
+// Integer requantizing GEMM (i8 · i8 -> i8): the `IntGemmQ` / `IntGemmVnniQ` families
+// fused with the `KRequantize` epilogue (per-tensor scale + zero-point + optional per-row
+// i32 bias). A dedicated task/dispatch, like `IntTask`, because the output is `i8` (not i32)
+// and it carries the quantization parameters.
+// ===========================================================================
+
+/// A fully described integer requantizing GEMM: `i8` inputs, `i32` accumulator, `i8` output.
+/// No `alpha` (folds into `scale`) and no `beta` (accumulating into a quantized C is
+/// ill-defined). `bias` is an optional per-row / per-col `i32` vector (`bias_dim` in the
+/// user frame; the dispatch flips it on an orientation swap).
+#[cfg(feature = "int8")]
+#[derive(Copy, Clone)]
+pub(crate) struct RequantTask {
+    pub m: usize,
+    pub k: usize,
+    pub n: usize,
+    pub a: *const i8,
+    pub rsa: isize,
+    pub csa: isize,
+    pub b: *const i8,
+    pub rsb: isize,
+    pub csb: isize,
+    pub c: *mut i8,
+    pub rsc: isize,
+    pub csc: isize,
+    pub scale: f32,
+    pub zp: i32,
+    pub bias: *const i32,
+    pub has_bias: bool,
+    pub bias_dim: BiasDim,
+}
+
+/// Top-level requantizing entry: the degenerate `k == 0` case (fill `C` with the requantized
+/// bias / zero-point) then the ISA-dispatched fused kernel.
+///
+/// # Safety
+/// `t`'s pointers valid; `c` not aliasing `a`/`b`, and `bias` (if `has_bias`) valid for the
+/// oriented axis and disjoint from `c` (the API validates this).
+#[cfg(feature = "int8")]
+pub(crate) unsafe fn execute_int_requant(t: RequantTask, par: Parallelism, ws: &mut Workspace) {
+    unsafe {
+        if t.m == 0 || t.n == 0 {
+            return;
+        }
+        // The A·B term vanishes (k == 0): C[i,j] = clamp(zp + round_ne(scale·bias[..])).
+        if t.k == 0 {
+            requant_degenerate(&t);
+            return;
+        }
+        let d = dispatched_i8_requant();
+        // Mirror `execute_int`: an auto-VNNI *small parallel* problem hands off to the widen
+        // `IntGemmQ` fallback (bit-identical, VNNI's pack barrier dominates there).
+        let vnni_min_par_mnk = tuning::i8_vnni_min_par_mnk();
+        let run = match d.small_par_fallback {
+            Some(fallback)
+                if matches!(par, Parallelism::Rayon(n) if n != 1)
+                    && t.m.saturating_mul(t.n).saturating_mul(t.k) < vnni_min_par_mnk =>
+            {
+                fallback
+            }
+            _ => d.run,
+        };
+        run(t, par, ws);
+    }
+}
+
+/// `k == 0` fill: `C[i,j] = clamp(zp + round_ne(scale·bias[i or j]), -128, 127)` (= `zp as i8`
+/// without bias). Uses the same `KRequantize::apply` as the kernel, applied to a zero
+/// accumulator, so it is bit-identical to a `k > 0` run whose products are all zero.
+#[cfg(feature = "int8")]
+unsafe fn requant_degenerate(t: &RequantTask) {
+    let epi = KRequantize {
+        scale: t.scale,
+        zp: t.zp,
+        bias: Ptr(t.bias as *mut i32),
+        has_bias: t.has_bias,
+        bias_dim: t.bias_dim,
+    };
+    unsafe {
+        for j in 0..t.n {
+            for i in 0..t.m {
+                // UFCS: `KRequantize` implements `Epilogue` for every `Acc = i32, Out = i8`
+                // family, so the bare `apply` would be ambiguous. Any of them gives the same
+                // scalar map; `IntGemmQ` is the always-available one.
+                let out = <KRequantize as Epilogue<IntGemmQ>>::apply(&epi, 0, i, j);
+                *t.c.offset(i as isize * t.rsc + j as isize * t.csc) = out;
+            }
+        }
+    }
+}
+
+/// Requantizing driver entry for a concrete `(family, ISA, tile)`: the inline orientation
+/// swap (which **flips the bias axis**), build the `KRequantize` epilogue, then the general
+/// driver. No gemv / small_k reroute (correct at any `k` since `kc = k`).
+///
+/// # Safety
+/// As [`execute_int_requant`].
+#[cfg(feature = "int8")]
+#[inline]
+unsafe fn run_typed_int_requant<Fam, S, const MR_REG: usize, const NR: usize>(
+    simd: S,
+    mut t: RequantTask,
+    par: Parallelism,
+    ws: &mut Workspace,
+) where
+    Fam: KernelFamily<Lhs = i8, Rhs = i8, Acc = i32, Out = i8>,
+    S: KernelSimd<i8, i8, i32, i8>,
+{
+    unsafe {
+        if t.csc.unsigned_abs() < t.rsc.unsigned_abs() {
+            let (oa, orsa, ocsa) = (t.a, t.rsa, t.csa);
+            let (ob, orsb, ocsb) = (t.b, t.rsb, t.csb);
+            core::mem::swap(&mut t.m, &mut t.n);
+            t.a = ob;
+            t.rsa = ocsb;
+            t.csa = orsb;
+            t.b = oa;
+            t.rsb = ocsa;
+            t.csb = orsa;
+            core::mem::swap(&mut t.rsc, &mut t.csc);
+            t.bias_dim = match t.bias_dim {
+                BiasDim::PerRow => BiasDim::PerCol,
+                BiasDim::PerCol => BiasDim::PerRow,
+            };
+        }
+        let epi = KRequantize {
+            scale: t.scale,
+            zp: t.zp,
+            bias: Ptr(t.bias as *mut i32),
+            has_bias: t.has_bias,
+            bias_dim: t.bias_dim,
+        };
+        // alpha = 1 (folded into scale), beta = 0 (no accumulate) — the family debug-asserts
+        // exactly these.
+        driver::run_epilogue::<Fam, S, KRequantize, MR_REG, NR>(
+            simd, t.m, t.k, t.n, 1, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb, 0, t.c, t.rsc, t.csc,
+            &epi, par, ws,
+        );
+    }
+}
+
+#[cfg(feature = "int8")]
+unsafe fn gemm_i8_requant_scalar(t: RequantTask, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_typed_int_requant::<IntGemmQ, ScalarTok, 4, 4>(ScalarTok, t, par, ws) }
+}
+#[cfg(all(feature = "int8", any(target_arch = "x86", target_arch = "x86_64")))]
+unsafe fn gemm_i8_requant_fma(t: RequantTask, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_typed_int_requant::<IntGemmQ, Fma, 2, 6>(Fma, t, par, ws) }
+}
+#[cfg(all(feature = "int8", any(target_arch = "x86", target_arch = "x86_64")))]
+unsafe fn gemm_i8_requant_avx512(t: RequantTask, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_typed_int_requant::<IntGemmQ, Avx512, 2, 12>(Avx512, t, par, ws) }
+}
+#[cfg(all(feature = "int8", any(target_arch = "x86", target_arch = "x86_64")))]
+unsafe fn gemm_i8_requant_avx512vnni(t: RequantTask, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_typed_int_requant::<IntGemmVnniQ, Avx512Vnni, 2, 12>(Avx512Vnni, t, par, ws) }
+}
+#[cfg(all(feature = "int8", target_arch = "aarch64"))]
+unsafe fn gemm_i8_requant_neon(t: RequantTask, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_typed_int_requant::<IntGemmQ, Neon, 4, 4>(Neon, t, par, ws) }
+}
+#[cfg(all(feature = "int8", target_arch = "wasm32", target_feature = "simd128"))]
+unsafe fn gemm_i8_requant_simd128(t: RequantTask, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_typed_int_requant::<IntGemmQ, Simd128, 2, 4>(Simd128, t, par, ws) }
+}
+
+#[cfg(feature = "int8")]
+type RequantFn = unsafe fn(RequantTask, Parallelism, &mut Workspace);
+
+/// Memoized requantizing dispatch slot (mirror of [`IntDispatched`]): the `small_par_fallback`
+/// swaps auto-VNNI to widen `IntGemmQ` for small parallel problems (bit-identical).
+#[cfg(feature = "int8")]
+#[derive(Copy, Clone)]
+struct IntRequantDispatched {
+    run: RequantFn,
+    small_par_fallback: Option<RequantFn>,
+}
+
+#[cfg(feature = "int8")]
+const RDISP_I8_SCALAR: IntRequantDispatched = IntRequantDispatched {
+    run: gemm_i8_requant_scalar,
+    small_par_fallback: None,
+};
+#[cfg(all(feature = "int8", any(target_arch = "x86", target_arch = "x86_64")))]
+const RDISP_I8_FMA: IntRequantDispatched = IntRequantDispatched {
+    run: gemm_i8_requant_fma,
+    small_par_fallback: None,
+};
+#[cfg(all(feature = "int8", any(target_arch = "x86", target_arch = "x86_64")))]
+const RDISP_I8_AVX512: IntRequantDispatched = IntRequantDispatched {
+    run: gemm_i8_requant_avx512,
+    small_par_fallback: None,
+};
+#[cfg(all(feature = "int8", any(target_arch = "x86", target_arch = "x86_64")))]
+const RDISP_I8_AVX512VNNI: IntRequantDispatched = IntRequantDispatched {
+    run: gemm_i8_requant_avx512vnni,
+    small_par_fallback: None,
+};
+#[cfg(all(feature = "int8", target_arch = "aarch64"))]
+const RDISP_I8_NEON: IntRequantDispatched = IntRequantDispatched {
+    run: gemm_i8_requant_neon,
+    small_par_fallback: None,
+};
+#[cfg(all(feature = "int8", target_arch = "wasm32", target_feature = "simd128"))]
+const RDISP_I8_SIMD128: IntRequantDispatched = IntRequantDispatched {
+    run: gemm_i8_requant_simd128,
+    small_par_fallback: None,
+};
+
+/// `i8` requantize ISA selection (mirror of [`select_i8`]).
+#[cfg(feature = "int8")]
+fn select_i8_requant() -> IntRequantDispatched {
+    match forced_isa() {
+        ForcedIsa::Scalar => return RDISP_I8_SCALAR,
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        ForcedIsa::Fma => {
+            assert!(
+                x86_isa_detected!("avx2") && x86_isa_detected!("fma"),
+                "GEMMKIT_REQUIRE_ISA=fma, but this CPU/emulator does not report avx2+fma"
+            );
+            return RDISP_I8_FMA;
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        ForcedIsa::Avx512F | ForcedIsa::Avx512Bf16 => {
+            assert!(
+                x86_isa_detected!("avx512f"),
+                "GEMMKIT_REQUIRE_ISA=avx512, but this CPU/emulator does not report avx512f"
+            );
+            return RDISP_I8_AVX512;
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        ForcedIsa::Avx512Vnni => {
+            assert!(
+                x86_isa_detected!("avx512vnni")
+                    && x86_isa_detected!("avx512bw")
+                    && x86_isa_detected!("avx512f"),
+                "GEMMKIT_REQUIRE_ISA=avx512vnni, but this CPU/emulator does not report avx512f+bw+vnni"
+            );
+            return RDISP_I8_AVX512VNNI;
+        }
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        ForcedIsa::Fma | ForcedIsa::Avx512F | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
+            panic!("GEMMKIT_REQUIRE_ISA: requested SIMD ISA is unavailable on this target")
+        }
+        #[cfg(target_arch = "aarch64")]
+        ForcedIsa::Neon => return RDISP_I8_NEON,
+        #[cfg(not(target_arch = "aarch64"))]
+        ForcedIsa::Neon => panic!("GEMMKIT_REQUIRE_ISA=neon, but this target is not aarch64"),
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        ForcedIsa::Simd128 => return RDISP_I8_SIMD128,
+        #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+        ForcedIsa::Simd128 => panic!(
+            "GEMMKIT_REQUIRE_ISA=simd128, but this build is not wasm32 with -C target-feature=+simd128"
+        ),
+        ForcedIsa::Auto => {}
+    }
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        // VNNI dot kernel first, with the widen `IntGemmQ` as the small-parallel fallback.
+        if x86_isa_detected!("avx512vnni")
+            && x86_isa_detected!("avx512bw")
+            && x86_isa_detected!("avx512f")
+        {
+            return IntRequantDispatched {
+                small_par_fallback: Some(gemm_i8_requant_avx512),
+                ..RDISP_I8_AVX512VNNI
+            };
+        }
+        if x86_isa_detected!("avx512f") {
+            return RDISP_I8_AVX512;
+        }
+        if x86_isa_detected!("avx2") && x86_isa_detected!("fma") {
+            return RDISP_I8_FMA;
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        RDISP_I8_NEON
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        #[cfg(target_feature = "simd128")]
+        {
+            RDISP_I8_SIMD128
+        }
+        #[cfg(not(target_feature = "simd128"))]
+        {
+            RDISP_I8_SCALAR
+        }
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "wasm32")))]
+    {
+        RDISP_I8_SCALAR
+    }
+}
+
+#[cfg(all(feature = "std", feature = "int8"))]
+static GEMM_I8_REQUANT: OnceLock<IntRequantDispatched> = OnceLock::new();
+
+#[cfg(feature = "int8")]
+#[inline]
+fn dispatched_i8_requant() -> IntRequantDispatched {
+    #[cfg(feature = "std")]
+    {
+        *GEMM_I8_REQUANT.get_or_init(select_i8_requant)
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        select_i8_requant()
     }
 }
 

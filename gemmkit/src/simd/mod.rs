@@ -147,6 +147,76 @@ impl<A: Scalar, S: SimdOps<A>> KernelSimd<A, A, A, A> for S {
     }
 }
 
+/// Requantizing-integer blanket: `i8` inputs, `i32` accumulator, **`i8` output**. This is
+/// the seam the requantizing integer families ([`crate::kernel::IntGemmQ`] /
+/// [`crate::kernel::IntGemmVnniQ`]) drive on. It is a single delegating impl over every
+/// token that already provides the widen kernel (`KernelSimd<i8, i8, i32, i32>`): the hot
+/// accumulate-side ops forward verbatim to that impl (so `Avx512Vnni`'s `dot_accumulate`
+/// override flows through unchanged), and the cold output-side ops are portable stack-spill
+/// widen/truncate loops (the `fma_bvec` idiom). Those output ops are **never** on the
+/// requant path — the epilogue routes every tile through the scratch/scalar drain
+/// (`Epilogue::VECTOR = false`) and `beta` is always `Zero` — they exist only to satisfy the
+/// driver's `KernelSimd<Lhs, Rhs, Acc, Out>` bound. Coherent: the homogeneous blanket above
+/// needs all four types equal, and here `Out = i8 != Acc = i32`.
+#[cfg(feature = "int8")]
+impl<S: KernelSimd<i8, i8, i32, i32>> KernelSimd<i8, i8, i32, i8> for S {
+    #[inline(always)]
+    unsafe fn load_lhs(self, p: *const i8) -> <Self as SimdOps<i32>>::Reg {
+        unsafe { <Self as KernelSimd<i8, i8, i32, i32>>::load_lhs(self, p) }
+    }
+    #[inline(always)]
+    unsafe fn splat_rhs(self, v: i8) -> <Self as SimdOps<i32>>::Reg {
+        unsafe { <Self as KernelSimd<i8, i8, i32, i32>>::splat_rhs(self, v) }
+    }
+    #[inline(always)]
+    unsafe fn dot_accumulate<const MR_REG: usize, const NR: usize>(
+        self,
+        kc: usize,
+        a: *const i8,
+        b: *const i8,
+        acc: &mut [[<Self as SimdOps<i32>>::Reg; MR_REG]; NR],
+    ) {
+        unsafe {
+            <Self as KernelSimd<i8, i8, i32, i32>>::dot_accumulate::<MR_REG, NR>(
+                self, kc, a, b, acc,
+            )
+        }
+    }
+    // Cold output-side ops (unused on the requant path): portable stack-spill widen/truncate.
+    // 16 is the widest `LANES` of any `SimdOps<i32>` (AVX-512), so the buffer always fits.
+    unsafe fn load_out(self, p: *const i8) -> <Self as SimdOps<i32>>::Reg {
+        let lanes = <Self as SimdOps<i32>>::LANES;
+        // `loadu` reads a full `lanes`-wide register from `buf`, so the buffer must hold
+        // every lane. 16 covers every current i32 token (AVX-512 is the widest); a wider
+        // future token would need this bumped, so guard it rather than silently overrun.
+        assert!(
+            lanes <= 16,
+            "i32 token wider than the out-conversion buffer"
+        );
+        let mut buf = [0i32; 16];
+        unsafe {
+            for (l, slot) in buf.iter_mut().enumerate().take(lanes) {
+                *slot = *p.add(l) as i32;
+            }
+            self.loadu(buf.as_ptr())
+        }
+    }
+    unsafe fn store_out(self, p: *mut i8, v: <Self as SimdOps<i32>>::Reg) {
+        let lanes = <Self as SimdOps<i32>>::LANES;
+        assert!(
+            lanes <= 16,
+            "i32 token wider than the out-conversion buffer"
+        );
+        let mut buf = [0i32; 16];
+        unsafe {
+            self.storeu(buf.as_mut_ptr(), v);
+            for (l, &x) in buf.iter().enumerate().take(lanes) {
+                *p.add(l) = x as i8;
+            }
+        }
+    }
+}
+
 /// An ISA token: a zero-sized marker carrying a set of target features.
 ///
 /// The only behaviour is [`Simd::vectorize`], which establishes the
@@ -243,6 +313,31 @@ pub trait SimdOps<T: Scalar>: Simd {
     /// # Safety
     /// See the trait-level note.
     unsafe fn reduce_sum(self, v: Self::Reg) -> T;
+
+    /// Lane-wise maximum. **Contract:** in any lane where `a` is `NaN` the result is
+    /// `b`'s lane. The fused-epilogue call sites always pass a finite splat/zero as `b`
+    /// (`max(v, zero)`), so a `NaN` accumulator maps to that finite operand — the
+    /// `ReLU(NaN) = 0` semantics — and the fast vector path agrees bit-for-bit with the
+    /// scalar `if a > b { a } else { b }` edge path (a `NaN > b` comparison is `false`).
+    ///
+    /// The default is unreachable: only the real-float (`f32`/`f64`) tokens override it,
+    /// and only the fused float epilogue ever calls it (the `dot_accumulate` pattern).
+    ///
+    /// # Safety
+    /// See the trait-level note.
+    #[inline(always)]
+    unsafe fn max(self, _a: Self::Reg, _b: Self::Reg) -> Self::Reg {
+        unreachable!("max is provided only by the real-float SimdOps tokens")
+    }
+    /// Lane-wise minimum, same `NaN`-in-`a` contract as [`Self::max`] (`min(v, zero)` at
+    /// the call site, so a `NaN` lane returns the finite `b`).
+    ///
+    /// # Safety
+    /// See the trait-level note.
+    #[inline(always)]
+    unsafe fn min(self, _a: Self::Reg, _b: Self::Reg) -> Self::Reg {
+        unreachable!("min is provided only by the real-float SimdOps tokens")
+    }
 
     /// Accumulate one contiguous block of `B` columns (loaded as the single
     /// register `bvec`) against the `MR_REG` already-loaded `A` registers,

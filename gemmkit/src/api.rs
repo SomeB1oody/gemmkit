@@ -14,8 +14,9 @@
 
 #[cfg(feature = "complex")]
 use crate::dispatch::ComplexScalar;
-use crate::dispatch::{self, GemmProblem, GemmScalar, PackedConsume, Task};
-use crate::parallel::Parallelism;
+use crate::dispatch::{self, FusedScalar, GemmProblem, GemmScalar, PackedConsume, Task};
+use crate::kernel::epilogue::{Act, BiasDim, BiasSpec, FusedEpi};
+use crate::parallel::{Parallelism, Ptr};
 use crate::workspace::{self, Workspace};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -1841,5 +1842,478 @@ pub unsafe fn gemm_unchecked_with<T: GemmScalar>(
             par,
             ws,
         );
+    }
+}
+
+/// The quantization parameters for [`gemm_i8_requant`]: a per-tensor `scale` and integer
+/// `zero_point`, plus an optional **per-row** `i32` bias (length `m`, the standard qlinear
+/// layer bias). The output is `C[i,j] = clamp(zero_point + round_ne(scale·(Σ_k A·B +
+/// bias[i])), -128, 127)`, with round-half-to-even.
+#[cfg(feature = "int8")]
+pub struct Requantize<'a> {
+    /// Per-tensor output scale (`alpha` folds into this; must be finite and `> 0`).
+    pub scale: f32,
+    /// Output zero-point, joined in integer after rounding (must be in `[-128, 127]`).
+    pub zero_point: i32,
+    /// Optional per-row `i32` bias (length `m`), added to the accumulator before scaling.
+    pub bias: Option<&'a [i32]>,
+}
+
+/// Requantizing integer GEMM: `i8` inputs multiplied into an `i32` accumulator, then
+/// requantized to an `i8` output in one pass (deleting the full `m·n` `i32` materialization
+/// a `gemm_i8` + separate requantize would pay). No `alpha` (folds into `scale`) and no
+/// `beta` (accumulating into a quantized C is ill-defined). Uses the thread-local workspace
+/// pool.
+///
+/// # Panics
+/// Same shape / bounds / aliasing conditions as [`gemm_i8`], plus: a non-finite or
+/// non-positive `scale`; a `zero_point` outside `[-128, 127]`; or a bias whose length is not
+/// `A.rows` or which overlaps `C`.
+#[cfg(feature = "int8")]
+pub fn gemm_i8_requant(
+    a: MatRef<'_, i8>,
+    b: MatRef<'_, i8>,
+    req: Requantize<'_>,
+    c: MatMut<'_, i8>,
+    par: Parallelism,
+) {
+    workspace::with_thread_pool(|ws| gemm_i8_requant_with(ws, a, b, req, c, par));
+}
+
+/// Like [`gemm_i8_requant`] but reuses a caller-owned [`Workspace`].
+///
+/// # Panics
+/// Same conditions as [`gemm_i8_requant`].
+#[cfg(feature = "int8")]
+pub fn gemm_i8_requant_with(
+    ws: &mut Workspace,
+    a: MatRef<'_, i8>,
+    b: MatRef<'_, i8>,
+    req: Requantize<'_>,
+    c: MatMut<'_, i8>,
+    par: Parallelism,
+) {
+    assert_eq!(
+        a.cols, b.rows,
+        "gemmkit: A.cols ({}) != B.rows ({})",
+        a.cols, b.rows
+    );
+    assert_eq!(
+        a.rows, c.rows,
+        "gemmkit: A.rows ({}) != C.rows ({})",
+        a.rows, c.rows
+    );
+    assert_eq!(
+        b.cols, c.cols,
+        "gemmkit: B.cols ({}) != C.cols ({})",
+        b.cols, c.cols
+    );
+
+    check_view(a.data, a.rows, a.cols, a.rs, a.cs, "A");
+    check_view(b.data, b.rows, b.cols, b.rs, b.cs, "B");
+    check_view(c.data, c.rows, c.cols, c.rs, c.cs, "C");
+
+    if self_aliases(c.rows, c.cols, c.rs, c.cs) {
+        panic!(
+            "gemmkit: C view aliases itself (strides {},{} map distinct elements to the same \
+             memory); C must address each (i,j) uniquely",
+            c.rs, c.cs
+        );
+    }
+
+    // C (i8) must not alias A or B (i8).
+    let cp = c.data.as_ptr() as *const u8;
+    let cl = c.data.len();
+    if overlaps_bytes(cp, cl, 1, a.data.as_ptr() as *const u8, a.data.len(), 1)
+        || overlaps_bytes(cp, cl, 1, b.data.as_ptr() as *const u8, b.data.len(), 1)
+    {
+        panic!("gemmkit: C aliases A or B");
+    }
+
+    assert!(
+        req.scale.is_finite() && req.scale > 0.0,
+        "gemmkit: requantize scale ({}) must be finite and > 0",
+        req.scale
+    );
+    assert!(
+        (-128..=127).contains(&req.zero_point),
+        "gemmkit: requantize zero_point ({}) out of i8 range [-128, 127]",
+        req.zero_point
+    );
+
+    let (bias_ptr, has_bias) = match req.bias {
+        Some(bias) => {
+            assert_eq!(
+                bias.len(),
+                a.rows,
+                "gemmkit: requantize bias length ({}) != A.rows ({})",
+                bias.len(),
+                a.rows
+            );
+            // bias (i32) must not overlap C (i8).
+            if overlaps_bytes(cp, cl, 1, bias.as_ptr() as *const u8, bias.len(), 4) {
+                panic!("gemmkit: requantize bias overlaps C");
+            }
+            (bias.as_ptr(), true)
+        }
+        None => (core::ptr::null(), false),
+    };
+
+    // SAFETY: validated above — shapes agree, strides in bounds, C addresses each (i,j)
+    // uniquely and does not alias A/B or the bias; scale/zp are in range. The bias pointer
+    // (borrowed for this call) stays valid for the whole `execute_int_requant` frame.
+    unsafe {
+        dispatch::execute_int_requant(
+            dispatch::RequantTask {
+                m: a.rows,
+                k: a.cols,
+                n: b.cols,
+                a: a.data.as_ptr(),
+                rsa: a.rs,
+                csa: a.cs,
+                b: b.data.as_ptr(),
+                rsb: b.rs,
+                csb: b.cs,
+                c: c.data.as_mut_ptr(),
+                rsc: c.rs,
+                csc: c.cs,
+                scale: req.scale,
+                zp: req.zero_point,
+                bias: bias_ptr,
+                has_bias,
+                bias_dim: BiasDim::PerRow,
+            },
+            par,
+            ws,
+        );
+    }
+}
+
+/// The raw requantizing engine: `C(i8) <- clamp(zp + round_ne(scale·(A·B + bias)), -128,
+/// 127)` over pointers and `isize` strides, with **no** bounds/alias/shape checks. `bias` is
+/// a per-row `i32` pointer enabled by `has_bias` (ignored when `has_bias == false`). Uses the
+/// thread-local workspace pool.
+///
+/// # Safety
+/// The caller guarantees `a`/`b` valid for reads and `c` for writes over the shape/strides;
+/// `c` does not alias `a`/`b`; when `has_bias`, `bias` is valid for `m` reads and disjoint
+/// from `c`; and `scale` is finite and `> 0` with `zero_point in [-128, 127]` (the checked
+/// API enforces the last two).
+#[cfg(feature = "int8")]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gemm_i8_requant_unchecked(
+    m: usize,
+    k: usize,
+    n: usize,
+    a: *const i8,
+    rsa: isize,
+    csa: isize,
+    b: *const i8,
+    rsb: isize,
+    csb: isize,
+    scale: f32,
+    zero_point: i32,
+    bias: *const i32,
+    has_bias: bool,
+    c: *mut i8,
+    rsc: isize,
+    csc: isize,
+    par: Parallelism,
+) {
+    // SAFETY: preconditions forwarded to the caller (see # Safety).
+    unsafe {
+        workspace::with_thread_pool(|ws| {
+            dispatch::execute_int_requant(
+                dispatch::RequantTask {
+                    m,
+                    k,
+                    n,
+                    a,
+                    rsa,
+                    csa,
+                    b,
+                    rsb,
+                    csb,
+                    c,
+                    rsc,
+                    csc,
+                    scale,
+                    zp: zero_point,
+                    bias,
+                    has_bias,
+                    bias_dim: BiasDim::PerRow,
+                },
+                par,
+                ws,
+            );
+        });
+    }
+}
+
+/// A bias vector fused into a [`gemm_fused`] call: one value per output **row** (length `m`)
+/// or per output **column** (length `n`), added to every element of that row / column after
+/// the product and before the activation.
+pub enum Bias<'a, T> {
+    /// One value per output row (length `m`).
+    PerRow(&'a [T]),
+    /// One value per output column (length `n`).
+    PerCol(&'a [T]),
+}
+
+/// An activation fused into a [`gemm_fused`] call, applied last (after the bias add).
+pub enum Activation<T> {
+    /// `max(v, 0)` (NaN maps to 0).
+    Relu,
+    /// `max(v, 0) + slope·min(v, 0)` (NaN maps to 0, −0 to +0).
+    LeakyRelu(T),
+}
+
+/// `true` iff `s` is finite, expressed generically (no `f32`/`f64` inherent method on the
+/// generic `T`): a finite value equals itself and `s - s == 0`, while `±inf - ±inf = NaN != 0`
+/// and `NaN != NaN`. The `eq_op` lint is expected — the self-comparison is the point.
+#[inline]
+#[allow(clippy::eq_op)]
+fn is_finite<T: FusedScalar>(s: T) -> bool {
+    s == s && (s - s) == T::ZERO
+}
+
+/// `C <- act(alpha·A·B + beta·C + bias)` in one pass: a **fused** GEMM epilogue over safe
+/// slice views, using the thread-local workspace pool. The bias is added by one IEEE add
+/// after the final `beta`-fold, then the activation is applied. `bias == None && act == None`
+/// delegates to plain [`gemm`].
+///
+/// The product is always computed through the general register-blocked driver, whose
+/// accumulation order the epilogue leaves untouched — so the result is **bit-identical** to
+/// that driver's `gemm` output followed by the same scalar map. Note that plain [`gemm`]
+/// routes gemv shapes (`m == 1` / `n == 1`), tiny `m,n`, and small-`k` products to dedicated
+/// kernels with a *different* summation order; against those special-cased shapes the fused
+/// result stays numerically correct but may differ from `gemm`-then-map in the low mantissa
+/// bits. It is deterministic across thread counts regardless.
+///
+/// # Panics
+/// Same conditions as [`gemm`], plus: a `PerRow` bias whose length is not `A.rows` (or a
+/// `PerCol` bias not `B.cols`); a bias slice that overlaps `C`; or a non-finite `LeakyRelu`
+/// slope.
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_fused<T: FusedScalar>(
+    alpha: T,
+    a: MatRef<'_, T>,
+    b: MatRef<'_, T>,
+    beta: T,
+    c: MatMut<'_, T>,
+    bias: Option<Bias<'_, T>>,
+    act: Option<Activation<T>>,
+    par: Parallelism,
+) {
+    workspace::with_thread_pool(|ws| gemm_fused_with(ws, alpha, a, b, beta, c, bias, act, par));
+}
+
+/// Like [`gemm_fused`] but reuses a caller-owned [`Workspace`].
+///
+/// # Panics
+/// Same conditions as [`gemm_fused`].
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_fused_with<T: FusedScalar>(
+    ws: &mut Workspace,
+    alpha: T,
+    a: MatRef<'_, T>,
+    b: MatRef<'_, T>,
+    beta: T,
+    c: MatMut<'_, T>,
+    bias: Option<Bias<'_, T>>,
+    act: Option<Activation<T>>,
+    par: Parallelism,
+) {
+    assert_eq!(
+        a.cols, b.rows,
+        "gemmkit: A.cols ({}) != B.rows ({})",
+        a.cols, b.rows
+    );
+    assert_eq!(
+        a.rows, c.rows,
+        "gemmkit: A.rows ({}) != C.rows ({})",
+        a.rows, c.rows
+    );
+    assert_eq!(
+        b.cols, c.cols,
+        "gemmkit: B.cols ({}) != C.cols ({})",
+        b.cols, c.cols
+    );
+
+    check_view(a.data, a.rows, a.cols, a.rs, a.cs, "A");
+    check_view(b.data, b.rows, b.cols, b.rs, b.cs, "B");
+    check_view(c.data, c.rows, c.cols, c.rs, c.cs, "C");
+
+    if self_aliases(c.rows, c.cols, c.rs, c.cs) {
+        panic!(
+            "gemmkit: C view aliases itself (strides {},{} map distinct elements to the same \
+             memory); C must address each (i,j) uniquely",
+            c.rs, c.cs
+        );
+    }
+
+    let cp = c.data.as_ptr();
+    let cl = c.data.len();
+    if overlaps(cp, cl, a.data.as_ptr(), a.data.len())
+        || overlaps(cp, cl, b.data.as_ptr(), b.data.len())
+    {
+        panic!("gemmkit: C aliases A or B");
+    }
+
+    // Fused-epilogue validation: bias length matches its axis and does not overlap C.
+    if let Some(bd) = &bias {
+        let (bp, bl) = match bd {
+            Bias::PerRow(s) => {
+                assert_eq!(
+                    s.len(),
+                    a.rows,
+                    "gemmkit: PerRow bias length ({}) != A.rows ({})",
+                    s.len(),
+                    a.rows
+                );
+                (s.as_ptr(), s.len())
+            }
+            Bias::PerCol(s) => {
+                assert_eq!(
+                    s.len(),
+                    b.cols,
+                    "gemmkit: PerCol bias length ({}) != B.cols ({})",
+                    s.len(),
+                    b.cols
+                );
+                (s.as_ptr(), s.len())
+            }
+        };
+        if overlaps(cp, cl, bp, bl) {
+            panic!("gemmkit: bias slice overlaps C");
+        }
+    }
+    if let Some(Activation::LeakyRelu(s)) = &act {
+        assert!(is_finite(*s), "gemmkit: LeakyRelu slope must be finite");
+    }
+
+    // The identity-fused case cannot even reach a fused monomorphization: delegate to plain
+    // gemm so the zero-cost path is guaranteed.
+    if bias.is_none() && act.is_none() {
+        gemm_with(ws, alpha, a, b, beta, c, par);
+        return;
+    }
+
+    let bias_spec = match bias {
+        None => BiasSpec::None,
+        Some(Bias::PerRow(s)) => BiasSpec::Row(Ptr(s.as_ptr() as *mut T)),
+        Some(Bias::PerCol(s)) => BiasSpec::Col(Ptr(s.as_ptr() as *mut T)),
+    };
+    let act_e = match act {
+        None => Act::None,
+        Some(Activation::Relu) => Act::Relu,
+        Some(Activation::LeakyRelu(s)) => Act::LeakyRelu(s),
+    };
+    let epi = FusedEpi {
+        bias: bias_spec,
+        act: act_e,
+    };
+
+    // SAFETY: validated above — shapes agree, every stride is in bounds, C addresses each
+    // (i,j) uniquely and does not alias A/B, and the bias slice (borrowed for this call) does
+    // not overlap C. The bias pointer stays valid for the whole `execute_fused` frame.
+    unsafe {
+        dispatch::execute_fused(
+            Task {
+                m: a.rows,
+                k: a.cols,
+                n: b.cols,
+                alpha,
+                a: a.data.as_ptr(),
+                rsa: a.rs,
+                csa: a.cs,
+                b: b.data.as_ptr(),
+                rsb: b.rs,
+                csb: b.cs,
+                beta,
+                c: c.data.as_mut_ptr(),
+                rsc: c.rs,
+                csc: c.cs,
+            },
+            epi,
+            par,
+            ws,
+        );
+    }
+}
+
+/// The raw fused engine: `C <- act(alpha·A·B + beta·C + bias)` over pointers and `isize`
+/// strides, with **no** bounds/alias/shape checks. `bias` is a `(ptr, dim)` pair enabled by
+/// `has_bias` (`bias` is ignored when `has_bias == false`). Uses the thread-local workspace
+/// pool.
+///
+/// # Safety
+/// As [`gemm_unchecked`], plus: when `has_bias`, `bias` is valid for reads of `m` (`PerRow`)
+/// or `n` (`PerCol`) elements and does not alias `c`; and a non-finite `LeakyRelu` slope is
+/// the caller's responsibility (the checked API rejects it).
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gemm_fused_unchecked<T: FusedScalar>(
+    m: usize,
+    k: usize,
+    n: usize,
+    alpha: T,
+    a: *const T,
+    rsa: isize,
+    csa: isize,
+    b: *const T,
+    rsb: isize,
+    csb: isize,
+    beta: T,
+    c: *mut T,
+    rsc: isize,
+    csc: isize,
+    bias: *const T,
+    bias_dim: BiasDim,
+    has_bias: bool,
+    act: Option<Activation<T>>,
+    par: Parallelism,
+) {
+    let bias_spec = if has_bias {
+        match bias_dim {
+            BiasDim::PerRow => BiasSpec::Row(Ptr(bias as *mut T)),
+            BiasDim::PerCol => BiasSpec::Col(Ptr(bias as *mut T)),
+        }
+    } else {
+        BiasSpec::None
+    };
+    let act_e = match act {
+        None => Act::None,
+        Some(Activation::Relu) => Act::Relu,
+        Some(Activation::LeakyRelu(s)) => Act::LeakyRelu(s),
+    };
+    let epi = FusedEpi {
+        bias: bias_spec,
+        act: act_e,
+    };
+    // SAFETY: preconditions forwarded to the caller (see # Safety).
+    unsafe {
+        workspace::with_thread_pool(|ws| {
+            dispatch::execute_fused(
+                Task {
+                    m,
+                    k,
+                    n,
+                    alpha,
+                    a,
+                    rsa,
+                    csa,
+                    b,
+                    rsb,
+                    csb,
+                    beta,
+                    c,
+                    rsc,
+                    csc,
+                },
+                epi,
+                par,
+                ws,
+            );
+        });
     }
 }

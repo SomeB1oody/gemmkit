@@ -222,6 +222,46 @@ vector path (load C, `β·C + α·AB`, store). Partial tiles or general/negative
 strides drain the accumulators to a stack scratch buffer and copy back with the
 real strides — one scratch tile per call, no lookup grid. `β == 0` never reads C.
 
+### Fused epilogues (`kernel::epilogue`)
+
+A second L1 seam, [`Epilogue<Fam>`], fuses a per-element transform into the store —
+`C[r,c] <- apply(α·AB + β·C, r, c)` — instead of materializing the raw product and
+mapping it in a second pass. It is threaded through a **provided** family method,
+`KernelFamily::microkernel_epi(.., row0, col0, last_k, epi, ..)`, whose default just
+forwards to `microkernel` (so `mixed`, `complex`, and the `i32`-out integer families are
+byte-for-byte unchanged and only debug-assert the epilogue is `Identity`). Only `FloatGemm`
+and the two requantizing families override it.
+
+The load-bearing invariant is **zero-cost identity**: every kernel hook is gated on the
+associated `const Epilogue::IS_IDENTITY`, so with `E = Identity` (a ZST) the guards const-fold
+away, `row0/col0/last_k` become dead arguments, and the monomorphized kernel is the
+pre-epilogue one. The driver's plain `run`/`run_packed_rhs` forward `&Identity`; a new
+`run_epilogue` forwards a real `E` — one extra instantiation per (family, ISA, tile) *only when
+the fused entry is linked*. The determinism contract is stronger: blocking is
+epilogue-independent and the epilogue is applied to the very register the plain store would
+have written, so `gemm_fused == gemm()` then a scalar map, **bit-for-bit**. The driver passes
+`last_k` (final depth panel) so a float epilogue fires exactly once; the requant families are
+`OUT_IS_ACC = false` (⇒ `kc = k`), so they fire once *structurally*.
+
+Two built-ins ship. `FusedEpi<T>` (f32/f64) is **one runtime-composed type** — bias
+(per-row/per-col/none) then activation (none/ReLU/LeakyReLU) as ~2 predictable branches per
+tile — so the kernel is not multiplied by the epilogue kind; it uses the fast vector path via
+new `SimdOps::{max, min}` (the NaN-non-propagating `maxnm`/`pmax` variants, so `ReLU(NaN)=0`
+and the vector and scratch/scalar paths agree bit-for-bit). `KRequantize` (`i8 -> i8`,
+scale + zero-point + optional integer bias) is scalar-only (`VECTOR = false`): every tile
+drains to `i32` scratch and only the requantize map is scalar, still deleting the full `m·n`
+`i32` materialization a `gemm_i8` + separate pass would pay. Its rounding is a single
+correctly-rounded f64 multiply with round-half-to-even (the `no_std`-safe `2^52` trick, no
+`std` float methods), joining the zero-point in integer — so it is **bit-exact across every ISA
+and serial ≡ parallel** (widen ≡ VNNI). It rides two new requant families, `IntGemmQ` (widen)
+and `IntGemmVnniQ` (`vpdpbusd`), both `Out = i8, Acc = i32`, reached through a single delegating
+`KernelSimd<i8,i8,i32,i8>` blanket that forwards the hot accumulate ops to the existing
+`<i8,i8,i32,i32>` impl. The public entry points are `gemm_fused` and `gemm_i8_requant` (L8);
+v1 covers the general driver path only (gemv/small_k/small_mn/prepacked keep the identity seam
+and adopt `E` later behind the same API).
+
+[`Epilogue<Fam>`]: gemmkit::kernel::epilogue::Epilogue
+
 ## L2 — packing
 
 Packed layout is **micropanel-major**: A as panels of `MR` rows (column-by-column,
@@ -431,6 +471,14 @@ call.
   reused operand once into the micropanel layout, then skip the per-call repack across many products
   (the fixed-weight inference pattern). RHS-packed needs column-major-ish C, LHS-packed
   row-major-ish — the no-swap orientation the prepacked operand was laid out for.
+- **Fused** ([`gemm_fused`] / `gemm_fused_with`): `C <- act(α·A·B + β·C + bias)` in one pass for
+  `f32`/`f64` (the sealed `FusedScalar` bound), with an optional per-row/per-col `Bias` and an
+  optional `Activation` (ReLU/LeakyReLU) — the fused L1 epilogue seam. `bias == None && act == None`
+  delegates to plain `gemm`. Validation adds bias-length, bias-vs-C overlap, and finite-slope checks;
+  the result is bit-identical to `gemm` then the scalar map.
+- **Requantize** ([`gemm_i8_requant`] / `gemm_i8_requant_with`, `int8` feature): `i8·i8 -> i8` with a
+  per-tensor `Requantize { scale, zero_point, bias }`, fusing the `i32 -> i8` requantize into the
+  store (deleting the `m·n` `i32` materialization). Bit-exact across ISAs and serial ≡ parallel.
 - **Unchecked** ([`gemm_unchecked`], plus a raw-pointer sibling for every safe entry:
   `gemm_batched_unchecked`, `prepack_rhs_unchecked`/`gemm_packed_b_unchecked`,
   `prepack_lhs_unchecked`/`gemm_packed_a_unchecked`, `gemm_i8_unchecked`, `gemm_cplx_unchecked` —

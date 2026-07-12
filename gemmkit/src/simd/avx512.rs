@@ -79,6 +79,15 @@ impl SimdOps<f32> for Avx512 {
         unsafe { _mm512_fnmadd_ps(a, b, c) }
     }
     #[inline(always)]
+    unsafe fn max(self, a: Self::Reg, b: Self::Reg) -> Self::Reg {
+        // x86 MAXPS returns the second operand on an unordered compare (NaN `a` -> `b`).
+        unsafe { _mm512_max_ps(a, b) }
+    }
+    #[inline(always)]
+    unsafe fn min(self, a: Self::Reg, b: Self::Reg) -> Self::Reg {
+        unsafe { _mm512_min_ps(a, b) }
+    }
+    #[inline(always)]
     unsafe fn reduce_sum(self, v: Self::Reg) -> f32 {
         unsafe { _mm512_reduce_add_ps(v) }
     }
@@ -129,6 +138,15 @@ impl SimdOps<f64> for Avx512 {
     unsafe fn fnma(self, a: Self::Reg, b: Self::Reg, c: Self::Reg) -> Self::Reg {
         // `_mm512_fnmadd_pd(a, b, c)` == `c - a*b`.
         unsafe { _mm512_fnmadd_pd(a, b, c) }
+    }
+    #[inline(always)]
+    unsafe fn max(self, a: Self::Reg, b: Self::Reg) -> Self::Reg {
+        // x86 MAXPD returns the second operand when unordered (NaN `a` -> `b`).
+        unsafe { _mm512_max_pd(a, b) }
+    }
+    #[inline(always)]
+    unsafe fn min(self, a: Self::Reg, b: Self::Reg) -> Self::Reg {
+        unsafe { _mm512_min_pd(a, b) }
     }
     #[inline(always)]
     unsafe fn reduce_sum(self, v: Self::Reg) -> f64 {
