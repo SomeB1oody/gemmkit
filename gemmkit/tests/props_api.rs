@@ -841,18 +841,20 @@ proptest! {
 
 /// Regression: on the mixed-precision (f16/bf16) path the depth panel is the whole `k`,
 /// and a broadcast (zero-stride) operand passes validation with a logically huge `k` —
-/// the pack sizing must fail closed. Two distinct overflow bands must both panic (in
-/// release, either would otherwise wrap into an undersized workspace the pack writes
-/// past): `k = isize::MAX` overflows the element-count product, while `k = 2^56`
-/// (element count `128·2^56 = 2^63`, still in `usize`) overflows only the later
-/// element→byte conversion.
+/// the pack sizing must fail closed rather than wrap into an undersized workspace the pack
+/// writes past. `k = isize::MAX` overflows the pack element-count product for every tile
+/// geometry (so the "too large" guard fires on every ISA). The narrower band where the
+/// element product fits `usize` but the element→byte conversion overflows is exercised
+/// tile-independently by `workspace::region_bytes` unit tests — an end-to-end `k` that hits
+/// that band is tile-size-dependent (a smaller tile just requests a huge-but-representable
+/// allocation, which is a safe OOM abort, not the checked "too large" panic).
 #[cfg(feature = "half")]
 #[test]
 fn mixed_huge_k_fails_closed() {
     use gemmkit::{bf16, f16};
 
-    // `2^56`: passes the element-count guard, must be caught by the byte-size guard.
-    for &huge in &[isize::MAX as usize, 1usize << 56] {
+    let huge = isize::MAX as usize;
+    {
         let a = vec![f16::from_f32(1.0); 100];
         let b = vec![f16::from_f32(1.0); 100];
         let mut c = vec![f16::from_f32(0.0); 100 * 100];

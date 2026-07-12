@@ -179,3 +179,56 @@ pub(crate) fn with_thread_pool<R>(f: impl FnOnce(&mut Workspace) -> R) -> R {
 pub(crate) fn with_thread_pool<R>(f: impl FnOnce(&mut Workspace) -> R) -> R {
     f(&mut Workspace::new())
 }
+
+#[cfg(all(test, feature = "std"))]
+mod tests {
+    use super::{ALIGN, region_bytes};
+
+    fn panic_msg(f: impl FnOnce() + std::panic::UnwindSafe) -> String {
+        match std::panic::catch_unwind(f) {
+            Ok(()) => String::new(),
+            Err(e) => e
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| e.downcast_ref::<String>().cloned())
+                .unwrap_or_default(),
+        }
+    }
+
+    #[test]
+    fn region_bytes_normal() {
+        assert_eq!(region_bytes(0, 4), 0);
+        assert_eq!(
+            region_bytes(1000, 4),
+            (1000usize * 4).next_multiple_of(ALIGN)
+        );
+        assert_eq!(region_bytes(7, 1), ALIGN); // 7 -> round up to 64
+    }
+
+    /// The element count fits `usize` but the element->byte product overflows: this is the
+    /// band a broadcast operand reaches after the driver's element-count guard, so the byte
+    /// conversion must fail closed rather than wrap (which would under-allocate the pack).
+    #[test]
+    fn region_bytes_byte_product_overflow_fails_closed() {
+        let elems = 1usize << 63; // fits usize
+        let msg = panic_msg(|| {
+            region_bytes(elems, 2); // *2 == 1<<64, overflows
+        });
+        assert!(
+            msg.contains("too large"),
+            "expected too-large panic, got {msg:?}"
+        );
+    }
+
+    /// The product fits but rounding up to `ALIGN` overflows.
+    #[test]
+    fn region_bytes_roundup_overflow_fails_closed() {
+        let msg = panic_msg(|| {
+            region_bytes(usize::MAX, 1); // usize::MAX, next_multiple_of(64) overflows
+        });
+        assert!(
+            msg.contains("too large"),
+            "expected too-large panic, got {msg:?}"
+        );
+    }
+}
