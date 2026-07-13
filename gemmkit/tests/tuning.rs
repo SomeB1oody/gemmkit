@@ -64,54 +64,21 @@ fn max_value_threshold_takes_effect() {
 #[test]
 fn rhs_packing_both_modes_correct() {
     let _g = knob_guard();
-    fn naive(a: &[f64], b: &[f64], m: usize, k: usize, n: usize) -> Vec<f64> {
-        let mut c = vec![0.0; m * n];
-        for i in 0..m {
-            for j in 0..n {
-                let mut s = 0.0;
-                for p in 0..k {
-                    s += a[i * k + p] * b[p * n + j]; // row-major logical
-                }
-                c[i * n + j] = s;
-            }
-        }
-        c
-    }
-    let col = |v: &[f64], r: usize, c: usize| {
-        let mut o = vec![0.0; r * c];
-        for i in 0..r {
-            for j in 0..c {
-                o[j * r + i] = v[i * c + j];
-            }
-        }
-        o
-    };
     for &force in &[0usize, usize::MAX] {
         tuning::set_rhs_pack_threshold(force); // 0 = always pack, MAX = never pack
         for &(m, k, n) in &[(33, 17, 19), (64, 40, 13), (128, 65, 11), (40, 33, 28)] {
-            let a: Vec<f64> = (0..m * k).map(|x| (x % 23) as f64 * 0.1 - 1.0).collect();
-            let b: Vec<f64> = (0..k * n).map(|x| (x % 19) as f64 * 0.2 - 1.5).collect();
-            let cref = naive(&a, &b, m, k, n);
-            let (ac, bc) = (col(&a, m, k), col(&b, k, n));
+            let (a, b) = mkmats(m, k, n);
+            let cref = naive_col(&a, &b, m, k, n);
             let mut cc = vec![0.0f64; m * n];
             gemm(
                 1.0,
-                MatRef::from_col_major(&ac, m, k),
-                MatRef::from_col_major(&bc, k, n),
+                MatRef::from_col_major(&a, m, k),
+                MatRef::from_col_major(&b, k, n),
                 0.0,
                 MatMut::from_col_major(&mut cc, m, n),
                 Parallelism::Rayon(0),
             );
-            for i in 0..m {
-                for j in 0..n {
-                    let got = cc[j * m + i];
-                    let exp = cref[i * n + j];
-                    assert!(
-                        (got - exp).abs() <= 1e-10 * (1.0 + exp.abs()),
-                        "force={force} {m}x{k}x{n} ({i},{j}): {got} vs {exp}"
-                    );
-                }
-            }
+            assert_close(&cc, &cref, &format!("force={force} {m}x{k}x{n}"));
         }
     }
 }
@@ -164,56 +131,23 @@ fn gemv_threshold_disables_path_but_stays_correct() {
 #[test]
 fn lhs_packing_both_modes_correct() {
     let _g = knob_guard();
-    fn naive(a: &[f64], b: &[f64], m: usize, k: usize, n: usize) -> Vec<f64> {
-        let mut c = vec![0.0; m * n];
-        for i in 0..m {
-            for j in 0..n {
-                let mut s = 0.0;
-                for p in 0..k {
-                    s += a[i * k + p] * b[p * n + j];
-                }
-                c[i * n + j] = s;
-            }
-        }
-        c
-    }
-    let col = |v: &[f64], r: usize, c: usize| {
-        let mut o = vec![0.0; r * c];
-        for i in 0..r {
-            for j in 0..c {
-                o[j * r + i] = v[i * c + j];
-            }
-        }
-        o
-    };
     // 1 = always pack a column-major A (csa*sizeof >= 1); MAX = never via stride.
     // (0 would mean "auto" — derive from page size — so it is not an extreme here.)
     for &stride in &[1usize, usize::MAX] {
         tuning::set_lhs_pack_stride(stride);
         for &(m, k, n) in &[(97, 64, 80), (160, 48, 133), (200, 96, 175), (33, 17, 19)] {
-            let a: Vec<f64> = (0..m * k).map(|x| (x % 23) as f64 * 0.1 - 1.0).collect();
-            let b: Vec<f64> = (0..k * n).map(|x| (x % 19) as f64 * 0.2 - 1.5).collect();
-            let cref = naive(&a, &b, m, k, n);
-            let (ac, bc) = (col(&a, m, k), col(&b, k, n));
+            let (a, b) = mkmats(m, k, n);
+            let cref = naive_col(&a, &b, m, k, n);
             let mut cc = vec![0.0f64; m * n];
             gemm(
                 1.0,
-                MatRef::from_col_major(&ac, m, k),
-                MatRef::from_col_major(&bc, k, n),
+                MatRef::from_col_major(&a, m, k),
+                MatRef::from_col_major(&b, k, n),
                 0.0,
                 MatMut::from_col_major(&mut cc, m, n),
                 Parallelism::Rayon(0),
             );
-            for i in 0..m {
-                for j in 0..n {
-                    let got = cc[j * m + i];
-                    let exp = cref[i * n + j];
-                    assert!(
-                        (got - exp).abs() <= 1e-10 * (1.0 + exp.abs()),
-                        "stride={stride} {m}x{k}x{n} ({i},{j}): {got} vs {exp}"
-                    );
-                }
-            }
+            assert_close(&cc, &cref, &format!("stride={stride} {m}x{k}x{n}"));
         }
     }
 }
@@ -224,54 +158,21 @@ fn lhs_packing_both_modes_correct() {
 #[test]
 fn parallel_oversample_extremes_stay_correct() {
     let _g = knob_guard();
-    fn naive(a: &[f64], b: &[f64], m: usize, k: usize, n: usize) -> Vec<f64> {
-        let mut c = vec![0.0; m * n];
-        for i in 0..m {
-            for j in 0..n {
-                let mut s = 0.0;
-                for p in 0..k {
-                    s += a[i * k + p] * b[p * n + j];
-                }
-                c[i * n + j] = s;
-            }
-        }
-        c
-    }
-    let col = |v: &[f64], r: usize, c: usize| {
-        let mut o = vec![0.0; r * c];
-        for i in 0..r {
-            for j in 0..c {
-                o[j * r + i] = v[i * c + j];
-            }
-        }
-        o
-    };
     let (m, k, n) = (96usize, 80, 64);
-    let a: Vec<f64> = (0..m * k).map(|x| (x % 23) as f64 * 0.1 - 1.0).collect();
-    let b: Vec<f64> = (0..k * n).map(|x| (x % 19) as f64 * 0.2 - 1.5).collect();
-    let cref = naive(&a, &b, m, k, n);
-    let (ac, bc) = (col(&a, m, k), col(&b, k, n));
+    let (a, b) = mkmats(m, k, n);
+    let cref = naive_col(&a, &b, m, k, n);
     for &ov in &[0usize, 1, usize::MAX] {
         tuning::set_parallel_oversample(ov);
         let mut cc = vec![0.0f64; m * n];
         gemm(
             1.0,
-            MatRef::from_col_major(&ac, m, k),
-            MatRef::from_col_major(&bc, k, n),
+            MatRef::from_col_major(&a, m, k),
+            MatRef::from_col_major(&b, k, n),
             0.0,
             MatMut::from_col_major(&mut cc, m, n),
             Parallelism::Rayon(0),
         );
-        for i in 0..m {
-            for j in 0..n {
-                let got = cc[j * m + i];
-                let exp = cref[i * n + j];
-                assert!(
-                    (got - exp).abs() <= 1e-10 * (1.0 + exp.abs()),
-                    "oversample={ov} ({i},{j}): {got} vs {exp}"
-                );
-            }
-        }
+        assert_close(&cc, &cref, &format!("oversample={ov}"));
     }
 }
 

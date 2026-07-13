@@ -41,36 +41,16 @@ struct KnobGuard {
 }
 impl KnobGuard {
     fn capture() -> Self {
-        use gemmkit::tuning as t;
         #[allow(unused_mut)]
-        let mut restore: Vec<(fn(usize), usize)> = vec![
-            (t::set_parallel_threshold, t::parallel_threshold()),
-            (t::set_rhs_pack_threshold, t::rhs_pack_threshold()),
-            (t::set_lhs_pack_threshold, t::lhs_pack_threshold()),
-            (t::set_lhs_pack_stride, t::lhs_pack_stride()),
-            (t::set_gemv_threshold, t::gemv_threshold()),
-            (t::set_small_k_threshold, t::small_k_threshold()),
-            (t::set_small_mn_dim, t::small_mn_dim()),
-            (t::set_gemv_parallel_bytes, t::gemv_parallel_bytes()),
-            (t::set_gemv_thread_cap, t::gemv_thread_cap()),
-            (t::set_parallel_oversample, t::parallel_oversample()),
-            (t::set_thread_dim_stride, 0),
-            (t::set_shared_lhs_mnk, t::shared_lhs_mnk()),
-            (t::set_k_stream_max, t::k_stream_max()),
-            (
-                t::set_seq_internal_bytes_per_worker,
-                t::seq_internal_bytes_per_worker(),
-            ),
-            (t::set_packed_oversample, t::packed_oversample()),
-            (t::set_mc_reg_panels, t::mc_reg_panels()),
-            (t::set_nc_no_l3_panels, t::nc_no_l3_panels()),
-            (t::set_tiny_block_dim, t::tiny_block_dim()),
-            (t::set_kc, t::kc()),
-            (t::set_kc_min, t::kc_min()),
-            (t::set_pack_transpose_tile, t::pack_transpose_tile()),
-        ];
+        let mut restore: Vec<(fn(usize), usize)> =
+            KNOBS.iter().map(|&(set, get)| (set, get())).collect();
+        // i8 VNNI stays a separate cfg'd append: it is captured/restored but deliberately
+        // excluded from the swept `KNOBS` table (int8/f32-inert; exercised by P20).
         #[cfg(feature = "int8")]
-        restore.push((t::set_i8_vnni_min_par_mnk, t::i8_vnni_min_par_mnk()));
+        restore.push((
+            tuning::set_i8_vnni_min_par_mnk,
+            tuning::i8_vnni_min_par_mnk(),
+        ));
         Self { restore }
     }
 }
@@ -82,38 +62,52 @@ impl Drop for KnobGuard {
     }
 }
 
-/// The 21 general-path knobs P16 sweeps (i8 VNNI is int8/f32-inert, exercised by P20).
-/// Order-independent: each is set to an independently-drawn value.
-fn knob_setters() -> Vec<fn(usize)> {
-    use gemmkit::tuning as t;
-    vec![
-        t::set_parallel_threshold,
-        t::set_rhs_pack_threshold,
-        t::set_lhs_pack_threshold,
-        t::set_lhs_pack_stride,
-        t::set_gemv_threshold,
-        t::set_small_k_threshold,
-        t::set_small_mn_dim,
-        t::set_gemv_parallel_bytes,
-        t::set_gemv_thread_cap,
-        t::set_parallel_oversample,
-        t::set_thread_dim_stride,
-        t::set_shared_lhs_mnk,
-        t::set_k_stream_max,
-        t::set_seq_internal_bytes_per_worker,
-        t::set_packed_oversample,
-        t::set_mc_reg_panels,
-        t::set_nc_no_l3_panels,
-        t::set_tiny_block_dim,
-        t::set_kc,
-        t::set_kc_min,
-        t::set_pack_transpose_tile,
-    ]
+/// `thread_dim_stride`'s getter maps a raw stored `0` to the core-derived auto value, so it
+/// does not round-trip; its `KNOBS` capture entry restores the shipped default `0`
+/// (THREAD_DIM_STRIDE_DEFAULT, tuning.rs:213) instead (see `KnobGuard`).
+fn thread_dim_stride_restore() -> usize {
+    0
 }
-const KNOB_COUNT: usize = 21;
+
+/// One swept knob: its setter paired with the capture fn that reads the value the setter
+/// round-trips to.
+type Knob = (fn(usize), fn() -> usize);
+
+/// The 21 general-path knobs P16 sweeps (i8 VNNI is int8/f32-inert, exercised by P20), each
+/// paired with the capture fn that reads the value its setter round-trips to. Order-independent:
+/// each is set to an independently-drawn value. Both `KnobGuard::capture` (restore side) and
+/// `apply_knobs` (sweep side) drive this single table, so their lengths — and hence
+/// [`KNOB_COUNT`] — can never drift apart.
+const KNOBS: &[Knob] = &[
+    (tuning::set_parallel_threshold, tuning::parallel_threshold),
+    (tuning::set_rhs_pack_threshold, tuning::rhs_pack_threshold),
+    (tuning::set_lhs_pack_threshold, tuning::lhs_pack_threshold),
+    (tuning::set_lhs_pack_stride, tuning::lhs_pack_stride),
+    (tuning::set_gemv_threshold, tuning::gemv_threshold),
+    (tuning::set_small_k_threshold, tuning::small_k_threshold),
+    (tuning::set_small_mn_dim, tuning::small_mn_dim),
+    (tuning::set_gemv_parallel_bytes, tuning::gemv_parallel_bytes),
+    (tuning::set_gemv_thread_cap, tuning::gemv_thread_cap),
+    (tuning::set_parallel_oversample, tuning::parallel_oversample),
+    (tuning::set_thread_dim_stride, thread_dim_stride_restore),
+    (tuning::set_shared_lhs_mnk, tuning::shared_lhs_mnk),
+    (tuning::set_k_stream_max, tuning::k_stream_max),
+    (
+        tuning::set_seq_internal_bytes_per_worker,
+        tuning::seq_internal_bytes_per_worker,
+    ),
+    (tuning::set_packed_oversample, tuning::packed_oversample),
+    (tuning::set_mc_reg_panels, tuning::mc_reg_panels),
+    (tuning::set_nc_no_l3_panels, tuning::nc_no_l3_panels),
+    (tuning::set_tiny_block_dim, tuning::tiny_block_dim),
+    (tuning::set_kc, tuning::kc),
+    (tuning::set_kc_min, tuning::kc_min),
+    (tuning::set_pack_transpose_tile, tuning::pack_transpose_tile),
+];
+const KNOB_COUNT: usize = KNOBS.len();
 
 fn apply_knobs(vals: &[usize]) {
-    for (set, &v) in knob_setters().iter().zip(vals) {
+    for (&(set, _), &v) in KNOBS.iter().zip(vals) {
         set(v);
     }
 }

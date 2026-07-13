@@ -18,31 +18,12 @@
 //! (tests c/d). All shapes are platform-independent (deterministic LCG fills, self-computed
 //! references).
 
+use crate::common::Rng;
 use gemmkit::{
     Activation, Bias, MatMut, MatRef, NarrowFloat, Parallelism, Workspace, gemm, gemm_fused_with,
 };
 
 // --------------------------------------------------------------------------- harness
-
-/// Deterministic LCG (xorshift*), reproducible across runs and platforms.
-struct Lcg(u64);
-impl Lcg {
-    fn new(seed: u64) -> Self {
-        Lcg(seed | 1)
-    }
-    fn next_u64(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        self.0 = x;
-        x.wrapping_mul(0x2545F491_4F6CDD1D)
-    }
-    /// A value in roughly `[-1, 1)`.
-    fn unit(&mut self) -> f64 {
-        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0
-    }
-}
 
 /// The narrow float under test (`f16`/`bf16`): exact widen/narrow, bit compare, NaN, tolerance.
 trait Narrow: NarrowFloat + gemmkit::FusedScalar {
@@ -148,7 +129,7 @@ fn ref_apply_narrow<N: Narrow>(v: f32, bias: f32, act: ActK) -> N {
 }
 
 /// Build an `m × n` narrow matrix (col-major storage) of LCG values scaled by `scale`.
-fn make<N: Narrow>(rng: &mut Lcg, m: usize, n: usize, scale: f64) -> Vec<N> {
+fn make<N: Narrow>(rng: &mut Rng, m: usize, n: usize, scale: f64) -> Vec<N> {
     (0..m * n).map(|_| N::of(rng.unit() * scale)).collect()
 }
 
@@ -274,7 +255,7 @@ fn assert_close<N: Narrow>(
 /// agree after the final narrowing absorbs a sub-narrow f32 difference — an ISA-dependent tie the
 /// pre-narrow precision contract is covered separately in tests b/c/d.)
 fn vector_scalar_bitwise<N: Narrow>() {
-    let mut rng = Lcg::new(0x11CE_A501);
+    let mut rng = Rng::new(0x11CE_A501);
     let (m, k, n) = (64usize, 96usize, 48usize);
     let alpha = N::of(1.3);
     let a = make::<N>(&mut rng, m, k, 1.0); // col-major m×k
@@ -351,7 +332,7 @@ fn fused_mixed_vector_scalar_bitwise() {
 /// `ReLU`/`LeakyReLU` are the identity, so the sub-narrow bits that make the `None` case diverge
 /// survive the activation on those elements.
 fn pre_narrow_semantics<N: Narrow>() {
-    let mut rng = Lcg::new(0x9E27_B1A5);
+    let mut rng = Rng::new(0x9E27_B1A5);
     let (m, k, n) = (32usize, 1usize, 24usize);
     // Values in [1, 2): products land in [1, 4) with up to 2·mantissa bits — beyond `N`'s
     // mantissa, so narrowing the product first loses bits a well-chosen bias keeps significant.
@@ -419,7 +400,7 @@ fn fused_mixed_pre_narrow_semantics() {
 
 /// General driver shape, full `bias × act × beta` sweep, against the f64 oracle within tolerance.
 fn matches_reference<N: Narrow>() {
-    let mut rng = Lcg::new(0xC0FF_EE12);
+    let mut rng = Rng::new(0xC0FF_EE12);
     let (m, k, n) = (96usize, 128usize, 64usize);
     let a = make::<N>(&mut rng, m, k, 1.0);
     let b = make::<N>(&mut rng, k, n, 1.0);
@@ -482,7 +463,7 @@ fn special_route<N: Narrow>(
     csb: isize,
     tag: &str,
 ) {
-    let mut rng = Lcg::new(0x5EC1_A177 ^ (m as u64) << 8 ^ n as u64);
+    let mut rng = Rng::new(0x5EC1_A177 ^ (m as u64) << 8 ^ n as u64);
     let alpha = N::of(1.0);
     let beta = N::of(0.7);
     let c0 = make::<N>(&mut rng, m, n, 1.0);
@@ -544,7 +525,7 @@ fn special_routes<N: Narrow>() {
     // small_mn: (8, 2048, 8), row-major A (csa == 1), col-major B (rsb == 1).
     {
         let (m, k, n) = (8usize, 2048usize, 8usize);
-        let mut rng = Lcg::new(0x5A11_3E00);
+        let mut rng = Rng::new(0x5A11_3E00);
         let a = make::<N>(&mut rng, m, k, 1.0); // logical, stored col-major here…
         let b = make::<N>(&mut rng, k, n, 1.0);
         // …but present A row-major: rebuild a row-major buffer so csa == 1.
@@ -561,7 +542,7 @@ fn special_routes<N: Narrow>() {
     // small_k: (100, 4, 80), col-major A (rsa == 1).
     {
         let (m, k, n) = (100usize, 4usize, 80usize);
-        let mut rng = Lcg::new(0x5A11_C400);
+        let mut rng = Rng::new(0x5A11_C400);
         let a = make::<N>(&mut rng, m, k, 1.0);
         let b = make::<N>(&mut rng, k, n, 1.0);
         special_route::<N>(m, k, n, &a, 1, m as isize, &b, 1, k as isize, "small_k");
@@ -578,7 +559,7 @@ fn fused_mixed_special_routes() {
 
 /// `bias None + act None` delegates to plain `gemm`, bit-for-bit (the zero-cost identity path).
 fn identity_delegates<N: Narrow>() {
-    let mut rng = Lcg::new(0x1DE7_17FF);
+    let mut rng = Rng::new(0x1DE7_17FF);
     let (m, k, n) = (48usize, 40usize, 33usize);
     let a = make::<N>(&mut rng, m, k, 1.0);
     let b = make::<N>(&mut rng, k, n, 1.0);
@@ -630,7 +611,7 @@ fn fused_mixed_identity_delegates() {
 /// which `ReLU` must map to `+0.0` on every ISA and store path — bit-for-bit `N::ZERO`. With
 /// `beta = 0` the whole output is affected; the reference (`ReLU(NaN) = +0`) agrees.
 fn nan_relu<N: Narrow>() {
-    let mut rng = Lcg::new(0x4A11_DEAD);
+    let mut rng = Rng::new(0x4A11_DEAD);
     let (m, k, n) = (64usize, 3usize, 48usize);
     let mut a = make::<N>(&mut rng, m, k, 1.0); // col-major m×k
     let b = make::<N>(&mut rng, k, n, 1.0);
