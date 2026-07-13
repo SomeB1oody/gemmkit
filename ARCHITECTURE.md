@@ -228,9 +228,9 @@ A second L1 seam, [`Epilogue<Fam>`], fuses a per-element transform into the stor
 `C[r,c] <- apply(α·AB + β·C, r, c)` — instead of materializing the raw product and
 mapping it in a second pass. It is threaded through a **provided** family method,
 `KernelFamily::microkernel_epi(.., row0, col0, last_k, epi, ..)`, whose default just
-forwards to `microkernel` (so `mixed`, `complex`, and the `i32`-out integer families are
-byte-for-byte unchanged and only debug-assert the epilogue is `Identity`). Only `FloatGemm`
-and the two requantizing families override it.
+forwards to `microkernel` (so `complex` and the `i32`-out integer families are byte-for-byte
+unchanged and only debug-assert the epilogue is `Identity`). `FloatGemm`, the mixed families
+(`MixedGemm<f16/bf16>` and `Bf16DotGemm`), and the two requantizing families override it.
 
 The load-bearing invariant is **zero-cost identity**: every kernel hook is gated on the
 associated `const Epilogue::IS_IDENTITY`, so with `E = Identity` (a ZST) the guards const-fold
@@ -243,11 +243,20 @@ have written, so `gemm_fused == gemm()` then a scalar map, **bit-for-bit**. The 
 `last_k` (final depth panel) so a float epilogue fires exactly once; the requant families are
 `OUT_IS_ACC = false` (⇒ `kc = k`), so they fire once *structurally*.
 
-Two built-ins ship. `FusedEpi<T>` (f32/f64) is **one runtime-composed type** — bias
+Two built-ins ship. `FusedEpi<T>` is **one runtime-composed type** — bias
 (per-row/per-col/none) then activation (none/ReLU/LeakyReLU) as ~2 predictable branches per
 tile — so the kernel is not multiplied by the epilogue kind; it uses the fast vector path via
 new `SimdOps::{max, min}` (the NaN-non-propagating `maxnm`/`pmax` variants, so `ReLU(NaN)=0`
-and the vector and scratch/scalar paths agree bit-for-bit). `KRequantize` (`i8 -> i8`,
+and the vector and scratch/scalar paths agree bit-for-bit). It covers `f32`/`f64` **and**, under
+`half`, the narrow floats `f16`/`bf16` (one blanket `Epilogue` impl over the three mixed
+families). For a narrow type the bias vector and `LeakyReLU` slope are the narrow type, widened
+**exactly** to `f32`; the epilogue applies in `f32` to the accumulator **before** the single
+round-to-nearest-even narrowing on store (`apply_reg` transforms the `f32` register and the
+family's `store_out` narrows; `apply` narrows itself). That is *more* precise than `gemm()` then
+a separate narrow map (which rounds to the narrow type, widens back, then rounds again), so for
+narrow types `gemm_fused` is **not** bitwise-equal to `gemm`-then-map — the every-shape bitwise
+contract holds for `f32`/`f64` only. Within a fused run the vector and scratch paths still agree
+bit-for-bit (both round once), and serial ≡ parallel is unchanged. `KRequantize` (`i8 -> i8`,
 scale + zero-point + optional integer bias) is scalar-only (`VECTOR = false`): every tile
 drains to `i32` scratch and only the requantize map is scalar, still deleting the full `m·n`
 `i32` materialization a `gemm_i8` + separate pass would pay. Its rounding is a single
@@ -261,11 +270,17 @@ and `IntGemmVnniQ` (`vpdpbusd`), both `Out = i8, Acc = i32`, reached through a s
 *and* the L6 float special paths (gemv, small-`m,n`, small-`k`), each threading `E` through the
 same `run`/`run_typed` decision tree via zero-cost `Identity` forwarders (`run_epi` /
 `run_typed_epi` / `core_epi`) — so the `gemm_fused == gemm()`-then-map contract is bit-for-bit
-for **every** float shape. gemv fuses as a final in-place epilogue sweep over each worker's own
-output range (the vector output is negligible next to the memory-bound matrix read, and the
+for **every** `f32`/`f64` shape. gemv fuses as a final in-place epilogue sweep over each worker's
+own output range (the vector output is negligible next to the memory-bound matrix read, and the
 strategy kernels stay byte-identical); the small-`m,n` / small-`k` paths apply `E` at each tile's
 single store. gemv routes in the user frame (before orientation), so its `epi` is unflipped; the
-others consume the orientation-flipped `epi`. `gemm_i8_requant` still covers the general driver
+others consume the orientation-flipped `epi`. The narrow (`f16`/`bf16`) fused path is the mirror
+`run_typed_mixed_fused`: **no gemv route** (the general driver handles those shapes) but the same
+small-`m,n` / small-`k` reroutes (through `MixedGemm<N>`, as the plain mixed path) and the same
+bias-axis flip — with the pre-narrow `f32` epilogue semantics above (more precise than, not
+bitwise-equal to, `gemm`-then-map). The `FusedScalar` bound admits exactly these four types; each
+supplies `dispatch_fused` and a `fused_degenerate` (the `C <- act(β·C + bias)` map when `A·B`
+vanishes — real floats in `T`, narrow types in `f32`, narrowing once). `gemm_i8_requant` still covers the general driver
 path only (the integer special paths keep the identity seam and adopt `E` later behind the same
 API); prepacked-RHS likewise keeps `Identity`.
 

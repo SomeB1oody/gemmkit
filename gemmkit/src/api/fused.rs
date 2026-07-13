@@ -22,15 +22,6 @@ pub enum Activation<T> {
     LeakyRelu(T),
 }
 
-/// `true` iff `s` is finite, expressed generically (no `f32`/`f64` inherent method on the
-/// generic `T`): a finite value equals itself and `s - s == 0`, while `±inf - ±inf = NaN != 0`
-/// and `NaN != NaN`. The `eq_op` lint is expected — the self-comparison is the point.
-#[inline]
-#[allow(clippy::eq_op)]
-fn is_finite<T: FusedScalar>(s: T) -> bool {
-    s == s && (s - s) == T::ZERO
-}
-
 /// `C <- act(alpha·A·B + beta·C + bias)` in one pass: a **fused** GEMM epilogue over safe
 /// slice views, using the thread-local workspace pool. The bias is added by one IEEE add
 /// after the final `beta`-fold, then the activation is applied. `bias == None && act == None`
@@ -39,8 +30,18 @@ fn is_finite<T: FusedScalar>(s: T) -> bool {
 /// The fused engine routes every shape through the **same** kernel `gemm` would use — the
 /// general register-blocked driver, gemv (`m == 1` / `n == 1`), the small-`m,n` horizontal
 /// path, or the small-`k` path — fusing the epilogue into that kernel's store without
-/// perturbing its accumulation order. So the result is **bit-identical** to `gemm()` followed
-/// by the same scalar map, for **every** shape, and deterministic across thread counts.
+/// perturbing its accumulation order. So for `f32`/`f64` the result is **bit-identical** to
+/// `gemm()` followed by the same scalar map, for **every** shape, and deterministic across
+/// thread counts.
+///
+/// **Narrow types (`f16`/`bf16`, feature `half`).** `T` may also be a narrow float. The bias
+/// vector and `LeakyRelu` slope are then the narrow type and are widened **exactly** to `f32`
+/// (`f16`/`bf16` are a subset of `f32`); the epilogue applies in `f32` to the accumulator
+/// **before** the single round-to-nearest-even narrowing to the output. This is *more* precise
+/// than `gemm()` followed by a separate narrow map (which rounds to the narrow type, widens
+/// back, then rounds again), so for narrow types it is **not** bitwise-equal to `gemm`-then-map
+/// — the every-shape bitwise contract above holds for `f32`/`f64` only. Reproducibility and
+/// determinism are unchanged (serial ≡ parallel, bit-for-bit).
 ///
 /// # Panics
 /// Same conditions as [`gemm`], plus: a `PerRow` bias whose length is not `A.rows` (or a
@@ -60,7 +61,9 @@ pub fn gemm_fused<T: FusedScalar>(
     workspace::with_thread_pool(|ws| gemm_fused_with(ws, alpha, a, b, beta, c, bias, act, par));
 }
 
-/// Like [`gemm_fused`] but reuses a caller-owned [`Workspace`].
+/// Like [`gemm_fused`] but reuses a caller-owned [`Workspace`]. Accepts `f32`/`f64` and, under
+/// the `half` feature, `f16`/`bf16` with the same pre-narrow `f32` epilogue semantics as
+/// [`gemm_fused`] (more precise than `gemm`-then-map; bitwise-equal to it only for `f32`/`f64`).
 ///
 /// # Panics
 /// Same conditions as [`gemm_fused`].
@@ -107,7 +110,7 @@ pub fn gemm_fused_with<T: FusedScalar>(
         }
     }
     if let Some(Activation::LeakyRelu(s)) = &act {
-        assert!(is_finite(*s), "gemmkit: LeakyRelu slope must be finite");
+        assert!(T::finite(*s), "gemmkit: LeakyRelu slope must be finite");
     }
 
     // The identity-fused case cannot even reach a fused monomorphization: delegate to plain
@@ -164,6 +167,12 @@ pub fn gemm_fused_with<T: FusedScalar>(
 /// strides, with **no** bounds/alias/shape checks. `bias` is a `(ptr, dim)` pair enabled by
 /// `has_bias` (`bias` is ignored when `has_bias == false`). Uses the thread-local workspace
 /// pool.
+///
+/// Accepts `f32`/`f64` and, under the `half` feature, `f16`/`bf16`. For narrow types the bias /
+/// slope are the narrow type, widened **exactly** to `f32`, and the epilogue applies in `f32`
+/// before the single narrowing to the output — *more* precise than a separate narrow map, hence
+/// not bitwise-equal to `gemm`-then-map (the `f32`/`f64` every-shape bitwise contract is
+/// unchanged); reproducibility/determinism are unchanged.
 ///
 /// # Safety
 /// As [`gemm_unchecked`], plus: when `has_bias`, `bias` is valid for reads of `m` (`PerRow`)

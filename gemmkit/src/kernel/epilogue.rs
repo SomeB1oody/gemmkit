@@ -13,9 +13,11 @@
 //! fused too — blocking is epilogue-independent, and the epilogue is applied to the very
 //! register the store would have written (see [`FusedEpi`]).
 //!
-//! Two built-ins ship in v1: [`FusedEpi`] (per-row/per-col bias + ReLU/LeakyReLU for
-//! `f32`/`f64`, via the fast vector path) and [`KRequantize`] (`i8 -> i8` quantized
-//! output, scalar map with the exact round-half-to-even [`round_ne_f64`]).
+//! Two built-ins ship in v1: [`FusedEpi`] (per-row/per-col bias + ReLU/LeakyReLU, via the
+//! fast vector path — for `f32`/`f64` and, under `half`, `f16`/`bf16` where the bias/slope
+//! widen exactly to `f32`, the transform applies in `f32`, and the single narrowing to the
+//! output happens on store) and [`KRequantize`] (`i8 -> i8` quantized output, scalar map with
+//! the exact round-half-to-even [`round_ne_f64`]).
 
 use super::KernelFamily;
 use super::float::FloatGemm;
@@ -39,10 +41,13 @@ pub trait Epilogue<Fam: KernelFamily>: Copy + Send + Sync {
     /// Compile-time identity marker: `true` => every kernel hook const-folds away and the
     /// monomorphization is bit-identical to the non-fused kernel.
     const IS_IDENTITY: bool = false;
-    /// `true` iff [`Epilogue::apply_reg`] is implemented **and** `Fam::Out == Fam::Acc`
-    /// (a documented contract): this enables the fast vector store path. `false` routes
-    /// every tile through the scratch/scalar path (correct for any tile shape), which is
-    /// the right call for an epilogue whose vector form is not yet worth it (requantize).
+    /// `true` iff [`Epilogue::apply_reg`] is implemented: this enables the fast vector store
+    /// path. The contract is that [`Epilogue::apply_reg`] transforms the `Fam::Acc`-typed
+    /// register and the family's store applies any narrowing **after** the transform —
+    /// `FloatGemm` stores the register as-is (`Out == Acc`), while the mixed (`f16`/`bf16`)
+    /// families narrow via `store_out` (`Out` narrower than `Acc = f32`). `false` routes every
+    /// tile through the scratch/scalar path (correct for any tile shape), which is the right
+    /// call for an epilogue whose vector form is not yet worth it (requantize).
     const VECTOR: bool = false;
 
     /// Scalar transform at absolute `(row, col)` in the **oriented** problem frame.
@@ -192,6 +197,84 @@ impl<T: Float<Acc = T> + PartialOrd> Epilogue<FloatGemm<T>> for FusedEpi<T> {
                 Act::LeakyRelu(sl) => {
                     s.add(s.max(v, s.zero()), s.mul(s.splat(sl), s.min(v, s.zero())))
                 }
+            }
+        }
+    }
+}
+
+// Narrow-family (`f16`/`bf16`) blanket: bias/slope are the narrow type `N`, widened **exactly**
+// to `f32` (both are a subset of `f32`); the epilogue applies in `f32` to the accumulator, then
+// the single round-to-nearest-even narrowing to `N` happens on store. It covers `MixedGemm<f16>`,
+// `MixedGemm<bf16>`, and `Bf16DotGemm` at once (all `Lhs = Rhs = Out = N`, `Acc = f32`). It cannot
+// overlap the `FloatGemm` impl above: `f32`/`f64` are not `NarrowFloat`.
+//
+// This is **more** precise than `gemm()` then a separate map (which would round to `N`, widen
+// back, and round again) — and therefore NOT bitwise-equal to `gemm`-then-map (unlike `f32`/`f64`,
+// whose every-shape bitwise contract is unchanged). Within the fused run, the vector fast path and
+// the scalar/scratch path agree bit-for-bit: both compute `act(bias(v))` in `f32` and round
+// exactly once (`apply` via [`crate::scalar::NarrowFloat::narrow`], `apply_reg` via `store_out`),
+// and widening is exact — the `accumulate_tile` edge-consistency contract.
+#[cfg(feature = "half")]
+impl<N, Fam> Epilogue<Fam> for FusedEpi<N>
+where
+    N: crate::scalar::NarrowFloat,
+    Fam: KernelFamily<Lhs = N, Rhs = N, Acc = f32, Out = N>,
+{
+    const VECTOR: bool = true;
+
+    #[inline(always)]
+    unsafe fn apply(&self, v: f32, r: usize, c: usize) -> N {
+        // Bias add in `f32` (the narrow bias value widened exactly).
+        let v = match self.bias {
+            BiasSpec::None => v,
+            BiasSpec::Row(p) => v + unsafe { (*p.0.add(r)).widen() },
+            BiasSpec::Col(p) => v + unsafe { (*p.0.add(c)).widen() },
+        };
+        // Activation in `f32`, the EXACT same scalar forms as the `FloatGemm` impl above.
+        let v = match self.act {
+            Act::None => v,
+            // NaN -> 0 (`NaN > 0` is false), matching the vector `max(v, 0)`.
+            Act::Relu => {
+                if v > 0.0 {
+                    v
+                } else {
+                    0.0
+                }
+            }
+            // Exact scalar mirror of the vector `max(v, 0) + s·min(v, 0)`: NaN -> 0, −0.0 -> +0.0.
+            Act::LeakyRelu(s) => {
+                let hi = if v > 0.0 { v } else { 0.0 };
+                let lo = if v < 0.0 { v } else { 0.0 };
+                hi + s.widen() * lo
+            }
+        };
+        // The single round-to-nearest-even narrowing is the epilogue's job here — the kernel's
+        // scratch path stores exactly what this returns.
+        N::narrow(v)
+    }
+
+    #[inline(always)]
+    unsafe fn apply_reg<S>(&self, s: S, v: S::Reg, r: usize, c: usize) -> S::Reg
+    where
+        S: KernelSimd<N, N, f32, N>,
+    {
+        unsafe {
+            let v = match self.bias {
+                // Fast path is a full tile with `rsc == 1`, so the `LANES` rows at `r` are
+                // consecutive narrow bias values — widen-load them into one `f32` register.
+                BiasSpec::None => v,
+                BiasSpec::Row(p) => s.add(v, s.load_lhs(p.0.add(r))),
+                BiasSpec::Col(p) => s.add(v, s.splat((*p.0.add(c)).widen())),
+            };
+            // Same register forms as the `FloatGemm` impl; returns the `f32` register — the
+            // family's `store_out` performs the single narrowing store.
+            match self.act {
+                Act::None => v,
+                Act::Relu => s.max(v, s.zero()),
+                Act::LeakyRelu(sl) => s.add(
+                    s.max(v, s.zero()),
+                    s.mul(s.splat(sl.widen()), s.min(v, s.zero())),
+                ),
             }
         }
     }

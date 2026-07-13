@@ -102,7 +102,10 @@ unsafe fn run_typed_fused<T, S, const MR_REG: usize, const NR: usize>(
     par: Parallelism,
     ws: &mut Workspace,
 ) where
-    T: FusedScalar,
+    // The real-float epilogue arithmetic (`FusedEpi<T>: Epilogue<FloatGemm<T>>`) and the special
+    // paths need `Float<Acc = T> + PartialOrd`; `FusedScalar` no longer implies them (it now also
+    // covers the narrow `f16`/`bf16` types, which route through `run_typed_mixed_fused` instead).
+    T: Float<Acc = T> + PartialOrd,
     S: SimdOps<T>,
 {
     unsafe {
@@ -380,20 +383,59 @@ unsafe fn gemm_f64_simd128_fused(
     unsafe { run_typed_fused::<f64, Simd128, 2, 4>(Simd128, t, epi, par, ws) }
 }
 
-/// The sealed element-type bound for the fused-epilogue public API: exactly the real floats
-/// `f32`/`f64`. It is a superset of [`GemmScalar`] (for dispatch) plus `Float<Acc = Self>`
-/// and `PartialOrd` (for the [`FusedEpi`] arithmetic and the `ReLU` comparisons), and it is
-/// sealed (a private supertrait) so downstream crates cannot widen the fused surface.
-pub trait FusedScalar: GemmScalar + Float<Acc = Self> + PartialOrd + sealed::Sealed {}
+/// The sealed element-type bound for the fused-epilogue public API: the real floats `f32`/`f64`
+/// and, under the `half` feature, the narrow floats `f16`/`bf16`. It is a superset of
+/// [`GemmScalar`] (for dispatch), sealed (a private supertrait) so downstream crates cannot widen
+/// the fused surface. It no longer requires `Float<Acc = Self> + PartialOrd`: the real-float
+/// [`FusedEpi`] arithmetic keeps those bounds on its own `Epilogue<FloatGemm<T>>` impl, and the
+/// narrow types are not `Float` (they widen to `f32`). What every fused type must provide is the
+/// finiteness test used to validate a `LeakyRelu` slope, and the degenerate `C <- act(β·C + bias)`
+/// map (type-specific: real floats compute in `T`, narrow types in `f32`, narrowing once).
+pub trait FusedScalar: GemmScalar + sealed::Sealed {
+    /// `true` iff `self` is finite. `f32`/`f64` use the inherent test; `f16`/`bf16` widen exactly
+    /// to `f32` first. `core`-only, so it is `no_std`-safe.
+    #[doc(hidden)]
+    fn finite(self) -> bool;
+
+    /// The degenerate fused epilogue `C[i,j] <- apply(β·C[i,j], i, j)` in the user frame, run when
+    /// the `A·B` term vanishes (`k == 0` or `alpha == 0`).
+    ///
+    /// # Safety
+    /// `c` valid for the `m × n` region; `epi`'s bias valid for the problem's `m`/`n`.
+    #[doc(hidden)]
+    unsafe fn fused_degenerate(t: &Task<Self>, epi: &FusedEpi<Self>);
+}
 
 mod sealed {
     pub trait Sealed {}
     impl Sealed for f32 {}
     impl Sealed for f64 {}
+    #[cfg(feature = "half")]
+    impl Sealed for half::f16 {}
+    #[cfg(feature = "half")]
+    impl Sealed for half::bf16 {}
 }
 
-impl FusedScalar for f32 {}
-impl FusedScalar for f64 {}
+impl FusedScalar for f32 {
+    #[inline]
+    fn finite(self) -> bool {
+        self.is_finite()
+    }
+    #[inline]
+    unsafe fn fused_degenerate(t: &Task<f32>, epi: &FusedEpi<f32>) {
+        unsafe { fused_degenerate_float::<f32>(t, epi) }
+    }
+}
+impl FusedScalar for f64 {
+    #[inline]
+    fn finite(self) -> bool {
+        self.is_finite()
+    }
+    #[inline]
+    unsafe fn fused_degenerate(t: &Task<f64>, epi: &FusedEpi<f64>) {
+        unsafe { fused_degenerate_float::<f64>(t, epi) }
+    }
+}
 
 /// Top-level fused entry (called by the API layer): handle the degenerate cases in the
 /// **user** frame (before orientation), then run the ISA-dispatched fused kernel.
@@ -412,20 +454,27 @@ pub(crate) unsafe fn execute_fused<T: FusedScalar>(
             return;
         }
         // The A·B term vanishes (`k == 0` or `alpha == 0`): `C <- act(beta·C + bias)`,
-        // element-wise in the user frame (bias axes as the caller specified).
+        // element-wise in the user frame (bias axes as the caller specified). This is
+        // type-specific — narrow types combine in `f32` and narrow once — so it is a
+        // `FusedScalar` method (the real floats and the narrow types provide their own).
         if task.k == 0 || task.alpha == T::ZERO {
-            fused_degenerate(&task, &epi);
+            T::fused_degenerate(&task, &epi);
             return;
         }
         T::dispatch_fused(task, epi, par, ws);
     }
 }
 
-/// The degenerate fused epilogue `C[i,j] <- apply(beta·C[i,j], i, j)` in the user frame.
+/// The degenerate fused epilogue `C[i,j] <- apply(beta·C[i,j], i, j)` in the user frame, for the
+/// **real floats** (`f32`/`f64`): all arithmetic is in `T`. The narrow (`f16`/`bf16`) sibling —
+/// which combines in `f32` and narrows once — lives in [`crate::dispatch`]'s `mixed` module.
 ///
 /// # Safety
 /// `c` valid for the `m × n` region; `epi`'s bias valid for the problem's `m`/`n`.
-unsafe fn fused_degenerate<T: FusedScalar>(t: &Task<T>, epi: &FusedEpi<T>) {
+pub(super) unsafe fn fused_degenerate_float<T: Float<Acc = T> + PartialOrd>(
+    t: &Task<T>,
+    epi: &FusedEpi<T>,
+) {
     unsafe {
         for j in 0..t.n {
             for i in 0..t.m {
@@ -445,10 +494,11 @@ unsafe fn fused_degenerate<T: FusedScalar>(t: &Task<T>, epi: &FusedEpi<T>) {
 
 type GemmFn<T> = unsafe fn(Task<T>, Parallelism, &mut Workspace);
 type PackedFn<T> = unsafe fn(PackedConsume<T>, Parallelism, &mut Workspace);
-/// The fused-epilogue kernel entry: a plain [`Task`] plus the runtime-composed
-/// [`FusedEpi`]. `Some` only for the real floats (`f32`/`f64`); the sealed
-/// [`FusedScalar`] bound makes the `None` (`f16`/`bf16`) case unreachable.
-type FusedFn<T> = unsafe fn(Task<T>, FusedEpi<T>, Parallelism, &mut Workspace);
+/// The fused-epilogue kernel entry: a plain [`Task`] plus the runtime-composed [`FusedEpi`].
+/// Every [`FusedScalar`] type (`f32`/`f64` here, `f16`/`bf16` in the `mixed` module) supplies one,
+/// so the slot is non-optional. `pub(super)` so `dispatch/mixed.rs` can name it (as with
+/// [`Dispatched`]).
+pub(super) type FusedFn<T> = unsafe fn(Task<T>, FusedEpi<T>, Parallelism, &mut Workspace);
 
 /// The memoized dispatch slot for one element type: the standard kernel, the
 /// prepacked-RHS kernel, the fused-epilogue kernel, and the microtile `(mr, nr)` they
@@ -459,8 +509,9 @@ type FusedFn<T> = unsafe fn(Task<T>, FusedEpi<T>, Parallelism, &mut Workspace);
 pub(super) struct Dispatched<T> {
     pub(super) run: GemmFn<T>,
     pub(super) run_packed: PackedFn<T>,
-    /// Fused-epilogue entry (`bias`/activation), or `None` for a type with no fused path.
-    pub(super) run_fused: Option<FusedFn<T>>,
+    /// Fused-epilogue entry (`bias`/activation). Every dispatched type supplies one (`f32`/`f64`
+    /// and, under `half`, `f16`/`bf16`), so it is non-optional.
+    pub(super) run_fused: FusedFn<T>,
     pub(super) mr: usize,
     pub(super) nr: usize,
     /// The dispatched kernel family's [`crate::kernel::KernelFamily::DEPTH_MULTIPLE`].
@@ -477,7 +528,7 @@ pub(super) struct Dispatched<T> {
 const DISP_F32_SCALAR: Dispatched<f32> = Dispatched {
     run: gemm_f32_scalar,
     run_packed: gemm_f32_scalar_packed,
-    run_fused: Some(gemm_f32_scalar_fused),
+    run_fused: gemm_f32_scalar_fused,
     mr: 4,
     nr: 4,
     depth_multiple: 1,
@@ -485,7 +536,7 @@ const DISP_F32_SCALAR: Dispatched<f32> = Dispatched {
 const DISP_F64_SCALAR: Dispatched<f64> = Dispatched {
     run: gemm_f64_scalar,
     run_packed: gemm_f64_scalar_packed,
-    run_fused: Some(gemm_f64_scalar_fused),
+    run_fused: gemm_f64_scalar_fused,
     mr: 4,
     nr: 4,
     depth_multiple: 1,
@@ -495,7 +546,7 @@ const DISP_F64_SCALAR: Dispatched<f64> = Dispatched {
 const DISP_F32_FMA: Dispatched<f32> = Dispatched {
     run: gemm_f32_fma,
     run_packed: gemm_f32_fma_packed,
-    run_fused: Some(gemm_f32_fma_fused),
+    run_fused: gemm_f32_fma_fused,
     mr: 16,
     nr: 6,
     depth_multiple: 1,
@@ -504,7 +555,7 @@ const DISP_F32_FMA: Dispatched<f32> = Dispatched {
 const DISP_F64_FMA: Dispatched<f64> = Dispatched {
     run: gemm_f64_fma,
     run_packed: gemm_f64_fma_packed,
-    run_fused: Some(gemm_f64_fma_fused),
+    run_fused: gemm_f64_fma_fused,
     mr: 8,
     nr: 6,
     depth_multiple: 1,
@@ -514,7 +565,7 @@ const DISP_F64_FMA: Dispatched<f64> = Dispatched {
 const DISP_F32_AVX512: Dispatched<f32> = Dispatched {
     run: gemm_f32_avx512,
     run_packed: gemm_f32_avx512_packed,
-    run_fused: Some(gemm_f32_avx512_fused),
+    run_fused: gemm_f32_avx512_fused,
     mr: 32,
     nr: 12,
     depth_multiple: 1,
@@ -523,7 +574,7 @@ const DISP_F32_AVX512: Dispatched<f32> = Dispatched {
 const DISP_F64_AVX512: Dispatched<f64> = Dispatched {
     run: gemm_f64_avx512,
     run_packed: gemm_f64_avx512_packed,
-    run_fused: Some(gemm_f64_avx512_fused),
+    run_fused: gemm_f64_avx512_fused,
     mr: 16,
     nr: 12,
     depth_multiple: 1,
@@ -533,7 +584,7 @@ const DISP_F64_AVX512: Dispatched<f64> = Dispatched {
 const DISP_F32_NEON: Dispatched<f32> = Dispatched {
     run: gemm_f32_neon,
     run_packed: gemm_f32_neon_packed,
-    run_fused: Some(gemm_f32_neon_fused),
+    run_fused: gemm_f32_neon_fused,
     mr: 16,
     nr: 4,
     depth_multiple: 1,
@@ -542,7 +593,7 @@ const DISP_F32_NEON: Dispatched<f32> = Dispatched {
 const DISP_F64_NEON: Dispatched<f64> = Dispatched {
     run: gemm_f64_neon,
     run_packed: gemm_f64_neon_packed,
-    run_fused: Some(gemm_f64_neon_fused),
+    run_fused: gemm_f64_neon_fused,
     mr: 8,
     nr: 4,
     depth_multiple: 1,
@@ -552,7 +603,7 @@ const DISP_F64_NEON: Dispatched<f64> = Dispatched {
 const DISP_F32_SIMD128: Dispatched<f32> = Dispatched {
     run: gemm_f32_simd128,
     run_packed: gemm_f32_simd128_packed,
-    run_fused: Some(gemm_f32_simd128_fused),
+    run_fused: gemm_f32_simd128_fused,
     mr: 8,
     nr: 4,
     depth_multiple: 1,
@@ -561,7 +612,7 @@ const DISP_F32_SIMD128: Dispatched<f32> = Dispatched {
 const DISP_F64_SIMD128: Dispatched<f64> = Dispatched {
     run: gemm_f64_simd128,
     run_packed: gemm_f64_simd128_packed,
-    run_fused: Some(gemm_f64_simd128_fused),
+    run_fused: gemm_f64_simd128_fused,
     mr: 4,
     nr: 4,
     depth_multiple: 1,
@@ -789,13 +840,7 @@ macro_rules! float_gemm_scalar {
                 par: Parallelism,
                 ws: &mut Workspace,
             ) {
-                unsafe {
-                    ($disp()
-                        .run_fused
-                        .expect(concat!($name, " fused kernel is always present")))(
-                        t, epi, par, ws
-                    )
-                }
+                unsafe { ($disp().run_fused)(t, epi, par, ws) }
             }
             #[inline]
             fn rhs_tile() -> (usize, usize) {

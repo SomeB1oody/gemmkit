@@ -277,23 +277,21 @@ pub trait GemmScalar: Scalar {
         1
     }
 
-    /// Run the ISA-dispatched **fused-epilogue** kernel for this type. The default is
-    /// unreachable — only the real floats (`f32`/`f64`, the sealed [`FusedScalar`] set) have
-    /// a fused path; `f16`/`bf16` keep the default and never reach it (the public API bound
-    /// forbids them).
+    /// Run the ISA-dispatched **fused-epilogue** kernel for this type. Every fused element type
+    /// provides one: the real floats (`f32`/`f64`) via [`crate::dispatch`]'s `float` module, and
+    /// the narrow floats (`f16`/`bf16`, `Acc = f32`) via its `mixed` module. It is a required
+    /// method — the [`FusedScalar`] bound on the public fused API admits exactly these four types.
     ///
     /// # Safety
     /// `task`'s pointers valid and `c` not aliasing `a`/`b`; `epi`'s bias valid and disjoint
     /// from `c` (validated by the API layer).
     #[doc(hidden)]
     unsafe fn dispatch_fused(
-        _task: Task<Self>,
-        _epi: FusedEpi<Self>,
-        _par: Parallelism,
-        _ws: &mut Workspace,
-    ) {
-        unreachable!("fused epilogue is dispatched only for f32/f64 (the FusedScalar bound)")
-    }
+        task: Task<Self>,
+        epi: FusedEpi<Self>,
+        par: Parallelism,
+        ws: &mut Workspace,
+    );
 }
 
 /// Top-level entry used by the API layer: handle the degenerate cases (here,

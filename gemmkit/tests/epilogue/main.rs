@@ -20,6 +20,8 @@
 mod common;
 
 mod float;
+#[cfg(feature = "half")]
+mod mixed;
 #[cfg(feature = "int8")]
 mod requant;
 mod special;

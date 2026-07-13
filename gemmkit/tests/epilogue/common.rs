@@ -26,8 +26,12 @@ impl Rng {
 }
 
 /// The real-float element under test (`f32`/`f64`): construction, bit compare, and the exact
-/// reference epilogue map (a byte-for-byte mirror of `FusedEpi::apply`).
-pub(crate) trait Flt: gemmkit::FusedScalar {
+/// reference epilogue map (a byte-for-byte mirror of `FusedEpi::apply`). The `Float + PartialOrd`
+/// bounds (which `FusedScalar` no longer implies, now that it also covers the narrow floats) give
+/// the reference map its `+`/`*` arithmetic and `ReLU` comparisons.
+pub(crate) trait Flt:
+    gemmkit::FusedScalar + gemmkit::Float<Acc = Self> + PartialOrd
+{
     fn of(x: f64) -> Self;
     fn bits(self) -> u64;
     fn name() -> &'static str;

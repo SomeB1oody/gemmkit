@@ -23,6 +23,8 @@
 //! the shape, independent of the worker count.
 
 use crate::kernel::FloatGemm;
+#[cfg(feature = "half")]
+use crate::kernel::MixedGemm;
 use crate::kernel::epilogue::{Epilogue, Identity};
 use crate::parallel::{self, JobCursor, Parallelism, Ptr};
 use crate::scalar::Float;
@@ -350,6 +352,10 @@ unsafe fn cell_dot<T, S, E>(
 /// ([`KernelSimd::load_lhs`]), accumulated in `f32`, and rounded to the narrow output once in the
 /// per-cell epilogue. `alpha`/`beta` arrive already widened to `f32`. Same reproducibility as [`run`].
 ///
+/// The zero-cost [`Identity`] forwarder over [`run_mixed_epi`]: with `E = Identity` the per-cell
+/// epilogue guard const-folds to the raw narrowing store, so this route is byte-for-byte unchanged
+/// from the pre-epilogue path and the public signature is preserved for every existing caller.
+///
 /// # Safety
 /// As [`run`] (A rows / B cols unit-stride along `k`, `c` not aliasing `a`/`b`, CPU supports `S`).
 #[cfg(feature = "half")]
@@ -375,10 +381,58 @@ pub unsafe fn run_mixed<N, S>(
     N: NarrowFloat,
     S: KernelSimd<N, N, f32, N>,
 {
+    // SAFETY: forwarded to `run_mixed_epi` with the zero-cost `Identity` epilogue — the raw
+    // narrowing store this route always did (`E::IS_IDENTITY` folds the per-cell hook away).
+    unsafe {
+        run_mixed_epi::<N, S, Identity>(
+            simd, m, k, n, par, alpha, a, rsa, csa, b, rsb, csb, beta, c, rsc, csc, &Identity,
+        )
+    }
+}
+
+/// Mixed-precision small-`m,n` horizontal GEMM applying the fused [`Epilogue`] `E` (over the
+/// [`MixedGemm`] family) to each output element at its single narrowing store, instead of
+/// materializing the raw product and mapping it afterward. [`run_mixed`] is exactly this with
+/// `E = Identity`; a non-identity `E` changes only the per-cell store, so the tiling / partition /
+/// read pattern is identical. The epilogue applies to the `f32` cell value **before** the single
+/// narrowing (matching the driver-path mixed semantics), so it is more precise than a separate map
+/// (`row`/`col` are oriented-frame coordinates; dispatch flips the bias axis on an orientation
+/// swap before calling).
+///
+/// # Safety
+/// As [`run_mixed`], plus `epi`'s interior pointers must be valid for the (oriented) `m`/`n`.
+#[cfg(feature = "half")]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn run_mixed_epi<N, S, E>(
+    simd: S,
+    m: usize,
+    k: usize,
+    n: usize,
+    par: Parallelism,
+    alpha: f32,
+    a: *const N,
+    rsa: isize,
+    csa: isize,
+    b: *const N,
+    rsb: isize,
+    csb: isize,
+    beta: f32,
+    c: *mut N,
+    rsc: isize,
+    csc: isize,
+    epi: &E,
+) where
+    N: NarrowFloat,
+    S: KernelSimd<N, N, f32, N>,
+    E: Epilogue<MixedGemm<N>>,
+{
     debug_assert!(
         csa == 1 && rsb == 1,
         "small_mn requires A rows / B cols unit-stride along k"
     );
+    // `E: Copy` (an `Epilogue` supertrait): copy it out of the borrow so the `move` worker
+    // closure captures it by value.
+    let epi = *epi;
     unsafe {
         let n_row_tiles = m.div_ceil(MT);
         let n_col_tiles = n.div_ceil(NT);
@@ -398,7 +452,7 @@ pub unsafe fn run_mixed<N, S>(
         let c = Ptr(c);
 
         let body = move |q_start: usize, q_end: usize| {
-            let (a, b, c) = (a, b, c);
+            let (a, b, c, epi) = (a, b, c, epi);
             let a = a.0 as *const N;
             let b = b.0 as *const N;
             let c = c.0;
@@ -411,13 +465,13 @@ pub unsafe fn run_mixed<N, S>(
                     let mi = core::cmp::min(MT, m - i0);
                     let nj = core::cmp::min(NT, n - j0);
                     if mi == MT && nj == NT {
-                        full_tile_mixed::<N, S, MT, NT>(
-                            simd, k, i0, j0, alpha, a, rsa, b, csb, beta, c, rsc, csc,
+                        full_tile_mixed::<N, S, E, MT, NT>(
+                            simd, k, i0, j0, alpha, a, rsa, b, csb, beta, c, rsc, csc, &epi,
                         );
                     } else {
                         for cc in 0..nj {
                             for ir in 0..mi {
-                                cell_dot_mixed::<N, S>(
+                                cell_dot_mixed::<N, S, E>(
                                     simd,
                                     k,
                                     i0 + ir,
@@ -431,6 +485,7 @@ pub unsafe fn run_mixed<N, S>(
                                     c,
                                     rsc,
                                     csc,
+                                    &epi,
                                 );
                             }
                         }
@@ -452,15 +507,17 @@ pub unsafe fn run_mixed<N, S>(
     }
 }
 
-/// Mixed sibling of [`full_tile`] (see [`run_mixed`]). The `f32` scalar tail and epilogue use plain
-/// `a·b + c` (not the fused intrinsic) so the route stays reproducible.
+/// Mixed sibling of [`full_tile`] (see [`run_mixed_epi`]). The `f32` scalar tail and epilogue use
+/// plain `a·b + c` (not the fused intrinsic) so the route stays reproducible; the fused
+/// [`Epilogue`] `E` is applied to the `f32` cell value at each cell's single narrowing store,
+/// exactly once (`E::IS_IDENTITY` const-folds it away to a raw narrowing store).
 ///
 /// # Safety
 /// As [`full_tile`], with `N`/`f32` operands.
 #[cfg(feature = "half")]
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-unsafe fn full_tile_mixed<N, S, const MT: usize, const NT: usize>(
+unsafe fn full_tile_mixed<N, S, E, const MT: usize, const NT: usize>(
     simd: S,
     k: usize,
     i0: usize,
@@ -474,9 +531,11 @@ unsafe fn full_tile_mixed<N, S, const MT: usize, const NT: usize>(
     c: *mut N,
     rsc: isize,
     csc: isize,
+    epi: &E,
 ) where
     N: NarrowFloat,
     S: KernelSimd<N, N, f32, N>,
+    E: Epilogue<MixedGemm<N>>,
 {
     unsafe {
         let lanes = <S as SimdOps<f32>>::LANES;
@@ -512,21 +571,28 @@ unsafe fn full_tile_mixed<N, S, const MT: usize, const NT: usize>(
                 } else {
                     beta * (*cp).widen()
                 };
-                *cp = N::narrow(alpha * dot + ov);
+                let out = alpha * dot + ov;
+                // Fused transform on the `f32` cell value, before the single narrowing.
+                *cp = if E::IS_IDENTITY {
+                    N::narrow(out)
+                } else {
+                    epi.apply(out, i0 + r, j0 + cc)
+                };
             }
         }
     }
 }
 
-/// Mixed sibling of [`cell_dot`] (edge-tile path; see [`run_mixed`]): an `f32` widen-load dot,
-/// rounded to `N` once.
+/// Mixed sibling of [`cell_dot`] (edge-tile path; see [`run_mixed_epi`]): an `f32` widen-load dot,
+/// with the fused [`Epilogue`] `E` applied to the `f32` cell value before it is rounded to `N`
+/// once (`E::IS_IDENTITY` const-folds to a raw narrowing store).
 ///
 /// # Safety
 /// As [`cell_dot`], with `N`/`f32` operands.
 #[cfg(feature = "half")]
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-unsafe fn cell_dot_mixed<N, S>(
+unsafe fn cell_dot_mixed<N, S, E>(
     simd: S,
     k: usize,
     i: usize,
@@ -540,9 +606,11 @@ unsafe fn cell_dot_mixed<N, S>(
     c: *mut N,
     rsc: isize,
     csc: isize,
+    epi: &E,
 ) where
     N: NarrowFloat,
     S: KernelSimd<N, N, f32, N>,
+    E: Epilogue<MixedGemm<N>>,
 {
     unsafe {
         let lanes = <S as SimdOps<f32>>::LANES;
@@ -567,6 +635,12 @@ unsafe fn cell_dot_mixed<N, S>(
         } else {
             beta * (*cp).widen()
         };
-        *cp = N::narrow(alpha * dot + ov);
+        let out = alpha * dot + ov;
+        // Fused transform on the `f32` cell value, before the single narrowing.
+        *cp = if E::IS_IDENTITY {
+            N::narrow(out)
+        } else {
+            epi.apply(out, i, j)
+        };
     }
 }
