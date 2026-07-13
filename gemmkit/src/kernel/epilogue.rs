@@ -409,10 +409,9 @@ impl QuantOut for u8 {
 pub(crate) struct KRequantize {
     pub scale: f32,
     pub zp: i32,
-    pub bias: Ptr<i32>,
-    pub has_bias: bool,
-    /// Bias axis in the driver (oriented) frame; the dispatch layer flips it on a swap.
-    pub bias_dim: BiasDim,
+    /// Optional per-row / per-col `i32` bias in the driver (oriented) frame; the dispatch
+    /// layer flips the axis (`Row` <-> `Col`) on a swap.
+    pub bias: BiasSpec<i32>,
 }
 
 #[cfg(feature = "int8")]
@@ -425,14 +424,10 @@ impl<O: QuantOut, Fam: KernelFamily<Acc = i32, Out = O>> Epilogue<Fam> for KRequ
 
     #[inline(always)]
     unsafe fn apply(&self, v: i32, r: usize, c: usize) -> O {
-        let b = if self.has_bias {
-            let idx = match self.bias_dim {
-                BiasDim::PerRow => r,
-                BiasDim::PerCol => c,
-            };
-            unsafe { *self.bias.0.add(idx) }
-        } else {
-            0
+        let b = match self.bias {
+            BiasSpec::None => 0,
+            BiasSpec::Row(p) => unsafe { *p.0.add(r) },
+            BiasSpec::Col(p) => unsafe { *p.0.add(c) },
         };
         // `i32` and `f32` are exactly representable in `f64`, so this is ONE rounding step
         // total. `zp` joins in integer (round-half-to-even is not shift-invariant, so it
@@ -455,15 +450,12 @@ impl<O: QuantOut, Fam: KernelFamily<Acc = i32, Out = O>> Epilogue<Fam> for KRequ
             let v = simd.loadu(src);
             // Bias add **in integer** — SIMD `i32` add is wrapping (`paddd`), matching `apply`'s
             // `wrapping_add`. The fast path is a full tile with `rsc == 1`, so the `LANES` rows at
-            // `row` are consecutive `PerRow` bias values (one aligned load); a `PerCol` bias is a
-            // single value broadcast across the column. No bias => `v` unchanged.
-            let v = if self.has_bias {
-                match self.bias_dim {
-                    BiasDim::PerRow => simd.add(v, simd.loadu(self.bias.0.add(row))),
-                    BiasDim::PerCol => simd.add(v, simd.splat(*self.bias.0.add(col))),
-                }
-            } else {
-                v
+            // `row` are consecutive `Row` bias values (one aligned load); a `Col` bias is a single
+            // value broadcast across the column. `None` => `v` unchanged.
+            let v = match self.bias {
+                BiasSpec::None => v,
+                BiasSpec::Row(p) => simd.add(v, simd.loadu(p.0.add(row))),
+                BiasSpec::Col(p) => simd.add(v, simd.splat(*p.0.add(col))),
             };
             // The vector `f64` map, bit-identical to `apply` (the `requant_store` contract):
             // scale widens `f32 -> f64` exactly; `O::LO`/`O::HI` are the output clamp band.

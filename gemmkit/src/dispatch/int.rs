@@ -9,7 +9,7 @@ use super::isa::{ForcedIsa, forced_isa};
 use super::orient_swap;
 use crate::driver;
 use crate::kernel::KernelFamily;
-use crate::kernel::epilogue::{BiasDim, Epilogue, KRequantize, QuantOut};
+use crate::kernel::epilogue::{BiasDim, BiasSpec, Epilogue, KRequantize, QuantOut};
 use crate::kernel::{IntGemm, IntGemmQ};
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use crate::kernel::{IntGemmVnni, IntGemmVnniQ};
@@ -408,6 +408,23 @@ pub(crate) unsafe fn execute_int_requant<O: RequantOut>(
     }
 }
 
+/// Build the `KRequantize` bias spec from a task's (already axis-flipped) bias fields:
+/// `has_bias == false` maps to `BiasSpec::None`, else the `Row` / `Col` variant selected by
+/// `bias_dim`. Shared by both construction sites so the encoding lives in one place.
+#[cfg(feature = "int8")]
+#[inline]
+fn requant_bias_spec<O>(t: &RequantTask<O>) -> BiasSpec<i32> {
+    if t.has_bias {
+        let p = Ptr(t.bias as *mut i32);
+        match t.bias_dim {
+            BiasDim::PerRow => BiasSpec::Row(p),
+            BiasDim::PerCol => BiasSpec::Col(p),
+        }
+    } else {
+        BiasSpec::None
+    }
+}
+
 /// `k == 0` fill: `C[i,j] = clamp(zp + round_ne(scale·bias[i or j]), O::LO, O::HI)` (= `zp`
 /// clamped into the output band, without bias). Uses the same `KRequantize::apply` as the
 /// kernel, applied to a zero accumulator, so it is bit-identical to a `k > 0` run whose
@@ -417,9 +434,7 @@ unsafe fn requant_degenerate<O: QuantOut>(t: &RequantTask<O>) {
     let epi = KRequantize {
         scale: t.scale,
         zp: t.zp,
-        bias: Ptr(t.bias as *mut i32),
-        has_bias: t.has_bias,
-        bias_dim: t.bias_dim,
+        bias: requant_bias_spec(t),
     };
     unsafe {
         for j in 0..t.n {
@@ -468,9 +483,7 @@ unsafe fn run_typed_int_requant<Fam, S, O, const MR_REG: usize, const NR: usize>
         let epi = KRequantize {
             scale: t.scale,
             zp: t.zp,
-            bias: Ptr(t.bias as *mut i32),
-            has_bias: t.has_bias,
-            bias_dim: t.bias_dim,
+            bias: requant_bias_spec(&t),
         };
         // alpha = 1 (folded into scale), beta = 0 (no accumulate) — the family debug-asserts
         // exactly these.
