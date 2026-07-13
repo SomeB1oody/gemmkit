@@ -35,12 +35,10 @@ pub use int::{IntGemm, IntGemmQ, IntGemmVnni, IntGemmVnniQ};
 pub use mixed::{Bf16DotGemm, MixedGemm};
 
 /// State of the `alpha` scale, precomputed once by the driver so the microkernel
-/// never compares floats. `Zero` never reaches the microkernel (the driver
-/// routes `alpha == 0` to a scale-only path), but is included for completeness.
+/// never compares floats. `alpha == 0` never reaches the microkernel — the driver
+/// routes it to a scale-only path upstream — so only `One` and `Other` exist.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum AlphaStatus {
-    /// `alpha == 0`.
-    Zero,
     /// `alpha == 1` — no scaling needed.
     One,
     /// Any other `alpha`.
@@ -164,11 +162,23 @@ pub trait KernelFamily: Copy + Send + Sync + 'static {
     /// * `mr_eff`/`nr_eff`: live sub-tile dimensions (≤ MR / NR at edges).
     /// * `scratch`: at least [`SCRATCH_LEN`] accumulator elements.
     ///
+    /// A family implements **exactly one** of the two microkernel methods. A *non-fusing*
+    /// family overrides this plain kernel and inherits the default [`microkernel_epi`], which
+    /// forwards straight here (carrying the free fail-closed `assert!(E::IS_IDENTITY)`):
+    /// `IntGemm`, `IntGemmVnni`, and the open/closed test family take this path. A *fusing*
+    /// family instead overrides [`microkernel_epi`] to thread the epilogue `E` through its own
+    /// store, and this plain method is then never called — so the **default** body here is
+    /// `unreachable!`. (`FloatGemm` and the mixed / requant families override `microkernel_epi`;
+    /// `ComplexGemm`'s override happens to also call `Self::microkernel`, so it provides both.)
+    ///
     /// # Safety
     /// All pointers must be valid for the accesses implied by the strides and
     /// dimensions, and the call must run inside the matching [`crate::simd::Simd::vectorize`]
     /// context for `S`.
+    ///
+    /// [`microkernel_epi`]: KernelFamily::microkernel_epi
     #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
     unsafe fn microkernel<S, const MR_REG: usize, const NR: usize>(
         simd: S,
         kc: usize,
@@ -188,7 +198,14 @@ pub trait KernelFamily: Copy + Send + Sync + 'static {
         nr_eff: usize,
         scratch: *mut Self::Acc,
     ) where
-        S: KernelSimd<Self::Lhs, Self::Rhs, Self::Acc, Self::Out>;
+        S: KernelSimd<Self::Lhs, Self::Rhs, Self::Acc, Self::Out>,
+    {
+        let _ = (
+            simd, kc, alpha, beta, alpha_status, beta_status, a, a_cs, b, b_rs, b_cs, c, rsc, csc,
+            mr_eff, nr_eff, scratch,
+        );
+        unreachable!("this family fuses via microkernel_epi and has no plain microkernel")
+    }
 
     /// Compute one `MR × NR` tile and apply the fused [`Epilogue`] `E` to each stored
     /// element. `row0`/`col0` are the tile's origin in the **oriented** problem frame (so

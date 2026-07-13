@@ -1,14 +1,16 @@
 //! The floating-point GEMM family: the *single* generic microkernel of the
 //! library, plus the float pack layout and epilogue.
 //!
-//! This one function — [`FloatGemm::microkernel`] — covers every ISA (scalar,
-//! FMA, AVX-512) and every tile (`MR_REG`, `NR`), because all the instruction
-//! variation is hidden behind [`SimdOps`] and all the geometry variation behind
-//! const generics. There is no macro, no per-ISA copy.
+//! One generic function (`microkernel_impl`) covers every ISA (scalar, FMA,
+//! AVX-512) and every tile (`MR_REG`, `NR`), because all the instruction variation
+//! is hidden behind [`SimdOps`] and all the geometry variation behind const generics.
+//! There is no macro, no per-ISA copy. The family exposes it through
+//! [`FloatGemm::microkernel_epi`], the fused entry the driver calls (the plain
+//! [`KernelFamily::microkernel`] is left as the trait's `unreachable!` default).
 
 use core::marker::PhantomData;
 
-use super::epilogue::{Epilogue, Identity};
+use super::epilogue::Epilogue;
 use super::{AlphaStatus, BetaStatus, KernelFamily};
 use crate::pack::pack_panels;
 use crate::scalar::Float;
@@ -66,59 +68,6 @@ where
         unsafe {
             pack_panels(
                 dst, src, /*lead*/ cs, /*depth*/ rs, /*n_lead*/ nc, kc, nr,
-            )
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    #[inline(always)]
-    unsafe fn microkernel<S, const MR_REG: usize, const NR: usize>(
-        simd: S,
-        kc: usize,
-        alpha: T,
-        beta: T,
-        alpha_status: AlphaStatus,
-        beta_status: BetaStatus,
-        a: *const T,
-        a_cs: isize,
-        b: *const T,
-        b_rs: isize,
-        b_cs: isize,
-        c: *mut T,
-        rsc: isize,
-        csc: isize,
-        mr_eff: usize,
-        nr_eff: usize,
-        scratch: *mut T,
-    ) where
-        S: KernelSimd<T, T, T, T>,
-    {
-        // The non-fused kernel: the identity epilogue at fixed `(0, 0, last_k = true)` —
-        // every epilogue hook const-folds away, so this is the exact byte stream it was
-        // before the epilogue seam existed.
-        unsafe {
-            microkernel_impl::<T, S, Identity, MR_REG, NR>(
-                simd,
-                kc,
-                alpha,
-                beta,
-                alpha_status,
-                beta_status,
-                a,
-                a_cs,
-                b,
-                b_rs,
-                b_cs,
-                c,
-                rsc,
-                csc,
-                mr_eff,
-                nr_eff,
-                0,
-                0,
-                true,
-                &Identity,
-                scratch,
             )
         }
     }

@@ -544,30 +544,6 @@ impl<O: QuantOut> KernelFamily for IntGemmQ<O> {
         unsafe { <IntGemm as KernelFamily>::pack_rhs(dst, src, rs, cs, kc, nc, nr) }
     }
 
-    unsafe fn microkernel<S, const MR_REG: usize, const NR: usize>(
-        _simd: S,
-        _kc: usize,
-        _alpha: i32,
-        _beta: i32,
-        _alpha_status: AlphaStatus,
-        _beta_status: BetaStatus,
-        _a: *const i8,
-        _a_cs: isize,
-        _b: *const i8,
-        _b_rs: isize,
-        _b_cs: isize,
-        _c: *mut O,
-        _rsc: isize,
-        _csc: isize,
-        _mr_eff: usize,
-        _nr_eff: usize,
-        _scratch: *mut i32,
-    ) where
-        S: KernelSimd<i8, i8, i32, O>,
-    {
-        unreachable!("requant families run only via microkernel_epi")
-    }
-
     #[allow(clippy::too_many_arguments)]
     #[inline(always)]
     unsafe fn microkernel_epi<S, E, const MR_REG: usize, const NR: usize>(
@@ -661,30 +637,6 @@ impl<O: QuantOut> KernelFamily for IntGemmVnniQ<O> {
         nr: usize,
     ) {
         unsafe { <IntGemmVnni as KernelFamily>::pack_rhs(dst, src, rs, cs, kc, nc, nr) }
-    }
-
-    unsafe fn microkernel<S, const MR_REG: usize, const NR: usize>(
-        _simd: S,
-        _kc: usize,
-        _alpha: i32,
-        _beta: i32,
-        _alpha_status: AlphaStatus,
-        _beta_status: BetaStatus,
-        _a: *const i8,
-        _a_cs: isize,
-        _b: *const i8,
-        _b_rs: isize,
-        _b_cs: isize,
-        _c: *mut O,
-        _rsc: isize,
-        _csc: isize,
-        _mr_eff: usize,
-        _nr_eff: usize,
-        _scratch: *mut i32,
-    ) where
-        S: KernelSimd<i8, i8, i32, O>,
-    {
-        unreachable!("requant families run only via microkernel_epi")
     }
 
     #[allow(clippy::too_many_arguments)]

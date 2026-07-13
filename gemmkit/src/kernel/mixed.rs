@@ -10,18 +10,17 @@
 
 use core::marker::PhantomData;
 
-use super::epilogue::{Epilogue, Identity};
+use super::epilogue::Epilogue;
 use super::{AlphaStatus, BetaStatus, KernelFamily};
 use crate::pack::{pack_kgroup_panels, pack_panels};
 use crate::scalar::NarrowFloat;
 use crate::simd::{KernelSimd, SimdOps};
 
-/// The widen-FMA accumulation loops of [`MixedGemm::microkernel`], factored out so the plain
-/// microkernel and the fused `microkernel_epi` share the exact same inner nest (they differ only
-/// in the epilogue). Widen-loads A, widen-broadcasts B, and fuses into the `f32` `acc` (pre-zeroed
-/// by the caller). `nr_eff == NR` fully unrolls the const-`NR` column loop (every accumulator in a
-/// register); the edge branch reads exactly `nr_eff` columns so an unpacked B is never read past
-/// its last real column.
+/// The widen-FMA accumulation loops of [`MixedGemm::microkernel_epi`], factored into their own
+/// helper so the fused kernel keeps a clean inner nest. Widen-loads A, widen-broadcasts B, and
+/// fuses into the `f32` `acc` (pre-zeroed by the caller). `nr_eff == NR` fully unrolls the
+/// const-`NR` column loop (every accumulator in a register); the edge branch reads exactly
+/// `nr_eff` columns so an unpacked B is never read past its last real column.
 ///
 /// # Safety
 /// As [`KernelFamily::microkernel`]; run inside `S`'s [`crate::simd::Simd::vectorize`].
@@ -85,8 +84,8 @@ unsafe fn mixed_accumulate<N, S, const MR_REG: usize, const NR: usize>(
 /// *produced*, so the `f32`-acc / narrow-`Out` epilogue lives here once. The whole contraction has
 /// accumulated in `f32` (`OUT_IS_ACC = false` ⇒ `kc = k`, a single depth panel), so there is no
 /// `last_k` gate: the epilogue fires unconditionally here, exactly once per element. With
-/// `E = Identity` every epilogue hook const-folds away (`E::IS_IDENTITY`), so the plain microkernel
-/// is byte-for-byte the pre-epilogue one.
+/// `E = Identity` every epilogue hook const-folds away (`E::IS_IDENTITY`), so the non-fused call
+/// is byte-for-byte the pre-epilogue kernel.
 ///
 /// # Safety
 /// As [`KernelFamily::microkernel`]; run inside `S`'s [`crate::simd::Simd::vectorize`]. `E`'s
@@ -276,58 +275,6 @@ where
         }
     }
 
-    #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
-    #[inline(always)]
-    unsafe fn microkernel<S, const MR_REG: usize, const NR: usize>(
-        simd: S,
-        kc: usize,
-        alpha: f32,
-        beta: f32,
-        alpha_status: AlphaStatus,
-        beta_status: BetaStatus,
-        a: *const N,
-        a_cs: isize,
-        b: *const N,
-        b_rs: isize,
-        b_cs: isize,
-        c: *mut N,
-        rsc: isize,
-        csc: isize,
-        mr_eff: usize,
-        nr_eff: usize,
-        scratch: *mut f32,
-    ) where
-        S: KernelSimd<N, N, f32, N>,
-    {
-        unsafe {
-            // --- accumulate in f32: widen-load A, widen-broadcast B, fused FMA ---
-            let mut acc: [[<S as SimdOps<f32>>::Reg; MR_REG]; NR] = [[simd.zero(); MR_REG]; NR];
-            mixed_accumulate::<N, S, MR_REG, NR>(
-                simd, kc, a, a_cs, b, b_rs, b_cs, nr_eff, &mut acc,
-            );
-
-            // alpha fold + narrow epilogue (the zero-cost `Identity` — every hook const-folds
-            // away, so this is byte-for-byte the pre-epilogue kernel). Shared with `Bf16DotGemm`.
-            mixed_epilogue::<Self, N, S, Identity, MR_REG, NR>(
-                simd,
-                alpha,
-                beta,
-                alpha_status,
-                beta_status,
-                &mut acc,
-                c,
-                rsc,
-                csc,
-                mr_eff,
-                nr_eff,
-                0,
-                0,
-                &Identity,
-                scratch,
-            );
-        }
-    }
-
     #[allow(clippy::too_many_arguments)]
     #[inline(always)]
     unsafe fn microkernel_epi<S, E, const MR_REG: usize, const NR: usize>(
@@ -463,56 +410,6 @@ impl KernelFamily for Bf16DotGemm {
         // lead = cols (`cs`), depth = rows (`rs`).
         unsafe {
             pack_kgroup_panels::<half::bf16, { Self::Q }, _>(dst, src, cs, rs, nc, kc, nr, |v| v)
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    #[inline(always)]
-    unsafe fn microkernel<S, const MR_REG: usize, const NR: usize>(
-        simd: S,
-        kc: usize,
-        alpha: f32,
-        beta: f32,
-        alpha_status: AlphaStatus,
-        beta_status: BetaStatus,
-        a: *const half::bf16,
-        _a_cs: isize,
-        b: *const half::bf16,
-        _b_rs: isize,
-        _b_cs: isize,
-        c: *mut half::bf16,
-        rsc: isize,
-        csc: isize,
-        mr_eff: usize,
-        nr_eff: usize,
-        scratch: *mut f32,
-    ) where
-        S: KernelSimd<half::bf16, half::bf16, f32, half::bf16>,
-    {
-        unsafe {
-            // Dot accumulation in f32. Full `NR` always: `FORCE_PACK_RHS` zero-pads tail
-            // columns (product 0); the epilogue copies only the live sub-tile.
-            let mut acc: [[<S as SimdOps<f32>>::Reg; MR_REG]; NR] = [[simd.zero(); MR_REG]; NR];
-            simd.dot_accumulate::<MR_REG, NR>(kc, a, b, &mut acc);
-
-            // alpha fold + narrow epilogue (the zero-cost `Identity`; shared with `MixedGemm`).
-            mixed_epilogue::<Self, half::bf16, S, Identity, MR_REG, NR>(
-                simd,
-                alpha,
-                beta,
-                alpha_status,
-                beta_status,
-                &mut acc,
-                c,
-                rsc,
-                csc,
-                mr_eff,
-                nr_eff,
-                0,
-                0,
-                &Identity,
-                scratch,
-            );
         }
     }
 

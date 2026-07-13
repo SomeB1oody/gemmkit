@@ -107,7 +107,6 @@ impl KernelFamily for NaiveFloat {
                             * *b.offset(p as isize * b_rs + j as isize * b_cs);
                     }
                     let prod = match ast {
-                        AlphaStatus::Zero => 0.0,
                         AlphaStatus::One => acc,
                         AlphaStatus::Other => alpha * acc,
                     };
