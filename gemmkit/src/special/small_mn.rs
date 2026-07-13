@@ -50,6 +50,42 @@ use crate::simd::SimdOps;
 const MT: usize = 4;
 const NT: usize = 4;
 
+/// Shared output-tile sweep for the small-`m,n` horizontal routes ([`run_epi`] and its mixed
+/// sibling [`run_mixed_epi`]): compute the `MT×NT` tile grid, cap the worker count with the
+/// bandwidth model (`bytes` — the per-type traffic — passed in so each caller keeps its own
+/// `sizeof`), take the `n_threads <= 1` serial fast path, else sweep the flat tiles through a
+/// shared [`JobCursor`]. `body(q_start, q_end)` computes the flat-tile range `[q_start, q_end)`
+/// with the caller's own tile kernels. The grid and the output partition are identical for every
+/// caller and add no cross-worker reduction, so the result is bit-identical to the serial run for
+/// any worker count.
+fn tile_sweep(
+    m: usize,
+    n: usize,
+    bytes: usize,
+    par: Parallelism,
+    body: impl Fn(usize, usize) + Copy + Send + Sync,
+) {
+    let n_row_tiles = m.div_ceil(MT);
+    let n_col_tiles = n.div_ceil(NT);
+    let n_tiles = n_row_tiles * n_col_tiles;
+    let n_threads = par.resolve_bandwidth(bytes, n_tiles);
+
+    if n_threads <= 1 {
+        body(0, n_tiles);
+        return;
+    }
+
+    // Output-partitioned parallel sweep: workers pull disjoint flat-tile ranges from a
+    // shared cursor. No cross-worker reduction, so no barrier and no perturbation of the
+    // per-element summation order.
+    let cur = JobCursor::new(n_tiles, parallel::job_grain(n_tiles, n_threads));
+    parallel::for_each_worker(n_threads, |_tid| {
+        while let Some((s, e)) = cur.next_chunk() {
+            body(s, e);
+        }
+    });
+}
+
 /// Dispatch a small-`m,n` horizontal GEMM, partitioning the `MT×NT` output tiles across up to
 /// `par`-many workers. Like the other special paths this shape is memory-bound (the operands
 /// stream from cache), so the worker count comes from the bandwidth model, not the compute ramp.
@@ -138,8 +174,6 @@ pub unsafe fn run_epi<T, S, E>(
     let epi = *epi;
     unsafe {
         let n_row_tiles = m.div_ceil(MT);
-        let n_col_tiles = n.div_ceil(NT);
-        let n_tiles = n_row_tiles * n_col_tiles;
 
         // Bandwidth-capped worker count: min traffic is A read once, B once, C written once.
         let sizeof = core::mem::size_of::<T>();
@@ -148,7 +182,6 @@ pub unsafe fn run_epi<T, S, E>(
             .saturating_add(k.saturating_mul(n))
             .saturating_add(m.saturating_mul(n))
             .saturating_mul(sizeof);
-        let n_threads = par.resolve_bandwidth(bytes, n_tiles);
 
         let a = Ptr(a as *mut T);
         let b = Ptr(b as *mut T);
@@ -200,20 +233,7 @@ pub unsafe fn run_epi<T, S, E>(
             });
         };
 
-        if n_threads <= 1 {
-            body(0, n_tiles);
-            return;
-        }
-
-        // Output-partitioned parallel sweep: workers pull disjoint flat-tile ranges from a
-        // shared cursor. No cross-worker reduction, so no barrier and no perturbation of the
-        // per-element summation order.
-        let cur = JobCursor::new(n_tiles, parallel::job_grain(n_tiles, n_threads));
-        parallel::for_each_worker(n_threads, |_tid| {
-            while let Some((s, e)) = cur.next_chunk() {
-                body(s, e);
-            }
-        });
+        tile_sweep(m, n, bytes, par, body);
     }
 }
 
@@ -435,8 +455,6 @@ pub unsafe fn run_mixed_epi<N, S, E>(
     let epi = *epi;
     unsafe {
         let n_row_tiles = m.div_ceil(MT);
-        let n_col_tiles = n.div_ceil(NT);
-        let n_tiles = n_row_tiles * n_col_tiles;
 
         // Bandwidth-capped worker count: A read once, B once, C written once (narrow bytes).
         let sizeof = core::mem::size_of::<N>();
@@ -445,7 +463,6 @@ pub unsafe fn run_mixed_epi<N, S, E>(
             .saturating_add(k.saturating_mul(n))
             .saturating_add(m.saturating_mul(n))
             .saturating_mul(sizeof);
-        let n_threads = par.resolve_bandwidth(bytes, n_tiles);
 
         let a = Ptr(a as *mut N);
         let b = Ptr(b as *mut N);
@@ -494,16 +511,7 @@ pub unsafe fn run_mixed_epi<N, S, E>(
             });
         };
 
-        if n_threads <= 1 {
-            body(0, n_tiles);
-            return;
-        }
-        let cur = JobCursor::new(n_tiles, parallel::job_grain(n_tiles, n_threads));
-        parallel::for_each_worker(n_threads, |_tid| {
-            while let Some((s, e)) = cur.next_chunk() {
-                body(s, e);
-            }
-        });
+        tile_sweep(m, n, bytes, par, body);
     }
 }
 
