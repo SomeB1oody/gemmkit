@@ -123,6 +123,56 @@ pub trait KernelSimd<L: Scalar, R: Scalar, A: Scalar, O: Scalar>: SimdOps<A> {
     ) {
         unreachable!("dot_accumulate is provided only by dot-capable ISA tokens")
     }
+
+    /// `true` iff [`Self::requant_store`] is a genuine vector implementation (an x86 token).
+    /// The requantizing epilogue's vector store path is gated on this: `false` tokens keep
+    /// the default `unreachable!` store and route every element through the scalar map
+    /// ([`crate::kernel::epilogue::KRequantize::apply`]).
+    const REQUANT_VECTOR: bool = false;
+
+    /// Vectorized `i32 -> i8` requantize store: clamp each `A`-accumulator lane through the
+    /// exact requant map and write its **low byte** to `LANES` consecutive slots at `dst`.
+    /// `dst` is a raw byte pointer regardless of `O` (a `u8` output would cast its pointer —
+    /// bit-identical, since the low byte of a value clamped into `[lo, hi]` is the same
+    /// whether read as `i8` or `u8`). Only requant-vector-capable tokens
+    /// ([`Self::REQUANT_VECTOR`] `= true`) override this; the default is `unreachable!`, the
+    /// same seam pattern as [`Self::dot_accumulate`].
+    ///
+    /// # Contract — bit-for-bit agreement with the scalar map
+    /// Per group of f64 lanes the token computes: widen `i32 -> f64` (exact); multiply by
+    /// `scale` widened `f32 -> f64` (exact widening, one IEEE multiply); round-to-nearest-even
+    /// in hardware (equals the scalar `round_ne_f64`: the `2^52` trick *is* roundTiesToEven
+    /// below `2^52`, and above it every `f64` is already integral, where the hardware round is
+    /// the identity); add `zp as f64`; `max(lo as f64)`; `min(hi as f64)`; convert `f64 -> i32`
+    /// (exact — the value is integral in `[lo, hi]`); store the low byte (TRUNCATION, never a
+    /// saturating pack). This equals the scalar
+    /// `clamp(zp + round_ne(scale·v), lo, hi)` case by case:
+    /// * `|t| < 2^52`: `t` is integral and exact, the scalar `t as i64` is exact, its `zp` add
+    ///   cannot saturate, and the `f64` `t + zp` is exact too (magnitudes stay far below
+    ///   `2^53`) — identical values into an identical clamp.
+    /// * `t >= 2^52`: both clamp to `hi` (scalar: huge `i64 + zp` saturating then clamp;
+    ///   vector: huge `f64 + zp` then `min(hi)`). Symmetrically `t <= -2^52 -> lo`.
+    /// * NaN is impossible: the API validates `scale` finite and `> 0`, and `v` is a finite
+    ///   `i32`.
+    ///
+    /// The caller supplies `v` already bias-added (SIMD `i32` add is wrapping — `paddd` — so it
+    /// matches the scalar `wrapping_add`). `lo`/`hi` are parameters (`-128`/`127` for the `i8`
+    /// output; the `u8` output phase reuses the machinery with `(0, 255)`).
+    ///
+    /// # Safety
+    /// `dst` valid for `LANES` byte writes; run inside this token's [`Simd::vectorize`].
+    #[inline(always)]
+    unsafe fn requant_store(
+        self,
+        _dst: *mut i8,
+        _v: <Self as SimdOps<A>>::Reg,
+        _scale: f64,
+        _zp: i32,
+        _lo: i32,
+        _hi: i32,
+    ) {
+        unreachable!("requant_store is provided only by requant-vector-capable ISA tokens")
+    }
 }
 
 /// Homogeneous blanket: when every family type is the accumulator type, the
@@ -180,6 +230,24 @@ impl<S: KernelSimd<i8, i8, i32, i32>> KernelSimd<i8, i8, i32, i8> for S {
             <Self as KernelSimd<i8, i8, i32, i32>>::dot_accumulate::<MR_REG, NR>(
                 self, kc, a, b, acc,
             )
+        }
+    }
+    // Requant store forwards straight to the widen impl (exactly like `dot_accumulate`): the
+    // `i8`-output requant path drives this blanket, but the vector map is identical whether the
+    // token's accumulator seam is `Out = i32` or `Out = i8`.
+    const REQUANT_VECTOR: bool = <S as KernelSimd<i8, i8, i32, i32>>::REQUANT_VECTOR;
+    #[inline(always)]
+    unsafe fn requant_store(
+        self,
+        dst: *mut i8,
+        v: <Self as SimdOps<i32>>::Reg,
+        scale: f64,
+        zp: i32,
+        lo: i32,
+        hi: i32,
+    ) {
+        unsafe {
+            <S as KernelSimd<i8, i8, i32, i32>>::requant_store(self, dst, v, scale, zp, lo, hi)
         }
     }
     // Cold output-side ops (unused on the requant path): portable stack-spill widen/truncate.
@@ -513,5 +581,117 @@ pub trait SimdOps<T: Scalar>: Simd {
         _scratch: *mut T,
     ) {
         unreachable!("cplx_microkernel is provided only by the complex `SimdOps` impls")
+    }
+}
+
+/// Direct unit test of the vectorized `requant_store` seam (Phase 4). For every runtime-available
+/// x86 vector-capable token it sweeps adversarial `i32` accumulators × scale × zero-point × clamp
+/// bounds and asserts each stored byte equals an **independent** scalar model of the map (std
+/// `round_ties_even`, not the kernel's `2^52` trick). The `(0, 255)` bounds pre-verify the future
+/// `u8`-output phase. Platform-independent: the scalar model is the oracle, never a machine number.
+#[cfg(all(test, feature = "int8"))]
+mod requant_store_tests {
+    #![allow(clippy::needless_range_loop)]
+    use super::{KernelSimd, SimdOps};
+
+    /// Independent scalar model of one lane of `requant_store` (bias already folded into `v`):
+    /// `low_byte(clamp(zp + round_ne(scale·v), lo, hi))`. Returns the stored low byte as `u8`
+    /// (for a value clamped into `[lo, hi]`, its low byte is the same read as `i8` or `u8`).
+    fn scalar_low_byte(v: i32, scale: f64, zp: i32, lo: i32, hi: i32) -> u8 {
+        let scaled = (v as f64 * scale).round_ties_even();
+        let q = (scaled as i64).saturating_add(zp as i64);
+        q.clamp(lo as i64, hi as i64) as u8
+    }
+
+    /// Sweep one token. The `KernelSimd<i8, i8, i32, i32>` bound carries `REQUANT_VECTOR` and
+    /// `requant_store`, and (via `SimdOps<i32>`) `loadu` / `LANES`.
+    ///
+    /// # Safety
+    /// The caller guarantees the CPU supports `S`'s target features (checked in the `#[test]`).
+    unsafe fn check_token<S: KernelSimd<i8, i8, i32, i32>>(simd: S, label: &str) {
+        unsafe {
+            simd.vectorize(|| {
+                let lanes = <S as SimdOps<i32>>::LANES;
+                assert!(
+                    <S as KernelSimd<i8, i8, i32, i32>>::REQUANT_VECTOR,
+                    "{label}: token is not requant-vector-capable",
+                );
+
+                // Adversarial accumulators (values are already bias-folded) + an LCG random tail.
+                let mut vals: Vec<i32> = vec![
+                    i32::MIN,
+                    i32::MIN + 1,
+                    -1,
+                    0,
+                    1,
+                    1 << 30,
+                    i32::MAX - 1,
+                    i32::MAX,
+                ];
+                let mut lcg = 0x1234_5678_9abc_def0u64;
+                for _ in 0..96 {
+                    lcg = lcg
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    vals.push((lcg >> 32) as i32);
+                }
+
+                for &scale in &[1.0f64, 0.1, 1e30, 1e-30, 0.0078125] {
+                    for &zp in &[0i32, -128, 127] {
+                        for &(lo, hi) in &[(-128i32, 127i32), (0i32, 255i32)] {
+                            let mut idx = 0;
+                            while idx < vals.len() {
+                                // A full `lanes`-wide register (tail padded with 0).
+                                let mut inbuf = [0i32; 16];
+                                for l in 0..lanes {
+                                    inbuf[l] = vals.get(idx + l).copied().unwrap_or(0);
+                                }
+                                let reg = simd.loadu(inbuf.as_ptr());
+                                let mut out = [0i8; 16];
+                                <S as KernelSimd<i8, i8, i32, i32>>::requant_store(
+                                    simd,
+                                    out.as_mut_ptr(),
+                                    reg,
+                                    scale,
+                                    zp,
+                                    lo,
+                                    hi,
+                                );
+                                for l in 0..lanes {
+                                    let want = scalar_low_byte(inbuf[l], scale, zp, lo, hi);
+                                    assert_eq!(
+                                        out[l] as u8, want,
+                                        "{label}: v={} scale={scale} zp={zp} bounds=({lo},{hi})",
+                                        inbuf[l],
+                                    );
+                                }
+                                idx += lanes;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn requant_store_matches_scalar_map() {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        // SAFETY: each token runs only after `is_x86_feature_detected!` confirms its features.
+        unsafe {
+            use super::{Avx512, Avx512Vnni, Fma};
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                check_token(Fma, "fma");
+            }
+            if is_x86_feature_detected!("avx512f") {
+                check_token(Avx512, "avx512");
+            }
+            if is_x86_feature_detected!("avx512f")
+                && is_x86_feature_detected!("avx512bw")
+                && is_x86_feature_detected!("avx512vnni")
+            {
+                check_token(Avx512Vnni, "avx512vnni");
+            }
+        }
     }
 }

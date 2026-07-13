@@ -282,6 +282,64 @@ impl SimdOps<i32> for Avx512 {
     }
 }
 
+/// Requantize one half (8 `i32` lanes as `__m256i`) of a `__m512i` accumulator to 8 integral
+/// `i32` in `[lo, hi]`, following the exact scalar map: widen `i32 -> f64`, multiply by
+/// `scale` (both exact), round-to-nearest-even in hardware, add `zp`, clamp `[lo, hi]`,
+/// convert back to `i32` (exact — the clamped value is integral). `#[inline(always)]`, so the
+/// intrinsics fold into the caller's `#[target_feature]` context.
+///
+/// The `roundscale` imm8 is `0b0000_1000`: bits `[1:0] = 00` (round-to-nearest-even), bit
+/// `[3] = 1` (suppress the precision exception), bits `[7:4] = 0` (scale `2^0`) — i.e.
+/// `_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC`.
+#[cfg(feature = "int8")]
+#[inline(always)]
+unsafe fn requant_half_avx512(
+    x: __m256i,
+    scale_v: __m512d,
+    zp_v: __m512d,
+    lo_v: __m512d,
+    hi_v: __m512d,
+) -> __m256i {
+    unsafe {
+        let t = _mm512_cvtepi32_pd(x);
+        let t = _mm512_mul_pd(t, scale_v);
+        let t = _mm512_roundscale_pd::<{ _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC }>(t);
+        let u = _mm512_add_pd(t, zp_v);
+        let u = _mm512_max_pd(u, lo_v);
+        let u = _mm512_min_pd(u, hi_v);
+        _mm512_cvtpd_epi32(u)
+    }
+}
+
+/// Vectorized `i32 -> i8` requantize store shared by [`Avx512`] and [`Avx512Vnni`] (see the
+/// [`KernelSimd::requant_store`] contract for the bit-for-bit equivalence with the scalar map):
+/// split the 16 `i32` into two `__m256i` halves, requantize each in `f64`
+/// ([`requant_half_avx512`]), recombine to a `__m512i` of 16 integral `i32` in `[lo, hi]`, and
+/// narrow with the **truncating** `vpmovdb` (`_mm512_cvtepi32_epi8`, NOT the saturating
+/// `vpmovsdb`/`vpmovusdb` — the lanes are already clamped, so the low byte is the answer and a
+/// saturating pack would be wrong for the `u8`/`[0, 255]` phase).
+///
+/// # Safety
+/// `dst` valid for 16 byte writes. Sound under either token's [`Simd::vectorize`]: both enable
+/// `avx512f` ([`Avx512Vnni`]'s `avx512f,avx512bw,avx512vnni` is a superset), which is all these
+/// intrinsics need.
+#[cfg(feature = "int8")]
+#[inline(always)]
+unsafe fn requant_store_avx512(dst: *mut i8, v: __m512i, scale: f64, zp: i32, lo: i32, hi: i32) {
+    unsafe {
+        let scale_v = _mm512_set1_pd(scale);
+        let zp_v = _mm512_set1_pd(zp as f64);
+        let lo_v = _mm512_set1_pd(lo as f64);
+        let hi_v = _mm512_set1_pd(hi as f64);
+        let lo8 = requant_half_avx512(_mm512_castsi512_si256(v), scale_v, zp_v, lo_v, hi_v);
+        let hi8 = requant_half_avx512(_mm512_extracti64x4_epi64::<1>(v), scale_v, zp_v, lo_v, hi_v);
+        // Recombine the two 8-lane halves into one 16-lane `__m512i`, then truncate each lane
+        // to its low byte (`vpmovdb`).
+        let combined = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(lo8), hi8);
+        _mm_storeu_si128(dst as *mut __m128i, _mm512_cvtepi32_epi8(combined));
+    }
+}
+
 /// `i8 -> i32`: sign-extend 16 LHS bytes on load, broadcast a sign-extended RHS
 /// byte; `Out == Acc == i32`, so `load_out`/`store_out` are plain `i32` load/store.
 #[cfg(feature = "int8")]
@@ -301,6 +359,12 @@ impl KernelSimd<i8, i8, i32, i32> for Avx512 {
     #[inline(always)]
     unsafe fn store_out(self, p: *mut i32, v: __m512i) {
         unsafe { _mm512_storeu_si512(p as *mut __m512i, v) }
+    }
+
+    const REQUANT_VECTOR: bool = true;
+    #[inline(always)]
+    unsafe fn requant_store(self, dst: *mut i8, v: __m512i, scale: f64, zp: i32, lo: i32, hi: i32) {
+        unsafe { requant_store_avx512(dst, v, scale, zp, lo, hi) }
     }
 }
 
@@ -431,6 +495,14 @@ impl KernelSimd<i8, i8, i32, i32> for Avx512Vnni {
     #[inline(always)]
     unsafe fn store_out(self, p: *mut i32, v: __m512i) {
         unsafe { <Avx512 as KernelSimd<i8, i8, i32, i32>>::store_out(Avx512, p, v) }
+    }
+
+    // Same vectorized requant store as [`Avx512`] — the shared helper needs only `avx512f`,
+    // which this token's `avx512f,avx512bw,avx512vnni` context is a superset of.
+    const REQUANT_VECTOR: bool = true;
+    #[inline(always)]
+    unsafe fn requant_store(self, dst: *mut i8, v: __m512i, scale: f64, zp: i32, lo: i32, hi: i32) {
+        unsafe { requant_store_avx512(dst, v, scale, zp, lo, hi) }
     }
 
     #[allow(clippy::needless_range_loop)]

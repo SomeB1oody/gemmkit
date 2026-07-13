@@ -79,6 +79,40 @@ pub trait Epilogue<Fam: KernelFamily>: Copy + Send + Sync {
     {
         unreachable!("apply_reg requires VECTOR = true")
     }
+
+    /// `true` iff [`Epilogue::apply_store`] is implemented: the **vector store-transform** for
+    /// an `Out != Acc` epilogue (the requantize pattern), enabling the fast store path when the
+    /// token is also requant-vector-capable ([`crate::simd::KernelSimd::REQUANT_VECTOR`]). This
+    /// is orthogonal to [`Epilogue::VECTOR`] (which governs the float-style *in-register*
+    /// `apply_reg` path, where `store_out` narrows *after* the transform): requantize keeps
+    /// `VECTOR = false` (no in-register clamp seam) but sets `VECTOR_STORE = true`.
+    const VECTOR_STORE: bool = false;
+
+    /// Vector store-transform: read `LANES` consecutive-row `Acc` values from contiguous
+    /// scratch at `src`, apply the full epilogue, and write `LANES` `Out` values to `dst` at
+    /// **unit row stride** (the caller guarantees `rsc == 1` on this path). It MUST agree with
+    /// [`Epilogue::apply`] bit-for-bit on the same values — the row tail, the strided-`C`
+    /// drain, and the `k == 0` degenerate fill all take `apply`, and a single output mixes the
+    /// two freely. The default is unreachable — only a `VECTOR_STORE = true` epilogue overrides
+    /// it (the `apply_reg`/`dot_accumulate` seam pattern).
+    ///
+    /// # Safety
+    /// `src` valid for `LANES` `Acc` reads, `dst` for `LANES` `Out` writes; interior pointers
+    /// (bias) valid for the problem; `simd` is the token whose [`crate::simd::Simd::vectorize`]
+    /// context is active.
+    #[inline(always)]
+    unsafe fn apply_store<S>(
+        &self,
+        _simd: S,
+        _src: *const Fam::Acc,
+        _dst: *mut Fam::Out,
+        _row: usize,
+        _col: usize,
+    ) where
+        S: KernelSimd<Fam::Lhs, Fam::Rhs, Fam::Acc, Fam::Out>,
+    {
+        unreachable!("apply_store requires VECTOR_STORE = true")
+    }
 }
 
 /// The identity epilogue: the seam's zero-cost default. Every kernel hook is gated on
@@ -282,9 +316,15 @@ where
 
 /// The `i8 -> i8` requantizing epilogue: `C[r, c] = clamp(zp + round_ne(scale·(acc + bias)),
 /// -128, 127)`, with an optional per-row / per-col `i32` bias joined **in integer** before
-/// the single f64 rounding. `VECTOR = false` in v1, so every tile drains to `i32` scratch
-/// (vectorized) and only this map is scalar — still a strict win over the unfused flow,
-/// which materializes a full `m·n` `i32` C.
+/// the single f64 rounding.
+///
+/// Every tile drains its `i32` accumulators to scratch (vectorized), then maps each element to
+/// `i8`. The map itself is split: on requant-vector-capable tokens (x86 — [`KRequantize::apply_store`]
+/// via [`crate::simd::KernelSimd::requant_store`]) a full lane-run is vectorized in `f64`; the
+/// row tail, a strided `C`, the `k == 0` degenerate fill, and non-vector ISAs (scalar / NEON /
+/// wasm) take the scalar [`KRequantize::apply`]. The two are **bit-identical** (the `requant_store`
+/// equivalence contract), so a single matrix mixes them freely. Either way this beats the unfused
+/// flow, which materializes a full `m·n` `i32` C.
 #[cfg(feature = "int8")]
 #[derive(Copy, Clone)]
 pub(crate) struct KRequantize {
@@ -298,7 +338,11 @@ pub(crate) struct KRequantize {
 
 #[cfg(feature = "int8")]
 impl<Fam: KernelFamily<Acc = i32, Out = i8>> Epilogue<Fam> for KRequantize {
-    const VECTOR: bool = false; // scratch/scalar path for every tile in v1
+    // `VECTOR = false`: requantize has no float-style in-register `apply_reg` path (`Out != Acc`,
+    // and the clamp/round is not a `store_out` narrowing). Its vector form is the store-transform
+    // `apply_store` below, gated by `VECTOR_STORE` instead.
+    const VECTOR: bool = false;
+    const VECTOR_STORE: bool = true;
 
     #[inline(always)]
     unsafe fn apply(&self, v: i32, r: usize, c: usize) -> i8 {
@@ -319,6 +363,32 @@ impl<Fam: KernelFamily<Acc = i32, Out = i8>> Epilogue<Fam> for KRequantize {
         let scaled = round_ne_f64(f64::from(v.wrapping_add(b)) * f64::from(self.scale));
         let q = (scaled as i64).saturating_add(i64::from(self.zp));
         q.clamp(-128, 127) as i8
+    }
+
+    #[inline(always)]
+    unsafe fn apply_store<S>(&self, simd: S, src: *const i32, dst: *mut i8, row: usize, col: usize)
+    where
+        S: KernelSimd<Fam::Lhs, Fam::Rhs, i32, i8>,
+    {
+        unsafe {
+            // `LANES` consecutive-row `i32` accumulators from contiguous scratch.
+            let v = simd.loadu(src);
+            // Bias add **in integer** — SIMD `i32` add is wrapping (`paddd`), matching `apply`'s
+            // `wrapping_add`. The fast path is a full tile with `rsc == 1`, so the `LANES` rows at
+            // `row` are consecutive `PerRow` bias values (one aligned load); a `PerCol` bias is a
+            // single value broadcast across the column. No bias => `v` unchanged.
+            let v = if self.has_bias {
+                match self.bias_dim {
+                    BiasDim::PerRow => simd.add(v, simd.loadu(self.bias.0.add(row))),
+                    BiasDim::PerCol => simd.add(v, simd.splat(*self.bias.0.add(col))),
+                }
+            } else {
+                v
+            };
+            // The vector `f64` map, bit-identical to `apply` (the `requant_store` contract):
+            // scale widens `f32 -> f64` exactly; `lo`/`hi` are the `i8` clamp bounds.
+            simd.requant_store(dst, v, f64::from(self.scale), self.zp, -128, 127);
+        }
     }
 }
 

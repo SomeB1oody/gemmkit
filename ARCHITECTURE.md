@@ -257,12 +257,17 @@ a separate narrow map (which rounds to the narrow type, widens back, then rounds
 narrow types `gemm_fused` is **not** bitwise-equal to `gemm`-then-map — the every-shape bitwise
 contract holds for `f32`/`f64` only. Within a fused run the vector and scratch paths still agree
 bit-for-bit (both round once), and serial ≡ parallel is unchanged. `KRequantize` (`i8 -> i8`,
-scale + zero-point + optional integer bias) is scalar-only (`VECTOR = false`): every tile
-drains to `i32` scratch and only the requantize map is scalar, still deleting the full `m·n`
-`i32` materialization a `gemm_i8` + separate pass would pay. Its rounding is a single
-correctly-rounded f64 multiply with round-half-to-even (the `no_std`-safe `2^52` trick, no
-`std` float methods), joining the zero-point in integer — so it is **bit-exact across every ISA
-and serial ≡ parallel** (widen ≡ VNNI). It rides two new requant families, `IntGemmQ` (widen)
+scale + zero-point + optional integer bias) keeps `VECTOR = false` (no float-style in-register
+path) but sets `VECTOR_STORE = true`: every tile drains to `i32` scratch, then the `i32 -> i8`
+map is **vectorized in f64** on x86 (`apply_store` → the `KernelSimd::requant_store` seam, with
+`REQUANT_VECTOR = true` on `Fma`/`Avx512`/`Avx512Vnni`; a NEON override is deferred pending device
+validation). A full lane-run of a unit-stride tile takes that vector store; the sub-lane row tail,
+a strided `C`, the `k == 0` fill, and non-vector ISAs take the scalar `apply` — and the two are
+**bit-identical**, so one output mixes them freely. Either way it deletes the full `m·n` `i32`
+materialization a `gemm_i8` + separate pass would pay. Its rounding is a single correctly-rounded
+f64 multiply with round-half-to-even (scalar: the `no_std`-safe `2^52` trick; vector: the hardware
+round-to-nearest-even, which equals it), joining the zero-point in integer — so it is **bit-exact
+across every ISA (vector ≡ scalar) and serial ≡ parallel** (widen ≡ VNNI). It rides two new requant families, `IntGemmQ` (widen)
 and `IntGemmVnniQ` (`vpdpbusd`), both `Out = i8, Acc = i32`, reached through a single delegating
 `KernelSimd<i8,i8,i32,i8>` blanket that forwards the hot accumulate ops to the existing
 `<i8,i8,i32,i32>` impl. The public entry points are `gemm_fused` and `gemm_i8_requant` (L8).

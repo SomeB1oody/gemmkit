@@ -386,6 +386,11 @@ impl SimdOps<i32> for Neon {
     }
 }
 
+// A NEON `requant_store` override (the `REQUANT_VECTOR` seam) is deliberately **deferred**:
+// this dev box cannot execute aarch64, and project policy is to validate an ISA kernel on the
+// device before shipping it. `Neon` therefore keeps the trait default (`REQUANT_VECTOR = false`),
+// so the requantizing epilogue routes every element through the scalar map on aarch64 — correct,
+// just not yet vectorized.
 #[cfg(feature = "int8")]
 impl KernelSimd<i8, i8, i32, i32> for Neon {
     #[inline(always)]

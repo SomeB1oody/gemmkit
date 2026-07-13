@@ -322,6 +322,67 @@ impl SimdOps<i32> for Fma {
     }
 }
 
+/// Requantize one quad (4 `i32` lanes as `__m128i`) of a `__m256i` accumulator to 4 integral
+/// `i32` in `[lo, hi]`, following the exact scalar map: widen `i32 -> f64`, multiply by
+/// `scale` (both exact), round-to-nearest-even in hardware, add `zp`, clamp `[lo, hi]`,
+/// convert back to `i32` (exact — the clamped value is integral). `#[inline(always)]`, so the
+/// intrinsics fold into the caller's `#[target_feature]` context.
+///
+/// `_mm256_round_pd` with `_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC` is
+/// round-to-nearest-even with the precision exception suppressed — the 256-bit VEX `vroundpd`
+/// *does* accept the suppress bit (unlike the 128/256-bit F16C `vcvtps2ph`, which rejects it).
+#[cfg(feature = "int8")]
+#[inline(always)]
+unsafe fn requant_quad_fma(
+    x: __m128i,
+    scale_v: __m256d,
+    zp_v: __m256d,
+    lo_v: __m256d,
+    hi_v: __m256d,
+) -> __m128i {
+    unsafe {
+        let t = _mm256_cvtepi32_pd(x);
+        let t = _mm256_mul_pd(t, scale_v);
+        let t = _mm256_round_pd::<{ _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC }>(t);
+        let u = _mm256_add_pd(t, zp_v);
+        let u = _mm256_max_pd(u, lo_v);
+        let u = _mm256_min_pd(u, hi_v);
+        _mm256_cvtpd_epi32(u)
+    }
+}
+
+/// Vectorized `i32 -> i8` requantize store for [`Fma`] (see the [`KernelSimd::requant_store`]
+/// contract for the bit-for-bit equivalence with the scalar map): split the 8 `i32` into two
+/// `__m128i` quads, requantize each in `f64` ([`requant_quad_fma`]), then gather the **low
+/// byte** of each of the 8 integral, pre-clamped lanes into 8 contiguous output bytes. This is
+/// a TRUNCATION (a byte gather), NOT a saturating `packs`/`packus`: the lanes are already in
+/// `[lo, hi]`, so only the byte-gather matters, and a saturating pack would be wrong for the
+/// `u8`/`[0, 255]` phase.
+///
+/// # Safety
+/// `dst` valid for 8 byte writes; run inside [`Fma`]'s `avx2,fma` [`Simd::vectorize`] context.
+#[cfg(feature = "int8")]
+#[inline(always)]
+unsafe fn requant_store_fma(dst: *mut i8, v: __m256i, scale: f64, zp: i32, lo: i32, hi: i32) {
+    unsafe {
+        let scale_v = _mm256_set1_pd(scale);
+        let zp_v = _mm256_set1_pd(zp as f64);
+        let lo_v = _mm256_set1_pd(lo as f64);
+        let hi_v = _mm256_set1_pd(hi as f64);
+        let i_lo = requant_quad_fma(_mm256_castsi256_si128(v), scale_v, zp_v, lo_v, hi_v);
+        let i_hi = requant_quad_fma(_mm256_extracti128_si256::<1>(v), scale_v, zp_v, lo_v, hi_v);
+        // `pshufb` mask gathering source bytes {0,4,8,12} (the low byte of each i32 lane) into
+        // the low 4 output bytes; the high 12 mask bytes are negative, so those lanes zero.
+        let mask = _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 12, 8, 4, 0);
+        let lo_u32 = _mm_cvtsi128_si32(_mm_shuffle_epi8(i_lo, mask)) as u32;
+        let hi_u32 = _mm_cvtsi128_si32(_mm_shuffle_epi8(i_hi, mask)) as u32;
+        // x86 is little-endian, so byte `l` of `packed` is output lane `l`: lanes 0..4 from the
+        // low quad, 4..8 from the high quad.
+        let packed = (lo_u32 as u64) | ((hi_u32 as u64) << 32);
+        core::ptr::write_unaligned(dst as *mut u64, packed);
+    }
+}
+
 /// `i8 -> i32`: sign-extend 8 LHS bytes on load, broadcast a sign-extended RHS byte;
 /// `Out == Acc == i32`, so `load_out`/`store_out` are plain `i32` load/store.
 #[cfg(feature = "int8")]
@@ -341,6 +402,12 @@ impl KernelSimd<i8, i8, i32, i32> for Fma {
     #[inline(always)]
     unsafe fn store_out(self, p: *mut i32, v: __m256i) {
         unsafe { _mm256_storeu_si256(p as *mut __m256i, v) }
+    }
+
+    const REQUANT_VECTOR: bool = true;
+    #[inline(always)]
+    unsafe fn requant_store(self, dst: *mut i8, v: __m256i, scale: f64, zp: i32, lo: i32, hi: i32) {
+        unsafe { requant_store_fma(dst, v, scale, zp, lo, hi) }
     }
 }
 

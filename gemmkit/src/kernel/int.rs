@@ -206,22 +206,49 @@ unsafe fn requant_scratch_epilogue<F, S, E, const MR_REG: usize, const NR: usize
     scratch: *mut i32,
 ) where
     F: KernelFamily<Acc = i32, Out = i8>,
-    S: SimdOps<i32>,
+    // `KernelSimd<F::Lhs, F::Rhs, i32, i8>` (not just `SimdOps<i32>`) so `epi.apply_store::<S>`
+    // type-checks — its bound is exactly this. Both call sites carry `KernelSimd<i8, i8, i32, i8>`.
+    S: KernelSimd<F::Lhs, F::Rhs, i32, i8>,
     E: Epilogue<F>,
 {
     unsafe {
         let lanes = <S as SimdOps<i32>>::LANES;
         let mr = MR_REG * lanes;
+        // Vectorized drain of the register-resident `acc` to contiguous `i32` scratch (unchanged).
         for j in 0..NR {
             for i in 0..MR_REG {
                 simd.storeu(scratch.add(j * mr + i * lanes), acc[j][i]);
             }
         }
-        for j in 0..nr_eff {
-            for i in 0..mr_eff {
-                let v = *scratch.add(j * mr + i);
-                let cp = c.offset(i as isize * rsc + j as isize * csc);
-                *cp = epi.apply(v, row0 + i, col0 + j);
+
+        // Map `i32` scratch -> `i8` C. When the epilogue and token are both requant-vector-capable
+        // and `C` has unit row stride, a full lane-run takes the vector store `apply_store`; the
+        // sub-lane row tail falls to the scalar `apply`. The two agree bit-for-bit (the
+        // `requant_store` equivalence contract), so one output mixes them — as it also mixes with
+        // the strided-`C` / `k == 0` degenerate / VNNI small-parallel paths, all of which run the
+        // scalar `apply` below. Non-vector tokens (scalar / NEON / wasm) and any strided `C` take
+        // the plain scalar loop verbatim.
+        if E::VECTOR_STORE && <S as KernelSimd<F::Lhs, F::Rhs, i32, i8>>::REQUANT_VECTOR && rsc == 1
+        {
+            for j in 0..nr_eff {
+                let src_col = scratch.add(j * mr);
+                let dst_col = c.offset(j as isize * csc); // rsc == 1: rows are unit-stride at `dst_col`
+                let mut i = 0;
+                while i + lanes <= mr_eff {
+                    epi.apply_store(simd, src_col.add(i), dst_col.add(i), row0 + i, col0 + j);
+                    i += lanes;
+                }
+                for i in i..mr_eff {
+                    *dst_col.add(i) = epi.apply(*src_col.add(i), row0 + i, col0 + j);
+                }
+            }
+        } else {
+            for j in 0..nr_eff {
+                for i in 0..mr_eff {
+                    let v = *scratch.add(j * mr + i);
+                    let cp = c.offset(i as isize * rsc + j as isize * csc);
+                    *cp = epi.apply(v, row0 + i, col0 + j);
+                }
             }
         }
     }
