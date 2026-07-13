@@ -262,12 +262,10 @@ static K_STREAM_MAX: Threshold = Threshold::new("GEMMKIT_K_STREAM_MAX", K_STREAM
 // on M4 Max (shared cluster-L2 + high unified bandwidth): ~128 KiB separates the DRAM/L2-bandwidth-
 // scaling elements (split across the cluster) from the small cache-hot ones (one-per-worker).
 /// Compiled default for [`seq_internal_bytes_per_worker`], ignoring any env override. Public so a
-/// calibration tool can read the shipped default as its baseline.
-#[cfg(target_arch = "aarch64")]
+/// calibration tool can read the shipped default as its baseline. Only consulted on aarch64 (inert
+/// on other targets), but the default is not `#[cfg]`-split: there is nothing arch-specific to
+/// calibrate for a value no other target reads.
 pub const SEQ_INTERNAL_BYTES_PER_WORKER_DEFAULT: usize = 128 * 1024;
-/// See the aarch64 variant (inert on other targets).
-#[cfg(not(target_arch = "aarch64"))]
-pub const SEQ_INTERNAL_BYTES_PER_WORKER_DEFAULT: usize = 320 * 1024;
 static SEQ_INTERNAL_BYTES_PER_WORKER: Threshold = Threshold::new(
     "GEMMKIT_SEQ_INTERNAL_BYTES_PER_WORKER",
     SEQ_INTERNAL_BYTES_PER_WORKER_DEFAULT,
