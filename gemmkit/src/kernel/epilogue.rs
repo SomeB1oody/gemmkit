@@ -8,8 +8,10 @@
 //! ([`Epilogue::IS_IDENTITY`]) and the monomorphized kernel is bit-identical to the
 //! non-fused kernel, so plain `gemm`/`gemm_i8` are unchanged. The determinism contract
 //! is stronger still: a fused GEMM is `gemm()` followed by a scalar map, **bit-for-bit**
-//! for floats, because blocking is epilogue-independent and the epilogue is applied to
-//! the very register the store would have written (see [`FusedEpi`]).
+//! for floats, because the fused engine routes every shape through the same kernel `gemm`
+//! would — the general driver *and* the gemv / small-`m,n` / small-`k` special paths, each
+//! fused too — blocking is epilogue-independent, and the epilogue is applied to the very
+//! register the store would have written (see [`FusedEpi`]).
 //!
 //! Two built-ins ship in v1: [`FusedEpi`] (per-row/per-col bias + ReLU/LeakyReLU for
 //! `f32`/`f64`, via the fast vector path) and [`KRequantize`] (`i8 -> i8` quantized

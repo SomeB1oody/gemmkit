@@ -36,13 +36,11 @@ fn is_finite<T: FusedScalar>(s: T) -> bool {
 /// after the final `beta`-fold, then the activation is applied. `bias == None && act == None`
 /// delegates to plain [`gemm`].
 ///
-/// The product is always computed through the general register-blocked driver, whose
-/// accumulation order the epilogue leaves untouched — so the result is **bit-identical** to
-/// that driver's `gemm` output followed by the same scalar map. Note that plain [`gemm`]
-/// routes gemv shapes (`m == 1` / `n == 1`), tiny `m,n`, and small-`k` products to dedicated
-/// kernels with a *different* summation order; against those special-cased shapes the fused
-/// result stays numerically correct but may differ from `gemm`-then-map in the low mantissa
-/// bits. It is deterministic across thread counts regardless.
+/// The fused engine routes every shape through the **same** kernel `gemm` would use — the
+/// general register-blocked driver, gemv (`m == 1` / `n == 1`), the small-`m,n` horizontal
+/// path, or the small-`k` path — fusing the epilogue into that kernel's store without
+/// perturbing its accumulation order. So the result is **bit-identical** to `gemm()` followed
+/// by the same scalar map, for **every** shape, and deterministic across thread counts.
 ///
 /// # Panics
 /// Same conditions as [`gemm`], plus: a `PerRow` bias whose length is not `A.rows` (or a

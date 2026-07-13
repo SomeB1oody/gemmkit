@@ -22,6 +22,8 @@
 //! and bit-identical to the serial run for any worker count. The tile grid is decided once from
 //! the shape, independent of the worker count.
 
+use crate::kernel::FloatGemm;
+use crate::kernel::epilogue::{Epilogue, Identity};
 use crate::parallel::{self, JobCursor, Parallelism, Ptr};
 use crate::scalar::Float;
 #[cfg(feature = "half")]
@@ -52,6 +54,10 @@ const NT: usize = 4;
 /// Each output tile is computed wholly by one worker over the full `k`, so the split adds no
 /// cross-thread reduction and the result is bit-identical to the serial run.
 ///
+/// The zero-cost [`Identity`] forwarder over [`run_epi`]: with `E = Identity` the epilogue guard
+/// const-folds to the raw store, so this route is byte-for-byte unchanged from the pre-epilogue
+/// path and the public signature is preserved for every existing caller.
+///
 /// # Safety
 /// Pointers must be valid for the regions implied by the strides/sizes; `c` must not alias
 /// `a`/`b`; A rows must be unit-stride (`csa == 1`) and B columns unit-stride (`rsb == 1`) so
@@ -78,10 +84,56 @@ pub unsafe fn run<T, S>(
     T: Float<Acc = T>,
     S: SimdOps<T>,
 {
+    // SAFETY: forwarded to `run_epi` with the zero-cost `Identity` epilogue — the raw store this
+    // route always did (`E::IS_IDENTITY` folds the per-cell hook away).
+    unsafe {
+        run_epi::<T, S, Identity>(
+            simd, m, k, n, par, alpha, a, rsa, csa, b, rsb, csb, beta, c, rsc, csc, &Identity,
+        )
+    }
+}
+
+/// Small-`m,n` horizontal GEMM applying the fused [`Epilogue`] `E` to each output element as its
+/// single store happens, instead of materializing the raw product and mapping it afterward.
+/// [`run`] is exactly this with `E = Identity`; a non-identity `E` changes only the per-cell
+/// store, so the tiling / partition / read pattern is identical and the fused result equals this
+/// route's plain output followed by the same scalar map. Each cell is one complete `k`-reduction,
+/// so the epilogue fires exactly once per element (`row`/`col` are oriented-frame coordinates;
+/// dispatch flips the bias axis on an orientation swap before calling).
+///
+/// # Safety
+/// As [`run`], plus `epi`'s interior pointers must be valid for the (oriented) problem's `m`/`n`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn run_epi<T, S, E>(
+    simd: S,
+    m: usize,
+    k: usize,
+    n: usize,
+    par: Parallelism,
+    alpha: T,
+    a: *const T,
+    rsa: isize,
+    csa: isize,
+    b: *const T,
+    rsb: isize,
+    csb: isize,
+    beta: T,
+    c: *mut T,
+    rsc: isize,
+    csc: isize,
+    epi: &E,
+) where
+    T: Float<Acc = T>,
+    S: SimdOps<T>,
+    E: Epilogue<FloatGemm<T>>,
+{
     debug_assert!(
         csa == 1 && rsb == 1,
         "small_mn requires A rows / B cols unit-stride along k"
     );
+    // `E: Copy` (an `Epilogue` supertrait): copy it out of the borrow so the `move` worker
+    // closure captures it by value.
+    let epi = *epi;
     unsafe {
         let n_row_tiles = m.div_ceil(MT);
         let n_col_tiles = n.div_ceil(NT);
@@ -103,7 +155,7 @@ pub unsafe fn run<T, S>(
         // Column-tile-outer flat iteration (`jt` outer): a worker's consecutive tiles share a C
         // column block, so a column-major C is stored down contiguous columns.
         let body = move |q_start: usize, q_end: usize| {
-            let (a, b, c) = (a, b, c);
+            let (a, b, c, epi) = (a, b, c, epi);
             let a = a.0 as *const T;
             let b = b.0 as *const T;
             let c = c.0;
@@ -116,14 +168,14 @@ pub unsafe fn run<T, S>(
                     let mi = core::cmp::min(MT, m - i0);
                     let nj = core::cmp::min(NT, n - j0);
                     if mi == MT && nj == NT {
-                        full_tile::<T, S, MT, NT>(
-                            simd, k, i0, j0, alpha, a, rsa, b, csb, beta, c, rsc, csc,
+                        full_tile::<T, S, E, MT, NT>(
+                            simd, k, i0, j0, alpha, a, rsa, b, csb, beta, c, rsc, csc, &epi,
                         );
                     } else {
                         // Edge tile (`m`/`n` not a multiple of the tile): one SIMD dot per cell.
                         for cc in 0..nj {
                             for ir in 0..mi {
-                                cell_dot::<T, S>(
+                                cell_dot::<T, S, E>(
                                     simd,
                                     k,
                                     i0 + ir,
@@ -137,6 +189,7 @@ pub unsafe fn run<T, S>(
                                     c,
                                     rsc,
                                     csc,
+                                    &epi,
                                 );
                             }
                         }
@@ -165,14 +218,15 @@ pub unsafe fn run<T, S>(
 /// Compute a full `MT × NT` tile at output origin `(i0, j0)` from the contiguous-along-`k`
 /// layout (`csa == 1`, `rsb == 1`): hold `MT·NT` accumulators in registers across the whole
 /// `k`-sweep, loading each A-row and B-column once per depth step, then one `reduce_sum` +
-/// ascending scalar tail + `β` epilogue per cell.
+/// ascending scalar tail + `β` epilogue per cell. The fused [`Epilogue`] `E` is applied to the
+/// final value at each cell's single store, exactly once (`E::IS_IDENTITY` const-folds it away).
 ///
 /// # Safety
 /// `a`/`b`/`c` valid for the tile's reads/writes; `csa == 1` and `rsb == 1` (unit-stride along
 /// `k`); the tile is fully in-bounds (`i0 + MT <= m`, `j0 + NT <= n`). Run inside `S::vectorize`.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-unsafe fn full_tile<T, S, const MT: usize, const NT: usize>(
+unsafe fn full_tile<T, S, E, const MT: usize, const NT: usize>(
     simd: S,
     k: usize,
     i0: usize,
@@ -186,9 +240,11 @@ unsafe fn full_tile<T, S, const MT: usize, const NT: usize>(
     c: *mut T,
     rsc: isize,
     csc: isize,
+    epi: &E,
 ) where
     T: Float<Acc = T>,
     S: SimdOps<T>,
+    E: Epilogue<FloatGemm<T>>,
 {
     unsafe {
         let lanes = <S as SimdOps<T>>::LANES;
@@ -224,7 +280,13 @@ unsafe fn full_tile<T, S, const MT: usize, const NT: usize>(
                 } else {
                     beta * *cp
                 };
-                *cp = alpha.mul_add(dot, ov);
+                let out = alpha.mul_add(dot, ov);
+                // Fused transform at the oriented-frame coordinate, applied once at the store.
+                *cp = if E::IS_IDENTITY {
+                    out
+                } else {
+                    epi.apply(out, i0 + r, j0 + cc)
+                };
             }
         }
     }
@@ -233,14 +295,15 @@ unsafe fn full_tile<T, S, const MT: usize, const NT: usize>(
 /// Compute one output element `C[i,j] = α·⟨A[i,:], B[:,j]⟩ + β·C[i,j]` as a single-accumulator
 /// SIMD dot over the contiguous A-row / B-column (`csa == 1`, `rsb == 1`) plus an ascending
 /// scalar `k`-tail. The edge-tile path (`m`/`n` not a multiple of the register tile); `β` folded
-/// into the epilogue.
+/// into the epilogue, then the fused [`Epilogue`] `E` applied once at the store (`E::IS_IDENTITY`
+/// const-folds it away).
 ///
 /// # Safety
 /// `a`/`b`/`c` valid for the element's reads/writes; `csa == 1` and `rsb == 1`. Run inside
 /// `S::vectorize`.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-unsafe fn cell_dot<T, S>(
+unsafe fn cell_dot<T, S, E>(
     simd: S,
     k: usize,
     i: usize,
@@ -254,9 +317,11 @@ unsafe fn cell_dot<T, S>(
     c: *mut T,
     rsc: isize,
     csc: isize,
+    epi: &E,
 ) where
     T: Float<Acc = T>,
     S: SimdOps<T>,
+    E: Epilogue<FloatGemm<T>>,
 {
     unsafe {
         let row = a.offset(i as isize * rsa); // A[i, :] contiguous (csa == 1)
@@ -270,7 +335,13 @@ unsafe fn cell_dot<T, S>(
         } else {
             beta * *cp
         };
-        *cp = alpha.mul_add(dot, ov);
+        let out = alpha.mul_add(dot, ov);
+        // Fused transform at the oriented-frame coordinate, applied once at the store.
+        *cp = if E::IS_IDENTITY {
+            out
+        } else {
+            epi.apply(out, i, j)
+        };
     }
 }
 

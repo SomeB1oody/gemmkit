@@ -256,9 +256,18 @@ correctly-rounded f64 multiply with round-half-to-even (the `no_std`-safe `2^52`
 and serial ≡ parallel** (widen ≡ VNNI). It rides two new requant families, `IntGemmQ` (widen)
 and `IntGemmVnniQ` (`vpdpbusd`), both `Out = i8, Acc = i32`, reached through a single delegating
 `KernelSimd<i8,i8,i32,i8>` blanket that forwards the hot accumulate ops to the existing
-`<i8,i8,i32,i32>` impl. The public entry points are `gemm_fused` and `gemm_i8_requant` (L8);
-v1 covers the general driver path only (gemv/small_k/small_mn/prepacked keep the identity seam
-and adopt `E` later behind the same API).
+`<i8,i8,i32,i32>` impl. The public entry points are `gemm_fused` and `gemm_i8_requant` (L8).
+`gemm_fused` routes every shape through the **same** kernel `gemm` would — the general driver
+*and* the L6 float special paths (gemv, small-`m,n`, small-`k`), each threading `E` through the
+same `run`/`run_typed` decision tree via zero-cost `Identity` forwarders (`run_epi` /
+`run_typed_epi` / `core_epi`) — so the `gemm_fused == gemm()`-then-map contract is bit-for-bit
+for **every** float shape. gemv fuses as a final in-place epilogue sweep over each worker's own
+output range (the vector output is negligible next to the memory-bound matrix read, and the
+strategy kernels stay byte-identical); the small-`m,n` / small-`k` paths apply `E` at each tile's
+single store. gemv routes in the user frame (before orientation), so its `epi` is unflipped; the
+others consume the orientation-flipped `epi`. `gemm_i8_requant` still covers the general driver
+path only (the integer special paths keep the identity seam and adopt `E` later behind the same
+API); prepacked-RHS likewise keeps `Identity`.
 
 [`Epilogue<Fam>`]: gemmkit::kernel::epilogue::Epilogue
 
@@ -475,7 +484,8 @@ call.
   `f32`/`f64` (the sealed `FusedScalar` bound), with an optional per-row/per-col `Bias` and an
   optional `Activation` (ReLU/LeakyReLU) — the fused L1 epilogue seam. `bias == None && act == None`
   delegates to plain `gemm`. Validation adds bias-length, bias-vs-C overlap, and finite-slope checks;
-  the result is bit-identical to `gemm` then the scalar map.
+  the result is bit-identical to `gemm` then the scalar map for **every** shape (the L6 special
+  paths — gemv, small-`m,n`, small-`k` — are fused too, so a fused shape routes exactly as `gemm`).
 - **Requantize** ([`gemm_i8_requant`] / `gemm_i8_requant_with`, `int8` feature): `i8·i8 -> i8` with a
   per-tensor `Requantize { scale, zero_point, bias }`, fusing the `i32 -> i8` requantize into the
   store (deleting the `m·n` `i32` materialization). Bit-exact across ISAs and serial ≡ parallel.

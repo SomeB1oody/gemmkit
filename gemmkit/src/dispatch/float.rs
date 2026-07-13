@@ -80,12 +80,17 @@ unsafe fn run_typed<T, S, const MR_REG: usize, const NR: usize>(
     }
 }
 
-/// **Fused-epilogue** driver entry for a concrete `(type, ISA, tile)`: mirror of [`run_typed`]
-/// but with the special-path routing **deleted**. gemv / small_mn / small_k have no epilogue
-/// hook — routing there would silently drop the epilogue — so every fused shape goes through
-/// the general driver (correct for any shape). The orientation swap flips the bias axis: a
-/// row-major-ish C makes the engine compute `Cᵀ = Bᵀ·Aᵀ`, swapping `m↔n`, so a user per-row
-/// bias becomes per-col in the driver frame (a field write, not a new monomorphization).
+/// **Fused-epilogue** driver entry for a concrete `(type, ISA, tile)`: a mirror of [`run_typed`]
+/// with the epilogue fused into each route, so a fused shape takes the *same* kernel plain `gemm`
+/// would (gemv / small_mn / small_k / general driver) rather than paying the driver's
+/// pack/blocking overhead on a shape the special paths win. Each route stores exactly the bits
+/// plain `gemm` would and applies the same scalar map exactly once per element, so the fused
+/// result is bit-identical to `gemm()` followed by that map for *every* shape (the vector fast
+/// path agrees bitwise with the scalar map by the [`Epilogue::apply_reg`] contract). gemv routes
+/// before orientation normalization in the **user** frame (no bias flip); the other routes run
+/// after the orientation swap, which flips the bias axis (a row-major-ish C makes the engine
+/// compute `Cᵀ = Bᵀ·Aᵀ`, swapping `m↔n`, so a user per-row bias becomes per-col in the oriented
+/// frame — a field write, not a new monomorphization).
 ///
 /// # Safety
 /// As [`run_typed`], plus `epi`'s interior pointers valid for the (pre-swap) problem's `m`/`n`.
@@ -101,6 +106,21 @@ unsafe fn run_typed_fused<T, S, const MR_REG: usize, const NR: usize>(
     S: SimdOps<T>,
 {
     unsafe {
+        // gemv shape (unless the dedicated path is disabled via tuning): fused via a final
+        // in-place epilogue sweep. gemv dispatches BEFORE orientation normalization, so `epi`
+        // stays in the user frame (no bias-axis flip) — `run_typed_epi` resolves the per-row /
+        // per-col coordinate itself from the `n == 1` / `m == 1` branch.
+        if (t.n == 1 || t.m == 1) && core::cmp::min(t.m, t.n) <= tuning::gemv_threshold() {
+            gemv::run_typed_epi::<T, S, FusedEpi<T>>(
+                simd, t.m, t.k, t.n, par, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb, t.beta,
+                t.c, t.rsc, t.csc, &epi,
+            );
+            return;
+        }
+
+        // Orientation normalization flips the bias axis for the routes below (they all consume
+        // the oriented `epi`): a row-major-ish C computes `Cᵀ = Bᵀ·Aᵀ` (swapping `m↔n`), so a
+        // user per-row bias becomes per-col in the oriented frame.
         let swap = orient_transpose(&mut t);
         if swap {
             epi.bias = match epi.bias {
@@ -108,6 +128,26 @@ unsafe fn run_typed_fused<T, S, const MR_REG: usize, const NR: usize>(
                 BiasSpec::Row(p) => BiasSpec::Col(p),
                 BiasSpec::Col(p) => BiasSpec::Row(p),
             };
+        }
+
+        // Small `m,n` with a long contraction and both operands streaming contiguously along
+        // `k`: the horizontal path computes each output as a direct SIMD dot, applying the
+        // epilogue at each cell's single store.
+        if small_mn_eligible(&t) {
+            small_mn::run_epi::<T, S, FusedEpi<T>>(
+                simd, t.m, t.k, t.n, par, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb, t.beta,
+                t.c, t.rsc, t.csc, &epi,
+            );
+            return;
+        }
+        // Skinny / low-depth shape: the whole product is one depth panel over the microkernel,
+        // the epilogue fused into the single per-tile store (`last_k` structurally true).
+        if t.k <= tuning::small_k_threshold() {
+            small_k::run_epi::<FloatGemm<T>, S, FusedEpi<T>, MR_REG, NR>(
+                simd, t.m, t.k, t.n, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb, t.beta, t.c,
+                t.rsc, t.csc, &epi, par, ws,
+            );
+            return;
         }
         driver::run_epilogue::<FloatGemm<T>, S, FusedEpi<T>, MR_REG, NR>(
             simd, t.m, t.k, t.n, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb, t.beta, t.c, t.rsc,

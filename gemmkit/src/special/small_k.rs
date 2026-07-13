@@ -21,6 +21,7 @@
 use core::mem::MaybeUninit;
 
 use crate::driver::{self, alpha_status, beta_status};
+use crate::kernel::epilogue::{Epilogue, Identity};
 use crate::kernel::{KernelFamily, MAX_MR, SCRATCH_LEN};
 use crate::parallel::{self, JobCursor, Parallelism, Ptr};
 use crate::simd::{KernelSimd, SimdOps};
@@ -35,6 +36,10 @@ const SMALL_K_MAX: usize = 32;
 /// Run a small-`k` GEMM with the given family, ISA token, and microtile geometry. The
 /// dispatch layer routes here (after orientation normalization) only when `k` is small;
 /// preconditions match [`driver::run`] (`m, n, k > 0`, `alpha != 0`, orientation-normalized).
+///
+/// The zero-cost [`Identity`] forwarder over [`run_epi`]: with `E = Identity` every epilogue
+/// hook const-folds away (`microkernel_epi` becomes `microkernel`), so the public signature —
+/// and every byte this route stores — is unchanged for all existing callers.
 ///
 /// # Safety
 /// All pointers must be valid for the regions implied by the strides/sizes, and `C` must
@@ -62,6 +67,49 @@ pub unsafe fn run<Fam, S, const MR_REG: usize, const NR: usize>(
     Fam: KernelFamily,
     S: KernelSimd<Fam::Lhs, Fam::Rhs, Fam::Acc, Fam::Out>,
 {
+    // SAFETY: forwarded to `run_epi` with the zero-cost `Identity` epilogue — the exact code
+    // path (and byte stream) this route stored before the epilogue seam existed.
+    unsafe {
+        run_epi::<Fam, S, Identity, MR_REG, NR>(
+            simd, m, k, n, alpha, a, rsa, csa, b, rsb, csb, beta, c, rsc, csc, &Identity, par, ws,
+        )
+    }
+}
+
+/// Run a small-`k` GEMM applying the fused [`Epilogue`] `E` to each output element as the tile
+/// is stored, instead of materializing the raw product and mapping it afterward. [`run`] is
+/// exactly this with `E = Identity`; a non-identity `E` changes only the per-tile store, so the
+/// blocking / partition / read pattern is identical and the fused result equals this route's
+/// plain output followed by the same scalar map. The whole product is one depth panel
+/// (`kc = k`), so `last_k` is structurally true and the epilogue fires exactly once per element.
+///
+/// # Safety
+/// As [`run`], plus `epi`'s interior pointers must be valid for the (oriented) problem's `m`/`n`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn run_epi<Fam, S, E, const MR_REG: usize, const NR: usize>(
+    simd: S,
+    m: usize,
+    k: usize,
+    n: usize,
+    alpha: Fam::Acc,
+    a: *const Fam::Lhs,
+    rsa: isize,
+    csa: isize,
+    b: *const Fam::Rhs,
+    rsb: isize,
+    csb: isize,
+    beta: Fam::Acc,
+    c: *mut Fam::Out,
+    rsc: isize,
+    csc: isize,
+    epi: &E,
+    par: Parallelism,
+    ws: &mut Workspace,
+) where
+    Fam: KernelFamily,
+    S: KernelSimd<Fam::Lhs, Fam::Rhs, Fam::Acc, Fam::Out>,
+    E: Epilogue<Fam>,
+{
     unsafe {
         // Defer to the general driver (still correct) when the in-place route does not apply
         // — packing never amortizes at tiny `k`, so there is nothing to gain by handling these
@@ -70,13 +118,18 @@ pub unsafe fn run<Fam, S, const MR_REG: usize, const NR: usize>(
         // with unit-stride rows, so an in-place A needs `rsa == 1` (column-major); and `k`
         // past `SMALL_K_MAX` both overflows the bottom-tile pad panel below and is where the
         // driver already wins. `FORCE_PACK_*` is a compile-time const, so it folds away for
-        // the in-place families.
+        // the in-place families. The driver applies the *same* epilogue, so the fused contract
+        // holds identically on the deferred shapes.
         if Fam::FORCE_PACK_LHS || Fam::FORCE_PACK_RHS || rsa != 1 || k > SMALL_K_MAX {
-            driver::run::<Fam, S, MR_REG, NR>(
-                simd, m, k, n, alpha, a, rsa, csa, b, rsb, csb, beta, c, rsc, csc, par, ws,
+            driver::run_epilogue::<Fam, S, E, MR_REG, NR>(
+                simd, m, k, n, alpha, a, rsa, csa, b, rsb, csb, beta, c, rsc, csc, epi, par, ws,
             );
             return;
         }
+
+        // `E: Copy` (an `Epilogue` supertrait): copy it out of the borrow so each `move` worker
+        // closure captures it by value (the same capture discipline the driver uses for `Ptr`).
+        let epi = *epi;
 
         let lanes = <S as SimdOps<Fam::Acc>>::LANES;
         let mr = MR_REG * lanes;
@@ -121,7 +174,7 @@ pub unsafe fn run<Fam, S, const MR_REG: usize, const NR: usize>(
         // grid, iterated column-tile-outer so a worker's consecutive tiles share a C column
         // block (contiguous stores for a column-major C). One `kc = k` panel per tile.
         let body = move |q_start: usize, q_end: usize| {
-            let (a, b, c) = (a, b, c);
+            let (a, b, c, epi) = (a, b, c, epi);
             let a = a.0 as *const Fam::Lhs;
             let b = b.0 as *const Fam::Rhs;
             let c = c.0;
@@ -167,7 +220,10 @@ pub unsafe fn run<Fam, S, const MR_REG: usize, const NR: usize>(
                     };
                     let bpan = b.offset(jc as isize * csb);
                     let cptr = c.offset(ic as isize * rsc + jc as isize * csc);
-                    Fam::microkernel::<S, MR_REG, NR>(
+                    // `ic`/`jc` are the tile origin in the oriented frame (a per-row/per-col
+                    // bias resolves its absolute base); `kc = k` is the single depth panel, so
+                    // `last_k = true` — the epilogue fires exactly once per element here.
+                    Fam::microkernel_epi::<S, E, MR_REG, NR>(
                         simd,
                         k,
                         alpha,
@@ -184,6 +240,10 @@ pub unsafe fn run<Fam, S, const MR_REG: usize, const NR: usize>(
                         csc,
                         mr_eff,
                         nr_eff,
+                        ic,
+                        jc,
+                        true,
+                        &epi,
                         scratch_ptr,
                     );
                 }

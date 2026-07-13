@@ -21,6 +21,8 @@
 //! is **reproducible** and bit-identical regardless of the worker count: the output-row
 //! partitioning ([`run_typed`]) never splits an element's reduction.
 
+use crate::kernel::FloatGemm;
+use crate::kernel::epilogue::{Epilogue, Identity};
 use crate::parallel::{self, JobCursor, Parallelism, Ptr};
 use crate::scalar::Float;
 use crate::simd::SimdOps;
@@ -38,6 +40,10 @@ const MB_REG: usize = 8;
 /// few cores that saturate DRAM, more workers stop helping. Each output row is computed by
 /// one worker over the full `k`, so the split adds no cross-thread reduction and the result
 /// stays bit-identical to the serial run.
+///
+/// The zero-cost [`Identity`] forwarder over [`run_typed_epi`]: with `E = Identity` the fused
+/// pass const-folds away, so this route is byte-for-byte unchanged and the public signature is
+/// preserved for every existing caller.
 ///
 /// # Safety
 /// Pointers must be valid for the regions implied by the strides/sizes; `c` must
@@ -64,23 +70,73 @@ pub unsafe fn run_typed<T, S>(
     T: Float<Acc = T>,
     S: SimdOps<T>,
 {
+    // SAFETY: forwarded to `run_typed_epi` with the zero-cost `Identity` epilogue — the exact
+    // bits this route always stored (`E::IS_IDENTITY` folds the final sweep away).
+    unsafe {
+        run_typed_epi::<T, S, Identity>(
+            simd, m, k, n, par, alpha, a, rsa, csa, b, rsb, csb, beta, c, rsc, csc, &Identity,
+        )
+    }
+}
+
+/// gemv applying the fused [`Epilogue`] `E` to its output. gemv is dispatched **before**
+/// orientation normalization, so `epi`'s coordinates are the **user** frame (the caller passes
+/// the unflipped epilogue). The `n == 1` branch's output element `i` is `C[i, 0]` (`swap_rc =
+/// false`); the `m == 1` branch views `Cᵀ`, so its element `i` is `C[0, i]` (`swap_rc = true`).
+///
+/// # Safety
+/// As [`run_typed`], plus `epi`'s interior pointers must be valid for the problem's `m`/`n`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn run_typed_epi<T, S, E>(
+    simd: S,
+    m: usize,
+    k: usize,
+    n: usize,
+    par: Parallelism,
+    alpha: T,
+    a: *const T,
+    rsa: isize,
+    csa: isize,
+    b: *const T,
+    rsb: isize,
+    csb: isize,
+    beta: T,
+    c: *mut T,
+    rsc: isize,
+    csc: isize,
+    epi: &E,
+) where
+    T: Float<Acc = T>,
+    S: SimdOps<T>,
+    E: Epilogue<FloatGemm<T>>,
+{
     unsafe {
         if n == 1 {
-            // C (m×1) = beta·C + alpha·A·b, A = m×k, b = k-vector.
-            core::<T, S>(simd, m, k, par, alpha, a, rsa, csa, b, rsb, beta, c, rsc);
+            // C (m×1) = beta·C + alpha·A·b, A = m×k, b = k-vector. Output element `i` is
+            // `C[i, 0]`, so the epilogue reads coordinate `(i, 0)` (`swap_rc = false`).
+            core_epi::<T, S, E>(
+                simd, m, k, par, alpha, a, rsa, csa, b, rsb, beta, c, rsc, false, epi,
+            );
         } else {
             // C (1×n) = beta·C + alpha·a·B. View Bᵀ (n×k) times a (k-vector):
-            // Bᵀ[j,k] = B[k,j] → row stride csb, col stride rsb; out stride csc.
-            core::<T, S>(simd, n, k, par, alpha, b, csb, rsb, a, csa, beta, c, csc);
+            // Bᵀ[j,k] = B[k,j] → row stride csb, col stride rsb; out stride csc. The transposed
+            // view makes output element `i` map to `C[0, i]`, so the epilogue reads coordinate
+            // `(0, i)` (`swap_rc = true`).
+            core_epi::<T, S, E>(
+                simd, n, k, par, alpha, b, csb, rsb, a, csa, beta, c, csc, true, epi,
+            );
         }
     }
 }
 
 /// `out[i] = beta·out[i] + alpha · Σ_k mat[i,k]·vec[k]` for `i in 0..rows`, split across
-/// bandwidth-capped workers over disjoint output-row panels.
+/// bandwidth-capped workers over disjoint output-row panels, then a fused [`Epilogue`] `E`
+/// applied as a final in-place sweep over each worker's own range (see the pass below).
+/// `swap_rc` picks the epilogue coordinate for output element `i`: `(i, 0)` when `false`
+/// (the `n == 1` shape), `(0, i)` when `true` (the transposed `m == 1` view).
 #[allow(clippy::too_many_arguments)]
 #[inline]
-unsafe fn core<T, S>(
+unsafe fn core_epi<T, S, E>(
     simd: S,
     rows: usize,
     k: usize,
@@ -94,10 +150,16 @@ unsafe fn core<T, S>(
     beta: T,
     out: *mut T,
     out_s: isize,
+    swap_rc: bool,
+    epi: &E,
 ) where
     T: Float<Acc = T>,
     S: SimdOps<T>,
+    E: Epilogue<FloatGemm<T>>,
 {
+    // `E: Copy` (an `Epilogue` supertrait): copy it out of the borrow so each `move` worker
+    // closure captures it by value.
+    let epi = *epi;
     unsafe {
         let lanes = <S as SimdOps<T>>::LANES;
         let sizeof = core::mem::size_of::<T>();
@@ -125,7 +187,7 @@ unsafe fn core<T, S>(
         let out = Ptr(out);
 
         let body = move |row_start: usize, row_end: usize| {
-            let (mat, vec, out) = (mat, vec, out);
+            let (mat, vec, out, epi) = (mat, vec, out, epi);
             let mat = mat.0 as *const T;
             let vec = vec.0 as *const T;
             let out = out.0;
@@ -149,6 +211,24 @@ unsafe fn core<T, S>(
                         simd, row_start, row_end, k, alpha, mat, mat_rs, mat_cs, vec, vec_s, beta,
                         out, out_s,
                     );
+                }
+                // Fused epilogue: a final in-place sweep over this worker's own output range.
+                // gemv fuses this way — NOT by threading `epi` into the four strategy kernels —
+                // because the output is one vector, tiny next to the matrix read that dominates
+                // this memory-bound path: one extra pass over `[row_start, row_end)` is
+                // negligible and keeps all four strategies byte-identical to the non-fused build.
+                // And because the strategy first stores exactly the bits plain gemv would store,
+                // mapping the re-read value is bitwise-identical to gemm-then-map by construction.
+                // Fires exactly once per element (each range is owned by one worker, swept after
+                // its full k-reduction). `E::IS_IDENTITY` const-folds the whole sweep away, so the
+                // non-fused instantiation is zero-cost. Kept inside `vectorize` so the epilogue
+                // runs in the token context (its `apply` uses scalar ops only).
+                if !E::IS_IDENTITY {
+                    for i in row_start..row_end {
+                        let op = out.offset(i as isize * out_s);
+                        let (r, c) = if swap_rc { (0, i) } else { (i, 0) };
+                        *op = epi.apply(*op, r, c);
+                    }
                 }
             });
         };
