@@ -1,0 +1,32 @@
+[package]
+name = "gemmkit-nalgebra"
+description = "nalgebra adapter for the gemmkit GEMM engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+
+[features]
+default = ["parallel"]
+parallel = ["gemmkit/parallel"]
+wasm_threads = ["parallel", "gemmkit/wasm_threads"]
+half = ["gemmkit/half"]
+complex = ["gemmkit/complex"]
+int8 = ["gemmkit/int8"]
+
+[dependencies]
+gemmkit = { path = "../gemmkit", version = "0.1.0", default-features = false, features = ["std"] }
+# nalgebra 0.35 has rust-version = 1.89.0 (== the workspace MSRV) and depends on
+# num-complex "0.4" (default-features = false) — the same semver-compatible version
+# gemmkit uses, so nalgebra's `Complex<f32>` *is* gemmkit's `num_complex::Complex<f32>`
+# and the `complex` entries type-unify. `std` is the only feature the adapter needs;
+# nalgebra's own `matrixmultiply` backend is off (we forward to gemmkit instead).
+nalgebra = { version = "0.35", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+approx = "0.5"

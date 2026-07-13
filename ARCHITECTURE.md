@@ -35,6 +35,7 @@ L6  special/         special paths (gemv.rs matrix·vector, small_k.rs skinny/lo
 L7  dispatch.rs      OnceLock<fn> ISA selection + orientation + per-(type,ISA) entry
 L8a api.rs           MatRef/MatMut safe API + unchecked raw engine
 L8b gemmkit-ndarray  ArrayBase adapter + dot
+L8b gemmkit-nalgebra nalgebra Matrix adapter + dot
         tuning.rs / workspace.rs    cross-cutting
 ```
 
@@ -566,6 +567,15 @@ forwards to the unchecked engine — so C-order, F-order, general-stride, and
 reversed views all work without copying. `dot` is the `.dot()`-style convenience.
 The same thin-wrapper treatment covers the batched (`gemm_batched`/`dot_batched` over an `Ix3`
 array, batch on axis 0) and packed (`prepack_rhs`/`prepack_lhs` + their consumers) raw entries.
+
+`gemmkit-nalgebra` is the same thin adapter for nalgebra: it accepts `&Matrix<T, R, C, S>` for any
+`S: RawStorage` (`DMatrix`, static `SMatrix`, and every view type), pulls `shape()`/`strides()` (the
+non-negative `usize` strides widened to `isize`) and the storage pointer, and forwards to the same
+unchecked engine — so column-major, row-major, and general-stride views all work without copying. It
+mirrors the ndarray surface fn-for-fn (`gemm`/`dot`/packed/`gemm_i8`/`gemm_cplx`, each with a `_with`
+form) minus the batched pair, which has no nalgebra analogue (no 3-D array type). `dot` returns a
+column-major `DMatrix` built through `VecStorage`, so the fresh-output allocation needs no nalgebra
+`Scalar`/`Zero` bound.
 
 ## Cross-cutting
 

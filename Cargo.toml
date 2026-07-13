@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["gemmkit", "gemmkit-ndarray", "gemmkit-tune"]
+members = ["gemmkit", "gemmkit-nalgebra", "gemmkit-ndarray", "gemmkit-tune"]
 # The cargo-fuzz crate is nightly-only (build-std + AddressSanitizer) and must never
 # enter the stable workspace: excluded so `cargo test/clippy/fmt --workspace` and the
 # MSRV-1.89 build never touch it. It is its own root with its own Cargo.lock/target.
