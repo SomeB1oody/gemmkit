@@ -251,41 +251,6 @@ pub unsafe fn pack_rhs_full<Fam: KernelFamily>(
     }
 }
 
-/// Pack the entire LHS of a fixed `(m, k)` problem into one micropanel-major
-/// buffer, for the prepacked-LHS reuse path ([`crate::gemm_packed_a`]).
-///
-/// By the engine's A/B symmetry a prepacked LHS is the prepacked RHS of the
-/// transposed product `Cᵀ = Bᵀ·Aᵀ` (the orientation dispatch already uses for a
-/// row-major-ish `C`), so the `m × k` LHS gets the exact micropanel-major layout
-/// [`pack_rhs_full`] lays down for a `k × m` RHS: depth `k`, leading dim the `m`
-/// rows. Hence the LHS row stride plays the RHS *column* stride and the LHS column
-/// stride the RHS *depth* stride. Delegating keeps one layout as the single source
-/// of truth, so [`run_packed_rhs`] (driven transposed) reads back the same bytes.
-/// `dst` must hold `ceil(m/nr) * nr * k` elements; `(kc, nc)` are the transposed
-/// problem's blocking (depth `kc`, leading `nc` over the `m` rows). Pointers are
-/// `Fam::Rhs`-typed since the LHS is both written and read as the transposed RHS;
-/// on the size-homogeneous float family `Lhs == Rhs`, so the call site needs no cast.
-///
-/// # Safety
-/// `a` valid for the `m × k` region at `rsa`/`csa`; `dst` valid for the count above.
-#[allow(clippy::too_many_arguments)]
-pub unsafe fn pack_lhs_full<Fam: KernelFamily>(
-    dst: *mut Fam::Rhs,
-    a: *const Fam::Rhs,
-    rsa: isize,
-    csa: isize,
-    m: usize,
-    k: usize,
-    kc: usize,
-    nc: usize,
-    nr: usize,
-) {
-    // The transposed RHS is `k × m`: depth = k (LHS columns, stride `csa`), leading =
-    // m (LHS rows, stride `rsa`). `pack_rhs_full` takes `(rsb = depth stride, csb =
-    // leading stride)`, so feed it `(rsb = csa, csb = rsa)` and `(k, n = m)`.
-    unsafe { pack_rhs_full::<Fam>(dst, a, csa, rsa, k, m, kc, nc, nr) }
-}
-
 /// The shared GEMM engine behind [`run`] (no prepacked RHS) and [`run_packed_rhs`]
 /// (`packed_b = Some(..)`). When prepacked, the per-call B-pack region is skipped
 /// and the compute region reads panels from the prepacked buffer instead.

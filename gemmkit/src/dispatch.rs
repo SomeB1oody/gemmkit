@@ -227,25 +227,6 @@ pub trait GemmScalar: Scalar {
         nr: usize,
     );
 
-    /// Pack a full LHS (in the transposed-RHS layout) for the prepacked-LHS path,
-    /// through this type's kernel family. Mirror of [`GemmScalar::pack_rhs_full`].
-    ///
-    /// # Safety
-    /// As [`crate::driver::pack_lhs_full`].
-    #[doc(hidden)]
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn pack_lhs_full(
-        dst: *mut Self,
-        a: *const Self,
-        rsa: isize,
-        csa: isize,
-        m: usize,
-        k: usize,
-        kc: usize,
-        nc: usize,
-        nr: usize,
-    );
-
     /// Run the dispatched kernel for this type. Used by the API layer.
     ///
     /// # Safety

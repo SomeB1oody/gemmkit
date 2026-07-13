@@ -777,12 +777,11 @@ memoized_select!(
 
 /// Emit the `GemmScalar` impl for a **homogeneous float** type (`f32` / `f64`): `Out == Acc`
 /// (`OUT_IS_ACC = true`), in-place `scale_c`, packing through `FloatGemm<$t>`, and the
-/// always-present fused path. `$disp` is the memoized dispatch accessor; `$name` names the
-/// type in the fused-kernel assert. The two float impls are pure type substitutions, so this
-/// keeps them from drifting. (Narrow `f16`/`bf16` differ — narrow scale, `MixedGemm`, no
-/// fused, bf16's depth-multiple pack switch — and stay manual below.)
+/// always-present fused path. `$disp` is the memoized dispatch accessor. The two float impls
+/// are pure type substitutions, so this keeps them from drifting. (Narrow `f16`/`bf16` differ —
+/// narrow scale, `MixedGemm`, no fused, bf16's depth-multiple pack switch — and stay manual below.)
 macro_rules! float_gemm_scalar {
-    ($t:ty, $disp:ident, $name:literal) => {
+    ($t:ty, $disp:ident) => {
         impl GemmScalar for $t {
             const OUT_IS_ACC: bool = true;
             #[inline]
@@ -803,22 +802,6 @@ macro_rules! float_gemm_scalar {
             ) {
                 unsafe {
                     driver::pack_rhs_full::<FloatGemm<$t>>(dst, b, rsb, csb, k, n, kc, nc, nr)
-                }
-            }
-            #[inline]
-            unsafe fn pack_lhs_full(
-                dst: *mut $t,
-                a: *const $t,
-                rsa: isize,
-                csa: isize,
-                m: usize,
-                k: usize,
-                kc: usize,
-                nc: usize,
-                nr: usize,
-            ) {
-                unsafe {
-                    driver::pack_lhs_full::<FloatGemm<$t>>(dst, a, rsa, csa, m, k, kc, nc, nr)
                 }
             }
             #[inline]
@@ -851,5 +834,5 @@ macro_rules! float_gemm_scalar {
     };
 }
 
-float_gemm_scalar!(f32, dispatched_f32, "f32");
-float_gemm_scalar!(f64, dispatched_f64, "f64");
+float_gemm_scalar!(f32, dispatched_f32);
+float_gemm_scalar!(f64, dispatched_f64);

@@ -851,20 +851,6 @@ impl GemmScalar for f16 {
         unsafe { driver::pack_rhs_full::<MixedGemm<f16>>(dst, b, rsb, csb, k, n, kc, nc, nr) }
     }
     #[inline]
-    unsafe fn pack_lhs_full(
-        dst: *mut f16,
-        a: *const f16,
-        rsa: isize,
-        csa: isize,
-        m: usize,
-        k: usize,
-        kc: usize,
-        nc: usize,
-        nr: usize,
-    ) {
-        unsafe { driver::pack_lhs_full::<MixedGemm<f16>>(dst, a, rsa, csa, m, k, kc, nc, nr) }
-    }
-    #[inline]
     unsafe fn dispatch(task: Task<f16>, par: Parallelism, ws: &mut Workspace) {
         unsafe { (dispatched_f16().run)(task, par, ws) }
     }
@@ -917,27 +903,6 @@ impl GemmScalar for bf16 {
                 return;
             }
             driver::pack_rhs_full::<MixedGemm<bf16>>(dst, b, rsb, csb, k, n, kc, nc, nr);
-        }
-    }
-    #[inline]
-    unsafe fn pack_lhs_full(
-        dst: *mut bf16,
-        a: *const bf16,
-        rsa: isize,
-        csa: isize,
-        m: usize,
-        k: usize,
-        kc: usize,
-        nc: usize,
-        nr: usize,
-    ) {
-        unsafe {
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            if dispatched_bf16().depth_multiple > 1 {
-                driver::pack_lhs_full::<Bf16DotGemm>(dst, a, rsa, csa, m, k, kc, nc, nr);
-                return;
-            }
-            driver::pack_lhs_full::<MixedGemm<bf16>>(dst, a, rsa, csa, m, k, kc, nc, nr);
         }
     }
     #[inline]

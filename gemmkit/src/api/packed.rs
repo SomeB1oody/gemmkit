@@ -369,63 +369,27 @@ pub unsafe fn prepack_lhs_unchecked<T: GemmScalar>(
     m: usize,
     k: usize,
 ) -> PackedLhs<T> {
-    // Resolve the panel geometry through the consuming call's ISA tile, for the
-    // *transposed* problem (whose RHS is this A): its `N` is the LHS's `m` rows, its
-    // `K` is `k`. The `tiny_block_dim() + 1` sentinel for the transposed `M` (the
-    // unknown-here `n`) dodges the tiny-matrix branch so the geometry is `n`-independent.
-    let (mr, nr) = <T as GemmScalar>::rhs_tile();
-    // Empty operand: short-circuit before the geometry/size arithmetic (see
-    // `prepack_rhs` — same overflow hazard for a huge `m` on an empty view, same
-    // safe round-trip through the consume path).
-    if k == 0 || m == 0 {
-        return PackedLhs {
-            buf: Vec::new(),
-            m,
-            k,
-            nr,
-            kc: 1,
-            nc: nr,
-        };
-    }
-    // Packed input (`Lhs` == `Rhs`) element size — the unit the panels are stored in,
-    // matching the driver (the prepacked buffer below is `T`-typed).
-    let lhs_size = core::mem::size_of::<T>().max(1);
-    let dodge_tiny = crate::tuning::tiny_block_dim().saturating_add(1);
-    let blk = crate::cache::topology().blocking(mr, nr, lhs_size, dodge_tiny, m, k);
-    let kc = if T::OUT_IS_ACC {
-        blk.kc.max(1)
-    } else {
-        k.max(1)
-    };
-    let nc = blk.nc.next_multiple_of(nr).max(nr);
-
-    // Depth-padded for a dot kernel (see `prepack_rhs`); identity for `DEPTH_MULTIPLE == 1`.
-    let k_pad = k.next_multiple_of(<T as GemmScalar>::rhs_depth_multiple());
-    // Checked for the same broadcast-view reason as `prepack_rhs`.
-    let total = m
-        .div_ceil(nr)
-        .checked_mul(nr)
-        .and_then(|v| v.checked_mul(k_pad))
-        .unwrap_or_else(|| {
-            panic!("gemmkit: prepacked LHS of {m}x{k} is too large; the pack buffer size overflows usize")
-        });
-    let mut buf = vec![T::ZERO; total];
-    if total > 0 {
-        // SAFETY: `buf` holds `ceil(m/nr)*nr*k_pad` elements (the exact layout size, with
-        // the depth padded to the dispatched family's `DEPTH_MULTIPLE`); `a` is caller-promised
-        // valid for the `(m, k)` strided reads; `pack_lhs_full` writes only that range and selects
-        // the right kernel family per type.
-        unsafe {
-            T::pack_lhs_full(buf.as_mut_ptr(), a, rsa, csa, m, k, kc, nc, nr);
-        }
-    }
+    // By the engine's A/B symmetry, a prepacked LHS *is* the prepacked RHS of the
+    // transposed product `Cᵀ = Bᵀ·Aᵀ`: the `m × k` LHS is that problem's `k × m` RHS
+    // (depth `k`, leading `m`), so the LHS row stride plays the RHS column stride and
+    // the LHS column stride the RHS depth stride. Delegating to `prepack_rhs_unchecked`
+    // keeps one geometry + pack path as the single source of truth (it lays down the
+    // identical micropanel-major buffer, which the consuming call — driven transposed —
+    // reads back verbatim); we only relabel the recorded dimensions into LHS terms.
+    // (One benign consequence: the effectively-unreachable overflow panic reports the
+    // problem as an RHS of `{k}x{m}` rather than an LHS of `{m}x{k}`.)
+    //
+    // SAFETY: `a` is caller-promised valid for the `(m, k)` reads at `i·rsa + j·csa`;
+    // those are exactly the `(k, n = m)` reads `prepack_rhs_unchecked` performs with the
+    // transposed strides `(rsb = csa, csb = rsa)`.
+    let packed = unsafe { prepack_rhs_unchecked(a, csa, rsa, k, m) };
     PackedLhs {
-        buf,
-        m,
-        k,
-        nr,
-        kc,
-        nc,
+        buf: packed.buf,
+        m: packed.n,
+        k: packed.k,
+        nr: packed.nr,
+        kc: packed.kc,
+        nc: packed.nc,
     }
 }
 
