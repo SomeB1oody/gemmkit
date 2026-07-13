@@ -3,7 +3,9 @@
 //! and ISA-independent, so the oracle holds bitwise under every `GEMMKIT_REQUIRE_ISA` pin.
 
 use crate::common::Rng;
-use gemmkit::{MatMut, MatRef, Parallelism, Requantize, gemm_i8, gemm_i8_requant};
+use gemmkit::{
+    MatMut, MatRef, Parallelism, Requantize, gemm_i8, gemm_i8_requant, gemm_i8_requant_u8,
+};
 
 /// The reference requantize map. The rounding uses the std `round_ties_even` — an
 /// *independent* implementation of the contract, NOT a copy of the kernel's `2^52`
@@ -546,6 +548,348 @@ fn requant_bad_bias_len() {
         bias: Some(&bias),
     };
     gemm_i8_requant(
+        MatRef::from_col_major(&a, 4, 4),
+        MatRef::from_col_major(&b, 4, 4),
+        req,
+        MatMut::from_col_major(&mut c, 4, 4),
+        Parallelism::Serial,
+    );
+}
+
+// ===========================================================================
+// u8-output requantize (ONNX-QLinearMatMul activation, clamp band [0, 255]).
+// Same bit-exactness bar as the i8 path: the `i32` accumulation is exact and ISA-independent,
+// so every oracle below holds bitwise under every `GEMMKIT_REQUIRE_ISA` pin. All expectations
+// are computed by an independent model (or hardcoded) — never a machine number.
+// ===========================================================================
+
+/// Independent reference for the `u8` requantize map: exact `i64` accumulate is done by the
+/// caller (or hardcoded), then f64 round-half-to-even (std `round_ties_even`, NOT the kernel's
+/// `2^52` trick) and clamp to the unsigned band `[0, 255]`.
+fn ref_requant_u8(acc: i64, bias: i32, scale: f32, zp: i32) -> u8 {
+    let scaled = ((acc + i64::from(bias)) as f64 * f64::from(scale)).round_ties_even();
+    let q = (scaled as i64).saturating_add(i64::from(zp));
+    q.clamp(0, 255) as u8
+}
+
+/// Run `gemm_i8_requant_u8` (col-major `m×k` A, `k×n` B) into a `u8` C with the given strides,
+/// returning the (possibly padded) buffer of length `buflen`.
+fn run_requant_u8(
+    a: &[i8],
+    b: &[i8],
+    m: usize,
+    k: usize,
+    n: usize,
+    scale: f32,
+    zp: i32,
+    bias: Option<&[i32]>,
+    rsc: isize,
+    csc: isize,
+    buflen: usize,
+    par: Parallelism,
+) -> Vec<u8> {
+    let mut c = vec![0u8; buflen];
+    let ar = MatRef::new(a, m, k, 1, m as isize);
+    let br = MatRef::new(b, k, n, 1, k as isize);
+    let cm = MatMut::new(&mut c, m, n, rsc, csc);
+    let req = Requantize {
+        scale,
+        zero_point: zp,
+        bias,
+    };
+    gemm_i8_requant_u8(ar, br, req, cm, par);
+    c
+}
+
+/// General shape (mixed signs), bias Some/None, scale + zero-point sweep including `zp = 0` and
+/// `zp = 255`, compared against the independent `i64`-accumulate / round-ties-even / clamp-[0,255]
+/// model. The accumulator (`|acc| <= k·127² ≈ 661k`) and bias stay far inside `i32`, so the
+/// kernel's `i32` accumulation is exactly the model's `i64` sum.
+#[test]
+fn requant_u8_matches_reference() {
+    let mut rng = Rng::new(0x0075_8000);
+    let (m, k, n) = (37usize, 41usize, 19usize);
+    let a = make_i8(&mut rng, m * k); // col-major m×k
+    let b = make_i8(&mut rng, k * n); // col-major k×n
+
+    // Exact i64 accumulator C = Aᵀ-free plain matmul over the col-major layouts.
+    let mut acc = vec![0i64; m * n];
+    for j in 0..n {
+        for i in 0..m {
+            let mut s = 0i64;
+            for p in 0..k {
+                s += i64::from(a[i + p * m]) * i64::from(b[p + j * k]);
+            }
+            acc[i + j * m] = s;
+        }
+    }
+
+    let bias: Vec<i32> = (0..m)
+        .map(|_| (rng.next_u64() % 2001) as i64 as i32 - 1000)
+        .collect();
+
+    for has_bias in [false, true] {
+        let bias_opt = if has_bias {
+            Some(bias.as_slice())
+        } else {
+            None
+        };
+        for &scale in &[0.003f32, 0.05, 0.5, 1.0, 7.25] {
+            for &zp in &[0i32, 1, 128, 200, 255] {
+                let c = run_requant_u8(
+                    &a,
+                    &b,
+                    m,
+                    k,
+                    n,
+                    scale,
+                    zp,
+                    bias_opt,
+                    1,
+                    m as isize,
+                    m * n,
+                    Parallelism::Serial,
+                );
+                for j in 0..n {
+                    for i in 0..m {
+                        let bterm = if has_bias { bias[i] } else { 0 };
+                        let want = ref_requant_u8(acc[i + j * m], bterm, scale, zp);
+                        assert_eq!(
+                            c[i + j * m],
+                            want,
+                            "u8 requant mismatch at ({i},{j}) acc={} has_bias={has_bias} scale={scale} zp={zp}",
+                            acc[i + j * m],
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Crafted `1×1` accumulators + a large scale drive both clamp rails: every positive product
+/// saturates to `255`, every negative to `0`. Hardcoded expected bytes (both rails present).
+#[test]
+fn requant_u8_saturates() {
+    let a: [i8; 8] = [127, -128, 100, -100, 1, -1, 64, -64];
+    let b: [i8; 1] = [1];
+    let mut c = [0u8; 8];
+    gemm_i8_requant_u8(
+        MatRef::from_col_major(&a, 8, 1),
+        MatRef::from_col_major(&b, 1, 1),
+        Requantize {
+            scale: 1000.0,
+            zero_point: 0,
+            bias: None,
+        },
+        MatMut::from_col_major(&mut c, 8, 1),
+        Parallelism::Serial,
+    );
+    let expect: [u8; 8] = [255, 0, 255, 0, 255, 0, 255, 0];
+    assert_eq!(c, expect, "u8 saturation rails");
+    assert!(
+        c.contains(&0) && c.contains(&255),
+        "both u8 rails must be present"
+    );
+}
+
+/// Hardcoded round-half-to-even ties in the `u8` domain (independent of any reference fn): each
+/// row is a `1×1` product with `scale = 0.5`, landing `scale·acc` on a half-integer, then a
+/// nonzero `zp = 10` joins in integer. Ties land both **above** the zero-point (12, 14) and
+/// **below** it (8, 6). A round-half-up/away regression would flip 2.5→3 (→13), 4.5→5 (→15),
+/// −2.5→−3 (→7), −4.5→−5 (→5).
+#[test]
+fn requant_u8_ties_even_exact() {
+    let a: [i8; 6] = [1, 5, 9, -1, -5, -9];
+    let b: [i8; 1] = [1];
+    // scale=0.5, zp=10: 0.5→0, 2.5→2, 4.5→4, -0.5→0, -2.5→-2, -4.5→-4, then + zp.
+    let expect: [u8; 6] = [10, 12, 14, 10, 8, 6];
+    let mut c = [0u8; 6];
+    gemm_i8_requant_u8(
+        MatRef::from_col_major(&a, 6, 1),
+        MatRef::from_col_major(&b, 1, 1),
+        Requantize {
+            scale: 0.5,
+            zero_point: 10,
+            bias: None,
+        },
+        MatMut::from_col_major(&mut c, 6, 1),
+        Parallelism::Serial,
+    );
+    assert_eq!(c, expect, "u8 round-half-to-even ties");
+}
+
+/// The vectorized `u8` requant map (unit-stride C, full lane-runs) must agree **bit-for-bit**
+/// with the scalar map (a strided C forces the scalar path for every element). `m = 64` spans
+/// several full lane-runs on every vector ISA; a `PerRow` bias including `i32::MAX`/`i32::MIN`
+/// exercises the wrapping integer bias-add on both paths. This is the end-to-end proof of the
+/// vector low-byte store in the `(0, 255)` band. Independent of any platform constant — the two
+/// layouts are each other's oracle.
+#[test]
+fn requant_u8_vector_scalar_bitwise() {
+    let mut rng = Rng::new(0x0075_B17E);
+    let (m, k, n) = (64usize, 37usize, 9usize);
+    let a = make_i8(&mut rng, m * k);
+    let b = make_i8(&mut rng, k * n);
+    // Per-row bias including the wrapping-add extremes.
+    let bias: Vec<i32> = (0..m)
+        .map(|i| match i % 5 {
+            0 => i32::MAX,
+            1 => i32::MIN,
+            2 => 1000,
+            3 => -1000,
+            _ => (rng.next_u64() % 4001) as i64 as i32 - 2000,
+        })
+        .collect();
+
+    for has_bias in [false, true] {
+        let bias_opt = if has_bias {
+            Some(bias.as_slice())
+        } else {
+            None
+        };
+        for &scale in &[1.0f32, 0.0078125, 0.1, 1e30, 1e-30] {
+            for &zp in &[0i32, 128, 255] {
+                // (1) unit-stride col-major C: full lane-runs take the vector store path.
+                let unit = run_requant_u8(
+                    &a,
+                    &b,
+                    m,
+                    k,
+                    n,
+                    scale,
+                    zp,
+                    bias_opt,
+                    1,
+                    m as isize,
+                    m * n,
+                    Parallelism::Serial,
+                );
+                // (2) strided C (rsc = 2): forces the scalar map for every element.
+                let strided = run_requant_u8(
+                    &a,
+                    &b,
+                    m,
+                    k,
+                    n,
+                    scale,
+                    zp,
+                    bias_opt,
+                    2,
+                    (2 * m) as isize,
+                    2 * m * n,
+                    Parallelism::Serial,
+                );
+                for j in 0..n {
+                    for i in 0..m {
+                        assert_eq!(
+                            unit[i + j * m],
+                            strided[2 * i + j * (2 * m)],
+                            "u8 vector != scalar has_bias={has_bias} scale={scale} zp={zp} at ({i},{j})",
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Degenerate `k == 0` (u8 output): C fills with `clamp(zp + round_ne(scale·bias), 0, 255)`
+/// (= `zp` without bias), with and without a per-row bias. Compared to the model.
+#[test]
+fn requant_u8_zero_k_degenerate() {
+    let m = 12usize;
+    let n = 10usize;
+    let bias: Vec<i32> = (0..m).map(|i| i as i32 * 60 - 300).collect();
+    let a: Vec<i8> = Vec::new();
+    let b: Vec<i8> = Vec::new();
+    let scale = 0.5f32;
+    let zp = 20i32;
+    for has_bias in [false, true] {
+        let bias_opt = if has_bias {
+            Some(bias.as_slice())
+        } else {
+            None
+        };
+        let mut c = vec![7u8; m * n];
+        {
+            let ar = MatRef::new(&a, m, 0, 1, m as isize);
+            let br = MatRef::new(&b, 0, n, 1, 0);
+            let cm = MatMut::new(&mut c, m, n, 1, m as isize);
+            let req = Requantize {
+                scale,
+                zero_point: zp,
+                bias: bias_opt,
+            };
+            gemm_i8_requant_u8(ar, br, req, cm, Parallelism::Serial);
+        }
+        for j in 0..n {
+            for i in 0..m {
+                let bterm = if has_bias { bias[i] } else { 0 };
+                let want = ref_requant_u8(0, bterm, scale, zp);
+                assert_eq!(
+                    c[i + j * m],
+                    want,
+                    "u8 degenerate ({i},{j}) has_bias={has_bias}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[should_panic(expected = "zero_point")]
+fn requant_u8_bad_zp_high() {
+    let a = vec![0i8; 16];
+    let b = vec![0i8; 16];
+    let mut c = vec![0u8; 16];
+    let req = Requantize {
+        scale: 1.0,
+        zero_point: 256,
+        bias: None,
+    };
+    gemm_i8_requant_u8(
+        MatRef::from_col_major(&a, 4, 4),
+        MatRef::from_col_major(&b, 4, 4),
+        req,
+        MatMut::from_col_major(&mut c, 4, 4),
+        Parallelism::Serial,
+    );
+}
+
+#[test]
+#[should_panic(expected = "zero_point")]
+fn requant_u8_bad_zp_low() {
+    let a = vec![0i8; 16];
+    let b = vec![0i8; 16];
+    let mut c = vec![0u8; 16];
+    let req = Requantize {
+        scale: 1.0,
+        zero_point: -1,
+        bias: None,
+    };
+    gemm_i8_requant_u8(
+        MatRef::from_col_major(&a, 4, 4),
+        MatRef::from_col_major(&b, 4, 4),
+        req,
+        MatMut::from_col_major(&mut c, 4, 4),
+        Parallelism::Serial,
+    );
+}
+
+#[test]
+#[should_panic(expected = "bias length")]
+fn requant_u8_bad_bias_len() {
+    let a = vec![0i8; 16];
+    let b = vec![0i8; 16];
+    let mut c = vec![0u8; 16];
+    let bias = vec![0i32; 3];
+    let req = Requantize {
+        scale: 1.0,
+        zero_point: 0,
+        bias: Some(&bias),
+    };
+    gemm_i8_requant_u8(
         MatRef::from_col_major(&a, 4, 4),
         MatRef::from_col_major(&b, 4, 4),
         req,

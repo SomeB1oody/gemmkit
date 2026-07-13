@@ -34,8 +34,9 @@ pub use cplx::{gemm_cplx, gemm_cplx_unchecked, gemm_cplx_unchecked_with, gemm_cp
 pub use fused::{Activation, Bias, gemm_fused, gemm_fused_unchecked, gemm_fused_with};
 #[cfg(feature = "int8")]
 pub use int8::{
-    Requantize, gemm_i8, gemm_i8_requant, gemm_i8_requant_unchecked, gemm_i8_requant_with,
-    gemm_i8_unchecked, gemm_i8_unchecked_with, gemm_i8_with,
+    Requantize, gemm_i8, gemm_i8_requant, gemm_i8_requant_u8, gemm_i8_requant_u8_unchecked,
+    gemm_i8_requant_u8_with, gemm_i8_requant_unchecked, gemm_i8_requant_with, gemm_i8_unchecked,
+    gemm_i8_unchecked_with, gemm_i8_with,
 };
 pub use packed::{
     PackedLhs, PackedRhs, gemm_packed_a, gemm_packed_a_unchecked, gemm_packed_a_unchecked_with,

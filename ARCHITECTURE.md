@@ -256,21 +256,27 @@ family's `store_out` narrows; `apply` narrows itself). That is *more* precise th
 a separate narrow map (which rounds to the narrow type, widens back, then rounds again), so for
 narrow types `gemm_fused` is **not** bitwise-equal to `gemm`-then-map — the every-shape bitwise
 contract holds for `f32`/`f64` only. Within a fused run the vector and scratch paths still agree
-bit-for-bit (both round once), and serial ≡ parallel is unchanged. `KRequantize` (`i8 -> i8`,
-scale + zero-point + optional integer bias) keeps `VECTOR = false` (no float-style in-register
-path) but sets `VECTOR_STORE = true`: every tile drains to `i32` scratch, then the `i32 -> i8`
-map is **vectorized in f64** on x86 (`apply_store` → the `KernelSimd::requant_store` seam, with
-`REQUANT_VECTOR = true` on `Fma`/`Avx512`/`Avx512Vnni`; a NEON override is deferred pending device
-validation). A full lane-run of a unit-stride tile takes that vector store; the sub-lane row tail,
-a strided `C`, the `k == 0` fill, and non-vector ISAs take the scalar `apply` — and the two are
-**bit-identical**, so one output mixes them freely. Either way it deletes the full `m·n` `i32`
-materialization a `gemm_i8` + separate pass would pay. Its rounding is a single correctly-rounded
-f64 multiply with round-half-to-even (scalar: the `no_std`-safe `2^52` trick; vector: the hardware
-round-to-nearest-even, which equals it), joining the zero-point in integer — so it is **bit-exact
-across every ISA (vector ≡ scalar) and serial ≡ parallel** (widen ≡ VNNI). It rides two new requant families, `IntGemmQ` (widen)
-and `IntGemmVnniQ` (`vpdpbusd`), both `Out = i8, Acc = i32`, reached through a single delegating
-`KernelSimd<i8,i8,i32,i8>` blanket that forwards the hot accumulate ops to the existing
-`<i8,i8,i32,i32>` impl. The public entry points are `gemm_fused` and `gemm_i8_requant` (L8).
+bit-for-bit (both round once), and serial ≡ parallel is unchanged. `KRequantize` (`i8 -> i8` or
+`i8 -> u8`, scale + zero-point + optional integer bias) keeps `VECTOR = false` (no float-style
+in-register path) but sets `VECTOR_STORE = true`: every tile drains to `i32` scratch, then the
+`i32 -> {i8,u8}` map is **vectorized in f64** on x86 (`apply_store` → the
+`KernelSimd::requant_store` seam, with `REQUANT_VECTOR = true` on `Fma`/`Avx512`/`Avx512Vnni`; a
+NEON override is deferred pending device validation). The output domain — its clamp band `[LO, HI]`
+and the final low-byte narrowing — is chosen per output type by the `QuantOut` trait (`i8` →
+`[-128, 127]`, `u8` → `[0, 255]`, the ONNX-QLinearMatMul activation); the vector store writes the
+same low byte either way (a value clamped into `[-128, 255]` has identical bytes read as `i8` or
+`u8`), so one `requant_store` serves both. A full lane-run of a unit-stride tile takes that vector
+store; the sub-lane row tail, a strided `C`, the `k == 0` fill, and non-vector ISAs take the scalar
+`apply` — and the two are **bit-identical**, so one output mixes them freely. Either way it deletes
+the full `m·n` `i32` materialization a `gemm_i8` + separate pass would pay. Its rounding is a single
+correctly-rounded f64 multiply with round-half-to-even (scalar: the `no_std`-safe `2^52` trick;
+vector: the hardware round-to-nearest-even, which equals it), joining the zero-point in integer —
+so it is **bit-exact across every ISA (vector ≡ scalar) and serial ≡ parallel** (widen ≡ VNNI). It
+rides two requant families, `IntGemmQ<O>` (widen) and `IntGemmVnniQ<O>` (`vpdpbusd`), generic in
+the output byte (`Out = O` in `{i8, u8}`, `Acc = i32`, `O` defaulting to `i8`), reached through a
+pair of delegating `KernelSimd<i8,i8,i32,i8>` / `<i8,i8,i32,u8>` blankets that forward the hot
+accumulate ops to the existing `<i8,i8,i32,i32>` impl. The public entry points are `gemm_fused`,
+`gemm_i8_requant` (`i8` output), and `gemm_i8_requant_u8` (`u8` output) (L8).
 `gemm_fused` routes every shape through the **same** kernel `gemm` would — the general driver
 *and* the L6 float special paths (gemv, small-`m,n`, small-`k`), each threading `E` through the
 same `run`/`run_typed` decision tree via zero-cost `Identity` forwarders (`run_epi` /
@@ -517,9 +523,12 @@ call.
   delegates to plain `gemm`. Validation adds bias-length, bias-vs-C overlap, and finite-slope checks;
   the result is bit-identical to `gemm` then the scalar map for **every** shape (the L6 special
   paths — gemv, small-`m,n`, small-`k` — are fused too, so a fused shape routes exactly as `gemm`).
-- **Requantize** ([`gemm_i8_requant`] / `gemm_i8_requant_with`, `int8` feature): `i8·i8 -> i8` with a
-  per-tensor `Requantize { scale, zero_point, bias }`, fusing the `i32 -> i8` requantize into the
-  store (deleting the `m·n` `i32` materialization). Bit-exact across ISAs and serial ≡ parallel.
+- **Requantize** ([`gemm_i8_requant`] / `gemm_i8_requant_with` → `i8` output; `gemm_i8_requant_u8` /
+  `gemm_i8_requant_u8_with` → `u8` output, ONNX-QLinearMatMul-style; `int8` feature): `i8·i8 -> i8`/`u8`
+  with a per-tensor `Requantize { scale, zero_point, bias }` (`zero_point` in `[-128, 127]` for `i8`,
+  `[0, 255]` for `u8`), fusing the `i32 -> {i8,u8}` requantize into the store (deleting the `m·n` `i32`
+  materialization). Bit-exact across ISAs and serial ≡ parallel; the two outputs share one
+  `KRequantize` epilogue and one requant-store seam, parametrized by the `QuantOut` output domain.
 - **Unchecked** ([`gemm_unchecked`], plus a raw-pointer sibling for every safe entry:
   `gemm_batched_unchecked`, `prepack_rhs_unchecked`/`gemm_packed_b_unchecked`,
   `prepack_lhs_unchecked`/`gemm_packed_a_unchecked`, `gemm_i8_unchecked`, `gemm_cplx_unchecked` —

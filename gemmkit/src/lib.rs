@@ -81,8 +81,9 @@ pub use api::{
 };
 #[cfg(feature = "int8")]
 pub use api::{
-    Requantize, gemm_i8, gemm_i8_requant, gemm_i8_requant_unchecked, gemm_i8_requant_with,
-    gemm_i8_unchecked, gemm_i8_unchecked_with, gemm_i8_with,
+    Requantize, gemm_i8, gemm_i8_requant, gemm_i8_requant_u8, gemm_i8_requant_u8_unchecked,
+    gemm_i8_requant_u8_with, gemm_i8_requant_unchecked, gemm_i8_requant_with, gemm_i8_unchecked,
+    gemm_i8_unchecked_with, gemm_i8_with,
 };
 #[cfg(feature = "complex")]
 pub use api::{gemm_cplx, gemm_cplx_unchecked, gemm_cplx_unchecked_with, gemm_cplx_with};

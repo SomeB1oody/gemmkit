@@ -70,6 +70,17 @@ impl Scalar for i32 {
     const ONE: Self = 1;
 }
 
+// Quantized *unsigned* output type: `u8` is the ONNX-QLinearMatMul-style activation
+// output of the requantizing GEMM. Like `i8` it accumulates in `i32` (`Acc = i32`) and
+// is widened *zero-extending* wherever a widen is ever needed; it is `Scalar` but not
+// `Float` — it only ever appears as the requant `Out`, never as a GEMM input.
+#[cfg(feature = "int8")]
+impl Scalar for u8 {
+    type Acc = i32;
+    const ZERO: Self = 0;
+    const ONE: Self = 1;
+}
+
 // Complex GEMM: `Complex<f32>` / `Complex<f64>` have native arithmetic (`num-complex`
 // provides Add/Mul/Sub), so they impl [`Float`] — used by the degenerate `C <- beta·C`
 // scale and the complex `alpha`/`beta` epilogue. Their GEMM rides the dedicated split

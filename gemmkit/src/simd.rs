@@ -285,6 +285,90 @@ impl<S: KernelSimd<i8, i8, i32, i32>> KernelSimd<i8, i8, i32, i8> for S {
     }
 }
 
+/// Requantizing-integer blanket, **`u8` output** (ONNX-QLinearMatMul activation): the exact
+/// mirror of the `<i8, i8, i32, i8>` blanket above, for the `[0, 255]` output domain. Same
+/// delegation over every widen-kernel token (`KernelSimd<i8, i8, i32, i32>`): the hot
+/// accumulate-side ops (`load_lhs`/`splat_rhs`/`dot_accumulate`) forward verbatim, and
+/// `requant_store` forwards unchanged — it already takes a raw `*mut i8` byte pointer and
+/// writes each pre-clamped lane's low byte, which for a value in `[0, 255]` is the same byte
+/// read as `i8` or `u8` (the [`crate::kernel::epilogue::KRequantize::apply_store`] cast). Only
+/// the cold, never-on-the-requant-path spill ops differ: `load_out` **zero-extends** (`u8 as
+/// i32`) and `store_out` truncates the low byte (`i32 as u8`). Coherent: it cannot overlap the
+/// homogeneous blanket (`u8 != i32`) nor the `i8` blanket above (different `Out`).
+#[cfg(feature = "int8")]
+impl<S: KernelSimd<i8, i8, i32, i32>> KernelSimd<i8, i8, i32, u8> for S {
+    #[inline(always)]
+    unsafe fn load_lhs(self, p: *const i8) -> <Self as SimdOps<i32>>::Reg {
+        unsafe { <Self as KernelSimd<i8, i8, i32, i32>>::load_lhs(self, p) }
+    }
+    #[inline(always)]
+    unsafe fn splat_rhs(self, v: i8) -> <Self as SimdOps<i32>>::Reg {
+        unsafe { <Self as KernelSimd<i8, i8, i32, i32>>::splat_rhs(self, v) }
+    }
+    #[inline(always)]
+    unsafe fn dot_accumulate<const MR_REG: usize, const NR: usize>(
+        self,
+        kc: usize,
+        a: *const i8,
+        b: *const i8,
+        acc: &mut [[<Self as SimdOps<i32>>::Reg; MR_REG]; NR],
+    ) {
+        unsafe {
+            <Self as KernelSimd<i8, i8, i32, i32>>::dot_accumulate::<MR_REG, NR>(
+                self, kc, a, b, acc,
+            )
+        }
+    }
+    // Requant store forwards straight to the widen impl (identical to the `i8` blanket): the
+    // `dst` is a raw `*mut i8` byte pointer regardless of the output type, and the low byte a
+    // value clamped into `[0, 255]` writes is the same whether the slot is read `i8` or `u8`.
+    const REQUANT_VECTOR: bool = <S as KernelSimd<i8, i8, i32, i32>>::REQUANT_VECTOR;
+    #[inline(always)]
+    unsafe fn requant_store(
+        self,
+        dst: *mut i8,
+        v: <Self as SimdOps<i32>>::Reg,
+        scale: f64,
+        zp: i32,
+        lo: i32,
+        hi: i32,
+    ) {
+        unsafe {
+            <S as KernelSimd<i8, i8, i32, i32>>::requant_store(self, dst, v, scale, zp, lo, hi)
+        }
+    }
+    // Cold output-side ops (unused on the requant path): portable stack-spill zero-extend /
+    // low-byte truncate. 16 is the widest `LANES` of any `SimdOps<i32>` (AVX-512), so it fits.
+    unsafe fn load_out(self, p: *const u8) -> <Self as SimdOps<i32>>::Reg {
+        let lanes = <Self as SimdOps<i32>>::LANES;
+        assert!(
+            lanes <= 16,
+            "i32 token wider than the out-conversion buffer"
+        );
+        let mut buf = [0i32; 16];
+        unsafe {
+            for (l, slot) in buf.iter_mut().enumerate().take(lanes) {
+                *slot = *p.add(l) as i32; // zero-extend u8 -> i32
+            }
+            self.loadu(buf.as_ptr())
+        }
+    }
+    unsafe fn store_out(self, p: *mut u8, v: <Self as SimdOps<i32>>::Reg) {
+        let lanes = <Self as SimdOps<i32>>::LANES;
+        assert!(
+            lanes <= 16,
+            "i32 token wider than the out-conversion buffer"
+        );
+        let mut buf = [0i32; 16];
+        unsafe {
+            self.storeu(buf.as_mut_ptr(), v);
+            for (l, &x) in buf.iter().enumerate().take(lanes) {
+                *p.add(l) = x as u8; // low-byte truncation
+            }
+        }
+    }
+}
+
 /// An ISA token: a zero-sized marker carrying a set of target features.
 ///
 /// The only behaviour is [`Simd::vectorize`], which establishes the

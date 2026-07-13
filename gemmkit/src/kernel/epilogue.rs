@@ -314,17 +314,56 @@ where
     }
 }
 
-/// The `i8 -> i8` requantizing epilogue: `C[r, c] = clamp(zp + round_ne(scale·(acc + bias)),
-/// -128, 127)`, with an optional per-row / per-col `i32` bias joined **in integer** before
-/// the single f64 rounding.
+/// The output domain of the requantizing [`KRequantize`] epilogue: the inclusive clamp
+/// bounds and the final narrowing of an already-clamped `i64` to the output byte. Implemented
+/// for the two quantized output types — `i8` (`[-128, 127]`) and `u8` (`[0, 255]`) — so one
+/// `KRequantize` impl and one requant family serve both. The narrowing `from_clamped` is only
+/// ever handed a value already in `[LO, HI]`, so the `as` cast is a plain reinterpret of the
+/// low byte (no saturation), matching the vector store's low-byte write.
+#[cfg(feature = "int8")]
+pub(crate) trait QuantOut: crate::scalar::Scalar {
+    /// Inclusive clamp bounds of the output domain.
+    const LO: i32;
+    /// Inclusive clamp bounds of the output domain.
+    const HI: i32;
+    /// Truncate an already-clamped `i64` (in `[LO, HI]`) to the output byte.
+    fn from_clamped(q: i64) -> Self;
+}
+
+#[cfg(feature = "int8")]
+impl QuantOut for i8 {
+    const LO: i32 = -128;
+    const HI: i32 = 127;
+    #[inline(always)]
+    fn from_clamped(q: i64) -> Self {
+        q as i8
+    }
+}
+
+#[cfg(feature = "int8")]
+impl QuantOut for u8 {
+    const LO: i32 = 0;
+    const HI: i32 = 255;
+    #[inline(always)]
+    fn from_clamped(q: i64) -> Self {
+        q as u8
+    }
+}
+
+/// The requantizing epilogue: `C[r, c] = clamp(zp + round_ne(scale·(acc + bias)), LO, HI)`,
+/// with an optional per-row / per-col `i32` bias joined **in integer** before the single f64
+/// rounding. The clamp band `[LO, HI]` is the output domain, chosen per output type by
+/// [`QuantOut`]: `i8` → `[-128, 127]` (signed) and `u8` → `[0, 255]` (the ONNX-QLinearMatMul
+/// activation output). The struct itself carries no `Out` — one value drives both, the domain
+/// coming from the `Fam::Out` the [`Epilogue`] impl is monomorphized for.
 ///
 /// Every tile drains its `i32` accumulators to scratch (vectorized), then maps each element to
-/// `i8`. The map itself is split: on requant-vector-capable tokens (x86 — [`KRequantize::apply_store`]
-/// via [`crate::simd::KernelSimd::requant_store`]) a full lane-run is vectorized in `f64`; the
-/// row tail, a strided `C`, the `k == 0` degenerate fill, and non-vector ISAs (scalar / NEON /
-/// wasm) take the scalar [`KRequantize::apply`]. The two are **bit-identical** (the `requant_store`
-/// equivalence contract), so a single matrix mixes them freely. Either way this beats the unfused
-/// flow, which materializes a full `m·n` `i32` C.
+/// the output byte. The map itself is split: on requant-vector-capable tokens (x86 —
+/// [`KRequantize::apply_store`] via [`crate::simd::KernelSimd::requant_store`]) a full lane-run is
+/// vectorized in `f64`; the row tail, a strided `C`, the `k == 0` degenerate fill, and non-vector
+/// ISAs (scalar / NEON / wasm) take the scalar [`KRequantize::apply`]. The two are **bit-identical**
+/// (the `requant_store` equivalence contract), so a single matrix mixes them freely. Either way
+/// this beats the unfused flow, which materializes a full `m·n` `i32` C.
 #[cfg(feature = "int8")]
 #[derive(Copy, Clone)]
 pub(crate) struct KRequantize {
@@ -337,7 +376,7 @@ pub(crate) struct KRequantize {
 }
 
 #[cfg(feature = "int8")]
-impl<Fam: KernelFamily<Acc = i32, Out = i8>> Epilogue<Fam> for KRequantize {
+impl<O: QuantOut, Fam: KernelFamily<Acc = i32, Out = O>> Epilogue<Fam> for KRequantize {
     // `VECTOR = false`: requantize has no float-style in-register `apply_reg` path (`Out != Acc`,
     // and the clamp/round is not a `store_out` narrowing). Its vector form is the store-transform
     // `apply_store` below, gated by `VECTOR_STORE` instead.
@@ -345,7 +384,7 @@ impl<Fam: KernelFamily<Acc = i32, Out = i8>> Epilogue<Fam> for KRequantize {
     const VECTOR_STORE: bool = true;
 
     #[inline(always)]
-    unsafe fn apply(&self, v: i32, r: usize, c: usize) -> i8 {
+    unsafe fn apply(&self, v: i32, r: usize, c: usize) -> O {
         let b = if self.has_bias {
             let idx = match self.bias_dim {
                 BiasDim::PerRow => r,
@@ -359,16 +398,17 @@ impl<Fam: KernelFamily<Acc = i32, Out = i8>> Epilogue<Fam> for KRequantize {
         // total. `zp` joins in integer (round-half-to-even is not shift-invariant, so it
         // must not be folded into the pre-round expression). The `f64 -> i64` cast
         // saturates, and `saturating_add`/`clamp` keep the whole map panic-free and
-        // bit-exact across every ISA.
+        // bit-exact across every ISA. `O::LO`/`O::HI` select the output band (`i8` or `u8`);
+        // `from_clamped` then reinterprets the already-clamped low byte.
         let scaled = round_ne_f64(f64::from(v.wrapping_add(b)) * f64::from(self.scale));
         let q = (scaled as i64).saturating_add(i64::from(self.zp));
-        q.clamp(-128, 127) as i8
+        O::from_clamped(q.clamp(i64::from(O::LO), i64::from(O::HI)))
     }
 
     #[inline(always)]
-    unsafe fn apply_store<S>(&self, simd: S, src: *const i32, dst: *mut i8, row: usize, col: usize)
+    unsafe fn apply_store<S>(&self, simd: S, src: *const i32, dst: *mut O, row: usize, col: usize)
     where
-        S: KernelSimd<Fam::Lhs, Fam::Rhs, i32, i8>,
+        S: KernelSimd<Fam::Lhs, Fam::Rhs, i32, O>,
     {
         unsafe {
             // `LANES` consecutive-row `i32` accumulators from contiguous scratch.
@@ -386,8 +426,20 @@ impl<Fam: KernelFamily<Acc = i32, Out = i8>> Epilogue<Fam> for KRequantize {
                 v
             };
             // The vector `f64` map, bit-identical to `apply` (the `requant_store` contract):
-            // scale widens `f32 -> f64` exactly; `lo`/`hi` are the `i8` clamp bounds.
-            simd.requant_store(dst, v, f64::from(self.scale), self.zp, -128, 127);
+            // scale widens `f32 -> f64` exactly; `O::LO`/`O::HI` are the output clamp band.
+            //
+            // The `*mut O -> *mut i8` cast is sound and value-correct: `requant_store` writes the
+            // LOW BYTE of each pre-clamped lane, and for any `x` in `[-128, 255]` the bytes of
+            // `(x as i8)` and `(x as u8)` are identical — so the byte written equals the scalar
+            // `O::from_clamped` result whether `O = i8` or `O = u8`.
+            simd.requant_store(
+                dst as *mut i8,
+                v,
+                f64::from(self.scale),
+                self.zp,
+                O::LO,
+                O::HI,
+            );
         }
     }
 }
