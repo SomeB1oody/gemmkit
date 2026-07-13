@@ -165,7 +165,7 @@ pub fn run_gemm(p: GemmPlan) {
 
 /// Every `set_*` compiled on x86_64 + `std,parallel,complex,half,int8`
 /// (`gemmkit/src/tuning.rs`); `set_wasm_threads` is wasm-gated and excluded.
-pub const KNOB_SETTERS: &[(&str, fn(usize))] = &[
+pub(crate) const KNOB_SETTERS: &[(&str, fn(usize))] = &[
     ("parallel_threshold", tuning::set_parallel_threshold),
     ("rhs_pack_threshold", tuning::set_rhs_pack_threshold),
     ("lhs_pack_threshold", tuning::set_lhs_pack_threshold),
@@ -193,11 +193,11 @@ pub const KNOB_SETTERS: &[(&str, fn(usize))] = &[
     ("i8_vnni_min_par_mnk", tuning::set_i8_vnni_min_par_mnk),
 ];
 
-pub const N_KNOBS: usize = 22;
+pub(crate) const N_KNOBS: usize = KNOB_SETTERS.len();
 
 /// The knob-value classes from the brief. Setters store unconditionally and clamp
 /// `usize::MAX` to `MAX-1` (the UNSET sentinel), so `MAX` exercises the clamp too.
-pub fn knob_value(u: &mut Unstructured) -> Result<usize> {
+pub(crate) fn knob_value(u: &mut Unstructured) -> Result<usize> {
     Ok(match u.int_in_range(0u8..=8)? {
         0 => 0, // 0 = auto convention on several knobs
         1 => 1,

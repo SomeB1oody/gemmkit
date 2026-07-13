@@ -19,15 +19,8 @@ mod plans;
 mod reference;
 
 pub use api_validation::{DimClass, EntryKind, StrideClass, ValidationPlan, drive_validation};
-pub use common::{
-    AB_TABLE, Canary, CplxElem, I8_AB_TABLE, LayoutPlan, RealElem, Rng, assert_no_gap_writes,
-    build_operand, extent_of,
-};
-pub use differential::{
-    differential_batched_real, differential_gemm_i8, differential_gemm_real,
-    differential_packed_a_real, differential_packed_b_real,
-};
+pub use common::LayoutPlan;
 pub use plans::{
-    BatchedPlan, GemmPlan, KNOB_SETTERS, KnobsPlan, N_KNOBS, PrepackPlan, Scenario, TypeTag,
-    knob_value, run_batched, run_gemm, run_knobs, run_prepack,
+    BatchedPlan, GemmPlan, KnobsPlan, PrepackPlan, Scenario, TypeTag, run_batched, run_gemm,
+    run_knobs, run_prepack,
 };

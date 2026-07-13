@@ -37,7 +37,7 @@ fn warm_ws<T: RealElem>(ws: &mut Workspace) {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn differential_gemm_real<T: RealElem>(
+pub(crate) fn differential_gemm_real<T: RealElem>(
     m: usize,
     k: usize,
     n: usize,
@@ -109,7 +109,7 @@ pub fn differential_gemm_real<T: RealElem>(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn differential_gemm_i8(
+pub(crate) fn differential_gemm_i8(
     m: usize,
     k: usize,
     n: usize,
@@ -214,7 +214,7 @@ pub(crate) fn differential_gemm_cplx<T: CplxElem>(
 /// C (the orientation the API requires). Gate is tolerance, not bitwise, per the API's
 /// tiny/gemv last-ULP allowance.
 #[allow(clippy::too_many_arguments)]
-pub fn differential_packed_b_real<T: RealElem>(
+pub(crate) fn differential_packed_b_real<T: RealElem>(
     m: usize,
     k: usize,
     n: usize,
@@ -273,7 +273,7 @@ pub fn differential_packed_b_real<T: RealElem>(
 
 /// Prepacked-LHS round trip: `prepack_lhs(A)` then `gemm_packed_a` with row-major-ish C.
 #[allow(clippy::too_many_arguments)]
-pub fn differential_packed_a_real<T: RealElem>(
+pub(crate) fn differential_packed_a_real<T: RealElem>(
     m: usize,
     k: usize,
     n: usize,
@@ -333,7 +333,7 @@ pub fn differential_packed_a_real<T: RealElem>(
 /// Strided-batched GEMM over one big buffer per operand (batch strides valid by
 /// construction) plus a `gemm_batched_slice` cross-check over per-element buffers.
 #[allow(clippy::too_many_arguments)]
-pub fn differential_batched_real<T: RealElem>(
+pub(crate) fn differential_batched_real<T: RealElem>(
     batch: usize,
     m: usize,
     k: usize,

@@ -10,20 +10,20 @@ use gemmkit::{Complex, ComplexScalar, GemmScalar, Parallelism, bf16, c32, c64, f
 /// alpha/beta values for the float/complex gates, mirroring the sets exercised by
 /// `tests/correctness/mixed.rs` (e.g. `correctness_f16_layouts`). `0.0` first so the
 /// `beta == 0` "C not read" contract is well-represented.
-pub const AB_TABLE: [f64; 6] = [0.0, 1.0, -1.0, 0.5, 0.75, 2.5];
+pub(crate) const AB_TABLE: [f64; 6] = [0.0, 1.0, -1.0, 0.5, 0.75, 2.5];
 
 /// Integer alpha/beta: `gemm_i8` takes `i32`, so the float table's `0.5`/`0.75`
 /// would truncate to `0` and collapse half of it — use a dedicated integer table.
-pub const I8_AB_TABLE: [i32; 6] = [0, 1, -1, 2, 3, -2];
+pub(crate) const I8_AB_TABLE: [i32; 6] = [0, 1, -1, 2, 3, -2];
 
 /// Distinctive `i32` fill for the gap slots of an `i8`-GEMM output buffer.
 const I32_CANARY: i32 = 0x0BAD_F00Du32 as i32;
 
 /// xorshift matching `rand_vec` (`tests/correctness/common.rs`), used to fill each operand
 /// from a single 8-byte plan seed so `-max_len` never starves per-element entropy.
-pub struct Rng(u64);
+pub(crate) struct Rng(u64);
 impl Rng {
-    pub fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         Rng(seed.wrapping_add(0x9E3779B97F4A7C15))
     }
     #[inline]
@@ -35,13 +35,13 @@ impl Rng {
     }
     /// A full-range `i8` (used directly for `i8` operands).
     #[inline]
-    pub fn next_i8(&mut self) -> i8 {
+    pub(crate) fn next_i8(&mut self) -> i8 {
         (self.step() >> 24) as u8 as i8
     }
     /// `i8 / 64.0` — magnitude ≤ 2 and exactly representable in every float type
     /// (denominator `2^6`), so the tolerance gate stays meaningful.
     #[inline]
-    pub fn next_quant(&mut self) -> f64 {
+    pub(crate) fn next_quant(&mut self) -> f64 {
         self.next_i8() as f64 / 64.0
     }
 }
@@ -52,7 +52,7 @@ impl Rng {
 
 /// Bit-pattern sentinel written into the non-view "gap" slots of an output buffer;
 /// the driver must never touch those, so a changed sentinel is a stray write.
-pub trait Canary: Copy {
+pub(crate) trait Canary: Copy {
     const SENTINEL: Self;
     fn is_sentinel(self) -> bool;
 }
@@ -100,7 +100,7 @@ impl Canary for c64 {
 }
 
 /// A real GEMM element (f32/f64/f16/bf16): construction, f64 view, and its EPS.
-pub trait RealElem: GemmScalar + Canary {
+pub(crate) trait RealElem: GemmScalar + Canary {
     const EPS: f64;
     fn from_f64(x: f64) -> Self;
     fn to_f64(self) -> f64;
@@ -145,7 +145,7 @@ impl RealElem for bf16 {
 }
 
 /// A complex GEMM element (c32/c64).
-pub trait CplxElem: ComplexScalar + Canary {
+pub(crate) trait CplxElem: ComplexScalar + Canary {
     const EPS: f64;
     fn make(re: f64, im: f64) -> Self;
     fn parts(self) -> (f64, f64);
@@ -207,7 +207,7 @@ impl LayoutPlan {
 
 /// Highest slice offset (exclusive) of a non-negative-stride view — mirror of
 /// `api.rs::extent` for the strides this harness builds (never negative/overflowing).
-pub fn extent_of(rows: usize, cols: usize, rs: isize, cs: isize) -> usize {
+pub(crate) fn extent_of(rows: usize, cols: usize, rs: isize, cs: isize) -> usize {
     if rows == 0 || cols == 0 {
         return 0;
     }
@@ -216,7 +216,7 @@ pub fn extent_of(rows: usize, cols: usize, rs: isize, cs: isize) -> usize {
 
 /// Allocate exactly the extent a `rows × cols` view needs, fill its view slots
 /// through the strides, and return `(buf, rs, cs)`. Gap slots keep `fill`.
-pub fn build_operand<T: Copy>(
+pub(crate) fn build_operand<T: Copy>(
     rows: usize,
     cols: usize,
     lp: LayoutPlan,
@@ -236,7 +236,7 @@ pub fn build_operand<T: Copy>(
 
 /// Assert the driver never wrote a slot outside the `rows × cols` view — the cheapest
 /// detector for the stride/epilogue out-of-bounds-write class the layouts probe.
-pub fn assert_no_gap_writes<T: Canary>(
+pub(crate) fn assert_no_gap_writes<T: Canary>(
     buf: &[T],
     rows: usize,
     cols: usize,
