@@ -36,6 +36,7 @@ L7  dispatch.rs      OnceLock<fn> ISA selection + orientation + per-(type,ISA) e
 L8a api.rs           MatRef/MatMut safe API + unchecked raw engine
 L8b gemmkit-ndarray  ArrayBase adapter + dot
 L8b gemmkit-nalgebra nalgebra Matrix adapter + dot
+L8b gemmkit-faer     faer MatRef/MatMut adapter + dot
         tuning.rs / workspace.rs    cross-cutting
 ```
 
@@ -576,6 +577,20 @@ mirrors the ndarray surface fn-for-fn (`gemm`/`dot`/packed/`gemm_i8`/`gemm_cplx`
 form) minus the batched pair, which has no nalgebra analogue (no 3-D array type). `dot` returns a
 column-major `DMatrix` built through `VecStorage`, so the fresh-output allocation needs no nalgebra
 `Scalar`/`Zero` bound.
+
+`gemmkit-faer` is the same thin adapter for faer 0.24. Because faer's `MatRef<'_, T>`/`MatMut<'_, T>`
+are *already* type-erased strided views (generic over an arbitrary element `T` — the vocabulary-view
+accessors carry no `Entity`/`ComplexField` bound), the entries take those view types directly rather
+than being generic over a storage trait: `gemm(alpha, a: MatRef, b: MatRef, beta, c: MatMut, par)`,
+reading `nrows()`/`ncols()` and the element-unit `isize` `row_stride()`/`col_stride()` (already the
+sign-and-unit convention gemmkit wants — negative for a `reverse_rows`/`reverse_cols` view — so no
+cast) plus `as_ptr()`/`as_ptr_mut()`, then forwarding to the same unchecked engine. It mirrors the
+nalgebra surface fn-for-fn (`gemm`/`dot`/packed/`gemm_i8`/`gemm_cplx`, each `_with`); `dot` returns a
+fresh column-major `Mat<T>` built with `Mat::from_fn` (no numeric bound, so `f16`/`bf16`/`i32` need
+not satisfy faer's `ComplexField`). Complex unifies for free: faer's `c32`/`c64` are
+`num_complex::Complex<f32>`/`<f64>` over the same num-complex 0.4 gemmkit uses, so no cast is needed.
+faer 0.24's MSRV (1.84) fits the workspace 1.89 and the dependency is `default-features = false`
+(view geometry + one `Mat` alloc only, never faer's own matmul).
 
 ## Cross-cutting
 
