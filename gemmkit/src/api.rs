@@ -13,7 +13,8 @@
 //! the output C is **not read**, so it may be uninitialized.
 
 use crate::dispatch::{self, GemmScalar, Task};
-use crate::parallel::Parallelism;
+use crate::kernel::epilogue::{Act, BiasSpec, FusedEpi};
+use crate::parallel::{Parallelism, Ptr};
 use crate::workspace::{self, Workspace};
 
 mod batched;
@@ -250,6 +251,63 @@ fn validate_gemm_views<TI, TO>(a: &MatRef<'_, TI>, b: &MatRef<'_, TI>, c: &MatMu
     {
         panic!("gemmkit: C aliases A or B");
     }
+}
+
+/// The shared fused-bias validation for the checked fused entries (`gemm_fused_with`,
+/// `gemm_batched_fused_with`, and the complex `gemm_cplx_fused_with`): a `PerRow` bias must have
+/// length `m` (the output rows) and a `PerCol` bias length `n` (the output cols), and the bias
+/// slice must not overlap `C`'s storage (compared via [`overlaps`]). `None` is a no-op. Panic
+/// messages are worded identically to the historic per-entry blocks (tests match the substrings),
+/// so this helper is the single source of that byte-for-byte wording. The activation /
+/// `LeakyRelu`-slope check is entry-local (complex has no activation) and stays at the call sites.
+fn validate_bias<T>(bias: &Option<Bias<'_, T>>, m: usize, n: usize, c: &MatMut<'_, T>) {
+    if let Some(bd) = bias {
+        let (bp, bl) = match bd {
+            Bias::PerRow(s) => {
+                assert_eq!(
+                    s.len(),
+                    m,
+                    "gemmkit: PerRow bias length ({}) != A.rows ({})",
+                    s.len(),
+                    m
+                );
+                (s.as_ptr(), s.len())
+            }
+            Bias::PerCol(s) => {
+                assert_eq!(
+                    s.len(),
+                    n,
+                    "gemmkit: PerCol bias length ({}) != B.cols ({})",
+                    s.len(),
+                    n
+                );
+                (s.as_ptr(), s.len())
+            }
+        };
+        if overlaps(c.data.as_ptr(), c.data.len(), bp, bl) {
+            panic!("gemmkit: bias slice overlaps C");
+        }
+    }
+}
+
+/// Lower the public `Option<Bias>` / `Option<Activation>` epilogue selectors into the internal
+/// [`FusedEpi`] the dispatch layer consumes: the bias pointer is erased to the `Send + Sync`
+/// [`Ptr`] shim, and a `None` selector maps to the matching `None` variant. Shared by the two
+/// full fused entries (`gemm_fused_with`, `gemm_batched_fused_with`); the complex entry builds its
+/// own bias-only [`FusedEpi`] (no activation) and `gemm_fused_unchecked` lowers raw pointers
+/// directly, so neither routes through here.
+fn to_fused_epi<T>(bias: Option<Bias<'_, T>>, act: Option<Activation<T>>) -> FusedEpi<T> {
+    let bias = match bias {
+        None => BiasSpec::None,
+        Some(Bias::PerRow(s)) => BiasSpec::Row(Ptr(s.as_ptr() as *mut T)),
+        Some(Bias::PerCol(s)) => BiasSpec::Col(Ptr(s.as_ptr() as *mut T)),
+    };
+    let act = match act {
+        None => Act::None,
+        Some(Activation::Relu) => Act::Relu,
+        Some(Activation::LeakyRelu(s)) => Act::LeakyRelu(s),
+    };
+    FusedEpi { bias, act }
 }
 
 /// `C <- alpha·A·B + beta·C` over safe slice views, using the thread-local

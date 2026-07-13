@@ -146,35 +146,8 @@ pub fn gemm_cplx_fused_with<T: ComplexScalar>(
 ) {
     validate_gemm_views(&a, &b, &c);
 
-    // Fused-bias validation: bias length matches its axis and does not overlap C. Byte-identical
-    // message shapes to `gemm_fused_with`.
-    if let Some(bd) = &bias {
-        let (bp, bl) = match bd {
-            Bias::PerRow(s) => {
-                assert_eq!(
-                    s.len(),
-                    a.rows,
-                    "gemmkit: PerRow bias length ({}) != A.rows ({})",
-                    s.len(),
-                    a.rows
-                );
-                (s.as_ptr(), s.len())
-            }
-            Bias::PerCol(s) => {
-                assert_eq!(
-                    s.len(),
-                    b.cols,
-                    "gemmkit: PerCol bias length ({}) != B.cols ({})",
-                    s.len(),
-                    b.cols
-                );
-                (s.as_ptr(), s.len())
-            }
-        };
-        if overlaps(c.data.as_ptr(), c.data.len(), bp, bl) {
-            panic!("gemmkit: bias slice overlaps C");
-        }
-    }
+    // Fused-bias validation: bias length matches its axis and does not overlap C.
+    validate_bias(&bias, a.rows, b.cols, &c);
 
     // No bias: the fused path is pure identity, so delegate to plain `gemm_cplx` — the zero-cost
     // path is then guaranteed (no fused monomorphization is instantiated).

@@ -2,8 +2,6 @@
 use super::fused::{Activation, Bias};
 use super::*;
 use crate::dispatch::{FusedScalar, GemmProblem};
-use crate::kernel::epilogue::{Act, BiasSpec, FusedEpi};
-use crate::parallel::Ptr;
 use alloc::vec::Vec;
 
 /// Bounds check for a **strided-batched** view: the `batch` element views (element `bi` based at
@@ -377,55 +375,15 @@ pub fn gemm_batched_fused_with<T: FusedScalar>(
         c_batch_stride,
     );
 
-    // Fused-epilogue validation, mirroring `gemm_fused_with`: the bias is ONE shared vector sized
-    // for a single element (its length matches the element axis, not `batch·axis`) and must not
-    // overlap C. The overlap test uses C's WHOLE backing slice, so it is conservative across every
-    // batch element.
-    if let Some(bd) = &bias {
-        let (bp, bl) = match bd {
-            Bias::PerRow(s) => {
-                assert_eq!(
-                    s.len(),
-                    a.rows,
-                    "gemmkit: PerRow bias length ({}) != A.rows ({})",
-                    s.len(),
-                    a.rows
-                );
-                (s.as_ptr(), s.len())
-            }
-            Bias::PerCol(s) => {
-                assert_eq!(
-                    s.len(),
-                    b.cols,
-                    "gemmkit: PerCol bias length ({}) != B.cols ({})",
-                    s.len(),
-                    b.cols
-                );
-                (s.as_ptr(), s.len())
-            }
-        };
-        if overlaps(c.data.as_ptr(), c.data.len(), bp, bl) {
-            panic!("gemmkit: bias slice overlaps C");
-        }
-    }
+    // Fused-epilogue validation: the bias is ONE shared vector sized for a single element (its
+    // length matches the element axis, not `batch·axis`) and must not overlap C. The overlap test
+    // uses C's WHOLE backing slice, so it is conservative across every batch element.
+    validate_bias(&bias, a.rows, b.cols, &c);
     if let Some(Activation::LeakyRelu(s)) = &act {
         assert!(T::finite(*s), "gemmkit: LeakyRelu slope must be finite");
     }
 
-    let bias_spec = match bias {
-        None => BiasSpec::None,
-        Some(Bias::PerRow(s)) => BiasSpec::Row(Ptr(s.as_ptr() as *mut T)),
-        Some(Bias::PerCol(s)) => BiasSpec::Col(Ptr(s.as_ptr() as *mut T)),
-    };
-    let act_e = match act {
-        None => Act::None,
-        Some(Activation::Relu) => Act::Relu,
-        Some(Activation::LeakyRelu(s)) => Act::LeakyRelu(s),
-    };
-    let epi = FusedEpi {
-        bias: bias_spec,
-        act: act_e,
-    };
+    let epi = to_fused_epi(bias, act);
 
     // SAFETY: validated above — per-element shapes agree, every element view (incl. the last) is in
     // bounds, the C outputs are pairwise disjoint and address uniquely, C does not alias A/B, the

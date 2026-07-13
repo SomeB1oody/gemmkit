@@ -82,33 +82,7 @@ pub fn gemm_fused_with<T: FusedScalar>(
     validate_gemm_views(&a, &b, &c);
 
     // Fused-epilogue validation: bias length matches its axis and does not overlap C.
-    if let Some(bd) = &bias {
-        let (bp, bl) = match bd {
-            Bias::PerRow(s) => {
-                assert_eq!(
-                    s.len(),
-                    a.rows,
-                    "gemmkit: PerRow bias length ({}) != A.rows ({})",
-                    s.len(),
-                    a.rows
-                );
-                (s.as_ptr(), s.len())
-            }
-            Bias::PerCol(s) => {
-                assert_eq!(
-                    s.len(),
-                    b.cols,
-                    "gemmkit: PerCol bias length ({}) != B.cols ({})",
-                    s.len(),
-                    b.cols
-                );
-                (s.as_ptr(), s.len())
-            }
-        };
-        if overlaps(c.data.as_ptr(), c.data.len(), bp, bl) {
-            panic!("gemmkit: bias slice overlaps C");
-        }
-    }
+    validate_bias(&bias, a.rows, b.cols, &c);
     if let Some(Activation::LeakyRelu(s)) = &act {
         assert!(T::finite(*s), "gemmkit: LeakyRelu slope must be finite");
     }
@@ -120,20 +94,7 @@ pub fn gemm_fused_with<T: FusedScalar>(
         return;
     }
 
-    let bias_spec = match bias {
-        None => BiasSpec::None,
-        Some(Bias::PerRow(s)) => BiasSpec::Row(Ptr(s.as_ptr() as *mut T)),
-        Some(Bias::PerCol(s)) => BiasSpec::Col(Ptr(s.as_ptr() as *mut T)),
-    };
-    let act_e = match act {
-        None => Act::None,
-        Some(Activation::Relu) => Act::Relu,
-        Some(Activation::LeakyRelu(s)) => Act::LeakyRelu(s),
-    };
-    let epi = FusedEpi {
-        bias: bias_spec,
-        act: act_e,
-    };
+    let epi = to_fused_epi(bias, act);
 
     // SAFETY: validated above — shapes agree, every stride is in bounds, C addresses each
     // (i,j) uniquely and does not alias A/B, and the bias slice (borrowed for this call) does
