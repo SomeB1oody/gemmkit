@@ -14,8 +14,9 @@
 //! * serial ≡ parallel through the special routes — test (d);
 //! * the zero-cost identity case equals plain `gemm` — test (e).
 //!
-//! Accuracy against an f64 oracle is checked within the mixed relative tolerance (tests c/d).
-//! All shapes are platform-independent (deterministic LCG fills, self-computed references).
+//! Accuracy against an f64 oracle is checked with a strict **per-element** absolute-tolerance gate
+//! (tests c/d). All shapes are platform-independent (deterministic LCG fills, self-computed
+//! references).
 
 use gemmkit::{
     Activation, Bias, MatMut, MatRef, NarrowFloat, Parallelism, Workspace, gemm, gemm_fused_with,
@@ -105,6 +106,13 @@ impl ActK {
             ActK::None => None,
             ActK::Relu => Some(Activation::Relu),
             ActK::Leaky(s) => Some(Activation::LeakyRelu(N::of(s))),
+        }
+    }
+    fn name(self) -> &'static str {
+        match self {
+            ActK::None => "none",
+            ActK::Relu => "relu",
+            ActK::Leaky(_) => "leaky",
         }
     }
 }
@@ -210,9 +218,19 @@ fn reference_f64<N: Narrow>(
     out
 }
 
-/// Relative Frobenius gate: `||got - ref|| / (||ref|| + ||A||·||B|| + tiny) <= 16·k·EPS`. The
-/// `||A||·||B||` term keeps cancellation from inflating the ratio; `||ref||` covers the
-/// bias-dominated / activation cases. `got` is read back through its strides.
+/// **Per-element** accuracy gate against the f64 reference `cref` (the un-narrowed oracle value).
+/// For each element `let r = cref[..]` and `got` widened to `f64`, assert
+/// `|got - r| <= (2·eps_n + 8·k·f32_eps)·(1 + |r|)`, with `eps_n = N::EPS` (2⁻¹⁰ / 2⁻⁷) and
+/// `f32_eps = 2⁻²³`.
+///
+/// Rationale: the fused path accumulates in `f32` (relative error `O(k·f32_eps)`) and rounds once
+/// to `N` (≤ 1 `N`-ulp from `r`, including the double-rounding vs the f64 reference), so the sum of
+/// those two, scaled by `(1 + |r|)`, bounds a *correct* element. Structural regressions — a dropped
+/// product term, a bias applied to the wrong row, a wrong activation slope — produce `O(1)`-relative
+/// per-element errors, orders of magnitude above this gate, so it FAILS on them. That is the point
+/// of moving off the old relative-Frobenius form, whose `||A||·||B||` denominator was so large that
+/// even an all-zeros output scored ~0.08 « the `16·k·EPS` tolerance and could not fail. `got` is
+/// read back through its strides.
 fn assert_close<N: Narrow>(
     got: &[N],
     rsc: isize,
@@ -220,39 +238,25 @@ fn assert_close<N: Narrow>(
     m: usize,
     n: usize,
     cref: &[f64],
-    a: &[N],
-    b: &[N],
     k: usize,
     ctx: &str,
 ) {
-    let na: f64 = a
-        .iter()
-        .map(|x| (x.f32() as f64).powi(2))
-        .sum::<f64>()
-        .sqrt();
-    let nb: f64 = b
-        .iter()
-        .map(|x| (x.f32() as f64).powi(2))
-        .sum::<f64>()
-        .sqrt();
-    let mut diff2 = 0.0;
-    let mut ref2 = 0.0;
+    let f32_eps = f32::EPSILON as f64; // exactly 2^-23
     for j in 0..n {
         for i in 0..m {
             let g = got[(i as isize * rsc + j as isize * csc) as usize].f32() as f64;
             let r = cref[i + j * m];
             assert!(g.is_finite(), "{ctx}: non-finite output at ({i},{j})");
-            diff2 += (g - r).powi(2);
-            ref2 += r * r;
+            let tol_e = (2.0 * N::EPS + 8.0 * (k as f64) * f32_eps) * (1.0 + r.abs());
+            assert!(
+                (g - r).abs() <= tol_e,
+                "{}: {ctx} abs error {:.3e} > tol {tol_e:.3e} at ({i},{j}) \
+                 (got {g:.6e}, ref {r:.6e}, m={m},k={k},n={n})",
+                N::name(),
+                (g - r).abs(),
+            );
         }
     }
-    let rel = diff2.sqrt() / (ref2.sqrt() + na * nb + 1e-30);
-    let tol = 16.0 * (k.max(1) as f64) * N::EPS;
-    assert!(
-        rel <= tol,
-        "{}: {ctx} relative error {rel:.3e} > tol {tol:.3e} (m={m},k={k},n={n})",
-        N::name(),
-    );
 }
 
 // --------------------------------------------------------------------------- a. vector == scalar
@@ -337,11 +341,15 @@ fn fused_mixed_vector_scalar_bitwise() {
 // --------------------------------------------------------------------------- b. pre-narrow lock
 
 /// `k = 1, alpha = 1, beta = 0`: the accumulator is a single `f32` product `a·b`, exact in `f32`
-/// (a narrow×narrow product fits the 23-bit mantissa), so it is order-independent. The fused
-/// output must equal the **single-rounding** reference `narrow(a·b + bias.widen())` **bitwise**,
-/// and that reference must DIFFER from the two-rounding alternative
-/// `narrow(narrow(a·b).widen() + bias.widen())` for at least one element — locking the pre-narrow
-/// semantic (and proving the test is not vacuous).
+/// (a narrow×narrow product fits the 23-bit mantissa), so it is order-independent. For each of the
+/// three activations (`None`, `ReLU`, `LeakyReLU(0.25)`) the fused output must equal the
+/// **single-rounding** reference `narrow(act(a·b + bias.widen()))` **bitwise**, and that reference
+/// must DIFFER from the two-rounding alternative `narrow(act(narrow(a·b).widen() + bias.widen()))`
+/// for at least one element — locking the pre-narrow semantic **through the activation** (and
+/// proving the test is not vacuous). The activations pass the divergence guard because most
+/// `a·b + bias` values are positive (`a, b ∈ [1, 2) ⇒ a·b ∈ [1, 4)`, `bias ∈ [-2, 2]`), where
+/// `ReLU`/`LeakyReLU` are the identity, so the sub-narrow bits that make the `None` case diverge
+/// survive the activation on those elements.
 fn pre_narrow_semantics<N: Narrow>() {
     let mut rng = Lcg::new(0x9E27_B1A5);
     let (m, k, n) = (32usize, 1usize, 24usize);
@@ -356,45 +364,49 @@ fn pre_narrow_semantics<N: Narrow>() {
     // A per-row bias of comparable magnitude, so `a·b + bias` preserves the sub-narrow bits.
     let bias_row: Vec<N> = (0..m).map(|_| N::of(rng.unit() * 2.0)).collect();
 
-    let mut c = vec![N::of(0.0); m * n]; // col-major, beta = 0 (unread)
-    let mut ws = Workspace::new();
-    gemm_fused_with(
-        &mut ws,
-        N::of(1.0),
-        MatRef::new(&a, m, k, 1, m as isize), // col-major A (rsa = 1) → small_k in-place
-        MatRef::new(&b, k, n, 1, k as isize),
-        N::of(0.0),
-        MatMut::new(&mut c, m, n, 1, m as isize),
-        Some(Bias::PerRow(&bias_row)),
-        None,
-        Parallelism::Serial,
-    );
+    for act in [ActK::None, ActK::Relu, ActK::Leaky(0.25)] {
+        let mut c = vec![N::of(0.0); m * n]; // col-major, beta = 0 (unread)
+        let mut ws = Workspace::new();
+        gemm_fused_with(
+            &mut ws,
+            N::of(1.0),
+            MatRef::new(&a, m, k, 1, m as isize), // col-major A (rsa = 1) → small_k in-place
+            MatRef::new(&b, k, n, 1, k as isize),
+            N::of(0.0),
+            MatMut::new(&mut c, m, n, 1, m as isize),
+            Some(Bias::PerRow(&bias_row)),
+            act.make::<N>(),
+            Parallelism::Serial,
+        );
 
-    let mut differs = 0usize;
-    for j in 0..n {
-        for i in 0..m {
-            // The single f32 product A[i,0]·B[0,j] (k == 1, col-major), exact.
-            let ab = a[i].f32() * b[j].f32();
-            let biasw = bias_row[i].f32();
-            let one_round: N = ref_apply_narrow::<N>(ab, biasw, ActK::None);
-            // Two-rounding alternative: narrow the product first, then add bias and narrow again.
-            let two_round: N = ref_apply_narrow::<N>(N::narrow(ab).f32(), biasw, ActK::None);
-            assert_eq!(
-                c[i + j * m].bits(),
-                one_round.bits(),
-                "{}: fused != single-rounding reference at ({i},{j})",
-                N::name(),
-            );
-            if one_round.bits() != two_round.bits() {
-                differs += 1;
+        let mut differs = 0usize;
+        for j in 0..n {
+            for i in 0..m {
+                // The single f32 product A[i,0]·B[0,j] (k == 1, col-major), exact.
+                let ab = a[i].f32() * b[j].f32();
+                let biasw = bias_row[i].f32();
+                let one_round: N = ref_apply_narrow::<N>(ab, biasw, act);
+                // Two-rounding alternative: narrow the product first, then add bias and narrow.
+                let two_round: N = ref_apply_narrow::<N>(N::narrow(ab).f32(), biasw, act);
+                assert_eq!(
+                    c[i + j * m].bits(),
+                    one_round.bits(),
+                    "{}: fused != single-rounding reference at ({i},{j}) [act={}]",
+                    N::name(),
+                    act.name(),
+                );
+                if one_round.bits() != two_round.bits() {
+                    differs += 1;
+                }
             }
         }
+        assert!(
+            differs > 0,
+            "{}: pre-narrow test vacuous — single- and two-rounding never diverged [act={}]",
+            N::name(),
+            act.name(),
+        );
     }
-    assert!(
-        differs > 0,
-        "{}: pre-narrow test vacuous — single- and two-rounding never diverged",
-        N::name(),
-    );
 }
 
 #[test]
@@ -441,7 +453,7 @@ fn matches_reference<N: Narrow>() {
                     m, k, n, alpha, &a, 1, m as isize, &b, 1, k as isize, beta, &c0, 1, m as isize,
                     bias_kind, &bias_row, &bias_col, act,
                 );
-                assert_close::<N>(&c, 1, m as isize, m, n, &cref, &a, &b, k, "matrix");
+                assert_close::<N>(&c, 1, m as isize, m, n, &cref, k, "matrix");
             }
         }
     }
@@ -525,7 +537,7 @@ fn special_route<N: Narrow>(
         &[],
         act,
     );
-    assert_close::<N>(&c_ser, 1, m as isize, m, n, &cref, a, b, k, tag);
+    assert_close::<N>(&c_ser, 1, m as isize, m, n, &cref, k, tag);
 }
 
 fn special_routes<N: Narrow>() {

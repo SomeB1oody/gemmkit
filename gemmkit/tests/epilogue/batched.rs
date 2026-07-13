@@ -14,6 +14,38 @@ use gemmkit::{
     gemm_batched_fused, gemm_fused_with,
 };
 
+/// Serializes the two threshold-mutating tests in this module, mirroring `tests/tuning.rs`'s
+/// `KNOB_LOCK`. `tuning::parallel_threshold` is process-global and the harness runs tests in this
+/// binary concurrently; without a shared lock one test's set/restore could interleave with another
+/// test's GEMM and flip a route. The plan-coverage tests here hold this via [`KnobGuard`] for their
+/// whole body and restore the prior value on drop, so no mutation is observed outside them. (The
+/// other epilogue tests do not take the lock: every contract in this suite is bitwise-invariant to
+/// scheduling — fused == gemm-then-map and serial == parallel both hold under any plan — so a
+/// transiently-lowered threshold cannot perturb their assertions.)
+static KNOB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Holds [`KNOB_LOCK`] and forces `tuning::parallel_threshold = override_to` for the calling test's
+/// duration, saving the prior value (read from the getter) and restoring it on drop. Recovers a
+/// poisoned lock so one panicking test does not cascade. The `_lock` field keeps the guard alive for
+/// the whole test body.
+struct KnobGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    saved: usize,
+}
+impl KnobGuard {
+    fn with_parallel_threshold(override_to: usize) -> Self {
+        let lock = KNOB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = gemmkit::tuning::parallel_threshold();
+        gemmkit::tuning::set_parallel_threshold(override_to);
+        KnobGuard { _lock: lock, saved }
+    }
+}
+impl Drop for KnobGuard {
+    fn drop(&mut self) {
+        gemmkit::tuning::set_parallel_threshold(self.saved);
+    }
+}
+
 /// The element under test: real floats and (under `half`) narrow floats. `of`/`bits` give
 /// deterministic construction and a bitwise compare; `leaky` builds a `LeakyRelu` in `T` (the
 /// public `Activation` is not `Clone`, so it is rebuilt per call).
@@ -289,6 +321,10 @@ fn batched_fused_identity_delegates() {
 // d. serial == parallel, bitwise (each element is element-serial under either schedule)
 // ---------------------------------------------------------------------------
 
+/// Serial ≡ Rayon(4), bitwise. These tiny shapes sit far below the default `parallel_threshold`, so
+/// resolve_batch returns `BatchPlan::Serial` for both calls — this covers the **Serial-resolved
+/// small-work regime**, not the parallel arms (those are `batched_fused_batch_parallel_bitwise` /
+/// `batched_fused_seq_internal_bitwise`, which lower the threshold under a knob guard).
 fn parallel_bitwise<T: BEl>() {
     let (batch, m, k, n) = (8usize, 12usize, 24usize, 9usize);
     let mut rng = Rng::new(0x5E71_A11E);
@@ -333,6 +369,176 @@ fn parallel_bitwise<T: BEl>() {
 fn batched_fused_parallel_bitwise() {
     parallel_bitwise::<f32>();
     parallel_bitwise::<f64>();
+}
+
+// ---------------------------------------------------------------------------
+// d2. BatchParallel arm: enough elements to fill the workers ⇒ BatchPlan::BatchParallel
+// ---------------------------------------------------------------------------
+
+fn batch_parallel_bitwise<T: BEl>() {
+    // Under `parallel_threshold = 1` the cheap total-work gate passes for any non-empty batch, so
+    // resolve_batch reaches the core-count branch instead of the small-work Serial short-circuit.
+    // Plan derivation (feature = "parallel", Rayon(4)): elem_mnk·batch = (13·9·11)·8 = 10296 ≥ 1
+    // (gate passes); budget = min(4, auto_threads); batch = 8 ≥ budget ⇒ BatchPlan::BatchParallel(
+    // budget). On any host with ≥ 2 usable cores this exercises the BatchParallel arm (its whole
+    // point); with only one usable core budget ≤ 1 short-circuits to Serial. Either way the two
+    // assertions below are plan-independent: BatchParallel runs every element serially on one worker,
+    // so the batch is bit-identical to a Serial loop of gemm_fused and to the Serial batched call. A
+    // future policy change that broke this routing is caught by re-deriving the plan against this
+    // comment.
+    let _guard = KnobGuard::with_parallel_threshold(1);
+
+    let (batch, m, k, n) = (8usize, 13usize, 9usize, 11usize);
+    let mut rng = Rng::new(0xB47C_9A2E);
+    let a = make_vec::<T>(&mut rng, batch * m * k, 1.0); // col-major, contiguously packed
+    let b = make_vec::<T>(&mut rng, batch * k * n, 1.0);
+    let c0 = make_vec::<T>(&mut rng, batch * m * n, 1.0);
+    let bias_row = make_vec::<T>(&mut rng, m, 2.0); // ONE shared per-row bias
+    let (alpha, beta) = (T::of(1.1), T::of(0.7));
+
+    // Reference: a loop of Serial gemm_fused, one per element on its offset window.
+    let mut c_loop = c0.clone();
+    let mut ws = Workspace::new();
+    for bi in 0..batch {
+        let (ao, bo, co) = (bi * m * k, bi * k * n, bi * m * n);
+        gemm_fused_with(
+            &mut ws,
+            alpha,
+            MatRef::new(&a[ao..ao + m * k], m, k, 1, m as isize),
+            MatRef::new(&b[bo..bo + k * n], k, n, 1, k as isize),
+            beta,
+            MatMut::new(&mut c_loop[co..co + m * n], m, n, 1, m as isize),
+            Some(Bias::PerRow(&bias_row)),
+            Some(T::leaky(0.25)),
+            Parallelism::Serial,
+        );
+    }
+
+    let run = |par: Parallelism| -> Vec<T> {
+        let mut c = c0.clone();
+        gemm_batched_fused(
+            batch,
+            alpha,
+            MatRef::new(&a, m, k, 1, m as isize),
+            (m * k) as isize,
+            MatRef::new(&b, k, n, 1, k as isize),
+            (k * n) as isize,
+            beta,
+            MatMut::new(&mut c, m, n, 1, m as isize),
+            (m * n) as isize,
+            Some(Bias::PerRow(&bias_row)),
+            Some(T::leaky(0.25)),
+            par,
+        );
+        c
+    };
+
+    let c_par = run(Parallelism::Rayon(4)); // BatchParallel(budget) on ≥ 2 cores
+    let c_ser = run(Parallelism::Serial); // BatchPlan::Serial
+    for idx in 0..batch * m * n {
+        assert_eq!(
+            c_par[idx].bits(),
+            c_loop[idx].bits(),
+            "{}: batch-parallel batched_fused != gemm_fused loop at {idx}",
+            T::name(),
+        );
+        assert_eq!(
+            c_par[idx].bits(),
+            c_ser[idx].bits(),
+            "{}: batch-parallel batched_fused != serial batched_fused at {idx}",
+            T::name(),
+        );
+    }
+}
+
+#[test]
+fn batched_fused_batch_parallel_bitwise() {
+    batch_parallel_bitwise::<f32>();
+    batch_parallel_bitwise::<f64>();
+}
+
+// ---------------------------------------------------------------------------
+// d3. SequentialInternal arm (best-effort, platform-dependent coverage): few but large,
+//     L2-spilling elements split each element across the machine in turn
+// ---------------------------------------------------------------------------
+
+fn seq_internal_bitwise() {
+    // Under `parallel_threshold = 1` the work gate passes. Plan derivation (feature = "parallel",
+    // Rayon(4)): budget = min(4, auto_threads); batch = 2. With ≥ 3 usable cores batch < budget, so
+    // resolve_batch reaches the residency split test. On x86 (private per-core L2) it splits when the
+    // element spills that L2: elem_bytes = (mk + kn + mn)·8 = 3·256·256·8 = 1.5 MiB > this Zen5's
+    // 1 MiB effective L2 ⇒ BatchPlan::SequentialInternal (each element gets the full engine
+    // parallelism in turn). On a host with a larger L2, on aarch64's share-based rule, or with < 3
+    // usable cores, the same shape may resolve BatchParallel instead — that changes only which arm is
+    // *covered*, never the result. SequentialInternal splits each element across workers, relying on
+    // that element's route being serial==parallel bit-identical, so the batch equals a Serial
+    // gemm_fused loop under either plan. The assertion is therefore plan-independent; only the
+    // coverage is platform-dependent.
+    let _guard = KnobGuard::with_parallel_threshold(1);
+
+    let (batch, m, k, n) = (2usize, 256usize, 256usize, 256usize); // 1.5 MiB f64 element
+    let mut rng = Rng::new(0x5E90_11A7);
+    let a = make_vec::<f64>(&mut rng, batch * m * k, 1.0);
+    let b = make_vec::<f64>(&mut rng, batch * k * n, 1.0);
+    let c0 = make_vec::<f64>(&mut rng, batch * m * n, 1.0);
+    let bias_row = make_vec::<f64>(&mut rng, m, 2.0);
+    let (alpha, beta) = (0.9f64, 0.5f64);
+
+    let mut c_loop = c0.clone();
+    let mut ws = Workspace::new();
+    for bi in 0..batch {
+        let (ao, bo, co) = (bi * m * k, bi * k * n, bi * m * n);
+        gemm_fused_with(
+            &mut ws,
+            alpha,
+            MatRef::new(&a[ao..ao + m * k], m, k, 1, m as isize),
+            MatRef::new(&b[bo..bo + k * n], k, n, 1, k as isize),
+            beta,
+            MatMut::new(&mut c_loop[co..co + m * n], m, n, 1, m as isize),
+            Some(Bias::PerRow(&bias_row)),
+            Some(<f64 as BEl>::leaky(0.25)),
+            Parallelism::Serial,
+        );
+    }
+
+    let run = |par: Parallelism| -> Vec<f64> {
+        let mut c = c0.clone();
+        gemm_batched_fused(
+            batch,
+            alpha,
+            MatRef::new(&a, m, k, 1, m as isize),
+            (m * k) as isize,
+            MatRef::new(&b, k, n, 1, k as isize),
+            (k * n) as isize,
+            beta,
+            MatMut::new(&mut c, m, n, 1, m as isize),
+            (m * n) as isize,
+            Some(Bias::PerRow(&bias_row)),
+            Some(<f64 as BEl>::leaky(0.25)),
+            par,
+        );
+        c
+    };
+
+    let c_par = run(Parallelism::Rayon(4)); // SequentialInternal on this Zen5
+    let c_ser = run(Parallelism::Serial); // BatchPlan::Serial
+    for idx in 0..batch * m * n {
+        assert_eq!(
+            c_par[idx].bits(),
+            c_loop[idx].bits(),
+            "f64: seq-internal batched_fused != gemm_fused loop at {idx}",
+        );
+        assert_eq!(
+            c_par[idx].bits(),
+            c_ser[idx].bits(),
+            "f64: seq-internal batched_fused != serial batched_fused at {idx}",
+        );
+    }
+}
+
+#[test]
+fn batched_fused_seq_internal_bitwise() {
+    seq_internal_bitwise();
 }
 
 // ---------------------------------------------------------------------------

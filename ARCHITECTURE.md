@@ -534,12 +534,18 @@ call.
   reused operand once into the micropanel layout, then skip the per-call repack across many products
   (the fixed-weight inference pattern). RHS-packed needs column-major-ish C, LHS-packed
   row-major-ish — the no-swap orientation the prepacked operand was laid out for.
-- **Fused** ([`gemm_fused`] / `gemm_fused_with`): `C <- act(α·A·B + β·C + bias)` in one pass for
-  `f32`/`f64` (the sealed `FusedScalar` bound), with an optional per-row/per-col `Bias` and an
-  optional `Activation` (ReLU/LeakyReLU) — the fused L1 epilogue seam. `bias == None && act == None`
+- **Fused** ([`gemm_fused`] / `gemm_fused_with`): `C <- act(α·A·B + β·C + bias)` in one pass, with
+  an optional per-row/per-col `Bias` and an optional `Activation` (ReLU/LeakyReLU) — the fused L1
+  epilogue seam. The sealed `FusedScalar` bound admits exactly `f32`/`f64` **and**, under the `half`
+  feature, the narrow floats `f16`/`bf16` (whose epilogue applies in `f32` *before* the single
+  round-to-nearest narrowing — the pre-narrow semantics of the fused-epilogue section above, more
+  precise than, so **not** bitwise-equal to, `gemm`-then-map). `bias == None && act == None`
   delegates to plain `gemm`. Validation adds bias-length, bias-vs-C overlap, and finite-slope checks;
-  the result is bit-identical to `gemm` then the scalar map for **every** shape (the L6 special
-  paths — gemv, small-`m,n`, small-`k` — are fused too, so a fused shape routes exactly as `gemm`).
+  the result is bit-identical to `gemm` then the scalar map for **every** `f32`/`f64` shape (the L6
+  special paths — gemv, small-`m,n`, small-`k` — are fused too, so a fused shape routes exactly as
+  `gemm`). A strided-batched twin (`gemm_batched_fused` / `gemm_batched_fused_with`, above) applies
+  one shared bias + activation per element, and a complex sibling (`gemm_cplx_fused`) fuses a bias
+  only (an ordering-based activation is undefined on `ℂ`); both reuse the same `FusedEpi` epilogue.
 - **Requantize** ([`gemm_i8_requant`] / `gemm_i8_requant_with` → `i8` output; `gemm_i8_requant_u8` /
   `gemm_i8_requant_u8_with` → `u8` output, ONNX-QLinearMatMul-style; `int8` feature): `i8·i8 -> i8`/`u8`
   with a per-tensor `Requantize { scale, zero_point, bias }` (`zero_point` in `[-128, 127]` for `i8`,
