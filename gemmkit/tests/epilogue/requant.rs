@@ -667,6 +667,68 @@ fn requant_u8_matches_reference() {
     }
 }
 
+/// `gemm_i8_requant_u8` and `gemm_i8_requant_u8_unchecked` are **parallel** entry points (the
+/// checked twin does not delegate to the unchecked one), so exercise the unchecked fn against
+/// the checked twin bit-for-bit on a driver-shaped case (m,n,k > 16, with bias).
+#[test]
+fn requant_u8_unchecked_matches_checked() {
+    use gemmkit::gemm_i8_requant_u8_unchecked;
+
+    let mut rng = Rng::new(0x0075_5EED);
+    let (m, k, n) = (32usize, 40usize, 24usize);
+    let a = make_i8(&mut rng, m * k);
+    let b = make_i8(&mut rng, k * n);
+    let bias: Vec<i32> = (0..m)
+        .map(|_| (rng.next_u64() % 2001) as i64 as i32 - 1000)
+        .collect();
+    let (scale, zp) = (0.5f32, 13i32);
+    let (rsc, csc) = (1isize, m as isize);
+    let par = Parallelism::Serial;
+
+    let mut c_checked = vec![0u8; m * n];
+    {
+        let ar = MatRef::new(&a, m, k, 1, m as isize);
+        let br = MatRef::new(&b, k, n, 1, k as isize);
+        let cm = MatMut::new(&mut c_checked, m, n, rsc, csc);
+        let req = Requantize {
+            scale,
+            zero_point: zp,
+            bias: Some(&bias),
+        };
+        gemm_i8_requant_u8(ar, br, req, cm, par);
+    }
+
+    let mut c_unchecked = vec![0u8; m * n];
+    // SAFETY: valid in-bounds col-major layouts; C aliases neither A/B nor the (per-row,
+    // length-m) bias.
+    unsafe {
+        gemm_i8_requant_u8_unchecked(
+            m,
+            k,
+            n,
+            a.as_ptr(),
+            1,
+            m as isize,
+            b.as_ptr(),
+            1,
+            k as isize,
+            scale,
+            zp,
+            bias.as_ptr(),
+            true,
+            c_unchecked.as_mut_ptr(),
+            rsc,
+            csc,
+            par,
+        );
+    }
+
+    assert_eq!(
+        c_checked, c_unchecked,
+        "u8 requant unchecked != checked [m={m} k={k} n={n}]"
+    );
+}
+
 /// Crafted `1×1` accumulators + a large scale drive both clamp rails: every positive product
 /// saturates to `255`, every negative to `0`. Hardcoded expected bytes (both rails present).
 #[test]
