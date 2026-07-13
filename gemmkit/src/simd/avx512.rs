@@ -35,7 +35,6 @@ impl Simd for Avx512 {
 impl SimdOps<f32> for Avx512 {
     type Reg = __m512;
     const LANES: usize = 16;
-    const ALIGN: usize = 64;
 
     #[inline(always)]
     unsafe fn zero(self) -> Self::Reg {
@@ -46,16 +45,8 @@ impl SimdOps<f32> for Avx512 {
         unsafe { _mm512_set1_ps(v) }
     }
     #[inline(always)]
-    unsafe fn load(self, p: *const f32) -> Self::Reg {
-        unsafe { _mm512_load_ps(p) }
-    }
-    #[inline(always)]
     unsafe fn loadu(self, p: *const f32) -> Self::Reg {
         unsafe { _mm512_loadu_ps(p) }
-    }
-    #[inline(always)]
-    unsafe fn store(self, p: *mut f32, v: Self::Reg) {
-        unsafe { _mm512_store_ps(p, v) }
     }
     #[inline(always)]
     unsafe fn storeu(self, p: *mut f32, v: Self::Reg) {
@@ -96,7 +87,6 @@ impl SimdOps<f32> for Avx512 {
 impl SimdOps<f64> for Avx512 {
     type Reg = __m512d;
     const LANES: usize = 8;
-    const ALIGN: usize = 64;
 
     #[inline(always)]
     unsafe fn zero(self) -> Self::Reg {
@@ -107,16 +97,8 @@ impl SimdOps<f64> for Avx512 {
         unsafe { _mm512_set1_pd(v) }
     }
     #[inline(always)]
-    unsafe fn load(self, p: *const f64) -> Self::Reg {
-        unsafe { _mm512_load_pd(p) }
-    }
-    #[inline(always)]
     unsafe fn loadu(self, p: *const f64) -> Self::Reg {
         unsafe { _mm512_loadu_pd(p) }
-    }
-    #[inline(always)]
-    unsafe fn store(self, p: *mut f64, v: Self::Reg) {
-        unsafe { _mm512_store_pd(p, v) }
     }
     #[inline(always)]
     unsafe fn storeu(self, p: *mut f64, v: Self::Reg) {
@@ -232,7 +214,6 @@ impl KernelSimd<bf16, bf16, f32, bf16> for Avx512 {
 impl SimdOps<i32> for Avx512 {
     type Reg = __m512i;
     const LANES: usize = 16;
-    const ALIGN: usize = 64;
 
     #[inline(always)]
     unsafe fn zero(self) -> __m512i {
@@ -243,16 +224,8 @@ impl SimdOps<i32> for Avx512 {
         unsafe { _mm512_set1_epi32(v) }
     }
     #[inline(always)]
-    unsafe fn load(self, p: *const i32) -> __m512i {
-        unsafe { _mm512_load_si512(p as *const __m512i) }
-    }
-    #[inline(always)]
     unsafe fn loadu(self, p: *const i32) -> __m512i {
         unsafe { _mm512_loadu_si512(p as *const __m512i) }
-    }
-    #[inline(always)]
-    unsafe fn store(self, p: *mut i32, v: __m512i) {
-        unsafe { _mm512_store_si512(p as *mut __m512i, v) }
     }
     #[inline(always)]
     unsafe fn storeu(self, p: *mut i32, v: __m512i) {
@@ -369,7 +342,7 @@ impl KernelSimd<i8, i8, i32, i32> for Avx512 {
 }
 
 /// Emit a `SimdOps<$t>` impl for a **superset AVX-512 token** ([`Avx512Vnni`] / [`Avx512Bf16`])
-/// that forwards `Reg`/`LANES`/`ALIGN` and every method to [`Avx512`]'s impl. Each token is a
+/// that forwards `Reg`/`LANES` and every method to [`Avx512`]'s impl. Each token is a
 /// distinct type only because `#[target_feature]` is per-token; the numeric ops are identical.
 /// Every method is an `#[inline(always)]` one-line forward through `<Avx512 as SimdOps<$t>>`,
 /// so — inlined inside the token's superset `vectorize` context — codegen is the same intrinsic
@@ -382,7 +355,6 @@ macro_rules! delegate_simdops {
         impl SimdOps<$t> for $tok {
             type Reg = <$src as SimdOps<$t>>::Reg;
             const LANES: usize = <$src as SimdOps<$t>>::LANES;
-            const ALIGN: usize = <$src as SimdOps<$t>>::ALIGN;
 
             #[inline(always)]
             unsafe fn zero(self) -> Self::Reg {
@@ -393,16 +365,8 @@ macro_rules! delegate_simdops {
                 unsafe { <$src as SimdOps<$t>>::splat(<$src as Default>::default(), v) }
             }
             #[inline(always)]
-            unsafe fn load(self, p: *const $t) -> Self::Reg {
-                unsafe { <$src as SimdOps<$t>>::load(<$src as Default>::default(), p) }
-            }
-            #[inline(always)]
             unsafe fn loadu(self, p: *const $t) -> Self::Reg {
                 unsafe { <$src as SimdOps<$t>>::loadu(<$src as Default>::default(), p) }
-            }
-            #[inline(always)]
-            unsafe fn store(self, p: *mut $t, v: Self::Reg) {
-                unsafe { <$src as SimdOps<$t>>::store(<$src as Default>::default(), p, v) }
             }
             #[inline(always)]
             unsafe fn storeu(self, p: *mut $t, v: Self::Reg) {
@@ -666,6 +630,6 @@ impl KernelSimd<bf16, bf16, f32, bf16> for Avx512Bf16 {
 // Complex (AVX-512): real `Reg`; `LANES` is the real lane count (16 / 8). Complex GEMM
 // routes through the shared SoA `soa_microkernel`.
 #[cfg(feature = "complex")]
-impl_complex_simd!(Avx512, f32, __m512, 16, 64);
+impl_complex_simd!(Avx512, f32, __m512, 16);
 #[cfg(feature = "complex")]
-impl_complex_simd!(Avx512, f64, __m512d, 8, 64);
+impl_complex_simd!(Avx512, f64, __m512d, 8);

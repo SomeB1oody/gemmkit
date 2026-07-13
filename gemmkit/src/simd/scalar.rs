@@ -30,7 +30,6 @@ macro_rules! impl_scalar_ops {
         impl SimdOps<$t> for ScalarTok {
             type Reg = $t;
             const LANES: usize = 1;
-            const ALIGN: usize = core::mem::align_of::<$t>();
 
             #[inline(always)]
             unsafe fn zero(self) -> Self::Reg {
@@ -41,16 +40,8 @@ macro_rules! impl_scalar_ops {
                 v
             }
             #[inline(always)]
-            unsafe fn load(self, p: *const $t) -> Self::Reg {
-                unsafe { *p }
-            }
-            #[inline(always)]
             unsafe fn loadu(self, p: *const $t) -> Self::Reg {
                 unsafe { *p }
-            }
-            #[inline(always)]
-            unsafe fn store(self, p: *mut $t, v: Self::Reg) {
-                unsafe { *p = v }
             }
             #[inline(always)]
             unsafe fn storeu(self, p: *mut $t, v: Self::Reg) {
@@ -126,7 +117,6 @@ impl KernelSimd<f16, f16, f32, f16> for ScalarTok {
 impl SimdOps<i32> for ScalarTok {
     type Reg = i32;
     const LANES: usize = 1;
-    const ALIGN: usize = core::mem::align_of::<i32>();
 
     #[inline(always)]
     unsafe fn zero(self) -> i32 {
@@ -137,16 +127,8 @@ impl SimdOps<i32> for ScalarTok {
         v
     }
     #[inline(always)]
-    unsafe fn load(self, p: *const i32) -> i32 {
-        unsafe { *p }
-    }
-    #[inline(always)]
     unsafe fn loadu(self, p: *const i32) -> i32 {
         unsafe { *p }
-    }
-    #[inline(always)]
-    unsafe fn store(self, p: *mut i32, v: i32) {
-        unsafe { *p = v }
     }
     #[inline(always)]
     unsafe fn storeu(self, p: *mut i32, v: i32) {
@@ -217,6 +199,6 @@ impl KernelSimd<bf16, bf16, f32, bf16> for ScalarTok {
 // Complex (scalar fallback): the Miri-checked SoA reference. `LANES = 1`, the real `Reg`
 // is the scalar itself; complex GEMM routes through the shared `soa_microkernel`.
 #[cfg(feature = "complex")]
-impl_complex_simd!(ScalarTok, f32, f32, 1, core::mem::align_of::<f32>());
+impl_complex_simd!(ScalarTok, f32, f32, 1);
 #[cfg(feature = "complex")]
-impl_complex_simd!(ScalarTok, f64, f64, 1, core::mem::align_of::<f64>());
+impl_complex_simd!(ScalarTok, f64, f64, 1);

@@ -16,8 +16,7 @@
 //! `core::arch::wasm32::v128` is an untyped 128-bit register shared by both widths;
 //! the lane width comes only from the intrinsic family (`f32x4_*` vs `f64x2_*`), so
 //! the type checker will *not* catch a `f32x4_*` op used in the `f64` impl — mind the
-//! family in each method. wasm loads/stores are alignment-agnostic, so `load == loadu`
-//! and `store == storeu` (as on NEON); `ALIGN = 16`.
+//! family in each method. wasm loads/stores are alignment-agnostic (as on NEON).
 
 use core::arch::wasm32::*;
 
@@ -53,7 +52,6 @@ impl Simd for Simd128 {
 impl SimdOps<f32> for Simd128 {
     type Reg = v128;
     const LANES: usize = 4;
-    const ALIGN: usize = 16;
 
     #[inline(always)]
     unsafe fn zero(self) -> Self::Reg {
@@ -64,21 +62,13 @@ impl SimdOps<f32> for Simd128 {
         f32x4_splat(v)
     }
     #[inline(always)]
-    unsafe fn load(self, p: *const f32) -> Self::Reg {
+    unsafe fn loadu(self, p: *const f32) -> Self::Reg {
         // wasm `v128_load` makes no aligned/unaligned distinction.
         unsafe { v128_load(p as *const v128) }
     }
     #[inline(always)]
-    unsafe fn loadu(self, p: *const f32) -> Self::Reg {
-        unsafe { v128_load(p as *const v128) }
-    }
-    #[inline(always)]
-    unsafe fn store(self, p: *mut f32, v: Self::Reg) {
-        // wasm `v128_store` makes no aligned/unaligned distinction.
-        unsafe { v128_store(p as *mut v128, v) }
-    }
-    #[inline(always)]
     unsafe fn storeu(self, p: *mut f32, v: Self::Reg) {
+        // wasm `v128_store` makes no aligned/unaligned distinction.
         unsafe { v128_store(p as *mut v128, v) }
     }
     #[inline(always)]
@@ -126,7 +116,6 @@ impl SimdOps<f32> for Simd128 {
 impl SimdOps<f64> for Simd128 {
     type Reg = v128;
     const LANES: usize = 2;
-    const ALIGN: usize = 16;
 
     #[inline(always)]
     unsafe fn zero(self) -> Self::Reg {
@@ -137,16 +126,8 @@ impl SimdOps<f64> for Simd128 {
         f64x2_splat(v)
     }
     #[inline(always)]
-    unsafe fn load(self, p: *const f64) -> Self::Reg {
-        unsafe { v128_load(p as *const v128) }
-    }
-    #[inline(always)]
     unsafe fn loadu(self, p: *const f64) -> Self::Reg {
         unsafe { v128_load(p as *const v128) }
-    }
-    #[inline(always)]
-    unsafe fn store(self, p: *mut f64, v: Self::Reg) {
-        unsafe { v128_store(p as *mut v128, v) }
     }
     #[inline(always)]
     unsafe fn storeu(self, p: *mut f64, v: Self::Reg) {
@@ -273,7 +254,6 @@ impl KernelSimd<bf16, bf16, f32, bf16> for Simd128 {
 impl SimdOps<i32> for Simd128 {
     type Reg = v128;
     const LANES: usize = 4;
-    const ALIGN: usize = 16;
 
     #[inline(always)]
     unsafe fn zero(self) -> v128 {
@@ -284,16 +264,8 @@ impl SimdOps<i32> for Simd128 {
         i32x4_splat(v)
     }
     #[inline(always)]
-    unsafe fn load(self, p: *const i32) -> v128 {
-        unsafe { v128_load(p as *const v128) }
-    }
-    #[inline(always)]
     unsafe fn loadu(self, p: *const i32) -> v128 {
         unsafe { v128_load(p as *const v128) }
-    }
-    #[inline(always)]
-    unsafe fn store(self, p: *mut i32, v: v128) {
-        unsafe { v128_store(p as *mut v128, v) }
     }
     #[inline(always)]
     unsafe fn storeu(self, p: *mut i32, v: v128) {
@@ -362,6 +334,6 @@ impl KernelSimd<i8, i8, i32, i32> for Simd128 {
 // `*_relaxed_madd` ops are never used: they would fuse the cross-terms into one rounding and
 // break the full-vs-edge identity (the same reason NEON avoids `FCMLA`).
 #[cfg(feature = "complex")]
-impl_complex_simd!(Simd128, f32, v128, 4, 16);
+impl_complex_simd!(Simd128, f32, v128, 4);
 #[cfg(feature = "complex")]
-impl_complex_simd!(Simd128, f64, v128, 2, 16);
+impl_complex_simd!(Simd128, f64, v128, 2);

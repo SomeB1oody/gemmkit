@@ -43,7 +43,6 @@ impl Simd for Fma {
 impl SimdOps<f32> for Fma {
     type Reg = __m256;
     const LANES: usize = 8;
-    const ALIGN: usize = 32;
 
     #[inline(always)]
     unsafe fn zero(self) -> Self::Reg {
@@ -54,16 +53,8 @@ impl SimdOps<f32> for Fma {
         unsafe { _mm256_set1_ps(v) }
     }
     #[inline(always)]
-    unsafe fn load(self, p: *const f32) -> Self::Reg {
-        unsafe { _mm256_load_ps(p) }
-    }
-    #[inline(always)]
     unsafe fn loadu(self, p: *const f32) -> Self::Reg {
         unsafe { _mm256_loadu_ps(p) }
-    }
-    #[inline(always)]
-    unsafe fn store(self, p: *mut f32, v: Self::Reg) {
-        unsafe { _mm256_store_ps(p, v) }
     }
     #[inline(always)]
     unsafe fn storeu(self, p: *mut f32, v: Self::Reg) {
@@ -114,7 +105,6 @@ impl SimdOps<f32> for Fma {
 impl SimdOps<f64> for Fma {
     type Reg = __m256d;
     const LANES: usize = 4;
-    const ALIGN: usize = 32;
 
     #[inline(always)]
     unsafe fn zero(self) -> Self::Reg {
@@ -125,16 +115,8 @@ impl SimdOps<f64> for Fma {
         unsafe { _mm256_set1_pd(v) }
     }
     #[inline(always)]
-    unsafe fn load(self, p: *const f64) -> Self::Reg {
-        unsafe { _mm256_load_pd(p) }
-    }
-    #[inline(always)]
     unsafe fn loadu(self, p: *const f64) -> Self::Reg {
         unsafe { _mm256_loadu_pd(p) }
-    }
-    #[inline(always)]
-    unsafe fn store(self, p: *mut f64, v: Self::Reg) {
-        unsafe { _mm256_store_pd(p, v) }
     }
     #[inline(always)]
     unsafe fn storeu(self, p: *mut f64, v: Self::Reg) {
@@ -264,7 +246,6 @@ impl KernelSimd<bf16, bf16, f32, bf16> for Fma {
 impl SimdOps<i32> for Fma {
     type Reg = __m256i;
     const LANES: usize = 8;
-    const ALIGN: usize = 32;
 
     #[inline(always)]
     unsafe fn zero(self) -> __m256i {
@@ -275,16 +256,8 @@ impl SimdOps<i32> for Fma {
         unsafe { _mm256_set1_epi32(v) }
     }
     #[inline(always)]
-    unsafe fn load(self, p: *const i32) -> __m256i {
-        unsafe { _mm256_load_si256(p as *const __m256i) }
-    }
-    #[inline(always)]
     unsafe fn loadu(self, p: *const i32) -> __m256i {
         unsafe { _mm256_loadu_si256(p as *const __m256i) }
-    }
-    #[inline(always)]
-    unsafe fn store(self, p: *mut i32, v: __m256i) {
-        unsafe { _mm256_store_si256(p as *mut __m256i, v) }
     }
     #[inline(always)]
     unsafe fn storeu(self, p: *mut i32, v: __m256i) {
@@ -414,6 +387,6 @@ impl KernelSimd<i8, i8, i32, i32> for Fma {
 // Complex (AVX2): real `Reg` is the f32/f64 register; `LANES` is the real lane count
 // (8 / 4). Complex GEMM routes through the shared SoA `soa_microkernel`.
 #[cfg(feature = "complex")]
-impl_complex_simd!(Fma, f32, __m256, 8, 32);
+impl_complex_simd!(Fma, f32, __m256, 8);
 #[cfg(feature = "complex")]
-impl_complex_simd!(Fma, f64, __m256d, 4, 32);
+impl_complex_simd!(Fma, f64, __m256d, 4);

@@ -1,9 +1,9 @@
 //! L0 SIMD-vocabulary conformance: every ISA token's [`SimdOps`] primitives, the homogeneous
 //! [`KernelSimd`] `L == A` blanket, and the portable default `fma_bvec` must agree with a scalar
 //! reference for each supported element type. The product kernels only ever call a subset of these
-//! per token (loadu/storeu + mul_add + zero/splat, plus the dot seam), so the aligned load/store,
-//! the integer `reduce_sum`/`fnma`, the blanket widen seam, and the lane-FMA fallback are otherwise
-//! untouched by any driver run — this sweep exercises them directly.
+//! per token (loadu/storeu + mul_add + zero/splat, plus the dot seam), so the integer
+//! `reduce_sum`/`fnma`, the blanket widen seam, and the lane-FMA fallback are otherwise untouched by
+//! any driver run — this sweep exercises them directly.
 //!
 //! Tokens are constructed directly (bypassing dispatch) and each is guarded behind the matching
 //! runtime feature probe, so the suite runs whatever the host supports and silently skips the rest;
@@ -16,12 +16,6 @@
 #![allow(clippy::needless_range_loop)]
 
 use gemmkit::simd::{KernelSimd, ScalarTok, SimdOps};
-
-/// A 64-byte-aligned (covers every ISA's `ALIGN`) one-register scratch, so the aligned
-/// `load`/`store` primitives can be exercised without an alignment fault. 16 elements is the
-/// widest `LANES` of any token (AVX-512 `f32`/`i32`).
-#[repr(C, align(64))]
-struct Aligned<T: Copy>([T; 16]);
 
 /// Generate a conformance check for one floating element type: every `SimdOps<$t>` primitive plus
 /// the `KernelSimd<$t,$t,$t,$t>` blanket, validated lane-by-lane against a scalar reference at a
@@ -74,16 +68,6 @@ macro_rules! float_conformance {
                     simd.storeu(out.as_mut_ptr(), vx);
                     for l in 0..lanes {
                         assert_eq!(out[l], xs[l], "{label} loadu/storeu lane {l}");
-                    }
-
-                    // aligned load/store round-trip.
-                    let mut ain = Aligned([0.0 as $t; 16]);
-                    let mut aout = Aligned([0.0 as $t; 16]);
-                    ain.0[..lanes].copy_from_slice(&xs[..lanes]);
-                    let va = simd.load(ain.0.as_ptr());
-                    simd.store(aout.0.as_mut_ptr(), va);
-                    for l in 0..lanes {
-                        assert_eq!(aout.0[l], xs[l], "{label} load/store lane {l}");
                     }
 
                     // mul / add / mul_add / fnma.
@@ -205,15 +189,6 @@ where
             simd.storeu(out.as_mut_ptr(), vx);
             for l in 0..lanes {
                 assert_eq!(out[l], xs[l], "{label} loadu/storeu lane {l}");
-            }
-
-            let mut ain = Aligned([0i32; 16]);
-            let mut aout = Aligned([0i32; 16]);
-            ain.0[..lanes].copy_from_slice(&xs[..lanes]);
-            let va = simd.load(ain.0.as_ptr());
-            simd.store(aout.0.as_mut_ptr(), va);
-            for l in 0..lanes {
-                assert_eq!(aout.0[l], xs[l], "{label} load/store lane {l}");
             }
 
             simd.storeu(out.as_mut_ptr(), simd.mul(vx, vy));

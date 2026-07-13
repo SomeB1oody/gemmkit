@@ -11,7 +11,7 @@
 //! which each concrete token supplies.
 //!
 //! The thin `SimdOps<Complex<_>>` glue exists only so the driver can read
-//! `LANES`/`ALIGN`/`size_of` and the homogeneous `KernelSimd` blanket applies; complex
+//! `LANES`/`size_of` and the homogeneous `KernelSimd` blanket applies; complex
 //! GEMM never calls its element ops (`zero`/`splat`/`mul`/…), which are therefore
 //! `unreachable!` — all real arithmetic happens in [`soa_microkernel`]. `LANES` is set to
 //! the **real** lane count (real lanes = complex rows the tile spans).
@@ -149,19 +149,18 @@ pub(crate) unsafe fn soa_microkernel<C, S, const MR_REG: usize, const NR: usize>
 }
 
 /// Generate the thin `SimdOps<Complex<$real>>` glue for one ISA token: the `LANES`
-/// (the **real** lane count) / `ALIGN` / `Reg` the driver reads, the element ops as
+/// (the **real** lane count) / `Reg` the driver reads, the element ops as
 /// `unreachable!` (complex GEMM never calls them — it routes through `cplx_microkernel`),
 /// and the `cplx_microkernel` override forwarding to [`soa_microkernel`]. This is glue
 /// boilerplate, not a kernel body (the kernel is the one `soa_microkernel` above) — the
 /// same role the scalar-`SimdOps` macros play.
 macro_rules! impl_complex_simd {
-    ($tok:ty, $real:ty, $reg:ty, $lanes:expr, $align:expr) => {
+    ($tok:ty, $real:ty, $reg:ty, $lanes:expr) => {
         impl $crate::simd::SimdOps<num_complex::Complex<$real>> for $tok {
             type Reg = $reg;
             // `LANES` is the *real* lane count: one real lane spans one complex row, so the
             // driver's `mr = MR_REG * LANES` is the tile's complex-row count.
             const LANES: usize = $lanes;
-            const ALIGN: usize = $align;
 
             // Element ops are never called for complex (the SoA kernel runs on the real
             // `SimdOps<$real>`); they exist only to satisfy the trait.
@@ -174,15 +173,7 @@ macro_rules! impl_complex_simd {
                 unreachable!("complex GEMM routes through cplx_microkernel")
             }
             #[inline(always)]
-            unsafe fn load(self, _p: *const num_complex::Complex<$real>) -> $reg {
-                unreachable!("complex GEMM routes through cplx_microkernel")
-            }
-            #[inline(always)]
             unsafe fn loadu(self, _p: *const num_complex::Complex<$real>) -> $reg {
-                unreachable!("complex GEMM routes through cplx_microkernel")
-            }
-            #[inline(always)]
-            unsafe fn store(self, _p: *mut num_complex::Complex<$real>, _v: $reg) {
                 unreachable!("complex GEMM routes through cplx_microkernel")
             }
             #[inline(always)]

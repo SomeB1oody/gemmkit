@@ -7,9 +7,9 @@
 //!
 //! AArch64 exposes **32** 128-bit vector registers, so the microkernel tile can
 //! be wider than the AVX2 one. `vld1q`/`vst1q` make no aligned/unaligned
-//! distinction, so `load == loadu` and `store == storeu`. `mul_add` maps to the
-//! true fused `vfmaq_*`; mind the operand order — `vfmaq_f32(c, a, b)` computes
-//! `a*b + c`, which is exactly our `mul_add(a, b, c)`.
+//! distinction. `mul_add` maps to the true fused `vfmaq_*`; mind the operand
+//! order — `vfmaq_f32(c, a, b)` computes `a*b + c`, which is exactly our
+//! `mul_add(a, b, c)`.
 
 use core::arch::aarch64::*;
 
@@ -42,7 +42,6 @@ impl Simd for Neon {
 impl SimdOps<f32> for Neon {
     type Reg = float32x4_t;
     const LANES: usize = 4;
-    const ALIGN: usize = 16;
     const LANE_FMA: bool = true;
 
     #[inline(always)]
@@ -54,17 +53,9 @@ impl SimdOps<f32> for Neon {
         unsafe { vdupq_n_f32(v) }
     }
     #[inline(always)]
-    unsafe fn load(self, p: *const f32) -> Self::Reg {
-        unsafe { vld1q_f32(p) }
-    }
-    #[inline(always)]
     unsafe fn loadu(self, p: *const f32) -> Self::Reg {
         // NEON `vld1q` has no aligned/unaligned distinction.
         unsafe { vld1q_f32(p) }
-    }
-    #[inline(always)]
-    unsafe fn store(self, p: *mut f32, v: Self::Reg) {
-        unsafe { vst1q_f32(p, v) }
     }
     #[inline(always)]
     unsafe fn storeu(self, p: *mut f32, v: Self::Reg) {
@@ -135,7 +126,6 @@ impl SimdOps<f32> for Neon {
 impl SimdOps<f64> for Neon {
     type Reg = float64x2_t;
     const LANES: usize = 2;
-    const ALIGN: usize = 16;
     const LANE_FMA: bool = true;
 
     #[inline(always)]
@@ -147,17 +137,9 @@ impl SimdOps<f64> for Neon {
         unsafe { vdupq_n_f64(v) }
     }
     #[inline(always)]
-    unsafe fn load(self, p: *const f64) -> Self::Reg {
-        unsafe { vld1q_f64(p) }
-    }
-    #[inline(always)]
     unsafe fn loadu(self, p: *const f64) -> Self::Reg {
         // NEON `vld1q` has no aligned/unaligned distinction.
         unsafe { vld1q_f64(p) }
-    }
-    #[inline(always)]
-    unsafe fn store(self, p: *mut f64, v: Self::Reg) {
-        unsafe { vst1q_f64(p, v) }
     }
     #[inline(always)]
     unsafe fn storeu(self, p: *mut f64, v: Self::Reg) {
@@ -335,7 +317,6 @@ impl KernelSimd<bf16, bf16, f32, bf16> for Neon {
 impl SimdOps<i32> for Neon {
     type Reg = int32x4_t;
     const LANES: usize = 4;
-    const ALIGN: usize = 16;
 
     #[inline(always)]
     unsafe fn zero(self) -> int32x4_t {
@@ -346,16 +327,8 @@ impl SimdOps<i32> for Neon {
         unsafe { vdupq_n_s32(v) }
     }
     #[inline(always)]
-    unsafe fn load(self, p: *const i32) -> int32x4_t {
-        unsafe { vld1q_s32(p) }
-    }
-    #[inline(always)]
     unsafe fn loadu(self, p: *const i32) -> int32x4_t {
         unsafe { vld1q_s32(p) }
-    }
-    #[inline(always)]
-    unsafe fn store(self, p: *mut i32, v: int32x4_t) {
-        unsafe { vst1q_s32(p, v) }
     }
     #[inline(always)]
     unsafe fn storeu(self, p: *mut i32, v: int32x4_t) {
@@ -434,6 +407,6 @@ impl KernelSimd<i8, i8, i32, i32> for Neon {
 // here — so they cannot interleave with this kernel without breaking the full-vs-edge
 // rounding identity (the analogue of why `sdot`/`bfmmla` are out of scope).
 #[cfg(feature = "complex")]
-impl_complex_simd!(Neon, f32, float32x4_t, 4, 16);
+impl_complex_simd!(Neon, f32, float32x4_t, 4);
 #[cfg(feature = "complex")]
-impl_complex_simd!(Neon, f64, float64x2_t, 2, 16);
+impl_complex_simd!(Neon, f64, float64x2_t, 2);
