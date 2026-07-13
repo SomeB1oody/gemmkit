@@ -10,7 +10,7 @@
 //!
 //! The numeric tolerances (`assert_accurate` = `8·k·EPS`, `assert_cplx_accurate` =
 //! `16·k·EPS`, the wrapping-i32 i8 reference) and the reference kernels are ported
-//! from `tests/correctness.rs` — that file is the canonical source; keep in sync.
+//! from `tests/correctness/common.rs` — that file is the canonical source; keep in sync.
 #![allow(dead_code)]
 
 use gemmkit::{GemmScalar, Parallelism};
@@ -27,7 +27,7 @@ pub fn cases(default: u32) -> u32 {
 }
 
 // ---------------------------------------------------------------------------
-// element trait (ported from tests/correctness.rs:23-100, without the Miri arms —
+// element trait (ported from tests/correctness/common.rs `Elem`, without the Miri arms —
 // these files are `not(miri)`)
 // ---------------------------------------------------------------------------
 
@@ -65,7 +65,7 @@ impl Elem for f64 {
 }
 // Narrow types accumulate in f32 and round outputs to 16 bits, so their `EPS` is the
 // 16-bit machine epsilon (f16 ≈ 9.8e-4, bf16 ≈ 7.8e-3) — the dominant error is the
-// final round (see tests/correctness.rs:46-52).
+// final round (see the f16 `Elem` impl in tests/correctness/common.rs).
 #[cfg(feature = "half")]
 impl Elem for gemmkit::f16 {
     const EPS: f64 = 9.765625e-4; // 2^-10
@@ -93,7 +93,7 @@ impl Elem for gemmkit::bf16 {
     }
 }
 
-/// Deterministic pseudo-random fill in [-1, 1) (port of tests/correctness.rs:103-114).
+/// Deterministic pseudo-random fill in [-1, 1) (port of `rand_vec` in tests/correctness/common.rs).
 pub fn rand_vec<T: Elem>(n: usize, seed: u64) -> Vec<T> {
     let mut s = seed.wrapping_add(0x9E3779B97F4A7C15);
     (0..n)
@@ -127,7 +127,7 @@ impl<T: Elem> Mat<T> {
 }
 
 // ---------------------------------------------------------------------------
-// layout / stride strategies (generalizes tests/correctness.rs build_view, :144-183;
+// layout / stride strategies (generalizes `build_view` in tests/correctness/common.rs;
 // the safe API accepts only non-negative strides — api.rs:107-128)
 // ---------------------------------------------------------------------------
 
@@ -160,7 +160,7 @@ fn strides_for(rows: usize, cols: usize, l: PLayout) -> (usize, usize) {
 
 /// Materialize a row-major logical matrix (`vals`, `rows`×`cols`) into a strided buffer
 /// presented in layout `l`; returns `(buf, rs, cs)`. Generic port of
-/// tests/correctness.rs:144 that also serves the i8 (i8/i32) element paths.
+/// tests/correctness/common.rs `build_view` that also serves the i8 (i8/i32) element paths.
 pub fn build_view_rowmajor<T: Copy>(
     vals: &[T],
     rows: usize,
@@ -239,7 +239,7 @@ pub fn kdim_pos() -> impl Strategy<Value = usize> {
     ]
 }
 
-/// Alpha/beta special values (union of the tests/correctness.rs:565-574 combos; no
+/// Alpha/beta special values (union of the `correctness_alpha_beta` combos in tests/correctness/common.rs; no
 /// NaN/Inf — those inputs have no documented contract).
 pub fn coeff() -> impl Strategy<Value = f64> {
     proptest::sample::select(&[0.0f64, 1.0, -1.0, 0.5, -1.5, 2.0, 2.5, 1e-3][..])
@@ -256,7 +256,7 @@ pub fn par() -> impl Strategy<Value = Parallelism> {
 }
 
 // ---------------------------------------------------------------------------
-// references + accuracy gates (ported from tests/correctness.rs:186-238)
+// references + accuracy gates (ported from `reference`/`assert_accurate` in tests/correctness/common.rs)
 // ---------------------------------------------------------------------------
 
 /// f64 reference: `C <- beta*C0 + alpha*A*B` (beta==0 overwrites, never reads C0).
@@ -286,9 +286,9 @@ pub fn frob_norm<T: Elem>(m: &Mat<T>) -> f64 {
 }
 
 /// Relative Frobenius error gate. `tol = 8*k*eps` is the tolerance factor of
-/// tests/correctness.rs:207-238 (keep in sync); the denominator is the textbook GEMM
+/// `assert_accurate` in tests/correctness/common.rs (keep in sync); the denominator is the textbook GEMM
 /// backward-error magnitude `||A||*||B|| + denom_extra`, where `denom_extra` carries the
-/// `|beta|*||C0||` term. correctness.rs keeps tiny dims on `beta == 0` so `||A||*||B||`
+/// `|beta|*||C0||` term. the correctness suite keeps tiny dims on `beta == 0` so `||A||*||B||`
 /// alone bounds the output there; the property suite draws beta over the full (dim, beta)
 /// space, so it must add the `beta*C0` contribution or a tiny `k` with a dominant
 /// `beta*C0` term would spuriously fail (`denom_extra == 0` reduces to the canonical gate).
@@ -339,7 +339,7 @@ pub fn bits_identical<T: Elem>(x: &[T], y: &[T]) -> bool {
 // integer (i8 -> i32) helpers
 // ---------------------------------------------------------------------------
 
-/// Deterministic **full-range** i8 fill (unlike the range-limited tests/correctness.rs
+/// Deterministic **full-range** i8 fill (unlike the range-limited tests/correctness/common.rs
 /// `rand_i8`, :2011-2022, this spans all of `i8` so accumulation wrap is exercised).
 #[cfg(feature = "int8")]
 pub fn fill_i8(n: usize, seed: u64) -> Vec<i8> {
@@ -355,7 +355,7 @@ pub fn fill_i8(n: usize, seed: u64) -> Vec<i8> {
 }
 
 /// **Wrapping**-i32 GEMM reference (row-major operands). The documented i8 contract is
-/// two's-complement wrapping i32 arithmetic (tests/correctness.rs:2155-2193); wrapping add
+/// two's-complement wrapping i32 arithmetic (`i8_wraps_on_overflow` in tests/correctness/int8.rs); wrapping add
 /// is associative, so the reference is order-independent and the kernel must match it exactly.
 #[cfg(feature = "int8")]
 #[allow(clippy::too_many_arguments)]
@@ -386,7 +386,7 @@ pub fn ref_i8_wrapping(
 }
 
 // ---------------------------------------------------------------------------
-// complex (c32 / c64) helpers (ported from tests/correctness.rs:2283-2390)
+// complex (c32 / c64) helpers (ported from the complex helpers in tests/correctness/common.rs)
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "complex")]
@@ -470,7 +470,7 @@ pub fn ref_cplx<T: CElem>(
 }
 
 /// Relative Frobenius gate for the column-major complex output: `rel <= 16*k*eps`
-/// (canonical formula from tests/correctness.rs:2363-2390; keep in sync).
+/// (canonical formula from `assert_cplx_accurate` in tests/correctness/common.rs; keep in sync).
 #[cfg(feature = "complex")]
 pub fn assert_cplx_accurate<T: CElem>(
     got: &[T],

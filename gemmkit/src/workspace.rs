@@ -210,9 +210,10 @@ mod tests {
     /// conversion must fail closed rather than wrap (which would under-allocate the pack).
     #[test]
     fn region_bytes_byte_product_overflow_fails_closed() {
-        let elems = 1usize << 63; // fits usize
+        // Top bit of usize, so the shift is legal on 32-bit targets (wasm32) too.
+        let elems = 1usize << (usize::BITS - 1); // fits usize
         let msg = panic_msg(|| {
-            region_bytes(elems, 2); // *2 == 1<<64, overflows
+            region_bytes(elems, 2); // *2 == 1 << usize::BITS, overflows
         });
         assert!(
             msg.contains("too large"),

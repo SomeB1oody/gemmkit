@@ -275,7 +275,7 @@ proptest! {
     // Serial and parallel runs are bit-identical **under the current thread-independent
     // blocking** — float add isn't associative, so this holds only because every thread
     // count reduces in the same order, not because the library promises it (see the
-    // canonical caveat at tests/correctness.rs:790-798). Kept as the strongest net against
+    // canonical caveat on `parallel_equals_serial_mixed` in tests/correctness/mixed.rs). Kept as the strongest net against
     // an accidental reduction-order divergence; relax to determinism + tolerance only if
     // blocking ever becomes parallelism-dependent (e.g. split-K).
     #[test]
@@ -332,7 +332,7 @@ fn beta_zero_overwrites<T: Elem>(
 ) {
     let a = Mat::<T>::rand(m, k, seed);
     let b = Mat::<T>::rand(k, n, seed ^ 0xB);
-    // Reference uses a *zeroed* C0 with beta = 0 (mirrors tests/correctness.rs:609-647).
+    // Reference uses a *zeroed* C0 with beta = 0 (mirrors `beta_zero_does_not_read_c` in tests/correctness/float.rs).
     let zero_c0 = Mat {
         v: vec![T::from_f64(0.0); m * n],
         rows: m,
