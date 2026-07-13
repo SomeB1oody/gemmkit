@@ -72,12 +72,12 @@ mod workspace;
 
 pub use api::{
     Activation, BatchProblem, Bias, MatMut, MatRef, PackedLhs, PackedRhs, gemm, gemm_batched,
-    gemm_batched_ptr_unchecked, gemm_batched_slice, gemm_batched_unchecked,
-    gemm_batched_unchecked_with, gemm_batched_with, gemm_fused, gemm_fused_unchecked,
-    gemm_fused_with, gemm_packed_a, gemm_packed_a_unchecked, gemm_packed_a_unchecked_with,
-    gemm_packed_a_with, gemm_packed_b, gemm_packed_b_unchecked, gemm_packed_b_unchecked_with,
-    gemm_packed_b_with, gemm_unchecked, gemm_unchecked_with, gemm_with, prepack_lhs,
-    prepack_lhs_unchecked, prepack_rhs, prepack_rhs_unchecked,
+    gemm_batched_fused, gemm_batched_fused_with, gemm_batched_ptr_unchecked, gemm_batched_slice,
+    gemm_batched_unchecked, gemm_batched_unchecked_with, gemm_batched_with, gemm_fused,
+    gemm_fused_unchecked, gemm_fused_with, gemm_packed_a, gemm_packed_a_unchecked,
+    gemm_packed_a_unchecked_with, gemm_packed_a_with, gemm_packed_b, gemm_packed_b_unchecked,
+    gemm_packed_b_unchecked_with, gemm_packed_b_with, gemm_unchecked, gemm_unchecked_with,
+    gemm_with, prepack_lhs, prepack_lhs_unchecked, prepack_rhs, prepack_rhs_unchecked,
 };
 #[cfg(feature = "int8")]
 pub use api::{

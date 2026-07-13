@@ -16,7 +16,8 @@
 //! workers and so is gated to `m, n > 1` shapes, whose route reduces each output within one worker
 //! (serial and parallel agree bit-for-bit under the current thread-independent blocking).
 
-use crate::dispatch::{self, GemmProblem, GemmScalar, Task};
+use crate::dispatch::{self, FusedScalar, GemmProblem, GemmScalar, Task};
+use crate::kernel::epilogue::FusedEpi;
 use crate::parallel::{self, BatchPlan, JobCursor, Parallelism, Ptr};
 use crate::workspace::{self, Workspace};
 
@@ -122,6 +123,130 @@ pub(crate) unsafe fn run<T: GemmScalar>(
                                     csc,
                                 };
                                 dispatch::execute(task, Parallelism::Serial, wsb);
+                            }
+                        }
+                    });
+                });
+            }
+        }
+    }
+}
+
+/// Run a strided-batched GEMM with a **fused epilogue**: element `bi` uses `A + bi·a_bs`,
+/// `B + bi·b_bs`, `C + bi·c_bs` (shared single-element shape `(m, k, n)` and strides), applying
+/// the SAME fused epilogue `epi` — one bias vector and one activation shared by every element —
+/// so `C_bi <- act(alpha·A_bi·B_bi + beta·C_bi + bias)`.
+///
+/// An exact mirror of [`run`] with [`crate::dispatch::execute`] replaced by
+/// [`crate::dispatch::execute_fused`] in every schedule arm: each element re-dispatches through
+/// the full fused engine, so element `bi`'s output is **bit-identical** to a standalone
+/// `gemm_fused` of that element (which for `f32`/`f64` is bit-identical to gemm-then-map for every
+/// shape, and for `f16`/`bf16` applies the epilogue **pre-narrow**). The degenerate
+/// `alpha == 0` / `k == 0` / `m,n == 0` cases are handled per element by `execute_fused`. `epi` is
+/// `Copy`, captured into the parallel workers exactly like the base pointers.
+///
+/// The scheduling / reproducibility contracts are identical to [`run`] (the fused routes are the
+/// same kernels, so [`Parallelism::resolve_batch`]'s policy carries over unchanged). Elements are
+/// independent, so the batch is reproducible across worker counts. The serial and batch-parallel
+/// schedules run each element serially (no element split across workers), so they are bit-identical
+/// across worker counts; the few-but-large schedule splits an element across workers and is gated
+/// to `m, n > 1` shapes, whose route reduces each output within one worker.
+///
+/// # Safety
+/// As [`run`], plus: `epi`'s bias pointer is valid for the element's `m` (`PerRow`) / `n`
+/// (`PerCol`) and does not alias any `C` region (the safe API validates this).
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn run_fused<T: FusedScalar>(
+    batch: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    alpha: T,
+    a: *const T,
+    rsa: isize,
+    csa: isize,
+    a_bs: isize,
+    b: *const T,
+    rsb: isize,
+    csb: isize,
+    b_bs: isize,
+    beta: T,
+    c: *mut T,
+    rsc: isize,
+    csc: isize,
+    c_bs: isize,
+    epi: FusedEpi<T>,
+    par: Parallelism,
+    ws: &mut Workspace,
+) {
+    unsafe {
+        if batch == 0 {
+            return;
+        }
+        // Element `bi`'s task (base pointers advanced by the batch strides).
+        let make = |bi: usize| Task {
+            m,
+            k,
+            n,
+            alpha,
+            a: a.offset(bi as isize * a_bs),
+            rsa,
+            csa,
+            b: b.offset(bi as isize * b_bs),
+            rsb,
+            csb,
+            beta,
+            c: c.offset(bi as isize * c_bs),
+            rsc,
+            csc,
+        };
+
+        match par.resolve_batch(m, k, n, core::mem::size_of::<T>(), batch) {
+            // Serial: whole batch on this thread, each element single-threaded on the passed ws.
+            BatchPlan::Serial => {
+                for bi in 0..batch {
+                    dispatch::execute_fused(make(bi), epi, Parallelism::Serial, ws);
+                }
+            }
+            // Few but large, DRAM-bound elements: loop the batch, giving each element the full
+            // engine parallelism in turn (only reached for `m, n > 1`, whose route reduces each
+            // output within one worker, so splitting it stays reproducible). Uses the passed `ws`
+            // sequentially.
+            BatchPlan::SequentialInternal => {
+                for bi in 0..batch {
+                    dispatch::execute_fused(make(bi), epi, par, ws);
+                }
+            }
+            // Batch-level parallelism: workers pull disjoint element ranges from a shared cursor,
+            // and every element runs *serially* on one worker — so no element is split across
+            // workers and the batch is bit-identical to the serial run for any worker count. Each
+            // worker packs through the re-entrancy-safe thread-local pool.
+            BatchPlan::BatchParallel(n_threads) => {
+                let (ap, bp, cp) = (Ptr(a as *mut T), Ptr(b as *mut T), Ptr(c));
+                let cur = JobCursor::new(batch, parallel::job_grain(batch, n_threads));
+                parallel::for_each_worker(n_threads, |_tid| {
+                    // `epi` is `Copy` — capture a per-worker copy alongside the base pointers.
+                    let (ap, bp, cp, epi) = (ap, bp, cp, epi);
+                    workspace::with_thread_pool(|wsb| {
+                        while let Some((s, e)) = cur.next_chunk() {
+                            for bi in s..e {
+                                let task = Task {
+                                    m,
+                                    k,
+                                    n,
+                                    alpha,
+                                    a: (ap.0 as *const T).offset(bi as isize * a_bs),
+                                    rsa,
+                                    csa,
+                                    b: (bp.0 as *const T).offset(bi as isize * b_bs),
+                                    rsb,
+                                    csb,
+                                    beta,
+                                    c: cp.0.offset(bi as isize * c_bs),
+                                    rsc,
+                                    csc,
+                                };
+                                dispatch::execute_fused(task, epi, Parallelism::Serial, wsb);
                             }
                         }
                     });

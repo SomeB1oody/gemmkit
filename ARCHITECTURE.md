@@ -462,6 +462,12 @@ worker count.
   each element serially, so they are **bit-identical across worker counts**. Workers pack through
   the re-entrancy-safe thread-local pool (see below), so a batch-parallel worker running an element
   inline while `gemm_batched`'s outer `with_thread_pool` still holds the pool can't double-borrow.
+  A **fused-epilogue** twin `run_fused` is an exact mirror that swaps `dispatch::execute` for
+  `dispatch::execute_fused` in every schedule arm, threading one shared `FusedEpi` (bias +
+  activation, `Copy`, captured into workers like the base pointers) through every element — so each
+  element is bit-identical to a standalone `gemm_fused` of that element, and the schedule /
+  reproducibility contract is unchanged (`resolve_batch` policy carries over: the fused routes are
+  the same kernels).
 
 ## L7 — dispatch
 
@@ -484,7 +490,12 @@ call.
 - **Batched** ([`gemm_batched`] / `gemm_batched_with`): strided-batched `C_b <-
   α·A_b·B_b + β·C_b`. One element shape + strides plus a per-operand batch stride;
   validation additionally checks every element (including the last) is in bounds and
-  the `batch` C regions are pairwise disjoint.
+  the `batch` C regions are pairwise disjoint (factored into a `validate_batched_views`
+  helper shared with the fused twin). A **fused** twin (`gemm_batched_fused` /
+  `gemm_batched_fused_with`, `FusedScalar` bound) applies **one** shared bias + activation to
+  every element — `C_b <- act(α·A_b·B_b + β·C_b + bias)`, the batched-linear-layer case —
+  bit-identical to a loop of `gemm_fused`; it reuses that validation plus the fused bias/slope
+  checks and has no unchecked variant.
 - **Pointer-array batched** ([`gemm_batched_slice`] / [`gemm_batched_ptr_unchecked`]): a slice of
   independent, **heterogeneously-shaped** problems (each its own pointers). The checked form takes
   safe views — a distinct `MatMut` per element, so the borrow checker already guarantees the

@@ -1,6 +1,9 @@
 //! Strided- and pointer-array-batched GEMM entries.
+use super::fused::{Activation, Bias};
 use super::*;
-use crate::dispatch::GemmProblem;
+use crate::dispatch::{FusedScalar, GemmProblem};
+use crate::kernel::epilogue::{Act, BiasSpec, FusedEpi};
+use crate::parallel::Ptr;
 use alloc::vec::Vec;
 
 /// Bounds check for a **strided-batched** view: the `batch` element views (element `bi` based at
@@ -43,6 +46,101 @@ fn check_batched_view<T>(
         );
     }
     e
+}
+
+/// The shared checked-API validation for a strided-batched `(A, B, C)` trio (used by both the
+/// plain [`gemm_batched_with`] and the fused [`gemm_batched_fused_with`]): matching per-element
+/// inner dimensions, every element view (incl. the last) in bounds, each `C` element addressing
+/// uniquely, the `batch` `C` outputs pairwise disjoint, and `C` not overlapping `A`/`B`. Panics on
+/// any violation (messages worded identically to the historic inline block; tests match the
+/// substrings). Callers add any entry-specific checks (fused bias) after this returns. Assumes
+/// `batch >= 1` — the callers short-circuit `batch == 0` before validating (the views are unused).
+#[allow(clippy::too_many_arguments)]
+fn validate_batched_views<T>(
+    batch: usize,
+    a: &MatRef<'_, T>,
+    a_batch_stride: isize,
+    b: &MatRef<'_, T>,
+    b_batch_stride: isize,
+    c: &MatMut<'_, T>,
+    c_batch_stride: isize,
+) {
+    assert_eq!(
+        a.cols, b.rows,
+        "gemmkit: A.cols ({}) != B.rows ({})",
+        a.cols, b.rows
+    );
+    assert_eq!(
+        a.rows, c.rows,
+        "gemmkit: A.rows ({}) != C.rows ({})",
+        a.rows, c.rows
+    );
+    assert_eq!(
+        b.cols, c.cols,
+        "gemmkit: B.cols ({}) != C.cols ({})",
+        b.cols, c.cols
+    );
+
+    check_batched_view(
+        a.data,
+        a.rows,
+        a.cols,
+        a.rs,
+        a.cs,
+        batch,
+        a_batch_stride,
+        "A",
+    );
+    check_batched_view(
+        b.data,
+        b.rows,
+        b.cols,
+        b.rs,
+        b.cs,
+        batch,
+        b_batch_stride,
+        "B",
+    );
+    let c_extent = check_batched_view(
+        c.data,
+        c.rows,
+        c.cols,
+        c.rs,
+        c.cs,
+        batch,
+        c_batch_stride,
+        "C",
+    );
+
+    // Each C element must address every (i,j) uniquely (a self-aliasing element would race in
+    // parallel), and — since the batch writes them concurrently — the elements must not overlap
+    // each other. Disjointness is enforced conservatively: the batch stride must clear one
+    // element's whole extent (sufficient, and simpler than a per-offset overlap test — it can
+    // reject an exotic layout that threads later elements through a strided element's internal
+    // gaps, but never accepts a real overlap). (`c_batch_stride >= 0` here: `check_batched_view`.)
+    if self_aliases(c.rows, c.cols, c.rs, c.cs) {
+        panic!(
+            "gemmkit: batched C element aliases itself (strides {},{} map distinct elements to \
+             the same memory); C must address each (i,j) uniquely",
+            c.rs, c.cs
+        );
+    }
+    if batch > 1 && (c_batch_stride as usize) < c_extent {
+        panic!(
+            "gemmkit: C batch stride ({c_batch_stride}) must be at least the element extent \
+             ({c_extent}) so the batched C outputs stay disjoint"
+        );
+    }
+
+    // C must not alias A or B (it is written). The whole-slice check is defensive — safe Rust's
+    // borrow checker already forbids overlapping &mut/& slices.
+    let cp = c.data.as_ptr();
+    let cl = c.data.len();
+    if overlaps(cp, cl, a.data.as_ptr(), a.data.len())
+        || overlaps(cp, cl, b.data.as_ptr(), b.data.len())
+    {
+        panic!("gemmkit: batched C aliases A or B");
+    }
 }
 
 /// Strided-batched GEMM: `C_b <- alpha·A_b·B_b + beta·C_b` for `b in 0..batch`, one call,
@@ -121,82 +219,15 @@ pub fn gemm_batched_with<T: GemmScalar>(
         return;
     }
 
-    assert_eq!(
-        a.cols, b.rows,
-        "gemmkit: A.cols ({}) != B.rows ({})",
-        a.cols, b.rows
-    );
-    assert_eq!(
-        a.rows, c.rows,
-        "gemmkit: A.rows ({}) != C.rows ({})",
-        a.rows, c.rows
-    );
-    assert_eq!(
-        b.cols, c.cols,
-        "gemmkit: B.cols ({}) != C.cols ({})",
-        b.cols, c.cols
-    );
-
-    check_batched_view(
-        a.data,
-        a.rows,
-        a.cols,
-        a.rs,
-        a.cs,
+    validate_batched_views(
         batch,
+        &a,
         a_batch_stride,
-        "A",
-    );
-    check_batched_view(
-        b.data,
-        b.rows,
-        b.cols,
-        b.rs,
-        b.cs,
-        batch,
+        &b,
         b_batch_stride,
-        "B",
-    );
-    let c_extent = check_batched_view(
-        c.data,
-        c.rows,
-        c.cols,
-        c.rs,
-        c.cs,
-        batch,
+        &c,
         c_batch_stride,
-        "C",
     );
-
-    // Each C element must address every (i,j) uniquely (a self-aliasing element would race in
-    // parallel), and — since the batch writes them concurrently — the elements must not overlap
-    // each other. Disjointness is enforced conservatively: the batch stride must clear one
-    // element's whole extent (sufficient, and simpler than a per-offset overlap test — it can
-    // reject an exotic layout that threads later elements through a strided element's internal
-    // gaps, but never accepts a real overlap). (`c_batch_stride >= 0` here: `check_batched_view`.)
-    if self_aliases(c.rows, c.cols, c.rs, c.cs) {
-        panic!(
-            "gemmkit: batched C element aliases itself (strides {},{} map distinct elements to \
-             the same memory); C must address each (i,j) uniquely",
-            c.rs, c.cs
-        );
-    }
-    if batch > 1 && (c_batch_stride as usize) < c_extent {
-        panic!(
-            "gemmkit: C batch stride ({c_batch_stride}) must be at least the element extent \
-             ({c_extent}) so the batched C outputs stay disjoint"
-        );
-    }
-
-    // C must not alias A or B (it is written). The whole-slice check is defensive — safe Rust's
-    // borrow checker already forbids overlapping &mut/& slices.
-    let cp = c.data.as_ptr();
-    let cl = c.data.len();
-    if overlaps(cp, cl, a.data.as_ptr(), a.data.len())
-        || overlaps(cp, cl, b.data.as_ptr(), b.data.len())
-    {
-        panic!("gemmkit: batched C aliases A or B");
-    }
 
     // SAFETY: validated above — per-element shapes agree, every element view (incl. the last) is
     // in bounds, the C outputs are pairwise disjoint and address uniquely, and C does not alias
@@ -223,6 +254,206 @@ pub fn gemm_batched_with<T: GemmScalar>(
             c.cs,
             c_batch_stride,
             par,
+        );
+    }
+}
+
+/// Strided-batched GEMM with a **fused epilogue** applied to every element:
+/// `C_b <- act(alpha·A_b·B_b + beta·C_b + bias)` for `b in 0..batch`, one call, parallelized
+/// **across the batch**. **One** bias vector and **one** activation are shared by every batch
+/// element (the batched-linear-layer case: the same layer applied to a batch of inputs). All
+/// elements share the single-element shape and strides of `a`/`b`/`c`; consecutive elements are
+/// `*_batch_stride` apart in their slices, and a `*_batch_stride` of `0` broadcasts one operand
+/// across the whole batch (valid for the read-only `A`/`B`, never for `C`). Uses the thread-local
+/// workspace pool. `bias == None && act == None` delegates to plain [`gemm_batched`].
+///
+/// The headline property: the result is **bit-identical to a loop of [`gemm_fused`] calls** — one
+/// per element, with the same shared bias/activation — because each element re-dispatches through
+/// the full fused engine. So for `f32`/`f64` every element equals `gemm()`-then-map bit-for-bit for
+/// every shape, and for `f16`/`bf16` the epilogue applies in `f32` **before** the single narrowing
+/// (more precise than a separate narrow map). Elements are independent, so the batch is
+/// **reproducible** across thread counts; the serial and batch-parallel schedules run each element
+/// serially, so they are additionally bit-identical across thread counts (the few-but-large
+/// schedule runs each element through the parallel engine and inherits its per-element behavior).
+///
+/// `T: FusedScalar` — `f32`/`f64` and, under the `half` feature, `f16`/`bf16`. There is no
+/// `unchecked` variant this round; an FFI caller can loop [`gemm_fused_unchecked`].
+///
+/// # Panics
+/// The [`gemm_batched`] conditions (per-element dimensions disagree; any element view out of
+/// bounds; a negative batch stride; the `batch` `C` regions overlap or a `C` element aliases
+/// itself; or `C` overlaps `A`/`B`), plus the fused conditions: a `PerRow` bias whose length is not
+/// the element `A.rows` (or a `PerCol` bias not the element `B.cols`) — the bias is one shared
+/// vector sized for a single element; a bias slice overlapping `C`'s storage; or a non-finite
+/// `LeakyRelu` slope.
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_batched_fused<T: FusedScalar>(
+    batch: usize,
+    alpha: T,
+    a: MatRef<'_, T>,
+    a_batch_stride: isize,
+    b: MatRef<'_, T>,
+    b_batch_stride: isize,
+    beta: T,
+    c: MatMut<'_, T>,
+    c_batch_stride: isize,
+    bias: Option<Bias<'_, T>>,
+    act: Option<Activation<T>>,
+    par: Parallelism,
+) {
+    workspace::with_thread_pool(|ws| {
+        gemm_batched_fused_with(
+            ws,
+            batch,
+            alpha,
+            a,
+            a_batch_stride,
+            b,
+            b_batch_stride,
+            beta,
+            c,
+            c_batch_stride,
+            bias,
+            act,
+            par,
+        );
+    });
+}
+
+/// Like [`gemm_batched_fused`] but reuses a caller-owned [`Workspace`] (the same pooling as
+/// [`gemm_batched_with`]: the serial / few-but-large schedules pack through `ws`, the batch-parallel
+/// schedule through each worker's own persistent per-thread pool).
+///
+/// # Panics
+/// Same conditions as [`gemm_batched_fused`].
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_batched_fused_with<T: FusedScalar>(
+    ws: &mut Workspace,
+    batch: usize,
+    alpha: T,
+    a: MatRef<'_, T>,
+    a_batch_stride: isize,
+    b: MatRef<'_, T>,
+    b_batch_stride: isize,
+    beta: T,
+    c: MatMut<'_, T>,
+    c_batch_stride: isize,
+    bias: Option<Bias<'_, T>>,
+    act: Option<Activation<T>>,
+    par: Parallelism,
+) {
+    // A zero-length batch is a pure no-op — nothing to validate (the views and bias are unused),
+    // mirroring `gemm_batched_with`.
+    if batch == 0 {
+        return;
+    }
+
+    // The identity-fused case delegates to plain batched gemm so the zero-cost path is guaranteed
+    // (and it runs the plain validation), mirroring `gemm_fused_with`.
+    if bias.is_none() && act.is_none() {
+        gemm_batched_with(
+            ws,
+            batch,
+            alpha,
+            a,
+            a_batch_stride,
+            b,
+            b_batch_stride,
+            beta,
+            c,
+            c_batch_stride,
+            par,
+        );
+        return;
+    }
+
+    validate_batched_views(
+        batch,
+        &a,
+        a_batch_stride,
+        &b,
+        b_batch_stride,
+        &c,
+        c_batch_stride,
+    );
+
+    // Fused-epilogue validation, mirroring `gemm_fused_with`: the bias is ONE shared vector sized
+    // for a single element (its length matches the element axis, not `batch·axis`) and must not
+    // overlap C. The overlap test uses C's WHOLE backing slice, so it is conservative across every
+    // batch element.
+    if let Some(bd) = &bias {
+        let (bp, bl) = match bd {
+            Bias::PerRow(s) => {
+                assert_eq!(
+                    s.len(),
+                    a.rows,
+                    "gemmkit: PerRow bias length ({}) != A.rows ({})",
+                    s.len(),
+                    a.rows
+                );
+                (s.as_ptr(), s.len())
+            }
+            Bias::PerCol(s) => {
+                assert_eq!(
+                    s.len(),
+                    b.cols,
+                    "gemmkit: PerCol bias length ({}) != B.cols ({})",
+                    s.len(),
+                    b.cols
+                );
+                (s.as_ptr(), s.len())
+            }
+        };
+        if overlaps(c.data.as_ptr(), c.data.len(), bp, bl) {
+            panic!("gemmkit: bias slice overlaps C");
+        }
+    }
+    if let Some(Activation::LeakyRelu(s)) = &act {
+        assert!(T::finite(*s), "gemmkit: LeakyRelu slope must be finite");
+    }
+
+    let bias_spec = match bias {
+        None => BiasSpec::None,
+        Some(Bias::PerRow(s)) => BiasSpec::Row(Ptr(s.as_ptr() as *mut T)),
+        Some(Bias::PerCol(s)) => BiasSpec::Col(Ptr(s.as_ptr() as *mut T)),
+    };
+    let act_e = match act {
+        None => Act::None,
+        Some(Activation::Relu) => Act::Relu,
+        Some(Activation::LeakyRelu(s)) => Act::LeakyRelu(s),
+    };
+    let epi = FusedEpi {
+        bias: bias_spec,
+        act: act_e,
+    };
+
+    // SAFETY: validated above — per-element shapes agree, every element view (incl. the last) is in
+    // bounds, the C outputs are pairwise disjoint and address uniquely, C does not alias A/B, the
+    // bias slice matches its element axis and does not overlap C, and the slope is finite. The bias
+    // pointer (borrowed for this call) stays valid for the whole `run_fused` frame.
+    unsafe {
+        crate::special::batched::run_fused(
+            batch,
+            a.rows,
+            a.cols,
+            b.cols,
+            alpha,
+            a.data.as_ptr(),
+            a.rs,
+            a.cs,
+            a_batch_stride,
+            b.data.as_ptr(),
+            b.rs,
+            b.cs,
+            b_batch_stride,
+            beta,
+            c.data.as_mut_ptr(),
+            c.rs,
+            c.cs,
+            c_batch_stride,
+            epi,
+            par,
+            ws,
         );
     }
 }

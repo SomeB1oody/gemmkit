@@ -25,8 +25,9 @@ mod int8;
 mod packed;
 
 pub use batched::{
-    BatchProblem, gemm_batched, gemm_batched_ptr_unchecked, gemm_batched_slice,
-    gemm_batched_unchecked, gemm_batched_unchecked_with, gemm_batched_with,
+    BatchProblem, gemm_batched, gemm_batched_fused, gemm_batched_fused_with,
+    gemm_batched_ptr_unchecked, gemm_batched_slice, gemm_batched_unchecked,
+    gemm_batched_unchecked_with, gemm_batched_with,
 };
 #[cfg(feature = "complex")]
 pub use cplx::{gemm_cplx, gemm_cplx_unchecked, gemm_cplx_unchecked_with, gemm_cplx_with};

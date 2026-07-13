@@ -19,6 +19,7 @@
 
 mod common;
 
+mod batched;
 mod float;
 #[cfg(feature = "half")]
 mod mixed;
