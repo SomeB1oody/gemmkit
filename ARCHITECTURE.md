@@ -52,9 +52,11 @@ No arithmetic lives on it, so adding an element type does not grow the trait.
 [`Float`] adds the scalar arithmetic the float epilogues need.
 
 [`SimdOps<T>`] is the **load-bearing wall**. It is *thick*: it exposes every
-primitive the whole microkernel needs — `zero`, `splat`, `load`/`loadu`,
-`store`/`storeu`, `mul`, `add`, `mul_add`, `fnma` (fused `c - a·b`, for the complex
-kernel's `acc_re -= ai·bi`), `reduce_sum` — plus `LANES` and `ALIGN`. Because the ISA
+primitive the whole microkernel needs — `zero`, `splat`, `loadu`, `storeu`
+(unaligned-tolerant; the packed buffers are 64-byte-aligned so nothing is paid for
+the tolerance, and no separate aligned entry points exist), `mul`, `add`, `mul_add`,
+`fnma` (fused `c - a·b`, for the complex
+kernel's `acc_re -= ai·bi`), `reduce_sum` — plus `LANES`. Because the ISA
 *token* and the element *type* are decoupled, `LANES` varies with the `(ISA, T)` pair
 (f32@FMA = 8, f32@AVX-512 = 16, f32@NEON = 4, f32@wasm-simd128 = 4, f64 halved).
 
@@ -231,8 +233,13 @@ A second L1 seam, [`Epilogue<Fam>`], fuses a per-element transform into the stor
 mapping it in a second pass. It is threaded through a **provided** family method,
 `KernelFamily::microkernel_epi(.., row0, col0, last_k, epi, ..)`, whose default just
 forwards to `microkernel` (so the `i32`-out integer families are byte-for-byte unchanged and only
-debug-assert the epilogue is `Identity`). `FloatGemm`, the mixed families (`MixedGemm<f16/bf16>`
-and `Bf16DotGemm`), the two requantizing families, and `ComplexGemm` override it. `ComplexGemm`
+debug-assert the epilogue is `Identity`). A family implements exactly **one** of the pair:
+a non-fusing family provides `microkernel` and rides the fail-closed default forward, while a
+fusing family overrides `microkernel_epi` and leaves `microkernel` on its default `unreachable!`
+body (the driver only ever calls `microkernel_epi`). `ComplexGemm` is the one deliberate
+exception that implements both — its override reuses its own plain `microkernel`, below. `FloatGemm`, the mixed families
+(`MixedGemm<f16/bf16>` and `Bf16DotGemm`), the two requantizing families, and `ComplexGemm`
+override it. `ComplexGemm`
 cannot thread `E` into its store (its α/β epilogue lives inside the L0 `cplx_microkernel` seam,
 which must not depend on this L1 trait), so its override instead runs the *unchanged* SoA kernel
 and then, on the final depth panel only (`!IS_IDENTITY && last_k`), sweeps the just-stored tile
