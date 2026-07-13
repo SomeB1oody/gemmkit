@@ -30,7 +30,10 @@ pub use batched::{
     gemm_batched_unchecked_with, gemm_batched_with,
 };
 #[cfg(feature = "complex")]
-pub use cplx::{gemm_cplx, gemm_cplx_unchecked, gemm_cplx_unchecked_with, gemm_cplx_with};
+pub use cplx::{
+    gemm_cplx, gemm_cplx_fused, gemm_cplx_fused_with, gemm_cplx_unchecked,
+    gemm_cplx_unchecked_with, gemm_cplx_with,
+};
 pub use fused::{Activation, Bias, gemm_fused, gemm_fused_unchecked, gemm_fused_with};
 #[cfg(feature = "int8")]
 pub use int8::{

@@ -20,6 +20,8 @@
 mod common;
 
 mod batched;
+#[cfg(feature = "complex")]
+mod cplx;
 mod float;
 #[cfg(feature = "half")]
 mod mixed;

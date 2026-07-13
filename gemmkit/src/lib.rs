@@ -86,7 +86,10 @@ pub use api::{
     gemm_i8_unchecked_with, gemm_i8_with,
 };
 #[cfg(feature = "complex")]
-pub use api::{gemm_cplx, gemm_cplx_unchecked, gemm_cplx_unchecked_with, gemm_cplx_with};
+pub use api::{
+    gemm_cplx, gemm_cplx_fused, gemm_cplx_fused_with, gemm_cplx_unchecked,
+    gemm_cplx_unchecked_with, gemm_cplx_with,
+};
 #[cfg(feature = "complex")]
 pub use dispatch::ComplexScalar;
 pub use dispatch::FusedScalar;

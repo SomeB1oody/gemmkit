@@ -314,6 +314,46 @@ where
     }
 }
 
+// Complex-family fused epilogue: **bias only**. `ComplexGemm<T, CA, CB>` is a distinct family
+// type from `FloatGemm` / the narrow families / `KRequantize`, so this impl cannot overlap any of
+// them (no coherence conflict). It deliberately has **no activation**: an ordering-based activation
+// (ReLU / LeakyReLU) is mathematically undefined on complex numbers, so the complex public entry
+// (`gemm_cplx_fused`) constructs only `Act::None` — the other `Act` arms are therefore
+// `unreachable!`.
+//
+// `VECTOR` stays `false` (the default): every complex tile is stored by the SoA kernel's own
+// scalar alpha/beta epilogue (inside the L0 `cplx_microkernel` seam, which must not depend on this
+// L1 trait), and this `apply` rides the tile-local in-place post-pass that
+// `ComplexGemm::microkernel_epi` runs on the final depth panel. So there is no `apply_reg` /
+// `apply_store` here — only the scalar `apply`. Because the kernel first stores exactly the bits
+// plain `gemm_cplx` would, the post-pass makes `gemm_cplx_fused` bitwise-identical to `gemm_cplx`
+// then the same element-wise bias add.
+#[cfg(feature = "complex")]
+impl<T, const CA: bool, const CB: bool> Epilogue<crate::kernel::ComplexGemm<T, CA, CB>>
+    for FusedEpi<T>
+where
+    T: crate::scalar::ComplexFloat,
+{
+    #[inline(always)]
+    unsafe fn apply(&self, v: T, r: usize, c: usize) -> T {
+        // Bias add only (the fast path is a full tile, so the `r`/`c` coordinate resolves the
+        // per-row / per-col base directly). Complex addition is `num_complex`'s `Add`, the same
+        // operation the `gemm_cplx`-then-map oracle applies — hence bitwise-identical.
+        let v = match self.bias {
+            BiasSpec::None => v,
+            BiasSpec::Row(p) => v + unsafe { *p.0.add(r) },
+            BiasSpec::Col(p) => v + unsafe { *p.0.add(c) },
+        };
+        match self.act {
+            Act::None => v,
+            // The complex entry never constructs an activation (undefined on `C`).
+            Act::Relu | Act::LeakyRelu(_) => {
+                unreachable!("complex fused epilogue has no activation")
+            }
+        }
+    }
+}
+
 /// The output domain of the requantizing [`KRequantize`] epilogue: the inclusive clamp
 /// bounds and the final narrowing of an already-clamped `i64` to the output byte. Implemented
 /// for the two quantized output types — `i8` (`[-128, 127]`) and `u8` (`[0, 255]`) — so one

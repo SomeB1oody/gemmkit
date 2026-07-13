@@ -228,9 +228,16 @@ A second L1 seam, [`Epilogue<Fam>`], fuses a per-element transform into the stor
 `C[r,c] <- apply(α·AB + β·C, r, c)` — instead of materializing the raw product and
 mapping it in a second pass. It is threaded through a **provided** family method,
 `KernelFamily::microkernel_epi(.., row0, col0, last_k, epi, ..)`, whose default just
-forwards to `microkernel` (so `complex` and the `i32`-out integer families are byte-for-byte
-unchanged and only debug-assert the epilogue is `Identity`). `FloatGemm`, the mixed families
-(`MixedGemm<f16/bf16>` and `Bf16DotGemm`), and the two requantizing families override it.
+forwards to `microkernel` (so the `i32`-out integer families are byte-for-byte unchanged and only
+debug-assert the epilogue is `Identity`). `FloatGemm`, the mixed families (`MixedGemm<f16/bf16>`
+and `Bf16DotGemm`), the two requantizing families, and `ComplexGemm` override it. `ComplexGemm`
+cannot thread `E` into its store (its α/β epilogue lives inside the L0 `cplx_microkernel` seam,
+which must not depend on this L1 trait), so its override instead runs the *unchanged* SoA kernel
+and then, on the final depth panel only (`!IS_IDENTITY && last_k`), sweeps the just-stored tile
+applying `epi` **in place** — a cache-hot `O(mr·nr)` post-pass that fires once per element and,
+because the kernel first stores exactly the bits plain `gemm_cplx` would, is bitwise-identical to
+`gemm_cplx`-then-map by construction (the same strategy as the gemv sweep). It const-folds back to
+the bare `microkernel` for `E = Identity`, so plain `gemm_cplx` stays byte-for-byte unchanged.
 
 The load-bearing invariant is **zero-cost identity**: every kernel hook is gated on the
 associated `const Epilogue::IS_IDENTITY`, so with `E = Identity` (a ZST) the guards const-fold
@@ -294,6 +301,16 @@ supplies `dispatch_fused` and a `fused_degenerate` (the `C <- act(β·C + bias)`
 vanishes — real floats in `T`, narrow types in `f32`, narrowing once). `gemm_i8_requant` still covers the general driver
 path only (the integer special paths keep the identity seam and adopt `E` later behind the same
 API); prepacked-RHS likewise keeps `Identity`.
+
+The **complex** family fuses a **bias only**: `gemm_cplx_fused` computes
+`C <- α·op(A)·op(B) + β·C + bias` in one pass (per-row / per-col complex bias), reusing the same
+`FusedEpi<T>` type with `Act::None`. It is **bit-identical** to `gemm_cplx`-then-bias-add for every
+shape and every conj combination (the tile-local post-pass above), and deterministic across thread
+counts. There is deliberately **no activation** on the complex entry: an ordering-based activation
+(ReLU / LeakyReLU) is mathematically undefined on `ℂ`. The dispatch mirror (`run_complex_fused`)
+swaps both the conj flags and the bias axis on the orientation swap; the degenerate `A·B`-vanishes
+map is bias-only (`C <- β·C + bias`, conj irrelevant). There is no `_unchecked` complex fused entry
+(minimal surface).
 
 [`Epilogue<Fam>`]: gemmkit::kernel::epilogue::Epilogue
 

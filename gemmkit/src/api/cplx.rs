@@ -1,6 +1,8 @@
 //! Complex GEMM entries with optional conjugation.
 use super::*;
 use crate::dispatch::ComplexScalar;
+use crate::kernel::epilogue::{Act, BiasSpec, FusedEpi};
+use crate::parallel::Ptr;
 
 /// Complex GEMM with optional conjugation: `C <- alpha·op(A)·op(B) + beta·C` where
 /// `op(A) = A̅` if `conj_a` (resp. `B̅` if `conj_b`). `T` is `Complex<f32>` or
@@ -69,6 +71,152 @@ pub fn gemm_cplx_with<T: ComplexScalar>(
                 rsc: c.rs,
                 csc: c.cs,
             },
+            par,
+            ws,
+        );
+    }
+}
+
+/// Complex GEMM with an **optional fused per-row / per-col bias**:
+/// `C <- alpha·op(A)·op(B) + beta·C + bias` in **one pass**, where `op(A) = A̅` if `conj_a`
+/// (resp. `B̅` if `conj_b`). `T` is `Complex<f32>` or `Complex<f64>`. Uses the thread-local
+/// workspace pool.
+///
+/// The bias is [`Bias::PerRow`] (length `A.rows`) or [`Bias::PerCol`] (length `B.cols`), added by
+/// one complex IEEE add to every element of that row / column after the `alpha·op(A)·op(B) + beta·C`
+/// combine. `bias == None` delegates to plain [`gemm_cplx`] (a zero-cost identity — no fused
+/// monomorphization is even reached).
+///
+/// **No activation.** Unlike [`gemm_fused`], the complex entry has no activation parameter: an
+/// ordering-based activation (ReLU / LeakyReLU) is mathematically undefined on complex numbers
+/// (`ℂ` is not ordered), so it is deliberately absent — bias is the only fusible complex epilogue.
+///
+/// **Bitwise contract.** The result is **bit-identical** (on both the real and imaginary parts) to
+/// [`gemm_cplx`] followed by the same element-wise bias add, for **every** shape and **every**
+/// conj combination: the engine stores exactly the bits plain `gemm_cplx` would and maps them in
+/// place on the final depth panel (a tile-local post-pass, applied once per element). It is also
+/// deterministic across thread counts (serial ≡ parallel, bit-for-bit — the same
+/// thread-independent-blocking caveat as plain `gemm_cplx`).
+///
+/// `conj_a` / `conj_b` conjugate the **operands only** — the bias is added verbatim, never
+/// conjugated.
+///
+/// There is no `_unchecked` variant (the minimal-surface decision shared with the other fused
+/// entries): advanced raw-stride callers use the checked entry or compose `gemm_cplx_unchecked`
+/// with their own bias pass.
+///
+/// # Panics
+/// Same shape / bounds / aliasing conditions as [`gemm_cplx`], plus: a `PerRow` bias whose length
+/// is not `A.rows` (or a `PerCol` bias not `B.cols`), or a bias slice that overlaps `C`.
+#[cfg(feature = "complex")]
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_cplx_fused<T: ComplexScalar>(
+    alpha: T,
+    a: MatRef<'_, T>,
+    conj_a: bool,
+    b: MatRef<'_, T>,
+    conj_b: bool,
+    beta: T,
+    c: MatMut<'_, T>,
+    bias: Option<Bias<'_, T>>,
+    par: Parallelism,
+) {
+    workspace::with_thread_pool(|ws| {
+        gemm_cplx_fused_with(ws, alpha, a, conj_a, b, conj_b, beta, c, bias, par)
+    });
+}
+
+/// Like [`gemm_cplx_fused`] but reuses a caller-owned [`Workspace`].
+///
+/// # Panics
+/// Same conditions as [`gemm_cplx_fused`].
+#[cfg(feature = "complex")]
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_cplx_fused_with<T: ComplexScalar>(
+    ws: &mut Workspace,
+    alpha: T,
+    a: MatRef<'_, T>,
+    conj_a: bool,
+    b: MatRef<'_, T>,
+    conj_b: bool,
+    beta: T,
+    c: MatMut<'_, T>,
+    bias: Option<Bias<'_, T>>,
+    par: Parallelism,
+) {
+    validate_gemm_views(&a, &b, &c);
+
+    // Fused-bias validation: bias length matches its axis and does not overlap C. Byte-identical
+    // message shapes to `gemm_fused_with`.
+    if let Some(bd) = &bias {
+        let (bp, bl) = match bd {
+            Bias::PerRow(s) => {
+                assert_eq!(
+                    s.len(),
+                    a.rows,
+                    "gemmkit: PerRow bias length ({}) != A.rows ({})",
+                    s.len(),
+                    a.rows
+                );
+                (s.as_ptr(), s.len())
+            }
+            Bias::PerCol(s) => {
+                assert_eq!(
+                    s.len(),
+                    b.cols,
+                    "gemmkit: PerCol bias length ({}) != B.cols ({})",
+                    s.len(),
+                    b.cols
+                );
+                (s.as_ptr(), s.len())
+            }
+        };
+        if overlaps(c.data.as_ptr(), c.data.len(), bp, bl) {
+            panic!("gemmkit: bias slice overlaps C");
+        }
+    }
+
+    // No bias: the fused path is pure identity, so delegate to plain `gemm_cplx` — the zero-cost
+    // path is then guaranteed (no fused monomorphization is instantiated).
+    let Some(bias) = bias else {
+        gemm_cplx_with(ws, alpha, a, conj_a, b, conj_b, beta, c, par);
+        return;
+    };
+
+    let bias_spec = match bias {
+        Bias::PerRow(s) => BiasSpec::Row(Ptr(s.as_ptr() as *mut T)),
+        Bias::PerCol(s) => BiasSpec::Col(Ptr(s.as_ptr() as *mut T)),
+    };
+    // Complex has no activation (undefined on `C`): always `Act::None`.
+    let epi = FusedEpi {
+        bias: bias_spec,
+        act: Act::None,
+    };
+
+    // SAFETY: validated above — shapes agree, every stride is in bounds, C addresses each (i,j)
+    // uniquely and does not alias A/B, and the bias slice (borrowed for this call) does not overlap
+    // C. The bias pointer stays valid for the whole `execute_complex_fused` frame.
+    unsafe {
+        dispatch::execute_complex_fused(
+            conj_a,
+            conj_b,
+            Task {
+                m: a.rows,
+                k: a.cols,
+                n: b.cols,
+                alpha,
+                a: a.data.as_ptr(),
+                rsa: a.rs,
+                csa: a.cs,
+                b: b.data.as_ptr(),
+                rsb: b.rs,
+                csb: b.cs,
+                beta,
+                c: c.data.as_mut_ptr(),
+                rsc: c.rs,
+                csc: c.cs,
+            },
+            epi,
             par,
             ws,
         );

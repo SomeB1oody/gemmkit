@@ -49,7 +49,7 @@ mod mixed;
 #[cfg(feature = "complex")]
 pub use complex::ComplexScalar;
 #[cfg(feature = "complex")]
-pub(crate) use complex::execute_complex;
+pub(crate) use complex::{execute_complex, execute_complex_fused};
 pub use float::FusedScalar;
 pub(crate) use float::execute_fused;
 #[cfg(feature = "int8")]
