@@ -1,7 +1,10 @@
 //! Strided- and pointer-array-batched GEMM entries.
+#[cfg(feature = "epilogue")]
 use super::fused::{Activation, Bias};
 use super::*;
-use crate::dispatch::{FusedScalar, GemmProblem};
+#[cfg(feature = "epilogue")]
+use crate::dispatch::FusedScalar;
+use crate::dispatch::GemmProblem;
 use alloc::vec::Vec;
 
 /// Bounds check for a **strided-batched** view: the `batch` element views (element `bi` based at
@@ -284,6 +287,7 @@ pub fn gemm_batched_with<T: GemmScalar>(
 /// the element `A.rows` (or a `PerCol` bias not the element `B.cols`) — the bias is one shared
 /// vector sized for a single element; a bias slice overlapping `C`'s storage; or a non-finite
 /// `LeakyRelu` slope.
+#[cfg(feature = "epilogue")]
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_batched_fused<T: FusedScalar>(
     batch: usize,
@@ -324,6 +328,7 @@ pub fn gemm_batched_fused<T: FusedScalar>(
 ///
 /// # Panics
 /// Same conditions as [`gemm_batched_fused`].
+#[cfg(feature = "epilogue")]
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_batched_fused_with<T: FusedScalar>(
     ws: &mut Workspace,

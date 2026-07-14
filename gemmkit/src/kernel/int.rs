@@ -12,6 +12,7 @@
 
 use core::marker::PhantomData;
 
+#[cfg(feature = "epilogue")]
 use super::epilogue::{Epilogue, QuantOut};
 use super::{AlphaStatus, BetaStatus, KernelFamily};
 use crate::pack::{pack_kgroup_panels, pack_panels};
@@ -191,6 +192,7 @@ unsafe fn i32_accumulate<S, O, const MR_REG: usize, const NR: usize>(
 /// # Safety
 /// As [`KernelFamily::microkernel_epi`]; `scratch` holds at least [`super::SCRATCH_LEN`]
 /// `i32` elements.
+#[cfg(feature = "epilogue")]
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 #[inline(always)]
 unsafe fn requant_scratch_epilogue<F, S, E, O, const MR_REG: usize, const NR: usize>(
@@ -505,9 +507,11 @@ impl KernelFamily for IntGemmVnni {
 /// folded into `scale` and `beta` is disallowed (accumulating into a quantized C is
 /// ill-defined), which the epilogue call site enforces (`AlphaStatus::One`,
 /// `BetaStatus::Zero`).
+#[cfg(feature = "epilogue")]
 #[derive(Clone, Copy)]
 pub struct IntGemmQ<O = i8>(PhantomData<O>);
 
+#[cfg(feature = "epilogue")]
 impl<O: QuantOut> KernelFamily for IntGemmQ<O> {
     type Lhs = i8;
     type Rhs = i8;
@@ -590,14 +594,17 @@ impl<O: QuantOut> KernelFamily for IntGemmQ<O> {
 /// VNNI's grouped sum is bit-equal to the widen sum (int.rs modular associativity + bias
 /// correction), so `IntGemmVnniQ<O>` and `IntGemmQ<O>` requantize to identical output. `O`
 /// defaults to `i8` (so bare `IntGemmVnniQ` means `IntGemmVnniQ<i8>`).
+#[cfg(feature = "epilogue")]
 #[derive(Clone, Copy)]
 pub struct IntGemmVnniQ<O = i8>(PhantomData<O>);
 
+#[cfg(feature = "epilogue")]
 impl<O> IntGemmVnniQ<O> {
     /// Depth steps folded per `vpdpbusd`.
     const Q: usize = 4;
 }
 
+#[cfg(feature = "epilogue")]
 impl<O: QuantOut> KernelFamily for IntGemmVnniQ<O> {
     type Lhs = i8;
     type Rhs = i8;

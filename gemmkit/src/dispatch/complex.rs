@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 use super::isa::{ForcedIsa, forced_isa};
 use super::{Task, orient_transpose, scale_c_float};
 use crate::driver;
-#[cfg(feature = "complex")]
+#[cfg(all(feature = "complex", feature = "epilogue"))]
 use crate::kernel::epilogue::{BiasSpec, Epilogue, FusedEpi};
 use crate::parallel::Parallelism;
 #[cfg(target_arch = "aarch64")]
@@ -94,7 +94,7 @@ unsafe fn run_complex<T, S, const MR_REG: usize, const NR: usize>(
 /// # Safety
 /// `t`'s pointers valid; `c` not aliasing `a`/`b`; `epi`'s bias valid for the (pre-swap) problem's
 /// `m`/`n`. Run after the degenerate check.
-#[cfg(feature = "complex")]
+#[cfg(all(feature = "complex", feature = "epilogue"))]
 #[inline]
 unsafe fn run_complex_fused<T, S, const MR_REG: usize, const NR: usize>(
     simd: S,
@@ -174,6 +174,7 @@ pub trait ComplexScalar: crate::scalar::ComplexFloat {
     /// `t`'s pointers valid; `c` not aliasing `a`/`b`; `epi`'s bias valid for the problem's
     /// `m`/`n`.
     #[doc(hidden)]
+    #[cfg(feature = "epilogue")]
     unsafe fn dispatch_complex_fused(
         conj_a: bool,
         conj_b: bool,
@@ -216,7 +217,7 @@ pub(crate) unsafe fn execute_complex<T: ComplexScalar>(
 ///
 /// # Safety
 /// `c` valid for the `m × n` region; `epi`'s bias valid for the problem's `m`/`n`.
-#[cfg(feature = "complex")]
+#[cfg(all(feature = "complex", feature = "epilogue"))]
 unsafe fn fused_degenerate_cplx<T>(t: &Task<T>, epi: &FusedEpi<T>)
 where
     T: crate::scalar::ComplexFloat,
@@ -249,7 +250,7 @@ where
 /// # Safety
 /// `t`'s pointers valid for the implied regions; `c` not aliasing `a`/`b`; `epi`'s bias valid for
 /// the problem's `m`/`n` (the API validates this).
-#[cfg(feature = "complex")]
+#[cfg(all(feature = "complex", feature = "epilogue"))]
 pub(crate) unsafe fn execute_complex_fused<T: ComplexScalar>(
     conj_a: bool,
     conj_b: bool,
@@ -277,7 +278,7 @@ type CplxFn<T> = unsafe fn(bool, bool, Task<T>, Parallelism, &mut Workspace);
 
 /// The fused-bias complex kernel entry: a plain [`Task`] plus the runtime-composed [`FusedEpi`]
 /// (bias-only for complex). Non-optional — every dispatched complex type supplies one.
-#[cfg(feature = "complex")]
+#[cfg(all(feature = "complex", feature = "epilogue"))]
 type CplxFusedFn<T> = unsafe fn(bool, bool, Task<T>, FusedEpi<T>, Parallelism, &mut Workspace);
 
 #[cfg(feature = "complex")]
@@ -285,6 +286,7 @@ type CplxFusedFn<T> = unsafe fn(bool, bool, Task<T>, FusedEpi<T>, Parallelism, &
 struct CplxDispatched<T> {
     run: CplxFn<T>,
     /// Fused-bias entry (same tile as `run`; the epilogue is tile-local).
+    #[cfg(feature = "epilogue")]
     run_fused: CplxFusedFn<T>,
 }
 
@@ -358,7 +360,7 @@ unsafe fn gemm_c64_simd128(ca: bool, cb: bool, t: Task<C64>, par: Parallelism, w
 // ---- fused-bias entry points: one per (c32/c64, ISA), SAME tiles as the plain wrappers (the
 // bias epilogue is a tile-local post-pass, so the accumulator-register budget is unchanged) ----
 
-#[cfg(feature = "complex")]
+#[cfg(all(feature = "complex", feature = "epilogue"))]
 unsafe fn gemm_c32_scalar_fused(
     ca: bool,
     cb: bool,
@@ -369,7 +371,7 @@ unsafe fn gemm_c32_scalar_fused(
 ) {
     unsafe { run_complex_fused::<C32, ScalarTok, 4, 4>(ScalarTok, ca, cb, t, epi, par, ws) }
 }
-#[cfg(feature = "complex")]
+#[cfg(all(feature = "complex", feature = "epilogue"))]
 unsafe fn gemm_c64_scalar_fused(
     ca: bool,
     cb: bool,
@@ -380,7 +382,11 @@ unsafe fn gemm_c64_scalar_fused(
 ) {
     unsafe { run_complex_fused::<C64, ScalarTok, 4, 4>(ScalarTok, ca, cb, t, epi, par, ws) }
 }
-#[cfg(all(feature = "complex", any(target_arch = "x86", target_arch = "x86_64")))]
+#[cfg(all(
+    feature = "complex",
+    feature = "epilogue",
+    any(target_arch = "x86", target_arch = "x86_64")
+))]
 unsafe fn gemm_c32_fma_fused(
     ca: bool,
     cb: bool,
@@ -391,7 +397,11 @@ unsafe fn gemm_c32_fma_fused(
 ) {
     unsafe { run_complex_fused::<C32, Fma, 1, 5>(Fma, ca, cb, t, epi, par, ws) }
 }
-#[cfg(all(feature = "complex", any(target_arch = "x86", target_arch = "x86_64")))]
+#[cfg(all(
+    feature = "complex",
+    feature = "epilogue",
+    any(target_arch = "x86", target_arch = "x86_64")
+))]
 unsafe fn gemm_c64_fma_fused(
     ca: bool,
     cb: bool,
@@ -402,7 +412,11 @@ unsafe fn gemm_c64_fma_fused(
 ) {
     unsafe { run_complex_fused::<C64, Fma, 1, 5>(Fma, ca, cb, t, epi, par, ws) }
 }
-#[cfg(all(feature = "complex", any(target_arch = "x86", target_arch = "x86_64")))]
+#[cfg(all(
+    feature = "complex",
+    feature = "epilogue",
+    any(target_arch = "x86", target_arch = "x86_64")
+))]
 unsafe fn gemm_c32_avx512_fused(
     ca: bool,
     cb: bool,
@@ -413,7 +427,11 @@ unsafe fn gemm_c32_avx512_fused(
 ) {
     unsafe { run_complex_fused::<C32, Avx512, 2, 6>(Avx512, ca, cb, t, epi, par, ws) }
 }
-#[cfg(all(feature = "complex", any(target_arch = "x86", target_arch = "x86_64")))]
+#[cfg(all(
+    feature = "complex",
+    feature = "epilogue",
+    any(target_arch = "x86", target_arch = "x86_64")
+))]
 unsafe fn gemm_c64_avx512_fused(
     ca: bool,
     cb: bool,
@@ -424,7 +442,7 @@ unsafe fn gemm_c64_avx512_fused(
 ) {
     unsafe { run_complex_fused::<C64, Avx512, 2, 6>(Avx512, ca, cb, t, epi, par, ws) }
 }
-#[cfg(all(feature = "complex", target_arch = "aarch64"))]
+#[cfg(all(feature = "complex", feature = "epilogue", target_arch = "aarch64"))]
 unsafe fn gemm_c32_neon_fused(
     ca: bool,
     cb: bool,
@@ -435,7 +453,7 @@ unsafe fn gemm_c32_neon_fused(
 ) {
     unsafe { run_complex_fused::<C32, Neon, 2, 5>(Neon, ca, cb, t, epi, par, ws) }
 }
-#[cfg(all(feature = "complex", target_arch = "aarch64"))]
+#[cfg(all(feature = "complex", feature = "epilogue", target_arch = "aarch64"))]
 unsafe fn gemm_c64_neon_fused(
     ca: bool,
     cb: bool,
@@ -449,6 +467,7 @@ unsafe fn gemm_c64_neon_fused(
 #[cfg(all(
     feature = "complex",
     target_arch = "wasm32",
+    feature = "epilogue",
     target_feature = "simd128"
 ))]
 unsafe fn gemm_c32_simd128_fused(
@@ -464,6 +483,7 @@ unsafe fn gemm_c32_simd128_fused(
 #[cfg(all(
     feature = "complex",
     target_arch = "wasm32",
+    feature = "epilogue",
     target_feature = "simd128"
 ))]
 unsafe fn gemm_c64_simd128_fused(
@@ -480,41 +500,49 @@ unsafe fn gemm_c64_simd128_fused(
 #[cfg(feature = "complex")]
 const CDISP_C32_SCALAR: CplxDispatched<C32> = CplxDispatched {
     run: gemm_c32_scalar,
+    #[cfg(feature = "epilogue")]
     run_fused: gemm_c32_scalar_fused,
 };
 #[cfg(feature = "complex")]
 const CDISP_C64_SCALAR: CplxDispatched<C64> = CplxDispatched {
     run: gemm_c64_scalar,
+    #[cfg(feature = "epilogue")]
     run_fused: gemm_c64_scalar_fused,
 };
 #[cfg(all(feature = "complex", any(target_arch = "x86", target_arch = "x86_64")))]
 const CDISP_C32_FMA: CplxDispatched<C32> = CplxDispatched {
     run: gemm_c32_fma,
+    #[cfg(feature = "epilogue")]
     run_fused: gemm_c32_fma_fused,
 };
 #[cfg(all(feature = "complex", any(target_arch = "x86", target_arch = "x86_64")))]
 const CDISP_C64_FMA: CplxDispatched<C64> = CplxDispatched {
     run: gemm_c64_fma,
+    #[cfg(feature = "epilogue")]
     run_fused: gemm_c64_fma_fused,
 };
 #[cfg(all(feature = "complex", any(target_arch = "x86", target_arch = "x86_64")))]
 const CDISP_C32_AVX512: CplxDispatched<C32> = CplxDispatched {
     run: gemm_c32_avx512,
+    #[cfg(feature = "epilogue")]
     run_fused: gemm_c32_avx512_fused,
 };
 #[cfg(all(feature = "complex", any(target_arch = "x86", target_arch = "x86_64")))]
 const CDISP_C64_AVX512: CplxDispatched<C64> = CplxDispatched {
     run: gemm_c64_avx512,
+    #[cfg(feature = "epilogue")]
     run_fused: gemm_c64_avx512_fused,
 };
 #[cfg(all(feature = "complex", target_arch = "aarch64"))]
 const CDISP_C32_NEON: CplxDispatched<C32> = CplxDispatched {
     run: gemm_c32_neon,
+    #[cfg(feature = "epilogue")]
     run_fused: gemm_c32_neon_fused,
 };
 #[cfg(all(feature = "complex", target_arch = "aarch64"))]
 const CDISP_C64_NEON: CplxDispatched<C64> = CplxDispatched {
     run: gemm_c64_neon,
+    #[cfg(feature = "epilogue")]
     run_fused: gemm_c64_neon_fused,
 };
 #[cfg(all(
@@ -524,6 +552,7 @@ const CDISP_C64_NEON: CplxDispatched<C64> = CplxDispatched {
 ))]
 const CDISP_C32_SIMD128: CplxDispatched<C32> = CplxDispatched {
     run: gemm_c32_simd128,
+    #[cfg(feature = "epilogue")]
     run_fused: gemm_c32_simd128_fused,
 };
 #[cfg(all(
@@ -533,6 +562,7 @@ const CDISP_C32_SIMD128: CplxDispatched<C32> = CplxDispatched {
 ))]
 const CDISP_C64_SIMD128: CplxDispatched<C64> = CplxDispatched {
     run: gemm_c64_simd128,
+    #[cfg(feature = "epilogue")]
     run_fused: gemm_c64_simd128_fused,
 };
 
@@ -702,6 +732,7 @@ impl ComplexScalar for C32 {
         let d = dispatched_c32();
         unsafe { (d.run)(ca, cb, t, par, ws) }
     }
+    #[cfg(feature = "epilogue")]
     #[inline]
     unsafe fn dispatch_complex_fused(
         ca: bool,
@@ -728,6 +759,7 @@ impl ComplexScalar for C64 {
         let d = dispatched_c64();
         unsafe { (d.run)(ca, cb, t, par, ws) }
     }
+    #[cfg(feature = "epilogue")]
     #[inline]
     unsafe fn dispatch_complex_fused(
         ca: bool,

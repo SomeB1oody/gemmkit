@@ -20,8 +20,11 @@
 //! the exact round-half-to-even [`round_ne_f64`]).
 
 use super::KernelFamily;
+#[cfg(feature = "epilogue")]
 use super::float::FloatGemm;
+#[cfg(feature = "epilogue")]
 use crate::parallel::Ptr;
+#[cfg(feature = "epilogue")]
 use crate::scalar::Float;
 use crate::simd::{KernelSimd, SimdOps};
 
@@ -132,6 +135,7 @@ impl<Fam: KernelFamily> Epilogue<Fam> for Identity {
 
 /// Which axis a bias vector is indexed on: per output **row** (`m`) or per output
 /// **column** (`n`). The dispatch layer flips this on an orientation swap.
+#[cfg(feature = "epilogue")]
 #[derive(Copy, Clone)]
 pub enum BiasDim {
     /// One bias value per output row (length `m`).
@@ -143,6 +147,7 @@ pub enum BiasDim {
 /// A bias vector in the driver (oriented) frame. `Ptr` is the `Send + Sync` raw-pointer
 /// shim (the bias slice outlives the call; the borrow is erased to `Ptr` in the call frame
 /// where it is live).
+#[cfg(feature = "epilogue")]
 #[derive(Copy, Clone)]
 pub(crate) enum BiasSpec<T> {
     /// No bias.
@@ -154,6 +159,7 @@ pub(crate) enum BiasSpec<T> {
 }
 
 /// The activation applied after the bias add.
+#[cfg(feature = "epilogue")]
 #[derive(Copy, Clone)]
 pub(crate) enum Act<T> {
     /// No activation.
@@ -171,6 +177,7 @@ pub(crate) enum Act<T> {
 ///
 /// It is a `pub` type with crate-private fields (constructed only by the API layer), so it
 /// can appear in the dispatch slot's function-pointer type without leaking its internals.
+#[cfg(feature = "epilogue")]
 #[derive(Copy, Clone)]
 pub struct FusedEpi<T> {
     pub(crate) bias: BiasSpec<T>,
@@ -181,6 +188,7 @@ pub struct FusedEpi<T> {
 // this kernel-layer file free of any dispatch-layer dependency, and it selects exactly the
 // real floats — `Complex` implements `Float` but not `PartialOrd`, so it is excluded, and
 // `f16`/`bf16` are not `Float`. The public API seals the surface with `FusedScalar`.
+#[cfg(feature = "epilogue")]
 impl<T: Float<Acc = T> + PartialOrd> Epilogue<FloatGemm<T>> for FusedEpi<T> {
     const VECTOR: bool = true;
 
@@ -248,7 +256,7 @@ impl<T: Float<Acc = T> + PartialOrd> Epilogue<FloatGemm<T>> for FusedEpi<T> {
 // the scalar/scratch path agree bit-for-bit: both compute `act(bias(v))` in `f32` and round
 // exactly once (`apply` via [`crate::scalar::NarrowFloat::narrow`], `apply_reg` via `store_out`),
 // and widening is exact — the `accumulate_tile` edge-consistency contract.
-#[cfg(feature = "half")]
+#[cfg(all(feature = "half", feature = "epilogue"))]
 impl<N, Fam> Epilogue<Fam> for FusedEpi<N>
 where
     N: crate::scalar::NarrowFloat,
@@ -328,7 +336,7 @@ where
 // `apply_store` here — only the scalar `apply`. Because the kernel first stores exactly the bits
 // plain `gemm_cplx` would, the post-pass makes `gemm_cplx_fused` bitwise-identical to `gemm_cplx`
 // then the same element-wise bias add.
-#[cfg(feature = "complex")]
+#[cfg(all(feature = "complex", feature = "epilogue"))]
 impl<T, const CA: bool, const CB: bool> Epilogue<crate::kernel::ComplexGemm<T, CA, CB>>
     for FusedEpi<T>
 where
@@ -360,7 +368,7 @@ where
 /// `KRequantize` impl and one requant family serve both. The narrowing `from_clamped` is only
 /// ever handed a value already in `[LO, HI]`, so the `as` cast is a plain reinterpret of the
 /// low byte (no saturation), matching the vector store's low-byte write.
-#[cfg(feature = "int8")]
+#[cfg(all(feature = "int8", feature = "epilogue"))]
 pub(crate) trait QuantOut: crate::scalar::Scalar {
     /// Inclusive clamp bounds of the output domain.
     const LO: i32;
@@ -370,7 +378,7 @@ pub(crate) trait QuantOut: crate::scalar::Scalar {
     fn from_clamped(q: i64) -> Self;
 }
 
-#[cfg(feature = "int8")]
+#[cfg(all(feature = "int8", feature = "epilogue"))]
 impl QuantOut for i8 {
     const LO: i32 = -128;
     const HI: i32 = 127;
@@ -380,7 +388,7 @@ impl QuantOut for i8 {
     }
 }
 
-#[cfg(feature = "int8")]
+#[cfg(all(feature = "int8", feature = "epilogue"))]
 impl QuantOut for u8 {
     const LO: i32 = 0;
     const HI: i32 = 255;
@@ -404,7 +412,7 @@ impl QuantOut for u8 {
 /// ISAs (scalar / NEON / wasm) take the scalar [`KRequantize::apply`]. The two are **bit-identical**
 /// (the `requant_store` equivalence contract), so a single matrix mixes them freely. Either way
 /// this beats the unfused flow, which materializes a full `m·n` `i32` C.
-#[cfg(feature = "int8")]
+#[cfg(all(feature = "int8", feature = "epilogue"))]
 #[derive(Copy, Clone)]
 pub(crate) struct KRequantize {
     pub scale: f32,
@@ -414,7 +422,7 @@ pub(crate) struct KRequantize {
     pub bias: BiasSpec<i32>,
 }
 
-#[cfg(feature = "int8")]
+#[cfg(all(feature = "int8", feature = "epilogue"))]
 impl<O: QuantOut, Fam: KernelFamily<Acc = i32, Out = O>> Epilogue<Fam> for KRequantize {
     // `VECTOR = false`: requantize has no float-style in-register `apply_reg` path (`Out != Acc`,
     // and the clamp/round is not a `store_out` narrowing). Its vector form is the store-transform
@@ -481,7 +489,7 @@ impl<O: QuantOut, Fam: KernelFamily<Acc = i32, Out = O>> Epilogue<Fam> for KRequ
 /// `|x| < 2^52`, adding then removing the `2^52` magnitude constant snaps `x` to the
 /// nearest integer under the default round-to-nearest-even mode; `|x| >= 2^52` is already
 /// integral. Uses only comparisons and `f64` add/sub, so it needs no `std` float methods.
-#[cfg(feature = "int8")]
+#[cfg(all(feature = "int8", feature = "epilogue"))]
 #[inline(always)]
 pub(crate) fn round_ne_f64(x: f64) -> f64 {
     const C: f64 = 4503599627370496.0; // 2^52

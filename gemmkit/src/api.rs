@@ -13,35 +13,41 @@
 //! the output C is **not read**, so it may be uninitialized.
 
 use crate::dispatch::{self, GemmScalar, Task};
+#[cfg(feature = "epilogue")]
 use crate::kernel::epilogue::{Act, BiasSpec, FusedEpi};
-use crate::parallel::{Parallelism, Ptr};
+use crate::parallel::Parallelism;
+#[cfg(feature = "epilogue")]
+use crate::parallel::Ptr;
 use crate::workspace::{self, Workspace};
 
 mod batched;
 #[cfg(feature = "complex")]
 mod cplx;
+#[cfg(feature = "epilogue")]
 mod fused;
 #[cfg(feature = "int8")]
 mod int8;
 mod packed;
 
 pub use batched::{
-    BatchProblem, gemm_batched, gemm_batched_fused, gemm_batched_fused_with,
-    gemm_batched_ptr_unchecked, gemm_batched_slice, gemm_batched_unchecked,
-    gemm_batched_unchecked_with, gemm_batched_with,
+    BatchProblem, gemm_batched, gemm_batched_ptr_unchecked, gemm_batched_slice,
+    gemm_batched_unchecked, gemm_batched_unchecked_with, gemm_batched_with,
 };
+#[cfg(feature = "epilogue")]
+pub use batched::{gemm_batched_fused, gemm_batched_fused_with};
 #[cfg(feature = "complex")]
-pub use cplx::{
-    gemm_cplx, gemm_cplx_fused, gemm_cplx_fused_with, gemm_cplx_unchecked,
-    gemm_cplx_unchecked_with, gemm_cplx_with,
-};
+pub use cplx::{gemm_cplx, gemm_cplx_unchecked, gemm_cplx_unchecked_with, gemm_cplx_with};
+#[cfg(all(feature = "complex", feature = "epilogue"))]
+pub use cplx::{gemm_cplx_fused, gemm_cplx_fused_with};
+#[cfg(feature = "epilogue")]
 pub use fused::{Activation, Bias, gemm_fused, gemm_fused_unchecked, gemm_fused_with};
-#[cfg(feature = "int8")]
+#[cfg(all(feature = "int8", feature = "epilogue"))]
 pub use int8::{
-    Requantize, gemm_i8, gemm_i8_requant, gemm_i8_requant_u8, gemm_i8_requant_u8_unchecked,
-    gemm_i8_requant_u8_with, gemm_i8_requant_unchecked, gemm_i8_requant_with, gemm_i8_unchecked,
-    gemm_i8_unchecked_with, gemm_i8_with,
+    Requantize, gemm_i8_requant, gemm_i8_requant_u8, gemm_i8_requant_u8_unchecked,
+    gemm_i8_requant_u8_with, gemm_i8_requant_unchecked, gemm_i8_requant_with,
 };
+#[cfg(feature = "int8")]
+pub use int8::{gemm_i8, gemm_i8_unchecked, gemm_i8_unchecked_with, gemm_i8_with};
 pub use packed::{
     PackedLhs, PackedRhs, gemm_packed_a, gemm_packed_a_unchecked, gemm_packed_a_unchecked_with,
     gemm_packed_a_with, gemm_packed_b, gemm_packed_b_unchecked, gemm_packed_b_unchecked_with,
@@ -260,6 +266,7 @@ fn validate_gemm_views<TI, TO>(a: &MatRef<'_, TI>, b: &MatRef<'_, TI>, c: &MatMu
 /// messages are worded identically to the historic per-entry blocks (tests match the substrings),
 /// so this helper is the single source of that byte-for-byte wording. The activation /
 /// `LeakyRelu`-slope check is entry-local (complex has no activation) and stays at the call sites.
+#[cfg(feature = "epilogue")]
 fn validate_bias<T>(bias: &Option<Bias<'_, T>>, m: usize, n: usize, c: &MatMut<'_, T>) {
     if let Some(bd) = bias {
         let (bp, bl) = match bd {
@@ -296,6 +303,7 @@ fn validate_bias<T>(bias: &Option<Bias<'_, T>>, m: usize, n: usize, c: &MatMut<'
 /// full fused entries (`gemm_fused_with`, `gemm_batched_fused_with`); the complex entry builds its
 /// own bias-only [`FusedEpi`] (no activation) and `gemm_fused_unchecked` lowers raw pointers
 /// directly, so neither routes through here.
+#[cfg(feature = "epilogue")]
 fn to_fused_epi<T>(bias: Option<Bias<'_, T>>, act: Option<Activation<T>>) -> FusedEpi<T> {
     let bias = match bias {
         None => BiasSpec::None,

@@ -22,6 +22,9 @@ complex = ["dep:num-complex"] # c32/c64 GEMM with conjA/conjB (`gemm_cplx`)
 half = ["dep:half"] # f16/bf16 mixed-precision GEMM (f32 accumulate)
 int8 = [] # i8 -> i32 integer GEMM (`gemm_i8`)
 
+# Optional capability
+epilogue = [] # fused epilogues: bias/activation (gemm_fused*, gemm_batched_fused*, gemm_cplx_fused*) and requantized int8/u8 output (gemm_i8_requant*, with "int8")
+
 [dependencies]
 rayon = { version = "1.10", optional = true }
 half = { version = "2", default-features = false, optional = true }

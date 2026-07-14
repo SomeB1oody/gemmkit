@@ -1,7 +1,9 @@
 //! Complex GEMM entries with optional conjugation.
 use super::*;
 use crate::dispatch::ComplexScalar;
+#[cfg(feature = "epilogue")]
 use crate::kernel::epilogue::{Act, BiasSpec, FusedEpi};
+#[cfg(feature = "epilogue")]
 use crate::parallel::Ptr;
 
 /// Complex GEMM with optional conjugation: `C <- alpha·op(A)·op(B) + beta·C` where
@@ -108,7 +110,7 @@ pub fn gemm_cplx_with<T: ComplexScalar>(
 /// # Panics
 /// Same shape / bounds / aliasing conditions as [`gemm_cplx`], plus: a `PerRow` bias whose length
 /// is not `A.rows` (or a `PerCol` bias not `B.cols`), or a bias slice that overlaps `C`.
-#[cfg(feature = "complex")]
+#[cfg(all(feature = "complex", feature = "epilogue"))]
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_cplx_fused<T: ComplexScalar>(
     alpha: T,
@@ -130,7 +132,7 @@ pub fn gemm_cplx_fused<T: ComplexScalar>(
 ///
 /// # Panics
 /// Same conditions as [`gemm_cplx_fused`].
-#[cfg(feature = "complex")]
+#[cfg(all(feature = "complex", feature = "epilogue"))]
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_cplx_fused_with<T: ComplexScalar>(
     ws: &mut Workspace,

@@ -16,7 +16,10 @@
 //! workers and so is gated to `m, n > 1` shapes, whose route reduces each output within one worker
 //! (serial and parallel agree bit-for-bit under the current thread-independent blocking).
 
-use crate::dispatch::{self, FusedScalar, GemmProblem, GemmScalar, Task};
+#[cfg(feature = "epilogue")]
+use crate::dispatch::FusedScalar;
+use crate::dispatch::{self, GemmProblem, GemmScalar, Task};
+#[cfg(feature = "epilogue")]
 use crate::kernel::epilogue::FusedEpi;
 use crate::parallel::{self, BatchPlan, JobCursor, Parallelism, Ptr};
 use crate::workspace::{self, Workspace};
@@ -164,8 +167,27 @@ pub(crate) unsafe fn run<T: GemmScalar>(
     // Plain per-element engine: forward each element's task to `dispatch::execute`.
     unsafe {
         schedule(
-            batch, m, k, n, alpha, a, rsa, csa, a_bs, b, rsb, csb, b_bs, beta, c, rsc, csc, c_bs,
-            par, ws, |task, par, ws| dispatch::execute(task, par, ws),
+            batch,
+            m,
+            k,
+            n,
+            alpha,
+            a,
+            rsa,
+            csa,
+            a_bs,
+            b,
+            rsb,
+            csb,
+            b_bs,
+            beta,
+            c,
+            rsc,
+            csc,
+            c_bs,
+            par,
+            ws,
+            |task, par, ws| dispatch::execute(task, par, ws),
         );
     }
 }
@@ -193,6 +215,7 @@ pub(crate) unsafe fn run<T: GemmScalar>(
 /// # Safety
 /// As [`run`], plus: `epi`'s bias pointer is valid for the element's `m` (`PerRow`) / `n`
 /// (`PerCol`) and does not alias any `C` region (the safe API validates this).
+#[cfg(feature = "epilogue")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn run_fused<T: FusedScalar>(
     batch: usize,
@@ -221,8 +244,27 @@ pub(crate) unsafe fn run_fused<T: FusedScalar>(
     // `dispatch::execute_fused` (`epi` is `Copy`, captured into the workers by the skeleton).
     unsafe {
         schedule(
-            batch, m, k, n, alpha, a, rsa, csa, a_bs, b, rsb, csb, b_bs, beta, c, rsc, csc, c_bs,
-            par, ws, move |task, par, ws| dispatch::execute_fused(task, epi, par, ws),
+            batch,
+            m,
+            k,
+            n,
+            alpha,
+            a,
+            rsa,
+            csa,
+            a_bs,
+            b,
+            rsb,
+            csb,
+            b_bs,
+            beta,
+            c,
+            rsc,
+            csc,
+            c_bs,
+            par,
+            ws,
+            move |task, par, ws| dispatch::execute_fused(task, epi, par, ws),
         );
     }
 }

@@ -49,12 +49,19 @@ mod mixed;
 #[cfg(feature = "complex")]
 pub use complex::ComplexScalar;
 #[cfg(feature = "complex")]
-pub(crate) use complex::{execute_complex, execute_complex_fused};
+pub(crate) use complex::execute_complex;
+#[cfg(all(feature = "complex", feature = "epilogue"))]
+pub(crate) use complex::execute_complex_fused;
+#[cfg(feature = "epilogue")]
 pub use float::FusedScalar;
+#[cfg(feature = "epilogue")]
 pub(crate) use float::execute_fused;
 #[cfg(feature = "int8")]
-pub(crate) use int::{IntTask, RequantTask, execute_int, execute_int_requant};
+pub(crate) use int::{IntTask, execute_int};
+#[cfg(all(feature = "int8", feature = "epilogue"))]
+pub(crate) use int::{RequantTask, execute_int_requant};
 
+#[cfg(feature = "epilogue")]
 use crate::kernel::epilogue::FusedEpi;
 use crate::parallel::Parallelism;
 use crate::scalar::{Float, Scalar};
@@ -267,6 +274,7 @@ pub trait GemmScalar: Scalar {
     /// `task`'s pointers valid and `c` not aliasing `a`/`b`; `epi`'s bias valid and disjoint
     /// from `c` (validated by the API layer).
     #[doc(hidden)]
+    #[cfg(feature = "epilogue")]
     unsafe fn dispatch_fused(
         task: Task<Self>,
         epi: FusedEpi<Self>,

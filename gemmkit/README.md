@@ -66,6 +66,9 @@ for _ in 0..1000 {
 - `half` — `f16`/`bf16` mixed-precision GEMM with f32 accumulation.
 - `int8` — `i8 → i32` integer GEMM (`gemm_i8`); arithmetic wraps on overflow.
 - `complex` — `c32`/`c64` complex GEMM with optional conjugation of A/B (`gemm_cplx`).
+- `epilogue` — fused epilogues: bias/activation (`gemm_fused*`, `gemm_batched_fused*`,
+  and with `complex` `gemm_cplx_fused*`) and, with `int8`, requantized `i8`/`u8` output
+  (`gemm_i8_requant*`). Off by default; a plain-GEMM build pays for none of its codegen.
 
 ## Tuning
 

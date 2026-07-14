@@ -13,6 +13,9 @@
 //! and [`requant`] the `i8 -> i8` requantize path (whose exact `i32` accumulation makes its oracle
 //! hold bitwise under every `GEMMKIT_REQUIRE_ISA` pin).
 
+// This whole suite exercises the fused-epilogue / requantize surface, which is gated behind the
+// `epilogue` cargo feature; compile it away entirely when the feature is off.
+#![cfg(feature = "epilogue")]
 // The index loops walk C and the bias vectors at different (strided) offsets, so explicit
 // indices read clearer than zipped iterators here.
 #![allow(clippy::too_many_arguments, clippy::needless_range_loop)]

@@ -44,9 +44,13 @@
 //!   ([`gemm_cplx`]); pulls in `num-complex`.
 //! * `half` — `f16`/`bf16` mixed-precision GEMM (`f32` accumulate); pulls in `half`.
 //! * `int8` — `i8 -> i32` integer GEMM ([`gemm_i8`]); no extra dependency.
+//! * `epilogue` — fused epilogues: bias/activation ([`gemm_fused`],
+//!   `gemm_batched_fused*`, and, with `complex`, `gemm_cplx_fused*`) and, with
+//!   `int8`, requantized `i8`/`u8` output (`gemm_i8_requant*`); no extra dependency.
 //!
 //! These three element-type families are off by default, so a plain `f32`/`f64`
-//! build pays for none of their codegen or dependencies.
+//! build pays for none of their codegen or dependencies. The `epilogue` capability
+//! is likewise off by default, so a plain-GEMM build pays for none of its codegen.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![warn(missing_docs)]
@@ -70,31 +74,37 @@ mod parallel;
 mod special;
 mod workspace;
 
+#[cfg(feature = "epilogue")]
 pub use api::{
-    Activation, BatchProblem, Bias, MatMut, MatRef, PackedLhs, PackedRhs, gemm, gemm_batched,
-    gemm_batched_fused, gemm_batched_fused_with, gemm_batched_ptr_unchecked, gemm_batched_slice,
-    gemm_batched_unchecked, gemm_batched_unchecked_with, gemm_batched_with, gemm_fused,
-    gemm_fused_unchecked, gemm_fused_with, gemm_packed_a, gemm_packed_a_unchecked,
+    Activation, Bias, gemm_batched_fused, gemm_batched_fused_with, gemm_fused,
+    gemm_fused_unchecked, gemm_fused_with,
+};
+pub use api::{
+    BatchProblem, MatMut, MatRef, PackedLhs, PackedRhs, gemm, gemm_batched,
+    gemm_batched_ptr_unchecked, gemm_batched_slice, gemm_batched_unchecked,
+    gemm_batched_unchecked_with, gemm_batched_with, gemm_packed_a, gemm_packed_a_unchecked,
     gemm_packed_a_unchecked_with, gemm_packed_a_with, gemm_packed_b, gemm_packed_b_unchecked,
     gemm_packed_b_unchecked_with, gemm_packed_b_with, gemm_unchecked, gemm_unchecked_with,
     gemm_with, prepack_lhs, prepack_lhs_unchecked, prepack_rhs, prepack_rhs_unchecked,
 };
-#[cfg(feature = "int8")]
+#[cfg(all(feature = "int8", feature = "epilogue"))]
 pub use api::{
-    Requantize, gemm_i8, gemm_i8_requant, gemm_i8_requant_u8, gemm_i8_requant_u8_unchecked,
-    gemm_i8_requant_u8_with, gemm_i8_requant_unchecked, gemm_i8_requant_with, gemm_i8_unchecked,
-    gemm_i8_unchecked_with, gemm_i8_with,
+    Requantize, gemm_i8_requant, gemm_i8_requant_u8, gemm_i8_requant_u8_unchecked,
+    gemm_i8_requant_u8_with, gemm_i8_requant_unchecked, gemm_i8_requant_with,
 };
 #[cfg(feature = "complex")]
-pub use api::{
-    gemm_cplx, gemm_cplx_fused, gemm_cplx_fused_with, gemm_cplx_unchecked,
-    gemm_cplx_unchecked_with, gemm_cplx_with,
-};
+pub use api::{gemm_cplx, gemm_cplx_unchecked, gemm_cplx_unchecked_with, gemm_cplx_with};
+#[cfg(all(feature = "complex", feature = "epilogue"))]
+pub use api::{gemm_cplx_fused, gemm_cplx_fused_with};
+#[cfg(feature = "int8")]
+pub use api::{gemm_i8, gemm_i8_unchecked, gemm_i8_unchecked_with, gemm_i8_with};
 #[cfg(feature = "complex")]
 pub use dispatch::ComplexScalar;
+#[cfg(feature = "epilogue")]
 pub use dispatch::FusedScalar;
 pub use dispatch::GemmProblem;
 pub use dispatch::GemmScalar;
+#[cfg(feature = "epilogue")]
 pub use kernel::epilogue::BiasDim;
 pub use parallel::Parallelism;
 #[cfg(feature = "complex")]

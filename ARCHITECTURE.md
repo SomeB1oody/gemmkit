@@ -151,6 +151,17 @@ and orthogonal to the seam: each feature toggles a family's kernel, its per-ISA
 packing framework, cache model, and parallelism are untouched, so a plain `f32`/`f64`
 build pays for none of their codegen or dependencies.
 
+A fourth, **off-by-default capability feature** `epilogue` (no dependency) gates the
+entire fused-epilogue / requantized-output surface: the `FusedEpi` bias/activation
+epilogue and its `gemm_fused*` / `gemm_batched_fused*` / `gemm_cplx_fused*` entries, plus
+the `KRequantize` epilogue and the `IntGemmQ`/`IntGemmVnniQ` requant families with their
+`gemm_i8_requant*` entries. It composes with the element-type features — a `half`/`complex`
+fused epilogue needs `half`+`epilogue` / `complex`+`epilogue`, and requant needs
+`int8`+`epilogue`. The plain-GEMM path (the zero-cost `Identity` epilogue: the `Epilogue`
+trait, the driver's `run_epilogue` threading, and every family's `microkernel_epi`) is
+**unconditional**, so with `epilogue` off `gemm`/`gemm_i8`/`gemm_cplx` are unchanged and
+pay for none of the fused codegen.
+
 **Complex (op-family seam) — a dedicated split (SoA) kernel.** `ComplexGemm` does
 **not** ride `FloatGemm`. The product runs in the **structure-of-arrays** layout: real
 and imaginary planes in **separate accumulator registers**, so one complex
@@ -230,7 +241,11 @@ real strides — one scratch tile per call, no lookup grid. `β == 0` never read
 
 A second L1 seam, [`Epilogue<Fam>`], fuses a per-element transform into the store —
 `C[r,c] <- apply(α·AB + β·C, r, c)` — instead of materializing the raw product and
-mapping it in a second pass. It is threaded through a **provided** family method,
+mapping it in a second pass. The seam itself — the `Epilogue` trait, the zero-cost
+`Identity`, the driver's `run_epilogue`, and every family's `microkernel_epi` — is
+**unconditional** (it is the plain-GEMM store path); the concrete fused epilogues below
+(`FusedEpi`, `KRequantize`) and their public entries are gated behind the `epilogue`
+feature (requant additionally behind `int8`). It is threaded through a **provided** family method,
 `KernelFamily::microkernel_epi(.., row0, col0, last_k, epi, ..)`, whose default just
 forwards to `microkernel` (so the `i32`-out integer families are byte-for-byte unchanged and only
 debug-assert the epilogue is `Identity`). A family implements exactly **one** of the pair:
@@ -543,7 +558,8 @@ call.
   reused operand once into the micropanel layout, then skip the per-call repack across many products
   (the fixed-weight inference pattern). RHS-packed needs column-major-ish C, LHS-packed
   row-major-ish — the no-swap orientation the prepacked operand was laid out for.
-- **Fused** ([`gemm_fused`] / `gemm_fused_with`): `C <- act(α·A·B + β·C + bias)` in one pass, with
+- **Fused** ([`gemm_fused`] / `gemm_fused_with`; `epilogue` feature): `C <- act(α·A·B + β·C + bias)`
+  in one pass, with
   an optional per-row/per-col `Bias` and an optional `Activation` (ReLU/LeakyReLU) — the fused L1
   epilogue seam. The sealed `FusedScalar` bound admits exactly `f32`/`f64` **and**, under the `half`
   feature, the narrow floats `f16`/`bf16` (whose epilogue applies in `f32` *before* the single
@@ -556,7 +572,7 @@ call.
   one shared bias + activation per element, and a complex sibling (`gemm_cplx_fused`) fuses a bias
   only (an ordering-based activation is undefined on `ℂ`); both reuse the same `FusedEpi` epilogue.
 - **Requantize** ([`gemm_i8_requant`] / `gemm_i8_requant_with` → `i8` output; `gemm_i8_requant_u8` /
-  `gemm_i8_requant_u8_with` → `u8` output, ONNX-QLinearMatMul-style; `int8` feature): `i8·i8 -> i8`/`u8`
+  `gemm_i8_requant_u8_with` → `u8` output, ONNX-QLinearMatMul-style; `int8` + `epilogue` features): `i8·i8 -> i8`/`u8`
   with a per-tensor `Requantize { scale, zero_point, bias }` (`zero_point` in `[-128, 127]` for `i8`,
   `[0, 255]` for `u8`), fusing the `i32 -> {i8,u8}` requantize into the store (deleting the `m·n` `i32`
   materialization). Bit-exact across ISAs and serial ≡ parallel; the two outputs share one

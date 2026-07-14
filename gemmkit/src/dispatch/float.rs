@@ -9,6 +9,7 @@ use super::isa::{ForcedIsa, forced_isa};
 use super::{GemmScalar, PackedConsume, Task, orient_transpose, scale_c_float, small_mn_eligible};
 use crate::driver;
 use crate::kernel::FloatGemm;
+#[cfg(feature = "epilogue")]
 use crate::kernel::epilogue::{BiasSpec, Epilogue, FusedEpi};
 use crate::parallel::Parallelism;
 use crate::scalar::Float;
@@ -94,6 +95,7 @@ unsafe fn run_typed<T, S, const MR_REG: usize, const NR: usize>(
 ///
 /// # Safety
 /// As [`run_typed`], plus `epi`'s interior pointers valid for the (pre-swap) problem's `m`/`n`.
+#[cfg(feature = "epilogue")]
 #[inline]
 unsafe fn run_typed_fused<T, S, const MR_REG: usize, const NR: usize>(
     simd: S,
@@ -294,6 +296,7 @@ unsafe fn gemm_f64_simd128_packed(r: PackedConsume<f64>, par: Parallelism, ws: &
 // ---- fused-epilogue entry points: one per (f32/f64, ISA), same tiles as the plain
 // wrappers (the epilogue is tile-local, so the register budget is unchanged) ----
 
+#[cfg(feature = "epilogue")]
 unsafe fn gemm_f32_scalar_fused(
     t: Task<f32>,
     epi: FusedEpi<f32>,
@@ -302,6 +305,7 @@ unsafe fn gemm_f32_scalar_fused(
 ) {
     unsafe { run_typed_fused::<f32, ScalarTok, 4, 4>(ScalarTok, t, epi, par, ws) }
 }
+#[cfg(feature = "epilogue")]
 unsafe fn gemm_f64_scalar_fused(
     t: Task<f64>,
     epi: FusedEpi<f64>,
@@ -310,7 +314,7 @@ unsafe fn gemm_f64_scalar_fused(
 ) {
     unsafe { run_typed_fused::<f64, ScalarTok, 4, 4>(ScalarTok, t, epi, par, ws) }
 }
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(feature = "epilogue", any(target_arch = "x86", target_arch = "x86_64")))]
 unsafe fn gemm_f32_fma_fused(
     t: Task<f32>,
     epi: FusedEpi<f32>,
@@ -319,7 +323,7 @@ unsafe fn gemm_f32_fma_fused(
 ) {
     unsafe { run_typed_fused::<f32, Fma, 2, 6>(Fma, t, epi, par, ws) }
 }
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(feature = "epilogue", any(target_arch = "x86", target_arch = "x86_64")))]
 unsafe fn gemm_f64_fma_fused(
     t: Task<f64>,
     epi: FusedEpi<f64>,
@@ -328,7 +332,7 @@ unsafe fn gemm_f64_fma_fused(
 ) {
     unsafe { run_typed_fused::<f64, Fma, 2, 6>(Fma, t, epi, par, ws) }
 }
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(feature = "epilogue", any(target_arch = "x86", target_arch = "x86_64")))]
 unsafe fn gemm_f32_avx512_fused(
     t: Task<f32>,
     epi: FusedEpi<f32>,
@@ -337,7 +341,7 @@ unsafe fn gemm_f32_avx512_fused(
 ) {
     unsafe { run_typed_fused::<f32, Avx512, 2, 12>(Avx512, t, epi, par, ws) }
 }
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(feature = "epilogue", any(target_arch = "x86", target_arch = "x86_64")))]
 unsafe fn gemm_f64_avx512_fused(
     t: Task<f64>,
     epi: FusedEpi<f64>,
@@ -346,7 +350,7 @@ unsafe fn gemm_f64_avx512_fused(
 ) {
     unsafe { run_typed_fused::<f64, Avx512, 2, 12>(Avx512, t, epi, par, ws) }
 }
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(feature = "epilogue", target_arch = "aarch64"))]
 unsafe fn gemm_f32_neon_fused(
     t: Task<f32>,
     epi: FusedEpi<f32>,
@@ -355,7 +359,7 @@ unsafe fn gemm_f32_neon_fused(
 ) {
     unsafe { run_typed_fused::<f32, Neon, 4, 4>(Neon, t, epi, par, ws) }
 }
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(feature = "epilogue", target_arch = "aarch64"))]
 unsafe fn gemm_f64_neon_fused(
     t: Task<f64>,
     epi: FusedEpi<f64>,
@@ -364,7 +368,11 @@ unsafe fn gemm_f64_neon_fused(
 ) {
     unsafe { run_typed_fused::<f64, Neon, 4, 4>(Neon, t, epi, par, ws) }
 }
-#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[cfg(all(
+    feature = "epilogue",
+    target_arch = "wasm32",
+    target_feature = "simd128"
+))]
 unsafe fn gemm_f32_simd128_fused(
     t: Task<f32>,
     epi: FusedEpi<f32>,
@@ -373,7 +381,11 @@ unsafe fn gemm_f32_simd128_fused(
 ) {
     unsafe { run_typed_fused::<f32, Simd128, 2, 4>(Simd128, t, epi, par, ws) }
 }
-#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[cfg(all(
+    feature = "epilogue",
+    target_arch = "wasm32",
+    target_feature = "simd128"
+))]
 unsafe fn gemm_f64_simd128_fused(
     t: Task<f64>,
     epi: FusedEpi<f64>,
@@ -391,6 +403,7 @@ unsafe fn gemm_f64_simd128_fused(
 /// narrow types are not `Float` (they widen to `f32`). What every fused type must provide is the
 /// finiteness test used to validate a `LeakyRelu` slope, and the degenerate `C <- act(β·C + bias)`
 /// map (type-specific: real floats compute in `T`, narrow types in `f32`, narrowing once).
+#[cfg(feature = "epilogue")]
 pub trait FusedScalar: GemmScalar + sealed::Sealed {
     /// `true` iff `self` is finite. `f32`/`f64` use the inherent test; `f16`/`bf16` widen exactly
     /// to `f32` first. `core`-only, so it is `no_std`-safe.
@@ -406,6 +419,7 @@ pub trait FusedScalar: GemmScalar + sealed::Sealed {
     unsafe fn fused_degenerate(t: &Task<Self>, epi: &FusedEpi<Self>);
 }
 
+#[cfg(feature = "epilogue")]
 mod sealed {
     pub trait Sealed {}
     impl Sealed for f32 {}
@@ -416,6 +430,7 @@ mod sealed {
     impl Sealed for half::bf16 {}
 }
 
+#[cfg(feature = "epilogue")]
 impl FusedScalar for f32 {
     #[inline]
     fn finite(self) -> bool {
@@ -426,6 +441,7 @@ impl FusedScalar for f32 {
         unsafe { fused_degenerate_float::<f32>(t, epi) }
     }
 }
+#[cfg(feature = "epilogue")]
 impl FusedScalar for f64 {
     #[inline]
     fn finite(self) -> bool {
@@ -443,6 +459,7 @@ impl FusedScalar for f64 {
 /// # Safety
 /// `task`'s pointers must be valid; `c` must not alias `a`/`b`, and `epi`'s bias slice must
 /// not overlap `c` (the API validates this).
+#[cfg(feature = "epilogue")]
 pub(crate) unsafe fn execute_fused<T: FusedScalar>(
     task: Task<T>,
     epi: FusedEpi<T>,
@@ -471,6 +488,7 @@ pub(crate) unsafe fn execute_fused<T: FusedScalar>(
 ///
 /// # Safety
 /// `c` valid for the `m × n` region; `epi`'s bias valid for the problem's `m`/`n`.
+#[cfg(feature = "epilogue")]
 pub(super) unsafe fn fused_degenerate_float<T: Float<Acc = T> + PartialOrd>(
     t: &Task<T>,
     epi: &FusedEpi<T>,
@@ -498,6 +516,7 @@ type PackedFn<T> = unsafe fn(PackedConsume<T>, Parallelism, &mut Workspace);
 /// Every [`FusedScalar`] type (`f32`/`f64` here, `f16`/`bf16` in the `mixed` module) supplies one,
 /// so the slot is non-optional. `pub(super)` so `dispatch/mixed.rs` can name it (as with
 /// [`Dispatched`]).
+#[cfg(feature = "epilogue")]
 pub(super) type FusedFn<T> = unsafe fn(Task<T>, FusedEpi<T>, Parallelism, &mut Workspace);
 
 /// The memoized dispatch slot for one element type: the standard kernel, the
@@ -511,6 +530,7 @@ pub(super) struct Dispatched<T> {
     pub(super) run_packed: PackedFn<T>,
     /// Fused-epilogue entry (`bias`/activation). Every dispatched type supplies one (`f32`/`f64`
     /// and, under `half`, `f16`/`bf16`), so it is non-optional.
+    #[cfg(feature = "epilogue")]
     pub(super) run_fused: FusedFn<T>,
     pub(super) mr: usize,
     pub(super) nr: usize,
@@ -528,6 +548,7 @@ pub(super) struct Dispatched<T> {
 const DISP_F32_SCALAR: Dispatched<f32> = Dispatched {
     run: gemm_f32_scalar,
     run_packed: gemm_f32_scalar_packed,
+    #[cfg(feature = "epilogue")]
     run_fused: gemm_f32_scalar_fused,
     mr: 4,
     nr: 4,
@@ -536,6 +557,7 @@ const DISP_F32_SCALAR: Dispatched<f32> = Dispatched {
 const DISP_F64_SCALAR: Dispatched<f64> = Dispatched {
     run: gemm_f64_scalar,
     run_packed: gemm_f64_scalar_packed,
+    #[cfg(feature = "epilogue")]
     run_fused: gemm_f64_scalar_fused,
     mr: 4,
     nr: 4,
@@ -546,6 +568,7 @@ const DISP_F64_SCALAR: Dispatched<f64> = Dispatched {
 const DISP_F32_FMA: Dispatched<f32> = Dispatched {
     run: gemm_f32_fma,
     run_packed: gemm_f32_fma_packed,
+    #[cfg(feature = "epilogue")]
     run_fused: gemm_f32_fma_fused,
     mr: 16,
     nr: 6,
@@ -555,6 +578,7 @@ const DISP_F32_FMA: Dispatched<f32> = Dispatched {
 const DISP_F64_FMA: Dispatched<f64> = Dispatched {
     run: gemm_f64_fma,
     run_packed: gemm_f64_fma_packed,
+    #[cfg(feature = "epilogue")]
     run_fused: gemm_f64_fma_fused,
     mr: 8,
     nr: 6,
@@ -565,6 +589,7 @@ const DISP_F64_FMA: Dispatched<f64> = Dispatched {
 const DISP_F32_AVX512: Dispatched<f32> = Dispatched {
     run: gemm_f32_avx512,
     run_packed: gemm_f32_avx512_packed,
+    #[cfg(feature = "epilogue")]
     run_fused: gemm_f32_avx512_fused,
     mr: 32,
     nr: 12,
@@ -574,6 +599,7 @@ const DISP_F32_AVX512: Dispatched<f32> = Dispatched {
 const DISP_F64_AVX512: Dispatched<f64> = Dispatched {
     run: gemm_f64_avx512,
     run_packed: gemm_f64_avx512_packed,
+    #[cfg(feature = "epilogue")]
     run_fused: gemm_f64_avx512_fused,
     mr: 16,
     nr: 12,
@@ -584,6 +610,7 @@ const DISP_F64_AVX512: Dispatched<f64> = Dispatched {
 const DISP_F32_NEON: Dispatched<f32> = Dispatched {
     run: gemm_f32_neon,
     run_packed: gemm_f32_neon_packed,
+    #[cfg(feature = "epilogue")]
     run_fused: gemm_f32_neon_fused,
     mr: 16,
     nr: 4,
@@ -593,6 +620,7 @@ const DISP_F32_NEON: Dispatched<f32> = Dispatched {
 const DISP_F64_NEON: Dispatched<f64> = Dispatched {
     run: gemm_f64_neon,
     run_packed: gemm_f64_neon_packed,
+    #[cfg(feature = "epilogue")]
     run_fused: gemm_f64_neon_fused,
     mr: 8,
     nr: 4,
@@ -603,6 +631,7 @@ const DISP_F64_NEON: Dispatched<f64> = Dispatched {
 const DISP_F32_SIMD128: Dispatched<f32> = Dispatched {
     run: gemm_f32_simd128,
     run_packed: gemm_f32_simd128_packed,
+    #[cfg(feature = "epilogue")]
     run_fused: gemm_f32_simd128_fused,
     mr: 8,
     nr: 4,
@@ -612,6 +641,7 @@ const DISP_F32_SIMD128: Dispatched<f32> = Dispatched {
 const DISP_F64_SIMD128: Dispatched<f64> = Dispatched {
     run: gemm_f64_simd128,
     run_packed: gemm_f64_simd128_packed,
+    #[cfg(feature = "epilogue")]
     run_fused: gemm_f64_simd128_fused,
     mr: 4,
     nr: 4,
@@ -816,6 +846,7 @@ macro_rules! float_gemm_scalar {
             ) {
                 unsafe { ($disp().run_packed)(req, par, ws) }
             }
+            #[cfg(feature = "epilogue")]
             #[inline]
             unsafe fn dispatch_fused(
                 t: Task<$t>,

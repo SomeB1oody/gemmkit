@@ -8,12 +8,18 @@ use std::sync::OnceLock;
 use super::isa::{ForcedIsa, forced_isa};
 use super::orient_swap;
 use crate::driver;
-use crate::kernel::KernelFamily;
-use crate::kernel::epilogue::{BiasDim, BiasSpec, Epilogue, KRequantize, QuantOut};
-use crate::kernel::{IntGemm, IntGemmQ};
+use crate::kernel::IntGemm;
+#[cfg(feature = "epilogue")]
+use crate::kernel::IntGemmQ;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-use crate::kernel::{IntGemmVnni, IntGemmVnniQ};
+use crate::kernel::IntGemmVnni;
+#[cfg(all(feature = "epilogue", any(target_arch = "x86", target_arch = "x86_64")))]
+use crate::kernel::IntGemmVnniQ;
+use crate::kernel::KernelFamily;
+#[cfg(feature = "epilogue")]
+use crate::kernel::epilogue::{BiasDim, BiasSpec, Epilogue, KRequantize, QuantOut};
 use crate::parallel::Parallelism;
+#[cfg(feature = "epilogue")]
 use crate::parallel::Ptr;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use crate::simd::Avx512Vnni;
@@ -355,7 +361,7 @@ memoized_select!(
 /// `beta` (accumulating into a quantized C is ill-defined). `bias` is an optional per-row /
 /// per-col `i32` vector (`bias_dim` in the user frame; the dispatch flips it on an orientation
 /// swap).
-#[cfg(feature = "int8")]
+#[cfg(all(feature = "int8", feature = "epilogue"))]
 #[derive(Copy, Clone)]
 pub(crate) struct RequantTask<O> {
     pub m: usize,
@@ -384,7 +390,7 @@ pub(crate) struct RequantTask<O> {
 /// # Safety
 /// `t`'s pointers valid; `c` not aliasing `a`/`b`, and `bias` (if `has_bias`) valid for the
 /// oriented axis and disjoint from `c` (the API validates this).
-#[cfg(feature = "int8")]
+#[cfg(all(feature = "int8", feature = "epilogue"))]
 pub(crate) unsafe fn execute_int_requant<O: RequantOut>(
     t: RequantTask<O>,
     par: Parallelism,
@@ -411,7 +417,7 @@ pub(crate) unsafe fn execute_int_requant<O: RequantOut>(
 /// Build the `KRequantize` bias spec from a task's (already axis-flipped) bias fields:
 /// `has_bias == false` maps to `BiasSpec::None`, else the `Row` / `Col` variant selected by
 /// `bias_dim`. Shared by both construction sites so the encoding lives in one place.
-#[cfg(feature = "int8")]
+#[cfg(all(feature = "int8", feature = "epilogue"))]
 #[inline]
 fn requant_bias_spec<O>(t: &RequantTask<O>) -> BiasSpec<i32> {
     if t.has_bias {
@@ -429,7 +435,7 @@ fn requant_bias_spec<O>(t: &RequantTask<O>) -> BiasSpec<i32> {
 /// clamped into the output band, without bias). Uses the same `KRequantize::apply` as the
 /// kernel, applied to a zero accumulator, so it is bit-identical to a `k > 0` run whose
 /// products are all zero.
-#[cfg(feature = "int8")]
+#[cfg(all(feature = "int8", feature = "epilogue"))]
 unsafe fn requant_degenerate<O: QuantOut>(t: &RequantTask<O>) {
     let epi = KRequantize {
         scale: t.scale,
@@ -456,7 +462,7 @@ unsafe fn requant_degenerate<O: QuantOut>(t: &RequantTask<O>) {
 ///
 /// # Safety
 /// As [`execute_int_requant`].
-#[cfg(feature = "int8")]
+#[cfg(all(feature = "int8", feature = "epilogue"))]
 #[inline]
 unsafe fn run_typed_int_requant<Fam, S, O, const MR_REG: usize, const NR: usize>(
     simd: S,
@@ -496,13 +502,13 @@ unsafe fn run_typed_int_requant<Fam, S, O, const MR_REG: usize, const NR: usize>
 
 /// A per-ISA requant kernel for a given output byte `O`. `Copy` (a fn pointer), so
 /// [`pick_int_kernel`] can swap in the small-parallel fallback.
-#[cfg(feature = "int8")]
+#[cfg(all(feature = "int8", feature = "epilogue"))]
 type RequantFn<O> = unsafe fn(RequantTask<O>, Parallelism, &mut Workspace);
 
 /// Memoized requantizing dispatch slot (mirror of [`IntDispatched`]), parametrized by the output
 /// byte `O`: the `small_par_fallback` swaps auto-VNNI to the widen `IntGemmQ<O>` kernel for small
 /// parallel problems (bit-identical). One instantiation exists per output type (`i8` / `u8`).
-#[cfg(feature = "int8")]
+#[cfg(all(feature = "int8", feature = "epilogue"))]
 #[derive(Copy, Clone)]
 pub(crate) struct IntRequantDispatched<O> {
     run: RequantFn<O>,
@@ -514,7 +520,7 @@ pub(crate) struct IntRequantDispatched<O> {
 /// the item names — same tiles, same cfg gates, same VNNI-first auto ladder (with the widen kernel
 /// as the small-parallel fallback) as the historic `i8`-only requant dispatch. Every wrapper is a
 /// thin `run_typed_int_requant::<Family<$O>, Token, $O, MR, NR>` call.
-#[cfg(feature = "int8")]
+#[cfg(all(feature = "int8", feature = "epilogue"))]
 macro_rules! requant_dispatch {
     (
         $O:ty,
@@ -685,6 +691,7 @@ macro_rules! requant_dispatch {
     };
 }
 
+#[cfg(all(feature = "int8", feature = "epilogue"))]
 requant_dispatch!(
     i8,
     requant_i8_scalar,
@@ -705,6 +712,7 @@ requant_dispatch!(
     "The memoized `i8`-output requantizing dispatch descriptor (selection runs once)."
 );
 
+#[cfg(all(feature = "int8", feature = "epilogue"))]
 requant_dispatch!(
     u8,
     requant_u8_scalar,
@@ -729,7 +737,7 @@ requant_dispatch!(
 /// the two quantized outputs (`i8` / `u8`); [`execute_int_requant`] is generic over
 /// `O: RequantOut` and calls `O::dispatched()` to pick the matching memoized slot without a
 /// runtime branch. Sealed by `QuantOut` (only `i8` / `u8` implement it).
-#[cfg(feature = "int8")]
+#[cfg(all(feature = "int8", feature = "epilogue"))]
 pub(crate) trait RequantOut: QuantOut {
     /// The memoized ISA descriptor for this output byte.
     fn dispatched() -> IntRequantDispatched<Self>
@@ -737,7 +745,7 @@ pub(crate) trait RequantOut: QuantOut {
         Self: Sized;
 }
 
-#[cfg(feature = "int8")]
+#[cfg(all(feature = "int8", feature = "epilogue"))]
 impl RequantOut for i8 {
     #[inline]
     fn dispatched() -> IntRequantDispatched<i8> {
@@ -745,7 +753,7 @@ impl RequantOut for i8 {
     }
 }
 
-#[cfg(feature = "int8")]
+#[cfg(all(feature = "int8", feature = "epilogue"))]
 impl RequantOut for u8 {
     #[inline]
     fn dispatched() -> IntRequantDispatched<u8> {

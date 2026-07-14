@@ -35,6 +35,10 @@ jobs:
         run: cargo build -p gemmkit --no-default-features
       - name: build with std off + element-type families
         run: cargo build -p gemmkit --no-default-features --features half,int8,complex
+      - name: build with std off + epilogue only (fused f32/f64, no element types)
+        run: cargo build -p gemmkit --no-default-features --features epilogue
+      - name: build with std off + element-type families + epilogue
+        run: cargo build -p gemmkit --no-default-features --features half,int8,complex,epilogue
 
   # Force a specific kernel end-to-end via GEMMKIT_REQUIRE_ISA
   kernel:

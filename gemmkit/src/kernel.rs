@@ -30,7 +30,9 @@ pub use complex::ComplexGemm;
 pub use epilogue::{Epilogue, Identity};
 pub use float::FloatGemm;
 #[cfg(feature = "int8")]
-pub use int::{IntGemm, IntGemmQ, IntGemmVnni, IntGemmVnniQ};
+pub use int::{IntGemm, IntGemmVnni};
+#[cfg(all(feature = "int8", feature = "epilogue"))]
+pub use int::{IntGemmQ, IntGemmVnniQ};
 #[cfg(feature = "half")]
 pub use mixed::{Bf16DotGemm, MixedGemm};
 
@@ -201,8 +203,23 @@ pub trait KernelFamily: Copy + Send + Sync + 'static {
         S: KernelSimd<Self::Lhs, Self::Rhs, Self::Acc, Self::Out>,
     {
         let _ = (
-            simd, kc, alpha, beta, alpha_status, beta_status, a, a_cs, b, b_rs, b_cs, c, rsc, csc,
-            mr_eff, nr_eff, scratch,
+            simd,
+            kc,
+            alpha,
+            beta,
+            alpha_status,
+            beta_status,
+            a,
+            a_cs,
+            b,
+            b_rs,
+            b_cs,
+            c,
+            rsc,
+            csc,
+            mr_eff,
+            nr_eff,
+            scratch,
         );
         unreachable!("this family fuses via microkernel_epi and has no plain microkernel")
     }

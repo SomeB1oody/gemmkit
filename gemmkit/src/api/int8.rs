@@ -1,5 +1,6 @@
 //! Integer (`i8` -> `i32`) and requantizing (`i8` -> `i8`) GEMM entries.
 use super::*;
+#[cfg(feature = "epilogue")]
 use crate::kernel::epilogue::BiasDim;
 
 /// Integer GEMM: `C <- alpha·A·B + beta·C` with **`i8` inputs accumulated into an
@@ -179,7 +180,7 @@ pub unsafe fn gemm_i8_unchecked_with(
 /// qlinear layer bias). The output is `C[i,j] = clamp(zero_point + round_ne(scale·(Σ_k A·B +
 /// bias[i])), LO, HI)`, with round-half-to-even, where the clamp band `[LO, HI]` is set by the
 /// entry: [`gemm_i8_requant`] → `[-128, 127]` (`i8`), [`gemm_i8_requant_u8`] → `[0, 255]` (`u8`).
-#[cfg(feature = "int8")]
+#[cfg(all(feature = "int8", feature = "epilogue"))]
 pub struct Requantize<'a> {
     /// Per-tensor output scale (`alpha` folds into this; must be finite and `> 0`).
     pub scale: f32,
@@ -200,7 +201,7 @@ pub struct Requantize<'a> {
 /// Same shape / bounds / aliasing conditions as [`gemm_i8`], plus: a non-finite or
 /// non-positive `scale`; a `zero_point` outside `[-128, 127]`; or a bias whose length is not
 /// `A.rows` or which overlaps `C`.
-#[cfg(feature = "int8")]
+#[cfg(all(feature = "int8", feature = "epilogue"))]
 pub fn gemm_i8_requant(
     a: MatRef<'_, i8>,
     b: MatRef<'_, i8>,
@@ -217,7 +218,7 @@ pub fn gemm_i8_requant(
 /// the task carries. Panic messages are byte-identical to the historic `i8`-only wording (tests
 /// match the substrings). The `scale` and `zero_point` range checks stay in each entry (the `zp`
 /// band differs between `i8` and `u8`), so this factors only the axis-independent bias check.
-#[cfg(feature = "int8")]
+#[cfg(all(feature = "int8", feature = "epilogue"))]
 fn requant_bias<TO>(a_rows: usize, c: &MatMut<'_, TO>, bias: Option<&[i32]>) -> (*const i32, bool) {
     match bias {
         Some(bias) => {
@@ -249,7 +250,7 @@ fn requant_bias<TO>(a_rows: usize, c: &MatMut<'_, TO>, bias: Option<&[i32]>) -> 
 ///
 /// # Panics
 /// Same conditions as [`gemm_i8_requant`].
-#[cfg(feature = "int8")]
+#[cfg(all(feature = "int8", feature = "epilogue"))]
 pub fn gemm_i8_requant_with(
     ws: &mut Workspace,
     a: MatRef<'_, i8>,
@@ -313,7 +314,7 @@ pub fn gemm_i8_requant_with(
 /// `c` does not alias `a`/`b`; when `has_bias`, `bias` is valid for `m` reads and disjoint
 /// from `c`; and `scale` is finite and `> 0` with `zero_point in [-128, 127]` (the checked
 /// API enforces the last two).
-#[cfg(feature = "int8")]
+#[cfg(all(feature = "int8", feature = "epilogue"))]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn gemm_i8_requant_unchecked(
     m: usize,
@@ -380,7 +381,7 @@ pub unsafe fn gemm_i8_requant_unchecked(
 /// Same shape / bounds / aliasing conditions as [`gemm_i8`], plus: a non-finite or non-positive
 /// `scale`; a `zero_point` outside `[0, 255]`; or a bias whose length is not `A.rows` or which
 /// overlaps `C`.
-#[cfg(feature = "int8")]
+#[cfg(all(feature = "int8", feature = "epilogue"))]
 pub fn gemm_i8_requant_u8(
     a: MatRef<'_, i8>,
     b: MatRef<'_, i8>,
@@ -395,7 +396,7 @@ pub fn gemm_i8_requant_u8(
 ///
 /// # Panics
 /// Same conditions as [`gemm_i8_requant_u8`].
-#[cfg(feature = "int8")]
+#[cfg(all(feature = "int8", feature = "epilogue"))]
 pub fn gemm_i8_requant_u8_with(
     ws: &mut Workspace,
     a: MatRef<'_, i8>,
@@ -459,7 +460,7 @@ pub fn gemm_i8_requant_u8_with(
 /// `c` does not alias `a`/`b`; when `has_bias`, `bias` is valid for `m` reads and disjoint
 /// from `c`; and `scale` is finite and `> 0` with `zero_point in [0, 255]` (the checked
 /// API enforces the last two).
-#[cfg(feature = "int8")]
+#[cfg(all(feature = "int8", feature = "epilogue"))]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn gemm_i8_requant_u8_unchecked(
     m: usize,
