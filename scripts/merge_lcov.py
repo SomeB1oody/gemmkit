@@ -1,37 +1,19 @@
 #!/usr/bin/env python3
-"""Merge LCOV coverage traces at line granularity, across machines/arches.
+"""Merge LCOV coverage traces at line granularity, across machines/arches
 
-Why this exists: the lcov/genhtml CLIs are not available in the gemmkit dev
-environment and nothing may be installed; the LCOV text format is trivially
-mergeable at line granularity with the stdlib, which is all cross-arch triage
-needs. This unifies the x86_64 (Zen5) and aarch64 (M4) reports so that code
-that is 0% on one arch (simd/neon.rs on x86, cpuid.rs/fma.rs on aarch64) is
-credited by the other.
+Why this exists:
+the lcov/genhtml CLIs are not available in the gemmkit dev environment and nothing may be installed
+the LCOV text format is trivially mergeable at line granularity with the stdlib,
+which is all cross-arch triage needs
 
 Usage:
     merge_lcov.py [--rev SHA] OUT.info IN.info:STRIP_PREFIX [IN.info:PREFIX ...]
 
-Each input is `path:prefix`. cargo-llvm-cov emits ABSOLUTE `SF:` paths that
-differ per machine (/home/stanyin/... vs /Users/...); `prefix` (the repo root
-on that machine) is stripped so merged `SF:` paths are repo-relative and align.
-An `SF:` line that does not start with its prefix is a hard error -- it flags a
-wrong prefix or mixed-in foreign data.
-
-Cross-revision guard: both inputs must come from the same git revision or the
-merged line numbers are meaningless. `cargo llvm-cov clean` never touches the
-coverage/ output dir, so a stale lcov-aarch64.info can silently outlive its
-source tree. For each input we auto-discover the sidecar written by
-scripts/coverage.sh -- `lcov-<arch>.info` -> `meta-<arch>.txt` in the same dir
--- and read its `rev=` line. If two inputs disclose different revs (or differ
-from --rev), we hard-fail. A missing sidecar only warns (arbitrary lcov files,
-e.g. the self-merge idempotency check, have no meta).
-
-FN/FNDA keying: function records are keyed by (file, FN-line), NOT by mangled
-name. The Rust symbol names embed cargo's -C metadata disambiguator hash, which
-depends on target/features/rustc, so the same source function has DISJOINT
-names across arches; name-keyed merging would double every function record.
-Line numbers are stable across arches at a fixed revision, so keying by line
-unifies them. DA (line) merging is additive, matching `lcov -a` semantics.
+Each input is `path:prefix`.
+cargo-llvm-cov emits ABSOLUTE `SF:` paths that differ per machine; `
+prefix` (the repo root on that machine) is stripped so merged `SF:` paths are repo-relative and align
+An `SF:` line that does not start with its prefix is a hard error:
+it flags a wrong prefix or mixed-in foreign data
 """
 
 import re
@@ -44,7 +26,7 @@ def die(msg):
 
 
 def sidecar_rev(lcov_path):
-    """Return the git rev from the coverage.sh meta sidecar, or None."""
+    """Return the git rev from the coverage.sh meta sidecar, or None"""
     import os
 
     d, base = os.path.split(lcov_path)
@@ -62,7 +44,7 @@ def sidecar_rev(lcov_path):
 
 
 def parse(path, prefix, lines, fn_name, fn_count):
-    """Accumulate one lcov file into the shared dicts (keyed by repo-rel file).
+    """Accumulate one lcov file into the shared dicts (keyed by repo-rel file)
 
     lines[file][ln]      -> summed DA count
     fn_name[file][fnln]  -> a representative FN name for that line
@@ -77,7 +59,7 @@ def parse(path, prefix, lines, fn_name, fn_count):
                 p = raw[3:]
                 # Require a path-component boundary so a sibling checkout sharing the
                 # string prefix (e.g. .../gemmkit-exp under prefix .../gemmkit) is
-                # rejected, not silently merged under a mangled name.
+                # rejected, not silently merged under a mangled name
                 pfx = prefix.rstrip("/")
                 if p != pfx and not p.startswith(pfx + "/"):
                     die(f"{path}: SF path {p!r} lacks prefix {prefix!r} "

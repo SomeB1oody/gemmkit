@@ -1,9 +1,6 @@
 name: Fuzz smoke
 
-# Non-mandatory harness-breadth check: the fuzz crate needs nightly (-Z build-std +
-# AddressSanitizer), which the stable-only mandatory gate keeps out, and GitHub's
-# standard runners have no AVX-512, so this covers the scalar/FMA dispatch routes only.
-# The full per-ISA soak runs locally (see gemmkit/fuzz/README.md).
+# Non-mandatory harness-breadth check
 on:
   schedule:
     - cron: "0 5 * * *"
@@ -24,9 +21,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: gemmkit/fuzz
-      # Persist the corpus across runs so each nightly smoke starts deeper than the last
-      # (the harness's coverage leans on accumulation). run_id key + prefix restore-keys
-      # means every run restores the latest corpus and saves a fresh, larger one.
+      # Persist the corpus across runs
       - uses: actions/cache@v4
         with:
           path: gemmkit/fuzz/corpus

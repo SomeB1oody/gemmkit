@@ -397,9 +397,11 @@ pub trait SimdOps<T: Scalar>: Simd {
 
     /// Accumulate one contiguous block of `B` columns (loaded as the single
     /// register `bvec`) against the `MR_REG` already-loaded `A` registers,
-    /// broadcasting each B lane: for `l in 0..acc.len()` and `i in 0..MR_REG`,
+    /// broadcasting each B lane: for `l in 0..LANES` and `i in 0..MR_REG`,
     /// `acc[l][i] = a_regs[i] * bvec[l] + acc[l][i]`. `acc.len()` must be
-    /// `<= LANES`
+    /// exactly `LANES` — the caller consumes whole B registers (the kernel path
+    /// is gated on `NR` being a multiple of `LANES`), so an override may
+    /// hard-code its lane count
     ///
     /// This is the fused inner step of the lane-indexed kernel path, taken only
     /// when [`Self::LANE_FMA`] is set. The default implementation broadcasts
@@ -409,8 +411,8 @@ pub trait SimdOps<T: Scalar>: Simd {
     /// `splat` path, so the 2 round consistently within a run
     ///
     /// # Safety
-    /// See the trait-level note; `acc.len()` must be `<= LANES` and `a_regs`
-    /// valid for `MR_REG` reads
+    /// See the trait-level note; `acc.len()` must be exactly `LANES` and
+    /// `a_regs` valid for `MR_REG` reads
     #[inline(always)]
     unsafe fn fma_bvec<const MR_REG: usize>(
         self,
@@ -418,7 +420,7 @@ pub trait SimdOps<T: Scalar>: Simd {
         bvec: Self::Reg,
         acc: &mut [[Self::Reg; MR_REG]],
     ) {
-        debug_assert!(acc.len() <= Self::LANES);
+        debug_assert_eq!(acc.len(), Self::LANES);
         unsafe {
             // Spill the B-vector to the stack, then broadcast each lane. 16 is
             // the widest LANES of any ISA (AVX-512 f32), so it always fits

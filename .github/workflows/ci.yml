@@ -355,7 +355,7 @@ jobs:
         run: cargo test -p gemmkit --target wasm32-wasip1-threads --no-default-features --features std,parallel,wasm_threads,half,int8,complex --test correctness --no-fail-fast
 
   # Code coverage (cargo-llvm-cov, scripts/coverage.sh). Report-only: no lines% floor
-  # until the first triage (scripts/COVERAGE.md) establishes the coverable baseline.
+  # until a coverage triage establishes the coverable baseline.
   coverage:
     runs-on: ubuntu-latest
     strategy:

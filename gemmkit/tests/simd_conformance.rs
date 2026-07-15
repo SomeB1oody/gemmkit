@@ -123,9 +123,7 @@ macro_rules! float_conformance {
                         assert_eq!(out[l], cs[l], "{label} store_out lane {l}");
                     }
 
-                    // Default `fma_bvec`: acc[l][i] = a_regs[i]*bvec[l] + acc[l][i] (splat + mul_add)
-                    // Only NEON overrides it; on x86/scalar this is the portable fallback body
-                    let nrows = core::cmp::min(lanes, 3);
+                    let nrows = lanes;
                     let a_regs = [vx, vy];
                     let bvec = simd.loadu(bvals.as_ptr());
                     let mut acc: Vec<[<S as SimdOps<$t>>::Reg; 2]> = vec![[vc, vc]; nrows];
@@ -246,7 +244,7 @@ where
                 assert_eq!(out[l], cs[l], "{label} store_out lane {l}");
             }
 
-            let nrows = core::cmp::min(lanes, 3);
+            let nrows = lanes;
             let a_regs = [vx, vy];
             let bvec = simd.loadu(bvals.as_ptr());
             let mut acc: Vec<[<S as SimdOps<i32>>::Reg; 2]> = vec![[vc, vc]; nrows];
