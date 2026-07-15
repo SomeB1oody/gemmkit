@@ -290,9 +290,11 @@ contract holds for `f32`/`f64` only. Within a fused run the vector and scratch p
 bit-for-bit (both round once), and serial ≡ parallel is unchanged. `KRequantize` (`i8 -> i8` or
 `i8 -> u8`, a per-tensor/per-row/per-col `ScaleSpec` scale + zero-point + optional integer bias)
 keeps `VECTOR = false` (no float-style in-register path) but sets `VECTOR_STORE = true`: every tile
-drains to `i32` scratch, then the `i32 -> {i8,u8}` map is **vectorized in f64** on x86 (`apply_store`
-→ the `KernelSimd::requant_store` seam, with `REQUANT_VECTOR = true` on `Fma`/`Avx512`/`Avx512Vnni`;
-a NEON override is deferred pending device validation). The output domain — its clamp band `[LO, HI]`
+drains to `i32` scratch, then the `i32 -> {i8,u8}` map is **vectorized in f64** on x86 and AArch64
+(`apply_store` → the `KernelSimd::requant_store` seam, with `REQUANT_VECTOR = true` on
+`Fma`/`Avx512`/`Avx512Vnni` and `Neon` — the NEON override is device-validated on Apple silicon,
+`vrndnq_f64` ties-to-even + a `vqtbl1q_u8` low-byte gather, bit-exact to the x86 tokens). The output
+domain — its clamp band `[LO, HI]`
 and the final low-byte narrowing — is chosen per output type by the `QuantOut` trait (`i8` →
 `[-128, 127]`, `u8` → `[0, 255]`, the ONNX-QLinearMatMul activation); the vector store writes the
 same low byte either way (a value clamped into `[-128, 255]` has identical bytes read as `i8` or

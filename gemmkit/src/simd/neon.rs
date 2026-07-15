@@ -359,11 +359,80 @@ impl SimdOps<i32> for Neon {
     }
 }
 
-// A NEON `requant_store` override (the `REQUANT_VECTOR` seam) is deliberately **deferred**:
-// this dev box cannot execute aarch64, and project policy is to validate an ISA kernel on the
-// device before shipping it. `Neon` therefore keeps the trait default (`REQUANT_VECTOR = false`),
-// so the requantizing epilogue routes every element through the scalar map on aarch64: correct,
-// just not yet vectorized
+/// Requantize one pair (2 `i32` lanes sign-extended to `int64x2_t`) of an `int32x4_t` accumulator
+/// to 2 integral `i64` in `[lo, hi]`, following the exact scalar map: widen `i64 -> f64` (exact,
+/// every `i32` is representable in `f64`), multiply by `scale` (one IEEE multiply), round-to-
+/// nearest-even in hardware, add `zp`, clamp `[lo, hi]`, convert back toward zero to `i64` (exact:
+/// the clamped value is already integral in `[lo, hi]`). `#[inline(always)]`, so the intrinsics
+/// fold into the caller's `#[target_feature]` context
+///
+/// `vrndnq_f64` is FRINTN, round-to-nearest ties-to-even, matching the x86 `vroundpd` reference and
+/// the scalar `round_ne_f64`. `vmaxq_f64` / `vminq_f64` (FMAX/FMIN) are the numeric clamp: no NaN
+/// can reach them (the API validates `scale` finite and `> 0` and `v` is a finite `i32`), so the
+/// FMAX-vs-FMAXNM NaN distinction is immaterial here and the plain min/max mirror the x86
+/// `max_pd`/`min_pd`
+///
+/// # Safety
+/// Run inside [`Neon`]'s `neon` [`Simd::vectorize`] context
+#[cfg(feature = "int8")]
+#[inline(always)]
+unsafe fn requant_pair_neon(
+    x: int64x2_t,
+    scale_v: float64x2_t,
+    zp_v: float64x2_t,
+    lo_v: float64x2_t,
+    hi_v: float64x2_t,
+) -> int64x2_t {
+    unsafe {
+        let t = vcvtq_f64_s64(x);
+        let t = vmulq_f64(t, scale_v);
+        let t = vrndnq_f64(t);
+        let u = vaddq_f64(t, zp_v);
+        let u = vmaxq_f64(u, lo_v);
+        let u = vminq_f64(u, hi_v);
+        vcvtq_s64_f64(u)
+    }
+}
+
+/// Vectorized `i32 -> i8` requantize store for [`Neon`] (see the [`KernelSimd::requant_store`]
+/// contract for the bit-for-bit equivalence with the scalar map): sign-extend the low/high `i32`
+/// pairs to 2 `int64x2_t` (exact), requantize each in `f64` ([`requant_pair_neon`]), narrow both
+/// integral pairs back to one `int32x4_t` (truncating `vmovn_s64`), then gather the **low byte** of
+/// each of the 4 integral, pre-clamped lanes into 4 contiguous output bytes with a byte-table
+/// lookup (`vqtbl1q_u8`, source indices {0, 4, 8, 12}: the direct analogue of the x86 `pshufb`).
+/// This is a TRUNCATION, NOT a saturating `vqmovn`/`vqmovun`: the lanes are already in `[lo, hi]`,
+/// so only the byte gather matters, and a saturating narrow would be wrong for the `u8` / `[0, 255]`
+/// phase
+///
+/// # Safety
+/// `dst` valid for 4 byte writes; run inside [`Neon`]'s `neon` [`Simd::vectorize`] context
+#[cfg(feature = "int8")]
+#[inline(always)]
+unsafe fn requant_store_neon(dst: *mut i8, v: int32x4_t, scale: f64, zp: i32, lo: i32, hi: i32) {
+    unsafe {
+        let scale_v = vdupq_n_f64(scale);
+        let zp_v = vdupq_n_f64(zp as f64);
+        let lo_v = vdupq_n_f64(lo as f64);
+        let hi_v = vdupq_n_f64(hi as f64);
+        // Sign-extend the low (lanes 0, 1) and high (lanes 2, 3) i32 pairs to i64, requant each pair
+        let i_lo = requant_pair_neon(vmovl_s32(vget_low_s32(v)), scale_v, zp_v, lo_v, hi_v);
+        let i_hi = requant_pair_neon(vmovl_s32(vget_high_s32(v)), scale_v, zp_v, lo_v, hi_v);
+        // Narrow both integral pairs back to the 4 i32 lanes (truncating; each value is in `[lo, hi]`
+        // so its low 32 bits are the value), lane order 0, 1, 2, 3 preserved
+        let i32_all = vcombine_s32(vmovn_s64(i_lo), vmovn_s64(i_hi));
+        // Byte-table gather of the low byte of each i32 lane {0, 4, 8, 12} into the low 4 output
+        // bytes (the x86 `pshufb` analogue); the high 12 index slots are out of range so read as 0
+        let idx: [u8; 16] = [
+            0, 4, 8, 12, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        ];
+        let gathered = vqtbl1q_u8(vreinterpretq_u8_s32(i32_all), vld1q_u8(idx.as_ptr()));
+        // AArch64 is little-endian, so byte `l` of the u32 is output lane `l`
+        let packed = vgetq_lane_u32::<0>(vreinterpretq_u32_u8(gathered));
+        core::ptr::write_unaligned(dst as *mut u32, packed);
+    }
+}
+
+// The NEON `requant_store` override (the `REQUANT_VECTOR` seam)
 #[cfg(feature = "int8")]
 impl KernelSimd<i8, i8, i32, i32> for Neon {
     #[inline(always)]
@@ -389,6 +458,20 @@ impl KernelSimd<i8, i8, i32, i32> for Neon {
     #[inline(always)]
     unsafe fn store_out(self, p: *mut i32, v: int32x4_t) {
         unsafe { vst1q_s32(p, v) }
+    }
+
+    const REQUANT_VECTOR: bool = true;
+    #[inline(always)]
+    unsafe fn requant_store(
+        self,
+        dst: *mut i8,
+        v: int32x4_t,
+        scale: f64,
+        zp: i32,
+        lo: i32,
+        hi: i32,
+    ) {
+        unsafe { requant_store_neon(dst, v, scale, zp, lo, hi) }
     }
 }
 

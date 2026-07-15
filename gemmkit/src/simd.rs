@@ -574,18 +574,18 @@ pub trait SimdOps<T: Scalar>: Simd {
     }
 }
 
-/// Direct unit test of the vectorized `requant_store` seam (Phase 4). For every runtime-available
-/// x86 vector-capable token it sweeps adversarial `i32` accumulators x scale x zero-point x clamp
-/// bounds and asserts each stored byte equals an **independent** scalar model of the map (std
-/// `round_ties_even`, not the kernel's `2^52` trick). The `(0, 255)` bounds pre-verify the future
-/// `u8`-output phase. Platform-independent: the scalar model is the oracle, never a machine number.
-/// x86-only for now: no other arch overrides `requant_store` (all take the scalar epilogue), so
-/// elsewhere the sweep would be vacuous and its helpers dead code; extend the gate with the arch
-/// when a non-x86 override (e.g. NEON) lands
+/// Direct unit test of the vectorized `requant_store` seam. For every runtime-available x86
+/// vector-capable token and the aarch64 NEON baseline token it sweeps adversarial `i32`
+/// accumulators x scale x zero-point x clamp bounds and asserts each stored byte equals an
+/// **independent** scalar model of the map (std `round_ties_even`, not the kernel's `2^52` trick).
+/// The `(0, 255)` bounds cover the `u8`-output phase. Platform-independent: the scalar model is the
+/// oracle, never a machine number. Gated to the arches that override `requant_store` (x86 + NEON);
+/// on any other arch every token takes the scalar epilogue, so the sweep would be vacuous and its
+/// helpers dead code
 #[cfg(all(
     test,
     feature = "int8",
-    any(target_arch = "x86", target_arch = "x86_64")
+    any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")
 ))]
 mod requant_store_tests {
     #![allow(clippy::needless_range_loop)]
@@ -689,6 +689,12 @@ mod requant_store_tests {
             {
                 check_token(Avx512Vnni, "avx512vnni");
             }
+        }
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: NEON is baseline / mandatory on aarch64, so its features are always present
+        unsafe {
+            use super::Neon;
+            check_token(Neon, "neon");
         }
     }
 }
