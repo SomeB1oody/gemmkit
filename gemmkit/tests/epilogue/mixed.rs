@@ -1,4 +1,4 @@
-//! Fused-epilogue mixed-precision (`f16`/`bf16`) suite (spec §10, Phase 2).
+//! Fused-epilogue mixed-precision (`f16`/`bf16`) suite (spec section 10, Phase 2)
 //!
 //! `gemm_fused` accepts the narrow floats under the `half` feature. Their contract differs from
 //! `f32`/`f64`: the bias vector and `LeakyRelu` slope are the narrow type, widened **exactly** to
@@ -8,31 +8,31 @@
 //! bitwise-equal to `gemm`-then-map. What *is* bitwise here:
 //!
 //! * within one fused run, the vector fast path and the scalar/scratch path agree bit-for-bit
-//!   (both compute `act(bias(v))` in `f32` and round once) — test (a);
+//!   (both compute `act(bias(v))` in `f32` and round once): test (a);
 //! * the pre-narrow semantic is locked exactly against a single-rounding reference, crafted so the
-//!   two-rounding alternative differs — test (b);
-//! * serial ≡ parallel through the special routes — test (d);
-//! * the zero-cost identity case equals plain `gemm` — test (e).
+//!   2-rounding alternative differs: test (b);
+//! * serial == parallel through the special routes: test (d);
+//! * the zero-cost identity case equals plain `gemm`: test (e)
 //!
 //! Accuracy against an f64 oracle is checked with a strict **per-element** absolute-tolerance gate
 //! (tests c/d). All shapes are platform-independent (deterministic LCG fills, self-computed
-//! references).
+//! references)
 
 use crate::common::Rng;
 use gemmkit::{
     Activation, Bias, MatMut, MatRef, NarrowFloat, Parallelism, Workspace, gemm, gemm_fused_with,
 };
 
-// --------------------------------------------------------------------------- harness
+// harness
 
-/// The narrow float under test (`f16`/`bf16`): exact widen/narrow, bit compare, NaN, tolerance.
+/// The narrow float under test (`f16`/`bf16`): exact widen/narrow, bit compare, NaN, tolerance
 trait Narrow: NarrowFloat + gemmkit::FusedScalar {
     fn of(x: f64) -> Self;
-    /// Widen exactly to `f32` (a subset of `f32`).
+    /// Widen exactly to `f32` (a subset of `f32`)
     fn f32(self) -> f32;
     fn bits(self) -> u16;
     fn nan() -> Self;
-    /// Machine epsilon of the 16-bit output (the dominant error is the final round).
+    /// Machine epsilon of the 16-bit output (the dominant error is the final round)
     const EPS: f64;
     fn name() -> &'static str;
 }
@@ -74,7 +74,7 @@ impl Narrow for gemmkit::bf16 {
 }
 
 /// The activation kind used by the self-computed references (the public `Activation` is not
-/// `Clone`, so carry a small copyable descriptor and rebuild it per call).
+/// `Clone`, so carry a small copyable descriptor and rebuild it per call)
 #[derive(Copy, Clone)]
 enum ActK {
     None,
@@ -98,7 +98,7 @@ impl ActK {
     }
 }
 
-/// Bias kind: none / per-row / per-col.
+/// Bias kind: none / per-row / per-col
 #[derive(Copy, Clone, PartialEq)]
 enum BiasK {
     None,
@@ -107,7 +107,7 @@ enum BiasK {
 }
 
 /// The exact scalar mirror of `FusedEpi::<N>::apply`: `narrow(act(v + bias.widen()))`, all in
-/// `f32`, a single narrowing at the end. `bias` is the already-widened `f32` bias term.
+/// `f32`, a single narrowing at the end. `bias` is the already-widened `f32` bias term
 fn ref_apply_narrow<N: Narrow>(v: f32, bias: f32, act: ActK) -> N {
     let v = v + bias;
     let v = match act {
@@ -128,14 +128,14 @@ fn ref_apply_narrow<N: Narrow>(v: f32, bias: f32, act: ActK) -> N {
     N::narrow(v)
 }
 
-/// Build an `m × n` narrow matrix (col-major storage) of LCG values scaled by `scale`.
+/// Build an `m x n` narrow matrix (col-major storage) of LCG values scaled by `scale`
 fn make<N: Narrow>(rng: &mut Rng, m: usize, n: usize, scale: f64) -> Vec<N> {
     (0..m * n).map(|_| N::of(rng.unit() * scale)).collect()
 }
 
-/// f64 reference for `C <- act(alpha·A·B + beta·C0 + bias)`: inputs/alpha/beta all in f64 (via the
+/// f64 reference for `C <- act(alpha*A*B + beta*C0 + bias)`: inputs/alpha/beta all in f64 (via the
 /// exact `f32` widening), bias/act in f64, returned un-narrowed in `[i + j*m]` logical order. The
-/// caller gates `got.to_f64()` against this within the mixed relative tolerance.
+/// caller gates `got.to_f64()` against this within the mixed relative tolerance
 fn reference_f64<N: Narrow>(
     m: usize,
     k: usize,
@@ -201,17 +201,17 @@ fn reference_f64<N: Narrow>(
 
 /// **Per-element** accuracy gate against the f64 reference `cref` (the un-narrowed oracle value).
 /// For each element `let r = cref[..]` and `got` widened to `f64`, assert
-/// `|got - r| <= (2·eps_n + 8·k·f32_eps)·(1 + |r|)`, with `eps_n = N::EPS` (2⁻¹⁰ / 2⁻⁷) and
-/// `f32_eps = 2⁻²³`.
+/// `|got - r| <= (2*eps_n + 8*k*f32_eps)*(1 + |r|)`, with `eps_n = N::EPS` (2^-10 / 2^-7) and
+/// `f32_eps = 2^-23`
 ///
-/// Rationale: the fused path accumulates in `f32` (relative error `O(k·f32_eps)`) and rounds once
-/// to `N` (≤ 1 `N`-ulp from `r`, including the double-rounding vs the f64 reference), so the sum of
-/// those two, scaled by `(1 + |r|)`, bounds a *correct* element. Structural regressions — a dropped
-/// product term, a bias applied to the wrong row, a wrong activation slope — produce `O(1)`-relative
+/// Rationale: the fused path accumulates in `f32` (relative error `O(k*f32_eps)`) and rounds once
+/// to `N` (<= 1 `N`-ulp from `r`, including the double-rounding vs the f64 reference), so the sum of
+/// those 2, scaled by `(1 + |r|)`, bounds a *correct* element. Structural regressions (a dropped
+/// product term, a bias applied to the wrong row, a wrong activation slope) produce `O(1)`-relative
 /// per-element errors, orders of magnitude above this gate, so it FAILS on them. That is the point
-/// of moving off the old relative-Frobenius form, whose `||A||·||B||` denominator was so large that
-/// even an all-zeros output scored ~0.08 « the `16·k·EPS` tolerance and could not fail. `got` is
-/// read back through its strides.
+/// of moving off the old relative-Frobenius form, whose `||A||*||B||` denominator was so large that
+/// even an all-zeros output scored ~0.08, far below the `16*k*EPS` tolerance, and could not fail.
+/// `got` is read back through its strides
 fn assert_close<N: Narrow>(
     got: &[N],
     rsc: isize,
@@ -240,34 +240,34 @@ fn assert_close<N: Narrow>(
     }
 }
 
-// --------------------------------------------------------------------------- a. vector == scalar
+// a. vector == scalar
 
 /// The fused vector fast path (unit-stride col-major C) and the scratch/scalar path (a strided C,
-/// which fails the `rsc == 1` gate for *every* tile) must agree **bit-for-bit** — proving
-/// `apply == apply_reg + store_out` end-to-end.
+/// which fails the `rsc == 1` gate for *every* tile) must agree **bit-for-bit**: proving
+/// `apply == apply_reg + store_out` end-to-end
 ///
-/// `beta` is `0` and `1` (not an arbitrary `Other`) deliberately: those are the two states where
-/// the mixed kernel's `β·C + A·B` combine is **bit-identical** between the two paths (`beta == 0`
+/// `beta` is `0` and `1` (not an arbitrary `Other`) deliberately: those are the 2 states where
+/// the mixed kernel's `beta*C + A*B` combine is **bit-identical** between the 2 paths (`beta == 0`
 /// reads no C; `beta == 1` is a plain add on both), so the `f32` value handed to `apply` /
 /// `apply_reg` is identical and the test isolates the epilogue transform structurally on every
-/// ISA. (For a general `beta` the fast path fuses the combine — `mul_add` — while the scratch path,
-/// preserved byte-for-byte from the pre-epilogue mixed kernel, does not, so the two would only
-/// agree after the final narrowing absorbs a sub-narrow f32 difference — an ISA-dependent tie the
-/// pre-narrow precision contract is covered separately in tests b/c/d.)
+/// ISA. (For a general `beta` the fast path fuses the combine, `mul_add`, while the scratch path,
+/// preserved byte-for-byte from the pre-epilogue mixed kernel, does not, so the 2 would only
+/// agree after the final narrowing absorbs a sub-narrow f32 difference: an ISA-dependent tie. The
+/// pre-narrow precision contract is covered separately in tests b/c/d)
 fn vector_scalar_bitwise<N: Narrow>() {
     let mut rng = Rng::new(0x11CE_A501);
     let (m, k, n) = (64usize, 96usize, 48usize);
     let alpha = N::of(1.3);
-    let a = make::<N>(&mut rng, m, k, 1.0); // col-major m×k
-    let b = make::<N>(&mut rng, k, n, 1.0); // col-major k×n
-    let c0 = make::<N>(&mut rng, m, n, 1.0); // logical col-major m×n
+    let a = make::<N>(&mut rng, m, k, 1.0); // col-major mxk
+    let b = make::<N>(&mut rng, k, n, 1.0); // col-major kxn
+    let c0 = make::<N>(&mut rng, m, n, 1.0); // logical col-major mxn
     let bias_row: Vec<N> = (0..m).map(|_| N::of(rng.unit() * 2.0)).collect();
 
     for beta in [N::of(0.0), N::of(1.0)] {
-        // Unit-stride col-major C (rsc = 1): the vector fast path.
+        // Unit-stride col-major C (rsc = 1): the vector fast path
         let mut c_vec = c0.clone();
-        // Strided C (rsc = 2, csc = 2m) over a 2×-larger buffer: |csc| >= |rsc| so no orientation
-        // swap, and `rsc != 1` forces the scratch/scalar path for every tile.
+        // Strided C (rsc = 2, csc = 2m) over a 2x-larger buffer: |csc| >= |rsc| so no orientation
+        // swap, and `rsc != 1` forces the scratch/scalar path for every tile
         let mut c_str = vec![N::of(0.0); 2 * m * n];
         for j in 0..n {
             for i in 0..m {
@@ -319,30 +319,30 @@ fn fused_mixed_vector_scalar_bitwise() {
     vector_scalar_bitwise::<gemmkit::bf16>();
 }
 
-// --------------------------------------------------------------------------- b. pre-narrow lock
+// b. pre-narrow lock
 
-/// `k = 1, alpha = 1, beta = 0`: the accumulator is a single `f32` product `a·b`, exact in `f32`
-/// (a narrow×narrow product fits the 23-bit mantissa), so it is order-independent. For each of the
-/// three activations (`None`, `ReLU`, `LeakyReLU(0.25)`) the fused output must equal the
-/// **single-rounding** reference `narrow(act(a·b + bias.widen()))` **bitwise**, and that reference
-/// must DIFFER from the two-rounding alternative `narrow(act(narrow(a·b).widen() + bias.widen()))`
-/// for at least one element — locking the pre-narrow semantic **through the activation** (and
+/// `k = 1, alpha = 1, beta = 0`: the accumulator is a single `f32` product `a*b`, exact in `f32`
+/// (a narrow x narrow product fits the 23-bit mantissa), so it is order-independent. For each of the
+/// 3 activations (`None`, `ReLU`, `LeakyReLU(0.25)`) the fused output must equal the
+/// **single-rounding** reference `narrow(act(a*b + bias.widen()))` **bitwise**, and that reference
+/// must DIFFER from the 2-rounding alternative `narrow(act(narrow(a*b).widen() + bias.widen()))`
+/// for at least one element: locking the pre-narrow semantic **through the activation** (and
 /// proving the test is not vacuous). The activations pass the divergence guard because most
-/// `a·b + bias` values are positive (`a, b ∈ [1, 2) ⇒ a·b ∈ [1, 4)`, `bias ∈ [-2, 2]`), where
+/// `a*b + bias` values are positive (`a, b in [1, 2) => a*b in [1, 4)`, `bias in [-2, 2]`), where
 /// `ReLU`/`LeakyReLU` are the identity, so the sub-narrow bits that make the `None` case diverge
-/// survive the activation on those elements.
+/// survive the activation on those elements
 fn pre_narrow_semantics<N: Narrow>() {
     let mut rng = Rng::new(0x9E27_B1A5);
     let (m, k, n) = (32usize, 1usize, 24usize);
-    // Values in [1, 2): products land in [1, 4) with up to 2·mantissa bits — beyond `N`'s
-    // mantissa, so narrowing the product first loses bits a well-chosen bias keeps significant.
+    // Values in [1, 2): products land in [1, 4) with up to 2*mantissa bits, beyond `N`'s
+    // mantissa, so narrowing the product first loses bits a well-chosen bias keeps significant
     let a: Vec<N> = (0..m * k)
         .map(|_| N::of(1.0 + (rng.unit() + 1.0) * 0.5))
         .collect();
     let b: Vec<N> = (0..k * n)
         .map(|_| N::of(1.0 + (rng.unit() + 1.0) * 0.5))
         .collect();
-    // A per-row bias of comparable magnitude, so `a·b + bias` preserves the sub-narrow bits.
+    // A per-row bias of comparable magnitude, so `a*b + bias` preserves the sub-narrow bits
     let bias_row: Vec<N> = (0..m).map(|_| N::of(rng.unit() * 2.0)).collect();
 
     for act in [ActK::None, ActK::Relu, ActK::Leaky(0.25)] {
@@ -351,7 +351,7 @@ fn pre_narrow_semantics<N: Narrow>() {
         gemm_fused_with(
             &mut ws,
             N::of(1.0),
-            MatRef::new(&a, m, k, 1, m as isize), // col-major A (rsa = 1) → small_k in-place
+            MatRef::new(&a, m, k, 1, m as isize), // col-major A (rsa = 1) -> small_k in-place
             MatRef::new(&b, k, n, 1, k as isize),
             N::of(0.0),
             MatMut::new(&mut c, m, n, 1, m as isize),
@@ -363,11 +363,11 @@ fn pre_narrow_semantics<N: Narrow>() {
         let mut differs = 0usize;
         for j in 0..n {
             for i in 0..m {
-                // The single f32 product A[i,0]·B[0,j] (k == 1, col-major), exact.
+                // The single f32 product A[i,0]*B[0,j] (k == 1, col-major), exact
                 let ab = a[i].f32() * b[j].f32();
                 let biasw = bias_row[i].f32();
                 let one_round: N = ref_apply_narrow::<N>(ab, biasw, act);
-                // Two-rounding alternative: narrow the product first, then add bias and narrow.
+                // Two-rounding alternative: narrow the product first, then add bias and narrow
                 let two_round: N = ref_apply_narrow::<N>(N::narrow(ab).f32(), biasw, act);
                 assert_eq!(
                     c[i + j * m].bits(),
@@ -396,9 +396,9 @@ fn fused_mixed_pre_narrow_semantics() {
     pre_narrow_semantics::<gemmkit::bf16>();
 }
 
-// --------------------------------------------------------------------------- c. f64 oracle sweep
+// c. f64 oracle sweep
 
-/// General driver shape, full `bias × act × beta` sweep, against the f64 oracle within tolerance.
+/// General driver shape, full `bias x act x beta` sweep, against the f64 oracle within tolerance
 fn matches_reference<N: Narrow>() {
     let mut rng = Rng::new(0xC0FF_EE12);
     let (m, k, n) = (96usize, 128usize, 64usize);
@@ -446,11 +446,11 @@ fn fused_mixed_matches_reference() {
     matches_reference::<gemmkit::bf16>();
 }
 
-// --------------------------------------------------------------------------- d. special routes
+// d. special routes
 
 /// One fused config over the small-`m,n` and small-`k` special routes: accuracy vs the f64 oracle,
-/// plus serial ≡ Rayon(4) **bitwise** (the routes partition the output with no cross-thread
-/// reduction, and the fused epilogue is a per-range pass).
+/// plus serial == Rayon(4) **bitwise** (the routes partition the output with no cross-thread
+/// reduction, and the fused epilogue is a per-range pass)
 fn special_route<N: Narrow>(
     m: usize,
     k: usize,
@@ -522,13 +522,13 @@ fn special_route<N: Narrow>(
 }
 
 fn special_routes<N: Narrow>() {
-    // small_mn: (8, 2048, 8), row-major A (csa == 1), col-major B (rsb == 1).
+    // small_mn: (8, 2048, 8), row-major A (csa == 1), col-major B (rsb == 1)
     {
         let (m, k, n) = (8usize, 2048usize, 8usize);
         let mut rng = Rng::new(0x5A11_3E00);
-        let a = make::<N>(&mut rng, m, k, 1.0); // logical, stored col-major here…
+        let a = make::<N>(&mut rng, m, k, 1.0); // logical, stored col-major here...
         let b = make::<N>(&mut rng, k, n, 1.0);
-        // …but present A row-major: rebuild a row-major buffer so csa == 1.
+        // ...but present A row-major: rebuild a row-major buffer so csa == 1
         let mut a_row = vec![N::of(0.0); m * k];
         for i in 0..m {
             for p in 0..k {
@@ -539,7 +539,7 @@ fn special_routes<N: Narrow>() {
             m, k, n, &a_row, k as isize, 1, &b, 1, k as isize, "small_mn",
         );
     }
-    // small_k: (100, 4, 80), col-major A (rsa == 1).
+    // small_k: (100, 4, 80), col-major A (rsa == 1)
     {
         let (m, k, n) = (100usize, 4usize, 80usize);
         let mut rng = Rng::new(0x5A11_C400);
@@ -555,9 +555,9 @@ fn fused_mixed_special_routes() {
     special_routes::<gemmkit::bf16>();
 }
 
-// --------------------------------------------------------------------------- e. identity delegates
+// e. identity delegates
 
-/// `bias None + act None` delegates to plain `gemm`, bit-for-bit (the zero-cost identity path).
+/// `bias None + act None` delegates to plain `gemm`, bit-for-bit (the zero-cost identity path)
 fn identity_delegates<N: Narrow>() {
     let mut rng = Rng::new(0x1DE7_17FF);
     let (m, k, n) = (48usize, 40usize, 33usize);
@@ -605,15 +605,15 @@ fn fused_mixed_identity_delegates() {
     identity_delegates::<gemmkit::bf16>();
 }
 
-// --------------------------------------------------------------------------- f. NaN → ReLU → 0
+// f. NaN -> ReLU -> 0
 
 /// A `NaN` in the first depth column of every A row poisons each output's `k`-reduction to `NaN`,
-/// which `ReLU` must map to `+0.0` on every ISA and store path — bit-for-bit `N::ZERO`. With
-/// `beta = 0` the whole output is affected; the reference (`ReLU(NaN) = +0`) agrees.
+/// which `ReLU` must map to `+0.0` on every ISA and store path: bit-for-bit `N::ZERO`. With
+/// `beta = 0` the whole output is affected; the reference (`ReLU(NaN) = +0`) agrees
 fn nan_relu<N: Narrow>() {
     let mut rng = Rng::new(0x4A11_DEAD);
     let (m, k, n) = (64usize, 3usize, 48usize);
-    let mut a = make::<N>(&mut rng, m, k, 1.0); // col-major m×k
+    let mut a = make::<N>(&mut rng, m, k, 1.0); // col-major mxk
     let b = make::<N>(&mut rng, k, n, 1.0);
     for i in 0..m {
         a[i] = N::nan(); // A[i, 0] at i + 0*m

@@ -1,9 +1,10 @@
 //! Property-based tests for the prepacked-reuse API (prepack_rhs/gemm_packed_b and
 //! prepack_lhs/gemm_packed_a): bit-identity to plain gemm on the general regime,
 //! accuracy + cross-thread determinism on the documented tiny/gemv exception set, and
-//! the orientation-guard panics. Never mutates knobs. See props_common for shared bars.
+//! the orientation-guard panics. Never mutates knobs. See props_common for shared bars
 #![cfg(all(not(miri), not(target_family = "wasm")))]
 
+// Shared proptest strategies, oracle references, and accuracy gates
 mod props_common;
 
 use gemmkit::{
@@ -17,8 +18,8 @@ use proptest::prelude::*;
 /// (gemv-shaped) or both-tiny (`m,n <= tiny_block_dim()`), read via getters so it tracks
 /// ambient env. Plain `gemm` also routes `m,n <= small_mn_dim() && k > small_k_threshold()`
 /// to the horizontal path (whose summation order differs from the packed driver); that set
-/// is a subset of both-tiny **iff** `small_mn_dim <= tiny_block_dim`, which we assert so a
-/// horizontal-routed shape can never fall into the strict BIT branch.
+/// is a subset of both-tiny **iff** `small_mn_dim <= tiny_block_dim`, asserted here so a
+/// horizontal-routed shape can never fall into the strict BIT branch
 fn assert_packed_env_sane() {
     assert!(
         tuning::small_mn_dim() <= tuning::tiny_block_dim(),
@@ -40,9 +41,7 @@ const PACKED_PARS: [Parallelism; 3] = [
     Parallelism::Rayon(8),
 ];
 
-// ---------------------------------------------------------------------------
-// P12 / P15(rhs) — prepack_rhs matches plain gemm (column-major-ish C)
-// ---------------------------------------------------------------------------
+// P12 / P15(rhs): prepack_rhs matches plain gemm (column-major-ish C)
 
 #[allow(clippy::too_many_arguments)]
 fn prepack_rhs_check<T: Elem>(
@@ -70,7 +69,7 @@ fn prepack_rhs_check<T: Elem>(
 
     if is_tiny_or_gemv(m, n) {
         // Buffer's own blocking may round differently from plain gemm's tiny shortcut, so
-        // check accuracy vs the f64 reference and bit-identity across thread counts.
+        // check accuracy vs the f64 reference and bit-identity across thread counts
         let cref = reference(&a, &b, &c0, al, be);
         let mut first: Option<Vec<T>> = None;
         for par in PACKED_PARS {
@@ -106,7 +105,7 @@ fn prepack_rhs_check<T: Elem>(
         }
     } else {
         // General regime: packing only rearranges B's values, so it is bit-identical to a
-        // plain gemm() for every thread count.
+        // plain gemm() for every thread count
         let mut c_ref = cbase.clone();
         gemm(
             alpha,
@@ -134,9 +133,7 @@ fn prepack_rhs_check<T: Elem>(
     }
 }
 
-// ---------------------------------------------------------------------------
-// P13 / P15(lhs) — prepack_lhs matches plain gemm (row-major-ish C)
-// ---------------------------------------------------------------------------
+// P13 / P15(lhs): prepack_lhs matches plain gemm (row-major-ish C)
 
 #[allow(clippy::too_many_arguments)]
 fn prepack_lhs_check<T: Elem>(
@@ -261,7 +258,7 @@ proptest! {
 }
 
 /// k drawn with an extra tail across the single-panel (`kc = k`) rule (api.rs:835-839),
-/// including `1024`, for the mixed-precision packed paths.
+/// including `1024`, for the mixed-precision packed paths
 #[cfg(feature = "half")]
 fn kdim_mixed() -> impl Strategy<Value = usize> {
     prop_oneof![
@@ -307,20 +304,18 @@ proptest! {
     }
 }
 
-// ---------------------------------------------------------------------------
-// P14 — packed paths reject the wrong C orientation. m,n >= 2 and a strict stride
-// inequality (the guards use >=/<=, so square-ish rs==cs C is accepted, not a panic).
-// ---------------------------------------------------------------------------
+// P14 packed paths reject the wrong C orientation. m,n >= 2 and a strict stride
+// inequality (the guards use >=/<=, so square-ish rs==cs C is accepted, not a panic)
 
 proptest! {
     #![proptest_config(ProptestConfig { cases: cases(64), ..ProptestConfig::default() })]
 
-    // packed_b requires column-major-ish C; a strictly row-major C must panic.
+    // packed_b requires column-major-ish C; a strictly row-major C must panic
     #[test]
     fn prop_packed_b_wrong_orientation_panics(m in 2usize..=32, k in 1usize..=16, n in 2usize..=32, pad in 0usize..=4) {
         let a = rand_vec::<f32>(m * k, 1);
         let b = rand_vec::<f32>(k * n, 2);
-        // Strictly row-major C: rs = n+pad > 1 = cs (|csc| < |rsc|).
+        // Strictly row-major C: rs = n+pad > 1 = cs (|csc| < |rsc|)
         let mut c = vec![0.0f32; m * (n + pad)];
         let packed = prepack_rhs(MatRef::from_col_major(&b, k, n));
         let msg = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -342,12 +337,12 @@ proptest! {
         );
     }
 
-    // packed_a requires row-major-ish C; a strictly column-major C must panic.
+    // packed_a requires row-major-ish C; a strictly column-major C must panic
     #[test]
     fn prop_packed_a_wrong_orientation_panics(m in 2usize..=32, k in 1usize..=16, n in 2usize..=32, pad in 0usize..=4) {
         let a = rand_vec::<f32>(m * k, 1);
         let b = rand_vec::<f32>(k * n, 2);
-        // Strictly column-major C: cs = m+pad > 1 = rs (|csc| > |rsc|).
+        // Strictly column-major C: cs = m+pad > 1 = rs (|csc| > |rsc|)
         let mut c = vec![0.0f32; (m + pad) * n];
         let packed = prepack_lhs(MatRef::from_col_major(&a, m, k));
         let msg = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -370,7 +365,7 @@ proptest! {
     }
 }
 
-/// Downcast a caught panic payload to its message string.
+/// Downcast a caught panic payload to its message string
 fn panic_string(e: Box<dyn std::any::Any + Send>) -> String {
     e.downcast_ref::<&str>()
         .map(|s| s.to_string())
@@ -378,8 +373,8 @@ fn panic_string(e: Box<dyn std::any::Any + Send>) -> String {
         .unwrap_or_default()
 }
 
-/// Regression: an empty operand must prepack — and round-trip through
-/// the consume call as `C <- beta*C` — without running the pack-geometry arithmetic.
+/// Regression: an empty operand must prepack (and round-trip through
+/// the consume call as `C <- beta*C`) without running the pack-geometry arithmetic
 #[test]
 fn prepack_empty_roundtrips() {
     let packed = prepack_rhs::<f32>(MatRef::new(&[], 0, 4, 1, 1));
@@ -419,7 +414,7 @@ fn prepack_empty_roundtrips() {
 
 /// Regression: an empty view's extent is 0, so the safe API accepts a
 /// huge free dimension (`usize::MAX x 0`); prepacking it must not touch the sizing
-/// arithmetic (debug: add-with-overflow panic; release: wrapped geometry).
+/// arithmetic (debug: add-with-overflow panic; release: wrapped geometry)
 #[test]
 fn prepack_huge_empty_dim_is_ok() {
     let packed = prepack_lhs::<f32>(MatRef::new(&[], usize::MAX, 0, 1, 1));
@@ -432,8 +427,8 @@ fn prepack_huge_empty_dim_is_ok() {
 
 /// Regression: a broadcast (zero-stride) view passes validation with a
 /// tiny backing slice, so a logically huge non-empty operand reaches the pack sizing
-/// arithmetic — it must fail closed (release would otherwise wrap the product into an
-/// undersized allocation the pack then writes past).
+/// arithmetic - it must fail closed (release would otherwise wrap the product into an
+/// undersized allocation the pack then writes past)
 #[test]
 fn prepack_huge_broadcast_panics() {
     let buf = vec![1.0f32; 4];

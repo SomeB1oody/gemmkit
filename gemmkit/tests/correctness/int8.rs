@@ -1,4 +1,4 @@
-//! Integer GEMM (i8 -> i32).
+//! Integer GEMM (i8 -> i32)
 
 use crate::common::*;
 use gemmkit::Parallelism;
@@ -24,7 +24,7 @@ fn correctness_i8() {
             let c0: Vec<i32> = (0..m * n).map(|x| (x as i32 % 7) - 3).collect();
             let cref = ref_i8(&a, &b, &c0, m, k, n, alpha, beta);
 
-            // Row-major A, column-major B, row-major C32.
+            // Row-major A, column-major B, row-major C32
             let bcol: Vec<i8> = {
                 let mut v = vec![0i8; k * n];
                 for i in 0..k {
@@ -48,8 +48,8 @@ fn correctness_i8() {
     }
 }
 
-/// `gemm_i8_unchecked_with` (raw pointers + a caller-owned `Workspace`) must equal `gemm_i8` — the
-/// FFI/adapter-facing signature and the missing `_with` sibling for the reuse-workspace path.
+/// `gemm_i8_unchecked_with` (raw pointers + a caller-owned `Workspace`) must equal `gemm_i8`.
+/// It is the FFI/adapter-facing signature and the missing `_with` sibling for the reuse-workspace path
 #[cfg(feature = "int8")]
 #[test]
 fn i8_unchecked_with_matches_gemm_i8() {
@@ -62,7 +62,7 @@ fn i8_unchecked_with_matches_gemm_i8() {
             let c0: Vec<i32> = (0..m * n).map(|x| (x as i32 % 7) - 3).collect();
             let cref = ref_i8(&a, &b, &c0, m, k, n, alpha, beta);
 
-            // Column-major B for the row-major-A / col-major-B / row-major-C layout.
+            // Column-major B for the row-major-A / col-major-B / row-major-C layout
             let bcol: Vec<i8> = {
                 let mut v = vec![0i8; k * n];
                 for i in 0..k {
@@ -74,7 +74,7 @@ fn i8_unchecked_with_matches_gemm_i8() {
             };
             let mut c = c0.clone();
             // SAFETY: A row-major (rsa=k, csa=1), B col-major (rsb=1, csb=k), C row-major
-            // (rsc=n, csc=1); all in bounds, distinct buffers, C doesn't alias A/B.
+            // (rsc=n, csc=1); all in bounds, distinct buffers, C doesn't alias A/B
             unsafe {
                 gemm_i8_unchecked_with(
                     &mut ws,
@@ -105,14 +105,14 @@ fn i8_unchecked_with_matches_gemm_i8() {
 
 /// The documented i8 contract is *wrapping* i32 arithmetic on overflow. Every other
 /// i8 test keeps values in range so the wrap never fires; force it here with a large
-/// `alpha` and check against a wrapping-i32 reference (not the range-checked `ref_i8`).
+/// `alpha` and check against a wrapping-i32 reference (not the range-checked `ref_i8`)
 #[cfg(feature = "int8")]
 #[test]
 fn i8_wraps_on_overflow() {
     use gemmkit::{MatMut, MatRef};
-    // 2×2×2, all 127s: each dot = 127*127 + 127*127 = 32258 (fits i32). A large `alpha`
-    // then overflows the i32 epilogue; 2×2 stays on the general kernel drain (not the
-    // gemv path), exercising the scalar `wrapping_mul`/`wrapping_add`.
+    // 2x2x2, all 127s: each dot = 127*127 + 127*127 = 32258 (fits i32). A large `alpha`
+    // then overflows the i32 epilogue; 2x2 stays on the general kernel drain (not the
+    // gemv path), exercising the scalar `wrapping_mul`/`wrapping_add`
     let a = [127i8; 4];
     let b = [127i8; 4];
     let c0 = [1_000_000i32, -2_000_000, 3_000_000, -4_000_000];
@@ -145,9 +145,9 @@ fn i8_wraps_on_overflow() {
 
 /// Integer serial == parallel **bit-identity** (integer accumulation is exact, so
 /// any thread count must produce identical i32 output). Unlike the float
-/// `parallel_equals_serial_*` tests, this is *order-independent* — wrapping i32 add is
-/// associative — so it stays a hard guarantee even if blocking ever becomes
-/// parallelism-dependent; it does not carry their thread-independent-blocking caveat.
+/// `parallel_equals_serial_*` tests, this is *order-independent* (wrapping i32 add is
+/// associative), so it stays a hard guarantee even if blocking ever becomes
+/// parallelism-dependent; it does not carry their thread-independent-blocking caveat
 #[cfg(feature = "int8")]
 #[test]
 fn parallel_equals_serial_i8() {
@@ -183,14 +183,14 @@ fn parallel_equals_serial_i8() {
 }
 
 /// Negative strides for the integer path via [`gemmkit::gemm_i8_unchecked`] (the
-/// heterogeneous escape hatch — the homogeneous `gemm_unchecked` can't serve
-/// `i8 -> i32`). Reversed-row A, compared to the row-reversed exact reference.
+/// heterogeneous escape hatch: the homogeneous `gemm_unchecked` can't serve
+/// `i8 -> i32`). Reversed-row A, compared to the row-reversed exact reference
 #[cfg(feature = "int8")]
 #[test]
 fn i8_negative_strides_unchecked() {
     let (m, k, n) = (12usize, 9, 7);
-    let a = rand_i8(m * k, 5); // row-major m×k
-    let b = rand_i8(k * n, 6); // row-major k×n
+    let a = rand_i8(m * k, 5); // row-major m x k
+    let b = rand_i8(k * n, 6); // row-major k x n
     let c0 = vec![0i32; m * n];
     let cref = ref_i8(&a, &b, &c0, m, k, n, 1, 0);
 
@@ -215,7 +215,7 @@ fn i8_negative_strides_unchecked() {
             Parallelism::Serial,
         );
     }
-    // Computed C[i,j] = sum_k A[m-1-i,k]·B[k,j]; compare to the reversed reference.
+    // Computed C[i,j] = sum_k A[m-1-i,k]*B[k,j]; compare to the reversed reference
     for i in 0..m {
         for j in 0..n {
             assert_eq!(

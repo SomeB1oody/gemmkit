@@ -1,25 +1,25 @@
-//! Proptest-free numeric oracle core, single-sourced for both test harnesses.
+//! Proptest-free numeric oracle core, single-sourced for both test harnesses
 //!
 //! The `Elem` / `CElem` element traits, the deterministic random fills, the row-major
 //! `Mat` view, the f64 `reference` GEMM, the complex `ref_cplx`, and the relative-Frobenius
 //! accuracy gates live here once. Both `tests/correctness/common.rs` and
 //! `tests/props_common/mod.rs` `#[path]`-include this file and `pub use` it, so this is the
-//! single source of truth — edit here, never in a copy.
+//! single source of truth: edit here, never in a copy
 //!
 //! Pulled in via `#[path = "../oracle_common/mod.rs"] mod oracle_common;`; it is never a
 //! test target of its own (cargo only builds top-level `tests/*.rs` and `tests/*/main.rs`).
-//! Each including binary uses a different subset of these helpers, so `dead_code` is allowed.
+//! Each including binary uses a different subset of these helpers, so `dead_code` is allowed
 #![allow(dead_code)]
 
 use gemmkit::GemmScalar;
 
 /// Trait letting the harness be generic over the homogeneous float element types
-/// (f32/f64, and — under the `half` feature — f16/bf16).
+/// (f32/f64, and, under the `half` feature, f16/bf16)
 pub trait Elem: GemmScalar {
     const EPS: f64;
     fn to_f64(self) -> f64;
     fn from_f64(x: f64) -> Self;
-    /// Native bit pattern (widened to u64) for the exact run-to-run determinism check.
+    /// Native bit pattern (widened to u64) for the exact run-to-run determinism check
     fn to_bits_u64(self) -> u64;
 }
 impl Elem for f32 {
@@ -47,12 +47,12 @@ impl Elem for f64 {
     }
 }
 // Narrow types accumulate in f32 and round outputs to 16 bits, so their `EPS` is the
-// 16-bit machine epsilon (f16 ≈ 9.8e-4, bf16 ≈ 7.8e-3) — the dominant error is the
-// final round, the f32 accumulation being far more accurate.
+// 16-bit machine epsilon (f16 ~= 9.8e-4, bf16 ~= 7.8e-3): the dominant error is the
+// final round, the f32 accumulation being far more accurate
 // `half`'s hardware `to_f64`/`from_f64` are inline asm on aarch64 (Miri can't interpret
 // it), so under `cfg(miri)` the harness routes through `half`'s pure-software `*_const`
-// conversions — bit-equivalent, keeping the mixed-precision scalar path exercisable under
-// Miri (the gemmkit-internal conversions are handled the same way in src/scalar.rs).
+// conversions, bit-equivalent, keeping the mixed-precision scalar path exercisable under
+// Miri (the gemmkit-internal conversions are handled the same way in src/scalar.rs)
 #[cfg(feature = "half")]
 impl Elem for gemmkit::f16 {
     const EPS: f64 = 9.765625e-4; // 2^-10
@@ -108,7 +108,7 @@ impl Elem for gemmkit::bf16 {
     }
 }
 
-/// Deterministic pseudo-random fill in [-1, 1).
+/// Deterministic pseudo-random fill in [-1, 1)
 pub fn rand_vec<T: Elem>(n: usize, seed: u64) -> Vec<T> {
     let mut s = seed.wrapping_add(0x9E3779B97F4A7C15);
     (0..n)
@@ -122,7 +122,7 @@ pub fn rand_vec<T: Elem>(n: usize, seed: u64) -> Vec<T> {
         .collect()
 }
 
-/// Logical matrix in row-major order plus its dimensions, for building views.
+/// Logical matrix in row-major order plus its dimensions, for building views
 pub struct Mat<T> {
     pub v: Vec<T>,
     pub rows: usize,
@@ -141,7 +141,7 @@ impl<T: Elem> Mat<T> {
     }
 }
 
-/// f64 reference: `C <- beta*C0 + alpha*A*B` (beta==0 overwrites, never reads C0).
+/// f64 reference: `C <- beta*C0 + alpha*A*B` (beta==0 overwrites, never reads C0)
 pub fn reference<T: Elem>(a: &Mat<T>, b: &Mat<T>, c0: &Mat<T>, alpha: f64, beta: f64) -> Vec<f64> {
     let (m, k, n) = (a.rows, a.cols, b.cols);
     let mut out = vec![0.0f64; m * n];
@@ -167,7 +167,7 @@ pub fn reference<T: Elem>(a: &Mat<T>, b: &Mat<T>, c0: &Mat<T>, alpha: f64, beta:
 /// `|beta|*||C0||` term. The correctness suite keeps tiny dims on `beta == 0` so `||A||*||B||`
 /// alone bounds the output there (it passes `denom_extra == 0`, reducing to the canonical
 /// gate); the property suite draws beta over the full (dim, beta) space, so it must add the
-/// `beta*C0` contribution or a tiny `k` with a dominant `beta*C0` term would spuriously fail.
+/// `beta*C0` contribution or a tiny `k` with a dominant `beta*C0` term would spuriously fail
 #[allow(clippy::too_many_arguments)]
 pub fn assert_accurate<T: Elem>(
     got: &[T],
@@ -203,7 +203,7 @@ pub fn assert_accurate<T: Elem>(
     );
 }
 
-/// A complex element type the complex test harness is generic over.
+/// A complex element type the complex test harness is generic over
 #[cfg(feature = "complex")]
 pub trait CElem: gemmkit::ComplexScalar {
     const EPS: f64;
@@ -243,7 +243,7 @@ pub fn rand_cplx<T: CElem>(n: usize, seed: u64) -> Vec<T> {
     (0..n).map(|_| T::of(next(), next())).collect()
 }
 
-/// f64 complex reference (column-major operands), with conj of A / B as selected.
+/// f64 complex reference (column-major operands), with conj of A / B as selected
 #[cfg(feature = "complex")]
 #[allow(clippy::too_many_arguments)]
 pub fn ref_cplx<T: CElem>(
@@ -284,7 +284,7 @@ pub fn ref_cplx<T: CElem>(
     out
 }
 
-/// Relative Frobenius gate for the column-major complex output: `rel <= 16*k*eps`.
+/// Relative Frobenius gate for the column-major complex output: `rel <= 16*k*eps`
 #[cfg(feature = "complex")]
 pub fn assert_cplx_accurate<T: CElem>(
     got: &[T],
@@ -294,7 +294,7 @@ pub fn assert_cplx_accurate<T: CElem>(
     k: usize,
     ctx: &str,
 ) {
-    // Relative error over the whole matrix (column-major `got`).
+    // Relative error over the whole matrix (column-major `got`)
     let mut diff2 = 0.0;
     let mut ref2 = 0.0;
     for i in 0..m {

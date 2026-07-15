@@ -1,18 +1,16 @@
-//! Prepacked-RHS/LHS reuse, gather-pack probe, shared-LHS gate sweep.
+//! Prepacked-RHS/LHS reuse, gather-pack probe, shared-LHS gate sweep
 
 use crate::harness::{BENCH_GUARD, fill, measure};
 use gemmkit::{MatMut, MatRef, Parallelism, gemm};
 
-// ---------------------------------------------------------------------------
 // Prepacked-RHS reuse
-// ---------------------------------------------------------------------------
 
 /// Per-call throughput of a reused prepacked B (`gemm_packed_b`) vs plain `gemm`
 /// (which re-reads / re-packs B every call) for a fixed `(k, n)` B and a varying
 /// `m` (the activation batch). `b_row_major` is the strided case: plain gemm reads
 /// B with a large K-stride each call and, below `m > 2048`, never packs it, so the
 /// contiguous prepacked panel should win per call. `colB` is the control. The win
-/// is the per-call speedup (the one-time pack amortizes away over many calls).
+/// is the per-call speedup (the one-time pack amortizes away over many calls)
 fn bench_prepack(k: usize, n: usize, m: usize, b_row_major: bool, par: Parallelism) {
     let a = fill(m * k, 1);
     let b = fill(k * n, 2);
@@ -64,7 +62,7 @@ fn bench_prepack(k: usize, n: usize, m: usize, b_row_major: bool, par: Paralleli
 /// Pack-path probe: isolate the gather-pack cost. Row-major A packs via the strided
 /// gather; col-major A at these sizes packs via the fast `copy_nonoverlapping`
 /// contiguous path. Same FLOPs otherwise, so the row/col gap is an upper bound on
-/// what a faster gather-pack could recover. Small `n` keeps A-packing unamortized.
+/// what a faster gather-pack could recover. Small `n` keeps A-packing unamortized
 fn bench_pack_probe(m: usize, k: usize, n: usize, par: Parallelism) {
     let a = fill(m * k, 1);
     let b = fill(k * n, 2);
@@ -139,8 +137,8 @@ fn perf_prepack() {
 /// packed-LHS path drives the product transposed, so C is row-major (its supported
 /// orientation) and A plays the transposed RHS. `a_col_major` is the strided case:
 /// after the transpose the driver reads A with a large K-stride (`= m`) and, below
-/// the pack gate (transposed `m = n > 2048`), never packs it — so the contiguous
-/// prepacked panel should win per call. Row-major A is the contiguous control.
+/// the pack gate (transposed `m = n > 2048`), never packs it, so the contiguous
+/// prepacked panel should win per call. Row-major A is the contiguous control
 fn bench_prepack_lhs(m: usize, k: usize, n: usize, a_col_major: bool, par: Parallelism) {
     let a = fill(m * k, 1);
     let b = fill(k * n, 2);
@@ -149,7 +147,7 @@ fn bench_prepack_lhs(m: usize, k: usize, n: usize, a_col_major: bool, par: Paral
     } else {
         (k as isize, 1)
     };
-    // Row-major C: the supported orientation for the prepacked-LHS path.
+    // Row-major C: the supported orientation for the prepacked-LHS path
     let mut c = vec![0.0f32; m * n];
 
     let s_plain = measure(m, k, n, || {
@@ -198,7 +196,7 @@ fn perf_prepack_lhs() {
     for &acm in &[true, false] {
         for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
             // n past 2048 crosses the RHS-pack gate, where plain gemm re-packs the
-            // (fixed) A every call — the case prepacking should win most.
+            // (fixed) A every call: the case prepacking should win most
             for &n in &[128usize, 512, 1024, 2048, 4096, 6144] {
                 bench_prepack_lhs(1024, 1024, n, acm, par);
             }
@@ -206,9 +204,7 @@ fn perf_prepack_lhs() {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Shared-LHS A-pack gate calibration
-// ---------------------------------------------------------------------------
 
 /// Force the shared-LHS A-pack gate **on vs off back-to-back in one process** (via
 /// the runtime setter, so the same buffers/thread-pool are reused and machine drift
@@ -216,7 +212,7 @@ fn perf_prepack_lhs() {
 /// behavior on the packed-A path: a row-major A (`rsa != 1`) always packs, so every
 /// size exercises the pre-pass; a column-major A packs only once its K-walk stride
 /// trips the TLB gate (large `m`), so its crossover sits higher. The `on % of off`
-/// column is the signal — above 100% the shared pre-pass wins, below it regresses.
+/// column is the signal: above 100% the shared pre-pass wins, below it regresses
 fn bench_shared_lhs(s: usize, row_major_a: bool) {
     let (m, k, n) = (s, s, s);
     let a = fill(m * k, 1);

@@ -1,4 +1,4 @@
-//! Differential drivers: run a gemmkit entry point and gate it against the reference.
+//! Differential drivers: run a gemmkit entry point and gate it against the reference
 
 use crate::common::{
     Canary, CplxElem, LayoutPlan, RealElem, Rng, assert_no_gap_writes, build_operand, extent_of,
@@ -12,13 +12,11 @@ use gemmkit::{
     gemm_cplx, gemm_i8, gemm_packed_a, gemm_packed_b, gemm_with, prepack_lhs, prepack_rhs,
 };
 
-// ---------------------------------------------------------------------------
 // generic differential drivers (shared across targets)
-// ---------------------------------------------------------------------------
 
 /// A moderately sized fixed problem run through a caller `Workspace` before the plan
-/// problem, so the reuse path sees a shape change (grow or shrink) — the
-/// `workspace_alloc.rs` axis the thread-local pool alone never exercises.
+/// problem, so the reuse path sees a shape change (grow or shrink): this is the
+/// `workspace_alloc.rs` axis the thread-local pool alone never exercises
 fn warm_ws<T: RealElem>(ws: &mut Workspace) {
     let (m, k, n) = (16usize, 16usize, 16usize);
     let mut rr = Rng::new(0xA11CE);
@@ -129,7 +127,7 @@ pub(crate) fn differential_gemm_i8(
     let mut rc = Rng::new(c_seed);
     let (abuf, rsa, csa) = build_operand::<i8>(m, k, la, 0, || ra.next_i8());
     let (bbuf, rsb, csb) = build_operand::<i8>(k, n, lb, 0, || rb.next_i8());
-    // C0 elements in [-128, 127] so the i32 epilogue stays in a sane magnitude.
+    // C0 elements in [-128, 127] so the i32 epilogue stays in a sane magnitude
     let (mut cbuf, rsc, csc) =
         build_operand::<i32>(m, n, lc, i32::SENTINEL, || rc.next_i8() as i32);
 
@@ -212,7 +210,7 @@ pub(crate) fn differential_gemm_cplx<T: CplxElem>(
 
 /// Prepacked-RHS round trip: `prepack_rhs(B)` then `gemm_packed_b` with column-major-ish
 /// C (the orientation the API requires). Gate is tolerance, not bitwise, per the API's
-/// tiny/gemv last-ULP allowance.
+/// tiny/gemv last-ULP allowance
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn differential_packed_b_real<T: RealElem>(
     m: usize,
@@ -235,7 +233,7 @@ pub(crate) fn differential_packed_b_real<T: RealElem>(
     let mut rc = Rng::new(c_seed);
     let (abuf, rsa, csa) = build_operand(m, k, la, T::ZERO, || T::from_f64(ra.next_quant()));
     let (bbuf, rsb, csb) = build_operand(k, n, lb, T::ZERO, || T::from_f64(rb.next_quant()));
-    // Column-major-ish C (|csc| >= |rsc|); dims are >= 1 so the invariant holds.
+    // Column-major-ish C (|csc| >= |rsc|); dims are >= 1 so the invariant holds
     let lc = LayoutPlan::ColIsh { il: 1, pad: 1 };
     let (mut cbuf, rsc, csc) =
         build_operand(m, n, lc, T::SENTINEL, || T::from_f64(rc.next_quant()));
@@ -271,7 +269,7 @@ pub(crate) fn differential_packed_b_real<T: RealElem>(
     assert_no_gap_writes(&cbuf, m, n, rsc, csc, ctx);
 }
 
-/// Prepacked-LHS round trip: `prepack_lhs(A)` then `gemm_packed_a` with row-major-ish C.
+/// Prepacked-LHS round trip: `prepack_lhs(A)` then `gemm_packed_a` with row-major-ish C
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn differential_packed_a_real<T: RealElem>(
     m: usize,
@@ -294,7 +292,7 @@ pub(crate) fn differential_packed_a_real<T: RealElem>(
     let mut rc = Rng::new(c_seed);
     let (abuf, rsa, csa) = build_operand(m, k, la, T::ZERO, || T::from_f64(ra.next_quant()));
     let (bbuf, rsb, csb) = build_operand(k, n, lb, T::ZERO, || T::from_f64(rb.next_quant()));
-    // Row-major-ish C (|csc| <= |rsc|); dims are >= 1 so the invariant holds.
+    // Row-major-ish C (|csc| <= |rsc|); dims are >= 1 so the invariant holds
     let lc = LayoutPlan::RowIsh { il: 1, pad: 1 };
     let (mut cbuf, rsc, csc) =
         build_operand(m, n, lc, T::SENTINEL, || T::from_f64(rc.next_quant()));
@@ -331,7 +329,7 @@ pub(crate) fn differential_packed_a_real<T: RealElem>(
 }
 
 /// Strided-batched GEMM over one big buffer per operand (batch strides valid by
-/// construction) plus a `gemm_batched_slice` cross-check over per-element buffers.
+/// construction) plus a `gemm_batched_slice` cross-check over per-element buffers
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn differential_batched_real<T: RealElem>(
     batch: usize,
@@ -360,7 +358,7 @@ pub(crate) fn differential_batched_real<T: RealElem>(
     let ea = extent_of(m, k, rsa, csa);
     let eb = extent_of(k, n, rsb, csb);
     let ec = extent_of(m, n, rsc, csc);
-    // Batch strides: 0 broadcasts a read-only operand; C must clear one element extent.
+    // Batch strides: 0 broadcasts a read-only operand; C must clear 1 element extent
     let a_bs = if a_broadcast { 0 } else { ea + a_bs_pad };
     let b_bs = if b_broadcast { 0 } else { eb + b_bs_pad };
     let c_bs = ec + c_bs_pad;
@@ -411,7 +409,7 @@ pub(crate) fn differential_batched_real<T: RealElem>(
         }
     }
 
-    // Per-element references before the call.
+    // Per-element references before the call
     let mut refs: Vec<(Vec<f64>, f64)> = Vec::with_capacity(batch);
     for e in 0..batch {
         let da = dense_real(&abuf[e * a_bs..], m, k, rsa, csa);
@@ -441,10 +439,10 @@ pub(crate) fn differential_batched_real<T: RealElem>(
         let slot = &cbuf[e * c_bs..e * c_bs + ec];
         real_gate::<T>(slot, rsc, csc, m, n, cref, *denom, k, ctx);
     }
-    // Whole-buffer canary: element gaps AND inter-element gaps must be untouched.
+    // Whole-buffer canary: element gaps AND inter-element gaps must be untouched
     assert_batched_no_gap_writes(&cbuf, batch, m, n, rsc, csc, c_bs, ctx);
 
-    // Second entry point: pointer-array batched over per-element buffers.
+    // 2nd entry point: pointer-array batched over per-element buffers
     if batch >= 1 {
         batched_slice_real::<T>(batch, m, k, n, alpha_f, beta_f, par, seed, ctx);
     }

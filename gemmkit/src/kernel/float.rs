@@ -1,12 +1,12 @@
-//! The floating-point GEMM family: the *single* generic microkernel of the
-//! library, plus the float pack layout and epilogue.
+//! The floating-point GEMM family: the single generic microkernel of the
+//! library, plus the float pack layout and epilogue
 //!
 //! One generic function (`microkernel_impl`) covers every ISA (scalar, FMA,
 //! AVX-512) and every tile (`MR_REG`, `NR`), because all the instruction variation
 //! is hidden behind [`SimdOps`] and all the geometry variation behind const generics.
 //! There is no macro, no per-ISA copy. The family exposes it through
 //! [`FloatGemm::microkernel_epi`], the fused entry the driver calls (the plain
-//! [`KernelFamily::microkernel`] is left as the trait's `unreachable!` default).
+//! [`KernelFamily::microkernel`] is left as the trait's `unreachable!` default)
 
 use core::marker::PhantomData;
 
@@ -16,7 +16,7 @@ use crate::pack::pack_panels;
 use crate::scalar::Float;
 use crate::simd::{KernelSimd, SimdOps};
 
-/// The real floating-point GEMM family (`Lhs = Rhs = Acc = Out = T`).
+/// The real floating-point GEMM family (`Lhs = Rhs = Acc = Out = T`)
 pub struct FloatGemm<T>(PhantomData<T>);
 
 impl<T> Clone for FloatGemm<T> {
@@ -64,7 +64,7 @@ where
     ) {
         // RHS panels are `nr` columns wide, stored row-by-row: the "leading"
         // direction is columns (stride `cs`) and the "depth" is rows (stride
-        // `rs`) — the transpose of the LHS case, handled by swapping strides.
+        // `rs`), the transpose of the LHS case, handled by swapping strides
         unsafe {
             pack_panels(
                 dst, src, /*lead*/ cs, /*depth*/ rs, /*n_lead*/ nc, kc, nr,
@@ -128,21 +128,21 @@ where
     }
 }
 
-/// The one generic float microkernel, now parameterized over the fused [`Epilogue`] `E`.
+/// The one generic float microkernel, now parameterized over the fused [`Epilogue`] `E`
 ///
 /// **Zero-cost identity.** Every epilogue use is gated on `!E::IS_IDENTITY` (and the fast
 /// route on `E::IS_IDENTITY || E::VECTOR`), all associated `const`s. With `E = Identity`
 /// the guards const-fold to `false`/`true` before LLVM sees them, `row0`/`col0`/`last_k`
 /// become dead arguments, and the emitted code is the pre-epilogue kernel byte-for-byte.
 /// With a `VECTOR` epilogue (`FusedEpi`) the fast path applies `E` to the very register the
-/// store would have written, so a fused GEMM equals `gemm()` then a scalar map, bitwise.
+/// store would have written, so a fused GEMM equals `gemm()` then a scalar map, bitwise
 ///
 /// The const-bounded index loops over `acc[j][i]` are deliberate: with `MR_REG`/`NR`
 /// monomorphized they fully unroll and the optimizer promotes each accumulator to a
-/// register. Iterator forms obscure that, so the range loops stay.
+/// register. Iterator forms obscure that, so the range loops stay
 ///
 /// # Safety
-/// As [`KernelFamily::microkernel_epi`]; run inside `S`'s [`crate::simd::Simd::vectorize`].
+/// As [`KernelFamily::microkernel_epi`]; run inside `S`'s [`crate::simd::Simd::vectorize`]
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 #[inline(always)]
 unsafe fn microkernel_impl<T, S, E, const MR_REG: usize, const NR: usize>(
@@ -176,7 +176,7 @@ unsafe fn microkernel_impl<T, S, E, const MR_REG: usize, const NR: usize>(
         let lanes = <S as SimdOps<T>>::LANES;
         let mr = MR_REG * lanes;
 
-        // --- accumulate: acc[j][i] = column j, rows i*lanes..(i+1)*lanes ---
+        // accumulate: acc[j][i] = column j, rows i*lanes..(i+1)*lanes
         let mut acc: [[<S as SimdOps<T>>::Reg; MR_REG]; NR] = [[simd.zero(); MR_REG]; NR];
 
         if nr_eff == NR {
@@ -188,14 +188,14 @@ unsafe fn microkernel_impl<T, S, E, const MR_REG: usize, const NR: usize>(
             // delivery at kc-loop boundaries) can override just this loop
             // with a software-pipelined schedule, leaving the driver,
             // packing, and epilogue untouched; the override reorders loads,
-            // not arithmetic, so it rounds consistently with the edge path.
+            // not arithmetic, so it rounds consistently with the edge path
             simd.accumulate_tile::<MR_REG, NR>(kc, a, a_cs, b, b_rs, b_cs, &mut acc);
         } else {
             // Edge column tile (`nr_eff < NR`): read exactly `nr_eff` columns
-            // so an *unpacked* B is never read past its last real column. The
+            // so an unpacked B is never read past its last real column. The
             // runtime bound costs unrolling, but this is only the trailing
             // column tile of a panel. (`acc[nr_eff..NR]` stay zero and are
-            // ignored by the scratch epilogue below.)
+            // ignored by the scratch epilogue below)
             for p in 0..kc {
                 let pa = a.offset(p as isize * a_cs);
                 let a_regs: [<S as SimdOps<T>>::Reg; MR_REG] =
@@ -210,7 +210,7 @@ unsafe fn microkernel_impl<T, S, E, const MR_REG: usize, const NR: usize>(
             }
         }
 
-        // --- fold alpha into the accumulators (skip when alpha == 1) ---
+        // fold alpha into the accumulators (skip when alpha == 1)
         if alpha_status == AlphaStatus::Other {
             let av = simd.splat(alpha);
             for j in 0..NR {
@@ -220,15 +220,15 @@ unsafe fn microkernel_impl<T, S, E, const MR_REG: usize, const NR: usize>(
             }
         }
 
-        // --- epilogue ---
+        // epilogue
         // The fast (vector) route is available to the identity kernel and to a `VECTOR`
         // epilogue; a scalar-only epilogue (`VECTOR = false`) forces the scratch route for
-        // every tile. With `E = Identity` this is `(true || _) && ...` — the pre-epilogue
-        // condition exactly.
+        // every tile. With `E = Identity` this is `(true || _) && ...`: the pre-epilogue
+        // condition exactly
         if (E::IS_IDENTITY || E::VECTOR) && mr_eff == mr && nr_eff == NR && rsc == 1 {
-            // Fast path: full tile, column-major C → vector load/store, then (on the final
+            // Fast path: full tile, column-major C -> vector load/store, then (on the final
             // depth panel, for a non-identity epilogue) the fused vector transform applied
-            // to the LANES consecutive rows the store would have written.
+            // to the LANES consecutive rows the store would have written
             match beta_status {
                 BetaStatus::Zero => {
                     for j in 0..NR {
@@ -279,7 +279,7 @@ unsafe fn microkernel_impl<T, S, E, const MR_REG: usize, const NR: usize>(
             }
         } else {
             // General / partial path: drain to contiguous column-major
-            // scratch (`scratch[j*mr + row]`), then strided copy-back.
+            // scratch (`scratch[j*mr + row]`), then strided copy-back
             for j in 0..NR {
                 for i in 0..MR_REG {
                     simd.storeu(scratch.add(j * mr + i * lanes), acc[j][i]);
@@ -296,7 +296,7 @@ unsafe fn microkernel_impl<T, S, E, const MR_REG: usize, const NR: usize>(
                     };
                     // Apply the fused scalar transform on the final depth panel; on
                     // intermediate panels store the raw `Acc` partial. Bit-identical to the
-                    // vector form above under the same token (the edge-consistency contract).
+                    // vector form above under the same token (the edge-consistency contract)
                     *cp = if !E::IS_IDENTITY && last_k {
                         epi.apply(out, row0 + i, col0 + j)
                     } else {

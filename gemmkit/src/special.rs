@@ -1,26 +1,30 @@
-//! Special-case paths (layer L6).
+//! Special-case paths (layer L6)
 //!
-//! These bypass the register-tiling driver for shapes where it is the wrong tool: [`gemv`]
-//! (matrix·vector), [`small_k`] (skinny / low-depth GEMM — gevv, rank-`k`, tall-skinny), and
-//! [`small_mn`] (small `m,n`, long `k` — the horizontal inner-product kernel). Batched GEMM is
-//! an orchestration layer over the single-GEMM engine.
+//! Bypasses the register-tiling driver for shapes where it is the wrong tool: [`gemv`]
+//! (matrix*vector), [`small_k`] (skinny / low-depth GEMM: gevv, rank-`k`, tall-skinny), and
+//! [`small_mn`] (small `m,n`, long `k`: the horizontal inner-product kernel). Batched GEMM is
+//! an orchestration layer over the single-GEMM engine
 
+// Batched GEMM: many independent products scheduled across workers
 pub mod batched;
+// gemv: matrix*vector product, dispatched by output-row partitioning
 pub mod gemv;
+// Skinny/low-depth GEMM computed unpacked, in place, in a single depth panel
 pub mod small_k;
+// Small-`m,n`, long-`k` horizontal (inner-product) path
 pub mod small_mn;
 
 use crate::scalar::Float;
 use crate::simd::SimdOps;
 
-/// Horizontal dot of two unit-stride length-`k` vectors: `Σ_k x[k]·y[k]`, a SIMD `mul_add` sweep
-/// reduced by `reduce_sum` (fixed lane order) then an ascending scalar tail. This is the single
-/// fixed-order reduction the bandwidth-bound dot paths share ([`gemv`]'s row·vector and
-/// [`small_mn`]'s edge-tile cell), so they round identically — the determinism contract those
-/// paths rely on.
+/// Horizontal dot of 2 unit-stride length-`k` vectors: `sum_k(x[k]*y[k])`, a SIMD `mul_add`
+/// sweep reduced by `reduce_sum` (fixed lane order) then an ascending scalar tail. This is the
+/// single fixed-order reduction the bandwidth-bound dot paths share ([`gemv`]'s row*vector and
+/// [`small_mn`]'s edge-tile cell), so they round identically: the determinism contract those
+/// paths rely on
 ///
 /// # Safety
-/// `x`/`y` valid for `k` contiguous reads; run inside `S`'s [`crate::simd::Simd::vectorize`].
+/// `x`/`y` valid for `k` contiguous reads; run inside `S`'s [`crate::simd::Simd::vectorize`]
 #[inline(always)]
 pub(crate) unsafe fn dot_contiguous<T, S>(simd: S, k: usize, x: *const T, y: *const T) -> T
 where

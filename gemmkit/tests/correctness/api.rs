@@ -1,15 +1,13 @@
-//! Safe-API panic guarantees and cache-topology sanity.
+//! Safe-API panic guarantees and cache-topology sanity
 
 use gemmkit::{MatMut, MatRef, Parallelism, gemm};
 
-// ---------------------------------------------------------------------------
-// cache detection (§7.5)
-// ---------------------------------------------------------------------------
+// cache detection (section 7.5)
 
 #[test]
 fn cache_topology_is_plausible() {
     let t = gemmkit::topology();
-    // Sane bounds (true on any real CPU).
+    // Sane bounds (true on any real CPU)
     assert!(
         t.l1d.bytes >= 8 * 1024 && t.l1d.bytes <= 256 * 1024,
         "L1d={}",
@@ -17,7 +15,7 @@ fn cache_topology_is_plausible() {
     );
     assert!(t.l1d.line >= 32 && t.l1d.line <= 256);
     assert!(t.l2.bytes >= 128 * 1024, "L2={}", t.l2.bytes);
-    // Blocking parameters are sane for a big problem.
+    // Blocking parameters are sane for a big problem
     let blk = t.blocking(32, 12, 4, 4096, 4096, 4096);
     assert!(blk.mc >= 32 && blk.kc >= 1 && blk.nc >= 12);
     assert!(blk.mc.is_multiple_of(32), "mc should be a multiple of MR");
@@ -32,9 +30,7 @@ fn cache_topology_is_plausible() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // safe-API panic guarantees
-// ---------------------------------------------------------------------------
 
 #[test]
 #[should_panic(expected = "A.cols")]
@@ -76,7 +72,7 @@ fn panic_extent_overflow_view() {
     let mut c = vec![0.0f32; 1];
     let half = isize::BITS / 2;
     let rows = (1usize << (half + 1)) + 1;
-    let rs = 1isize << half; // (rows-1)*rs = 2^(2·half+1), overflows isize on the target
+    let rs = 1isize << half; // (rows-1)*rs = 2^(2*half+1), overflows isize on the target
     gemm(
         1.0,
         MatRef::new(&a, rows, 1, rs, 1),
@@ -90,8 +86,8 @@ fn panic_extent_overflow_view() {
 #[test]
 #[should_panic(expected = "aliases itself")]
 fn panic_self_aliasing_c() {
-    // rsc == 0 collapses all rows of C onto the same memory — accepted by the
-    // bounds check (extent fits) but a data race in parallel. Must panic.
+    // rsc == 0 collapses all rows of C onto the same memory: accepted by the
+    // bounds check (extent fits) but a data race in parallel. Must panic
     let a = vec![0.0f32; 8]; // 4x2
     let b = vec![0.0f32; 6]; // 2x3
     let mut c = vec![0.0f32; 3];
@@ -108,14 +104,12 @@ fn panic_self_aliasing_c() {
 #[test]
 #[should_panic(expected = "aliases")]
 fn panic_c_aliases_a() {
-    // Force an alias via raw slices over the same buffer through MatRef/MatMut.
+    // Force an alias via raw slices over the same buffer through MatRef/MatMut
     let mut buf = vec![1.0f32; 16];
-    let (a_part, c_part) = buf.split_at_mut(0); // a_part empty? need overlap
+    let (a_part, c_part) = buf.split_at_mut(0);
     let _ = (a_part, c_part);
-    // Build overlapping views by unsafe transmute of lifetimes is messy; instead
-    // use the same slice for A and C via raw pointers is not possible in safe
-    // API. We simulate by pointing both at `buf` through separate borrows is
-    // disallowed; so construct via std::slice::from_raw_parts.
+    // Safe borrows can't produce overlapping A/C views over one buffer; build them
+    // via raw pointers and std::slice::from_raw_parts(_mut) instead
     let ptr = buf.as_mut_ptr();
     let len = buf.len();
     unsafe {

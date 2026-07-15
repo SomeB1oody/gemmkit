@@ -1,6 +1,6 @@
 //! ndarray adapter correctness: accepts both `&Array2` and `ArrayView2`, handles
 //! C-order / F-order / transposed / reversed views, and `dot` matches ndarray's
-//! own `.dot()`.
+//! own `.dot()`
 
 use approx::assert_relative_eq;
 use ndarray::{Array2, Array3, Axis};
@@ -66,14 +66,14 @@ fn transposed_and_fortran_layouts() {
     let a = rand2(m, k, 5);
     let b = rand2(k, n, 6);
 
-    // A transposed: build a (k,m) array and transpose to a (m,k) view (col-major).
+    // A transposed: build a (k,m) array and transpose to a (m,k) view (col-major)
     let at = rand2(k, m, 7);
     let a_view = at.t(); // shape (m,k), F-order strides
     let exp = a_view.dot(&b);
     let got = dot(&a_view, &b);
     assert_relative_eq!(got, exp, max_relative = 1e-10);
 
-    // F-order C output via gemm into a column-major array.
+    // F-order C output via gemm into a column-major array
     use ndarray::ShapeBuilder;
     let mut c = Array2::<f64>::zeros((m, n).f());
     gemm(1.0, &a, &b, 0.0, &mut c, Parallelism::Rayon(0));
@@ -84,7 +84,7 @@ fn transposed_and_fortran_layouts() {
 fn reversed_view_negative_strides() {
     let a = rand2(10, 8, 9);
     let b = rand2(8, 6, 10);
-    // Reverse A along rows → negative row stride.
+    // Reverse A along rows -> negative row stride
     let a_rev = a.slice(ndarray::s![..;-1, ..]);
     let exp = a_rev.dot(&b);
     let got = dot(&a_rev, &b);
@@ -141,7 +141,7 @@ fn gemm_batched_matches_per_element_loop() {
     }
 }
 
-/// Batched over a permuted-axes (non-contiguous) 3-D view: strides read straight through, no copy.
+/// Batched over a permuted-axes (non-contiguous) 3-D view: strides read straight through, no copy
 #[test]
 fn gemm_batched_permuted_axes_view() {
     let (batch, m, k, n) = (3usize, 6, 4, 5);
@@ -160,7 +160,7 @@ fn gemm_batched_permuted_axes_view() {
     }
 }
 
-/// Prepacked RHS (`prepack_rhs` + `gemm_packed_b`) into a column-major-ish C matches `dot`.
+/// Prepacked RHS (`prepack_rhs` + `gemm_packed_b`) into a column-major-ish C matches `dot`
 #[test]
 fn packed_b_matches_dot() {
     use ndarray::ShapeBuilder;
@@ -175,7 +175,7 @@ fn packed_b_matches_dot() {
     }
 }
 
-/// Prepacked LHS (`prepack_lhs` + `gemm_packed_a`) into a row-major-ish C matches `dot`.
+/// Prepacked LHS (`prepack_lhs` + `gemm_packed_a`) into a row-major-ish C matches `dot`
 #[test]
 fn packed_a_matches_dot() {
     let (m, k, n) = (96usize, 50, 72);
@@ -191,7 +191,7 @@ fn packed_a_matches_dot() {
 
 /// The i8 adapter (`gemm_i8`/`dot_i8`) accumulates `i8` inputs into an `i32` output; checked
 /// against a naive `i32` reference, including a transposed (F-order) A view. Values stay in range
-/// so the wrapping semantics never fire and the comparison is exact.
+/// so the wrapping semantics never fire and the comparison is exact
 #[cfg(feature = "int8")]
 #[test]
 fn i8_matches_reference() {
@@ -218,10 +218,10 @@ fn i8_matches_reference() {
     let a = randi8(m, k, 0x1);
     let b = randi8(k, n, 0x2);
 
-    // dot_i8 == naive product.
+    // dot_i8 == naive product
     assert_eq!(dot_i8(&a, &b), refmul(&a, &b));
 
-    // gemm_i8 with alpha/beta accumulate over a transposed (F-order) A view.
+    // gemm_i8 with alpha/beta accumulate over a transposed (F-order) A view
     let at = randi8(k, m, 0x3);
     let a_view = at.t(); // (m, k), F-order strides
     let mut c = Array2::<i32>::from_shape_fn((m, n), |(i, j)| (i * n + j) as i32 - 5);
@@ -234,7 +234,7 @@ fn i8_matches_reference() {
 }
 
 /// `f16` (a `GemmScalar`) flows through the same generic `dot`/`gemm` with no
-/// adapter-specific code; checked against the `f64` reference at 16-bit tolerance.
+/// adapter-specific code; checked against the `f64` reference at 16-bit tolerance
 #[cfg(feature = "half")]
 #[test]
 fn dot_f16_matches_reference() {
@@ -256,9 +256,9 @@ fn dot_f16_matches_reference() {
     }
 }
 
-/// Complex adapters `dot_cplx` (plain `A·B`) and `gemm_cplx` (conj + accumulate),
-/// checked against a naive reference — including a transposed (F-order) conjugated
-/// A view, the case the raw `gemm_cplx_unchecked` path exists for.
+/// Complex adapters `dot_cplx` (plain `A*B`) and `gemm_cplx` (conj + accumulate),
+/// checked against a naive reference, including a transposed (F-order) conjugated
+/// A view, the case the raw `gemm_cplx_unchecked` path exists for
 #[cfg(feature = "complex")]
 #[test]
 fn cplx_dot_and_conj_matches_reference() {
@@ -268,14 +268,14 @@ fn cplx_dot_and_conj_matches_reference() {
 
     type C = Complex<f64>;
     // `Complex::norm` needs `sqrt`, unavailable via the `no_std` num-complex re-export;
-    // compute the magnitude with `f64::hypot` instead.
+    // compute the magnitude with `f64::hypot` instead
     let cabs = |z: C| z.re.hypot(z.im);
     let crand = |r: usize, c: usize, s: u64| -> Array2<C> {
         let re = rand2(r, c, s);
         let im = rand2(r, c, s ^ 0xABCD);
         Array2::from_shape_fn((r, c), |(i, j)| Complex::new(re[(i, j)], im[(i, j)]))
     };
-    // Naive reference: C = alpha·op(A)·op(B) + beta·C0.
+    // Naive reference: C = alpha*op(A)*op(B) + beta*C0
     let refgemm = |a: &Array2<C>,
                    ca: bool,
                    b: &Array2<C>,
@@ -301,7 +301,7 @@ fn cplx_dot_and_conj_matches_reference() {
     let a = crand(m, k, 1);
     let b = crand(k, n, 2);
 
-    // dot_cplx == plain A·B.
+    // dot_cplx == plain A*B
     let got = dot_cplx(&a, &b);
     let zero = Array2::from_elem((m, n), Complex::new(0.0, 0.0));
     let exp = refgemm(
@@ -317,7 +317,7 @@ fn cplx_dot_and_conj_matches_reference() {
         assert!(cabs(g - exp[(i, j)]) < 1e-10, "dot_cplx ({i},{j})");
     }
 
-    // gemm_cplx with conj-A on a transposed (F-order) A view + beta accumulate.
+    // gemm_cplx with conj-A on a transposed (F-order) A view + beta accumulate
     let at = crand(k, m, 3); // (k,m); transpose to an (m,k) F-order view
     let a_view = at.t();
     let alpha = Complex::new(1.3, -0.4);
@@ -341,8 +341,8 @@ fn cplx_dot_and_conj_matches_reference() {
 }
 
 /// `gemm_fused` (a `PerRow` bias + `ReLU`, and the identity `None`/`None` case) is **bit-identical**
-/// to plain `gemm` followed by the same scalar map — gemmkit's `f32`/`f64` fused contract, mirrored
-/// through the adapter over a general-stride C.
+/// to plain `gemm` followed by the same scalar map: gemmkit's `f32`/`f64` fused contract, mirrored
+/// through the adapter over a general-stride C
 #[cfg(feature = "epilogue")]
 #[test]
 fn fused_matches_plain_then_map() {
@@ -354,7 +354,7 @@ fn fused_matches_plain_then_map() {
     let bias: Vec<f64> = (0..m).map(|i| 0.5 * i as f64 - 2.0).collect();
     let (alpha, beta) = (1.3f64, -0.7);
     for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
-        // PerRow bias + ReLU.
+        // PerRow bias + ReLU
         let mut c_fused = c0.clone();
         gemm_fused(
             alpha,
@@ -379,7 +379,7 @@ fn fused_matches_plain_then_map() {
                 );
             }
         }
-        // None/None ≡ plain gemm, bit-for-bit.
+        // None/None == plain gemm, bit-for-bit
         let mut c_id = c0.clone();
         gemm_fused(alpha, &a, &b, beta, &mut c_id, None, None, par);
         let mut c_plain = c0.clone();
@@ -397,8 +397,8 @@ fn fused_matches_plain_then_map() {
 }
 
 /// A reversed (negative-stride) A view through `gemm_fused` must equal plain `gemm` on the **same**
-/// reversed view then the same scalar map, **bit-for-bit**: the fused entry now forwards to gemmkit's
-/// raw engine (no reversed-view rejection), exactly like the plain entry.
+/// reversed view then the same scalar map, **bit-for-bit**: the fused entry forwards to gemmkit's
+/// raw engine with no reversed-view rejection, exactly like the plain entry
 #[cfg(feature = "epilogue")]
 #[test]
 fn fused_reversed_view_matches_plain_then_map() {
@@ -443,7 +443,7 @@ fn fused_reversed_view_matches_plain_then_map() {
 }
 
 /// `gemm_batched_fused` (one shared `PerRow` bias + `ReLU`) is **bit-identical** to a loop of
-/// [`gemm_fused`] calls, one per batch element — gemmkit's batched-fused headline property.
+/// [`gemm_fused`] calls, one per batch element: gemmkit's batched-fused headline property
 #[cfg(feature = "epilogue")]
 #[test]
 fn batched_fused_matches_loop_of_gemm_fused() {
@@ -494,7 +494,7 @@ fn batched_fused_matches_loop_of_gemm_fused() {
 }
 
 /// `gemm_i8_requant` / `gemm_i8_requant_u8` are **bit-exact** against an independent scalar model
-/// (round-half-to-even, clamp) applied to the exact `i32` accumulator from `dot_i8`.
+/// (round-half-to-even, clamp) applied to the exact `i32` accumulator from `dot_i8`
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 #[test]
 fn requant_matches_scalar_model() {
@@ -509,7 +509,7 @@ fn requant_matches_scalar_model() {
             ((s >> 40) as i32 % 51 - 25) as i8
         })
     };
-    // Independent contract: round-ties-even scale, integer zero-point join, saturating clamp.
+    // Independent contract: round-ties-even scale, integer zero-point join, saturating clamp
     let ref_i8 = |acc: i32, bias: i32, scale: f32, zp: i32| -> i8 {
         let scaled = (f64::from(acc.wrapping_add(bias)) * f64::from(scale)).round_ties_even();
         (scaled as i64).saturating_add(zp as i64).clamp(-128, 127) as i8
@@ -527,7 +527,7 @@ fn requant_matches_scalar_model() {
     let (scale, zp_i8, zp_u8) = (0.05f32, -7i32, 30i32);
 
     for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
-        // i8 output, with bias.
+        // i8 output, with bias
         let mut c = Array2::<i8>::zeros((m, n));
         let req = Requantize {
             scale,
@@ -544,7 +544,7 @@ fn requant_matches_scalar_model() {
                 );
             }
         }
-        // u8 output, no bias.
+        // u8 output, no bias
         let mut cu = Array2::<u8>::zeros((m, n));
         let requ = Requantize {
             scale,
@@ -565,7 +565,7 @@ fn requant_matches_scalar_model() {
 }
 
 /// `gemm_cplx_fused` (a `PerRow` complex bias, with conjugation) is **bit-identical** to
-/// [`gemm_cplx`] followed by the same element-wise bias add.
+/// [`gemm_cplx`] followed by the same element-wise bias add
 #[cfg(all(feature = "complex", feature = "epilogue"))]
 #[test]
 fn cplx_fused_matches_gemm_cplx_then_add() {

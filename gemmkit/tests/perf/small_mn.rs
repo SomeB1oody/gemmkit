@@ -1,14 +1,14 @@
-//! Small-m,n horizontal (inner-product) route benches.
+//! Small-m,n horizontal (inner-product) route benches
 
 use crate::harness::{BENCH_GUARD, fill, measure};
 use gemmkit::{MatMut, MatRef, Parallelism, gemm};
 
-// ---- small-matrix horizontal (inner-product) route: perf_small_mn ----
+// small-matrix horizontal (inner-product) route: perf_small_mn
 
-/// Force the horizontal / small_k / driver route for a `gemm` call by pinning the two gates,
+/// Force the horizontal / small_k / driver route for a `gemm` call by pinning the 2 gates,
 /// run `f`, then restore. `small_mn_dim = MAX` + `small_k_threshold = 0` sends every small-m,n
 /// shape to the horizontal path (its gate needs `k > small_k_threshold`, so drop the latter to
-/// 0); `small_mn_dim = 0` + `small_k_threshold = MAX` forces small_k; both `0` forces the driver.
+/// 0); `small_mn_dim = 0` + `small_k_threshold = MAX` forces small_k; both `0` forces the driver
 #[cfg(not(target_family = "wasm"))]
 fn with_route<R>(small_mn: usize, small_k: usize, f: impl FnOnce() -> R) -> R {
     let (pm, pk) = (
@@ -23,9 +23,9 @@ fn with_route<R>(small_mn: usize, small_k: usize, f: impl FnOnce() -> R) -> R {
     r
 }
 
-/// `gemm`-crate / `matrixmultiply` GFLOP/s for a small-`m,n` f32 `C = A·B` in the horizontal
+/// `gemm`-crate / `matrixmultiply` GFLOP/s for a small-`m,n` f32 `C = A*B` in the horizontal
 /// path's target layout (`row_major_a` ? row-major A : col-major A; col-major B; col-major C).
-/// Native-only. Returns `(gemm, Option<mm>)`; mm is serial-only.
+/// Native-only. Returns `(gemm, Option<mm>)`; mm is serial-only
 #[cfg(not(target_family = "wasm"))]
 fn extern_gflops_small(
     m: usize,
@@ -37,7 +37,7 @@ fn extern_gflops_small(
     let a = fill(m * k, 1);
     let b = fill(k * n, 2);
     let mut c = vec![0.0f32; m * n];
-    // A: row-major (col_stride 1, row_stride k) or col-major (col_stride m, row_stride 1).
+    // A: row-major (col_stride 1, row_stride k) or col-major (col_stride m, row_stride 1)
     let (a_cs, a_rs) = if row_major_a {
         (1isize, k as isize)
     } else {
@@ -97,9 +97,9 @@ fn extern_gflops_small(
 
 /// One `perf_small_mn` row: the horizontal path vs the small_k route vs the register-tiling
 /// driver on a small-`m,n` / long-`k` shape, plus the `gemm`-crate and `matrixmultiply`
-/// baselines — all GFLOP/s, back-to-back over the same buffers so drift cancels. `row_major_a`
+/// baselines: all GFLOP/s, back-to-back over the same buffers so drift cancels. `row_major_a`
 /// selects the horizontal path's contiguous-`k` fast-path layout (row-major A, col-major B) vs
-/// col-major A (its strided fallback).
+/// col-major A (its strided fallback)
 #[cfg(not(target_family = "wasm"))]
 fn bench_small_mn(m: usize, n: usize, k: usize, row_major_a: bool, par: Parallelism) {
     let a = fill(m * k, 1);
@@ -148,7 +148,7 @@ fn bench_small_mn(m: usize, n: usize, k: usize, row_major_a: bool, par: Parallel
 /// `perf_small_mn` row for **f16** (f32-accumulate mixed horizontal kernel): the horizontal path
 /// vs the register-tiling driver, plus the `gemm` crate (same f16-in-f32-acc convention), all
 /// GFLOP/s in the fast-path layout (row-major A, col-major B). Confirms the widen-load horizontal
-/// path beats the driver's padded microtile the same way f32 does.
+/// path beats the driver's padded microtile the same way f32 does
 #[cfg(all(feature = "half", not(target_family = "wasm")))]
 fn bench_small_mn_f16(m: usize, n: usize, k: usize, par: Parallelism) {
     use gemmkit::f16;
@@ -214,9 +214,9 @@ fn bench_small_mn_f16(m: usize, n: usize, k: usize, par: Parallelism) {
 }
 
 /// `perf_small_mn` row for **bf16**. On x86 the driver takes the `vdpbf16ps` VNNI dot path while
-/// the horizontal route widens bf16→f32 like f16 does, so the `×h` ratio measures the widen
+/// the horizontal route widens bf16->f32 like f16 does, so the `xh` ratio measures the widen
 /// route against the VNNI driver (a different, faster kernel than the f16 widen driver). No
-/// `gemm`-crate bf16 support, so it is horiz-vs-driver only.
+/// `gemm`-crate bf16 support, so it is horiz-vs-driver only
 #[cfg(all(feature = "half", not(target_family = "wasm")))]
 fn bench_small_mn_bf16(m: usize, n: usize, k: usize, par: Parallelism) {
     use gemmkit::bf16;
@@ -252,9 +252,9 @@ fn bench_small_mn_bf16(m: usize, n: usize, k: usize, par: Parallelism) {
 }
 
 /// Small-matrix horizontal (inner-product) route: small `m,n`, long `k`. Sweeps the output
-/// dimensions against the contraction, forcing each of the three gemmkit routes (horizontal /
-/// small_k / driver) plus the `gemm`-crate and `matrixmultiply` baselines. The crossover — where
-/// the driver catches up as `m,n` grow — is visible in the `×h` (driver-over-horizontal) ratio.
+/// dimensions against the contraction, forcing each of the 3 gemmkit routes (horizontal /
+/// small_k / driver) plus the `gemm`-crate and `matrixmultiply` baselines. The crossover (where
+/// the driver catches up as `m,n` grow) is visible in the `xh` (driver-over-horizontal) ratio
 #[cfg(not(target_family = "wasm"))]
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
@@ -269,7 +269,7 @@ fn perf_small_mn() {
                 bench_small_mn(s, s, k, true, par);
             }
         }
-        // A couple of non-square small shapes.
+        // A couple of non-square small shapes
         for &(m, n) in &[(2usize, 8usize), (8, 2), (4, 16), (16, 4)] {
             for &k in &[256usize, 4096] {
                 bench_small_mn(m, n, k, true, par);
@@ -278,7 +278,7 @@ fn perf_small_mn() {
     }
     // The route needs A rows / B cols unit-stride along `k`; a col-major A (strided along `k`)
     // would force a scalar dot that loses to the driver's packed microkernel, so the dispatch
-    // gate excludes it and those shapes stay on the driver.
+    // gate excludes it and those shapes stay on the driver
 
     #[cfg(feature = "half")]
     {

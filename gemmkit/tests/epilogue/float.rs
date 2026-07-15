@@ -1,17 +1,15 @@
-//! Float fused-epilogue tests (spec §10): the core `fused == gemm-then-map` oracle, identity
-//! delegation + `run_epilogue` plumbing, fire-once (multi-panel K), bias orientation, NaN / −0
-//! semantics, degenerate cases, validation panics, and checked/unchecked twin equivalence.
+//! Float fused-epilogue tests (spec section 10): the core `fused == gemm-then-map` oracle, identity
+//! delegation + `run_epilogue` plumbing, fire-once (multi-panel K), bias orientation, NaN / -0
+//! semantics, degenerate cases, validation panics, and checked/unchecked twin equivalence
 //!
 //! Every comparison is **bitwise**. The `gemm`/`gemm_fused` oracle holds for every shape (the
 //! fused engine routes through the same kernel `gemm` does), but these tests use driver shapes
-//! (m,n > 16, k > 16, not gemv); the special-path routes are covered in `special`.
+//! (m,n > 16, k > 16, not gemv); the special-path routes are covered in `special`
 
 use crate::common::*;
 use gemmkit::{Activation, Bias, MatMut, MatRef, Parallelism, Workspace, gemm, gemm_fused};
 
-// ---------------------------------------------------------------------------
 // test 2 (the core oracle): fused == gemm-then-map, bitwise
-// ---------------------------------------------------------------------------
 
 fn fused_matrix<T: Flt>(par: Parallelism) {
     let mut rng = Rng::new(0xE91109E1);
@@ -65,12 +63,10 @@ fn fused_eq_gemm_then_map_parallel() {
     fused_matrix::<f64>(Parallelism::Rayon(8));
 }
 
-// ---------------------------------------------------------------------------
 // test 1: identity delegation + run_epilogue plumbing
-// ---------------------------------------------------------------------------
 
-/// `gemm_fused(None, None)` must delegate to plain `gemm`, bit-for-bit — the zero-cost
-/// identity case never even reaches a fused monomorphization.
+/// `gemm_fused(None, None)` must delegate to plain `gemm`, bit-for-bit: the zero-cost
+/// identity case never even reaches a fused monomorphization
 #[test]
 fn identity_delegates_to_gemm() {
     let mut rng = Rng::new(42);
@@ -106,7 +102,7 @@ fn identity_delegates_to_gemm() {
 
 /// The internal `run_epilogue::<Identity>` path is byte-identical to the plain `run` path
 /// (the observational zero-cost-identity proof), across strides and parallelism, for a fixed
-/// ISA token (`ScalarTok`, always valid regardless of `GEMMKIT_REQUIRE_ISA`).
+/// ISA token (`ScalarTok`, always valid regardless of `GEMMKIT_REQUIRE_ISA`)
 #[test]
 fn run_epilogue_identity_matches_run() {
     use gemmkit::driver;
@@ -122,7 +118,7 @@ fn run_epilogue_identity_matches_run() {
             let mut c_run = c0.clone();
             let mut c_epi = c0.clone();
             let mut ws = Workspace::new();
-            // SAFETY: valid col-major A/B/C, disjoint buffers, ScalarTok always runnable.
+            // SAFETY: valid col-major A/B/C, disjoint buffers, ScalarTok always runnable
             unsafe {
                 driver::run::<FloatGemm<f32>, ScalarTok, 4, 4>(
                     ScalarTok,
@@ -171,17 +167,15 @@ fn run_epilogue_identity_matches_run() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// test 3: fire-once (multi-panel K) — a per-panel epilogue would diverge from the oracle
-// ---------------------------------------------------------------------------
+// test 3: fire-once (multi-panel K): a per-panel epilogue would diverge from the oracle
 
 /// A large-`k` driver shape forces `kc < k` (multiple depth slices), so the epilogue must
 /// fire exactly once, on the final panel. Sign-mixed data + `beta = 0.7` makes a per-panel
-/// ReLU or a re-added bias diverge loudly from the oracle.
+/// ReLU or a re-added bias diverge loudly from the oracle
 #[test]
 fn fire_once_multi_panel() {
     let mut rng = Rng::new(0xF11E);
-    // k = 4096 is far above any realistic L1-fit kc (~512), so there are several pc slices.
+    // k = 4096 is far above any realistic L1-fit kc (~512), so there are several pc slices
     check_fused::<f32>(
         &mut rng,
         40,
@@ -210,12 +204,10 @@ fn fire_once_multi_panel() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // test 4: bias orientation matrix (col-major vs row-major C)
-// ---------------------------------------------------------------------------
 
-/// {PerRow, PerCol} × {col-major, row-major} C. `check_fused` applies the reference bias in
-/// the user frame, so a wrong orientation-flip (row-major C swaps m↔n internally) diverges.
+/// {PerRow, PerCol} x {col-major, row-major} C. `check_fused` applies the reference bias in
+/// the user frame, so a wrong orientation-flip (row-major C swaps m<->n internally) diverges
 #[test]
 fn bias_orientation() {
     let mut rng = Rng::new(0xB1A5);
@@ -251,15 +243,13 @@ fn bias_orientation() {
     }
 }
 
-// ---------------------------------------------------------------------------
 // test 5: NaN / -0 semantics through the fused path
-// ---------------------------------------------------------------------------
 
 /// A NaN accumulator (from `inf - inf`) must map to 0 under ReLU/LeakyReLU on every ISA, and
-/// −0 must map to +0 — verified end-to-end through `gemm_fused` bitwise. `m`/`n` are `>= mr`
+/// -0 must map to +0: verified end-to-end through `gemm_fused` bitwise. `m`/`n` are `>= mr`
 /// and `>= NR` with a col-major C so the full tiles take the SIMD fast path, exercising the
 /// `max`/`min` NaN-in-`a` contract (`_mm512_max_ps` / `vmaxnmq` / `f32x4_pmax`), not only the
-/// scalar `apply`.
+/// scalar `apply`
 #[test]
 fn nan_and_neg_zero() {
     nan_and_neg_zero_for::<f32>();
@@ -271,9 +261,9 @@ fn nan_and_neg_zero_for<T: Flt>() {
     let k = 2usize;
     let n = 64usize;
     let ctx = T::name();
-    // A·B with `inf` inputs: product 0 = inf·1 = +inf, product 1 = inf·(-1) = -inf, and
-    // +inf + (-inf) = NaN. (Using `inf` inputs — not `MAX` — is robust under FMA, whose
-    // exact intermediate product would otherwise keep `MAX·MAX + inf` finite-then-inf.)
+    // A*B with `inf` inputs: product 0 = inf*1 = +inf, product 1 = inf*(-1) = -inf, and
+    // +inf + (-inf) = NaN. (Using `inf` inputs, not `MAX`, is robust under FMA, whose
+    // exact intermediate product would otherwise keep `MAX*MAX + inf` finite-then-inf)
     let mut a = vec![T::of(0.0); m * k];
     let mut b = vec![T::of(0.0); k * n];
     for i in 0..m {
@@ -315,7 +305,7 @@ fn nan_and_neg_zero_for<T: Flt>() {
         }
     }
 
-    // −0 handling: a zero product with a negative slope must yield +0 under LeakyReLU.
+    // -0 handling: a zero product with a negative slope must yield +0 under LeakyReLU
     let a2 = vec![T::of(0.0); m * k];
     let b2 = vec![T::of(1.0); k * n];
     let mut c2 = vec![T::of(0.0); m * n];
@@ -343,9 +333,7 @@ fn nan_and_neg_zero_for<T: Flt>() {
     }
 }
 
-// ---------------------------------------------------------------------------
 // test 7: degenerate fused cases (k == 0 / alpha == 0 => C <- act(beta*C + bias))
-// ---------------------------------------------------------------------------
 
 #[test]
 fn fused_degenerate() {
@@ -373,7 +361,7 @@ fn fused_degenerate() {
                     Parallelism::Serial,
                 );
             }
-            // Reference: C = ReLU(0.5*C0 + bias[i]).
+            // Reference: C = ReLU(0.5*C0 + bias[i])
             for j in 0..n {
                 for i in 0..m {
                     let idx = i + j * m;
@@ -385,9 +373,7 @@ fn fused_degenerate() {
     }
 }
 
-// ---------------------------------------------------------------------------
 // test 8: validation panics
-// ---------------------------------------------------------------------------
 
 mod validation {
     use super::*;
@@ -441,7 +427,7 @@ mod validation {
         let mut buf = vec![0.0f32; 16];
         // A bias slice aliasing C's storage. It is raw-derived (its lifetime is not tied to
         // `buf`), so `&mut buf` still type-checks; `gemm_fused` panics on the overlap check
-        // before any element is read or written, so no aliased access occurs.
+        // before any element is read or written, so no aliased access occurs
         let bias: &[f32] = unsafe { core::slice::from_raw_parts(buf.as_ptr(), 4) };
         gemm_fused(
             1.0,
@@ -456,24 +442,22 @@ mod validation {
     }
 }
 
-// ---------------------------------------------------------------------------
 // checked/unchecked twin equivalence
-// ---------------------------------------------------------------------------
 
-/// `gemm_fused` and `gemm_fused_unchecked` are **parallel** entry points — the checked twin
+/// `gemm_fused` and `gemm_fused_unchecked` are **parallel** entry points: the checked twin
 /// does not delegate to the unchecked one, so a divergence in the `Bias`/`Act` translation
 /// would go silently undetected. Exercise the unchecked fn against the checked twin on a
 /// driver-shaped problem (m,n,k > 16), bit-for-bit, across both `BiasDim` arms, `has_bias =
-/// false`, and every activation arm.
+/// false`, and every activation arm
 #[test]
 fn fused_unchecked_matches_checked() {
     use gemmkit::{BiasDim, gemm_fused, gemm_fused_unchecked};
 
     let mut rng = Rng::new(0x0F05_ED12);
     let (m, k, n) = (33usize, 24usize, 40usize);
-    let a = make::<f32>(&mut rng, m, k); // col-major m×k
-    let b = make::<f32>(&mut rng, k, n); // col-major k×n
-    let c0 = make::<f32>(&mut rng, m * n, 1); // col-major m×n C
+    let a = make::<f32>(&mut rng, m, k); // col-major mxk
+    let b = make::<f32>(&mut rng, k, n); // col-major kxn
+    let c0 = make::<f32>(&mut rng, m * n, 1); // col-major mxn C
     let bias_row: Vec<f32> = (0..m).map(|_| (rng.unit() * 3.0) as f32).collect();
     let bias_col: Vec<f32> = (0..n).map(|_| (rng.unit() * 3.0) as f32).collect();
     let (alpha, beta) = (0.9f32, 0.7f32);
@@ -485,7 +469,7 @@ fn fused_unchecked_matches_checked() {
         _ => None,
     };
 
-    // 0 none, 1 per-row, 2 per-col.
+    // 0 none, 1 per-row, 2 per-col
     for bias_kind in 0u8..=2 {
         for act_kind in 0u8..=2 {
             let bias_checked = match bias_kind {
@@ -509,7 +493,7 @@ fn fused_unchecked_matches_checked() {
 
             let mut c_unchecked = c0.clone();
             // SAFETY: every view is a valid in-bounds col-major layout, C aliases neither A/B
-            // nor the bias, and the bias slice (when present) is the right length for its axis.
+            // nor the bias, and the bias slice (when present) is the right length for its axis
             unsafe {
                 gemm_fused_unchecked(
                     m,
@@ -547,16 +531,16 @@ fn fused_unchecked_matches_checked() {
 
 /// The `_with` twin `gemm_fused_unchecked_with` shares the raw lowering with `gemm_fused_unchecked`
 /// but drives a caller-owned `Workspace`; exercise it against the checked `gemm_fused_with` twin
-/// bit-for-bit (per-row bias + LeakyReLU on a driver shape).
+/// bit-for-bit (per-row bias + LeakyReLU on a driver shape)
 #[test]
 fn fused_unchecked_with_matches_checked() {
     use gemmkit::{BiasDim, gemm_fused_unchecked_with, gemm_fused_with};
 
     let mut rng = Rng::new(0x0F05_ED13);
     let (m, k, n) = (40usize, 33usize, 24usize);
-    let a = make::<f64>(&mut rng, m, k); // col-major m×k
-    let b = make::<f64>(&mut rng, k, n); // col-major k×n
-    let c0 = make::<f64>(&mut rng, m * n, 1); // col-major m×n C
+    let a = make::<f64>(&mut rng, m, k); // col-major mxk
+    let b = make::<f64>(&mut rng, k, n); // col-major kxn
+    let c0 = make::<f64>(&mut rng, m * n, 1); // col-major mxn C
     let bias_row: Vec<f64> = (0..m).map(|_| rng.unit() * 3.0).collect();
     let (alpha, beta) = (0.9f64, 0.7f64);
     let par = Parallelism::Serial;
@@ -583,7 +567,7 @@ fn fused_unchecked_with_matches_checked() {
     let mut c_unchecked = c0.clone();
     let mut ws = Workspace::new();
     // SAFETY: valid in-bounds col-major layouts; C aliases neither A/B nor the (per-row, length-m)
-    // bias.
+    // bias
     unsafe {
         gemm_fused_unchecked_with(
             &mut ws,

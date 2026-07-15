@@ -1,5 +1,5 @@
 //! Per-ISA kernels via the generic driver (column-major, no orientation needed),
-//! plus the Miri scalar-path suite covering every element family.
+//! plus the Miri scalar-path suite covering every element family
 
 use crate::common::*;
 use gemmkit::driver;
@@ -13,12 +13,10 @@ use gemmkit::simd::Simd128;
 use gemmkit::simd::{Avx512, Fma};
 use gemmkit::{MatMut, MatRef, Parallelism, Workspace, gemm};
 
-// ---------------------------------------------------------------------------
 // per-ISA kernels via the generic driver (column-major, no orientation needed)
-// ---------------------------------------------------------------------------
 
 /// Run `FloatGemm` through the driver with an explicit ISA token + tile, all
-/// column-major (rsc==1), and check accuracy. Exercises each kernel directly.
+/// column-major (rsc==1), and check accuracy. Exercises each kernel directly
 fn driver_case<T, S, const MR_REG: usize, const NR: usize>(simd: S, m: usize, k: usize, n: usize)
 where
     T: Elem + gemmkit::Float<Acc = T>,
@@ -81,7 +79,7 @@ fn isa_scalar() {
 /// Miri (no SIMD intrinsics) over the scalar `SimdOps` + packing + scratch +
 /// epilogue + gemv + driver. Small shapes keep Miri fast. Under Miri the runtime
 /// feature detection reports nothing, so the dispatched `gemm` also takes the
-/// scalar path.
+/// scalar path
 #[test]
 fn miri_scalar_path() {
     for (m, k, n) in [
@@ -95,7 +93,7 @@ fn miri_scalar_path() {
         driver_case::<f32, ScalarTok, 4, 4>(ScalarTok, m, k, n);
         driver_case::<f64, ScalarTok, 4, 4>(ScalarTok, m, k, n);
     }
-    // Safe API end-to-end (partial tiles, beta != 0, general strides).
+    // Safe API end-to-end (partial tiles, beta != 0, general strides)
     run_case::<f32>(
         7,
         9,
@@ -119,7 +117,7 @@ fn miri_scalar_path() {
         Parallelism::Serial,
     );
     // Mixed-precision (f16 / bf16) scalar path: widen-load, f32 accumulate, narrow
-    // store, plus the strided copy-back epilogue and beta != 0 read of narrow C.
+    // store, plus the strided copy-back epilogue and beta != 0 read of narrow C
     #[cfg(feature = "half")]
     {
         run_case::<gemmkit::f16>(
@@ -130,7 +128,7 @@ fn miri_scalar_path() {
             Layout::Col,
             Layout::Row,
             // via `Elem::from_f64` so the alpha/beta build is Miri-safe too (routes to the
-            // `*_const` software conversion under `cfg(miri)`; see the `Elem` impls above).
+            // `*_const` software conversion under `cfg(miri)`; see the `Elem` impls above)
             Elem::from_f64(1.0),
             Elem::from_f64(0.5),
             Parallelism::Serial,
@@ -148,7 +146,7 @@ fn miri_scalar_path() {
         );
     }
     // Complex (c32) scalar path with conj-A: the conjugate-on-pack variant + the
-    // scalar complex multiply and epilogue.
+    // scalar complex multiply and epilogue
     #[cfg(feature = "complex")]
     {
         let (m, k, n) = (5usize, 4, 6);
@@ -174,7 +172,7 @@ fn miri_scalar_path() {
         assert_cplx_accurate(&c, m, n, &cref, k, "miri complex conjA");
     }
     // Integer (i8 -> i32) scalar path: widen-load, i32 accumulate, partial-tile
-    // copy-back, and the beta != 0 i32 read of C.
+    // copy-back, and the beta != 0 i32 read of C
     #[cfg(feature = "int8")]
     {
         let (m, k, n) = (7usize, 9, 5);
@@ -193,7 +191,7 @@ fn miri_scalar_path() {
         );
         assert_eq!(c, cref, "miri: i8 mismatch");
     }
-    // gemv shapes.
+    // gemv shapes
     run_case::<f32>(
         8,
         5,
@@ -216,8 +214,8 @@ fn miri_scalar_path() {
         0.0,
         Parallelism::Serial,
     );
-    // Prepacked-RHS path on the scalar engine: bit-identical to plain gemm.
-    // Shape is not both-tiny (m > 64), so the prepacked geometry matches.
+    // Prepacked-RHS path on the scalar engine: bit-identical to plain gemm
+    // Shape is not both-tiny (m > 64), so the prepacked geometry matches
     {
         let (m, k, n) = (66usize, 4, 6);
         let a = rand_vec::<f32>(m * k, 1);
@@ -244,9 +242,9 @@ fn miri_scalar_path() {
         );
         assert_eq!(c_ref, c_pk, "miri: prepack != gemm");
     }
-    // Prepacked-LHS path on the scalar engine: bit-identical to plain gemm.
+    // Prepacked-LHS path on the scalar engine: bit-identical to plain gemm
     // Shape is not both-tiny (m > 64), and C is row-major (the supported
-    // orientation), so the prepacked geometry matches plain gemm exactly.
+    // orientation), so the prepacked geometry matches plain gemm exactly
     {
         let (m, k, n) = (66usize, 4, 6);
         let a = rand_vec::<f32>(m * k, 1);
@@ -304,7 +302,7 @@ fn isa_avx512() {
 }
 
 /// NEON is baseline on aarch64, so no feature-detection guard is needed: the
-/// kernel always runs here. Tile matches the production dispatch choice (4×4).
+/// kernel always runs here. Tile matches the production dispatch choice (4x4)
 #[test]
 #[cfg(target_arch = "aarch64")]
 fn isa_neon() {
@@ -314,11 +312,11 @@ fn isa_neon() {
     }
 }
 
-/// wasm `simd128` is a compile-time feature (no runtime detection), so — like the
-/// NEON baseline — no guard is needed: when the build enables `simd128` this test
+/// wasm `simd128` is a compile-time feature (no runtime detection), so, like the
+/// NEON baseline, no guard is needed: when the build enables `simd128` this test
 /// is compiled and the kernel always runs. Tile matches the production dispatch
-/// choice (`MR_REG=2, NR=4`). The two-rounding `mul_add` rounds within the
-/// `assert_accurate` relative-Frobenius tolerance, so no bitwise compare is implied.
+/// choice (`MR_REG=2, NR=4`). The 2-rounding `mul_add` rounds within the
+/// `assert_accurate` relative-Frobenius tolerance, so no bitwise compare is implied
 #[test]
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 fn isa_simd128() {
@@ -329,9 +327,9 @@ fn isa_simd128() {
 }
 
 /// The SIMD narrow-store (`KernelSimd::store_out`) must be **bit-identical** to the
-/// scalar `NarrowFloat::narrow` (= `half::from_f32`) across edge values — normals,
-/// subnormals, ±0, ±Inf, and NaN — so the full-tile vector path and the partial-tile
-/// scalar path never disagree. AVX-512, 16-wide.
+/// scalar `NarrowFloat::narrow` (= `half::from_f32`) across edge values (normals,
+/// subnormals, +/-0, +/-Inf, and NaN) so the full-tile vector path and the partial-tile
+/// scalar path never disagree. AVX-512, 16-wide
 #[test]
 #[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
 #[cfg_attr(miri, ignore = "Miri cannot execute AVX intrinsics")]
@@ -341,7 +339,7 @@ fn simd_narrow_store_matches_half_avx512() {
         eprintln!("skipping: no avx512f");
         return;
     }
-    // A spread of representative f32 bit patterns.
+    // A spread of representative f32 bit patterns
     let vals: Vec<f32> = vec![
         0.0,
         -0.0,
@@ -364,7 +362,7 @@ fn simd_narrow_store_matches_half_avx512() {
         f32::from_bits(0xFFC00000), // negative qNaN
         123.456,
     ];
-    // Pad to a multiple of 16 lanes.
+    // Pad to a multiple of 16 lanes
     let mut padded = vals.clone();
     while !padded.len().is_multiple_of(16) {
         padded.push(0.0);

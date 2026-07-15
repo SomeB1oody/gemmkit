@@ -1,8 +1,8 @@
-//! Architecture acceptance (§7.3, strongest claim): a *second* `KernelFamily`
+//! Architecture acceptance (section 7.3, strongest claim): a *2nd* `KernelFamily`
 //! can be declared using only gemmkit's **public** API and driven by the same
-//! generic `driver::run` — with **no change** to `driver.rs` or `pack.rs`. The
+//! generic `driver::run`, with **no change** to `driver.rs` or `pack.rs`. The
 //! mere fact that this external file compiles and produces correct results is
-//! the proof that the operation-family seam is open for extension.
+//! the proof that the operation-family seam is open for extension
 
 use gemmkit::kernel::{AlphaStatus, BetaStatus, KernelFamily};
 use gemmkit::scalar::Scalar;
@@ -11,12 +11,12 @@ use gemmkit::{Parallelism, Workspace, driver};
 
 /// A deliberately naive, independently-implemented float GEMM family. It shares
 /// nothing with the built-in `FloatGemm` except the public trait it satisfies:
-/// its own micropanel packing and a plain scalar microkernel.
+/// its own micropanel packing and a plain scalar microkernel
 #[derive(Copy, Clone)]
 struct NaiveFloat;
 
 /// Re-implement micropanel-major packing using only public items (the crate's
-/// internal `pack` helper is not visible here — exactly the third-party case).
+/// internal `pack` helper is not visible here, exactly the third-party case)
 unsafe fn pack_panels(
     mut d: *mut f32,
     src: *const f32,
@@ -139,12 +139,12 @@ fn reference(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f64> {
 #[test]
 fn second_kernel_family_drives_unchanged() {
     let (m, k, n) = (40usize, 33, 28);
-    // Row-major logical inputs.
+    // Row-major logical inputs
     let a: Vec<f32> = (0..m * k).map(|x| (x % 17) as f32 * 0.1 - 0.5).collect();
     let b: Vec<f32> = (0..k * n).map(|x| (x % 13) as f32 * 0.2 - 0.7).collect();
     let cref = reference(&a, &b, m, k, n);
 
-    // Present everything column-major so the driver needs no orientation.
+    // Present everything column-major so the driver needs no orientation
     let to_col = |v: &[f32], r: usize, c: usize| {
         let mut o = vec![0.0f32; r * c];
         for i in 0..r {

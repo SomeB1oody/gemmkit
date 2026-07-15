@@ -1,4 +1,4 @@
-//! Adversarial-geometry plan and driver for fuzz_api_validation.
+//! Adversarial-geometry plan and driver for fuzz_api_validation
 
 use arbitrary::{Arbitrary, Result, Unstructured};
 
@@ -8,12 +8,10 @@ use gemmkit::{
     prepack_rhs,
 };
 
-// ===========================================================================
 // fuzz_api_validation
-// ===========================================================================
 
-/// The dim class table from the brief; `2^33` targets the extent isize-mul overflow,
-/// `usize::MAX/2` / `usize::MAX` the "too large to address" reject.
+/// Edge-case dimension classes for validation fuzzing: `2^33` targets the extent
+/// isize-mul overflow; `usize::MAX/2` / `usize::MAX` the "too large to address" reject
 #[derive(Debug, Clone, Copy)]
 pub enum DimClass {
     Zero,
@@ -52,8 +50,8 @@ impl DimClass {
     }
 }
 
-/// Adversarial isize stride table; `isize::MIN/MAX` and `±2^33` drive the checked-mul
-/// overflow inside `extent()`.
+/// Adversarial isize stride table; `isize::MIN/MAX` and `+/-2^33` drive the checked-mul
+/// overflow inside `extent()`
 #[derive(Debug, Clone, Copy)]
 pub enum StrideClass {
     Zero,
@@ -180,11 +178,11 @@ impl<'a> Arbitrary<'a> for ValidationPlan {
 
 /// Skip-cap on accepted-and-expensive plans: a bounded, valid geometry must not turn
 /// into billions of MACs or a k-proportional gigabyte alloc under ASan (those would be
-/// false-positive timeouts/OOMs, not memory-unsafety). 2^24 elements/MACs.
+/// false-positive timeouts/OOMs, not memory-unsafety). 2^24 elements/MACs
 const WORK_CAP: usize = 1 << 24;
 
 /// Mirror of `api.rs::extent`: highest slice offset (exclusive), or `None` for a
-/// negative-stride or too-large-to-address view (both of which validation rejects).
+/// negative-stride or too-large-to-address view (both of which validation rejects)
 fn mirror_extent(rows: usize, cols: usize, rs: isize, cs: isize) -> Option<usize> {
     if rows == 0 || cols == 0 {
         return Some(0);
@@ -206,7 +204,7 @@ fn mirror_extent(rows: usize, cols: usize, rs: isize, cs: isize) -> Option<usize
     }
 }
 
-/// Mirror of `api.rs::self_aliases`.
+/// Mirror of `api.rs::self_aliases`
 fn mirror_self_aliases(rows: usize, cols: usize, rs: isize, cs: isize) -> bool {
     if rows == 0 || cols == 0 {
         return false;
@@ -233,7 +231,7 @@ fn sat3(a: usize, b: usize, c: usize) -> usize {
 
 /// The raw driver behind `fuzz_api_validation`. May panic with a documented
 /// `gemmkit:` message (accepted by the target's `catch_unwind`) or run cleanly; the
-/// WORK_CAP guard only skips plans that WOULD fully validate and then do unbounded work.
+/// WORK_CAP guard only skips plans that WOULD fully validate and then do unbounded work
 pub fn drive_validation(p: &ValidationPlan) {
     let (m, k, n) = (p.m.get(), p.k.get(), p.n.get());
     let (mc, nc) = (p.mc.get(), p.nc.get());
@@ -245,7 +243,7 @@ pub fn drive_validation(p: &ValidationPlan) {
 
     match p.entry {
         EntryKind::Gemm | EntryKind::GemmI8 | EntryKind::GemmCplx => {
-            // Would this geometry fully pass validation? If so, cap the compute.
+            // Would this geometry fully pass validation? If so, cap the compute
             let would_pass = in_bounds(m, k, rsa, csa, p.len_a)
                 && in_bounds(k, n, rsb, csb, p.len_b)
                 && in_bounds(mc, nc, rsc, csc, p.len_c)
@@ -305,7 +303,7 @@ pub fn drive_validation(p: &ValidationPlan) {
             let b_bs = p.b_bs.get();
             let c_bs = p.c_bs.get();
             // Batched bounds mirror (extent + (batch-1)*bs). A batch stride < 0 with
-            // batch>1 is a documented reject, so it is not "would_pass".
+            // batch>1 is a documented reject, so it is not "would_pass"
             let batched_ok = |rows, cols, rs, cs, bs: isize, len: usize| -> bool {
                 let Some(e) = mirror_extent(rows, cols, rs, cs) else {
                     return false;
@@ -329,8 +327,8 @@ pub fn drive_validation(p: &ValidationPlan) {
                 && !mirror_self_aliases(mc, nc, rsc, csc)
                 && (batch <= 1 || (c_bs >= 0 && ec.map(|e| (c_bs as usize) >= e).unwrap_or(false)));
             // The batch LOOP count is itself unbounded work even when each element is
-            // empty (m*n == 0 zeroes the product), so cap the raw batch too — else
-            // gemm_batched spins over `batch` no-op elements and libFuzzer times out.
+            // empty (m*n == 0 zeroes the product), so cap the raw batch too, else
+            // gemm_batched spins over `batch` no-op elements and libFuzzer times out
             if would_pass && (batch > WORK_CAP || batch.saturating_mul(sat3(m, n, k)) > WORK_CAP) {
                 return;
             }
@@ -355,7 +353,7 @@ pub fn drive_validation(p: &ValidationPlan) {
             // whose ~n*k element count fits usize yet exceeds the work cap would OOM
             // on correct behavior. Everything else is fast to run: empty operands
             // short-circuit in prepack, and a pack size that overflows usize is a
-            // documented "too large" reject — both stay fuzzed.
+            // documented "too large" reject - both stay fuzzed
             let would_pass = in_bounds(k, n, rsb, csb, p.len_b);
             let expensive = n != 0
                 && k != 0

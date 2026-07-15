@@ -2,7 +2,7 @@
 //! `gemm_packed_b_with`, `gemm_packed_a_with`, `gemm_i8_with`, and `gemm_cplx_with` must each
 //! produce the same result as their allocating counterpart (already checked in `adapter.rs`),
 //! reusing one caller-owned [`Workspace`] across calls. This also drives the `Some(ws)` match arm
-//! of both `_common` helpers and, transitively, `gemmkit::gemm_unchecked_with`.
+//! of both `_common` helpers and, transitively, `gemmkit::gemm_unchecked_with`
 
 use approx::assert_relative_eq;
 use ndarray::{Array2, Array3, Axis, ShapeBuilder};
@@ -33,7 +33,7 @@ fn rand3(b: usize, r: usize, c: usize, seed: u64) -> Array3<f64> {
     })
 }
 
-/// `gemm_with` reusing one workspace across several shapes must equal the allocating `gemm`.
+/// `gemm_with` reusing one workspace across several shapes must equal the allocating `gemm`
 #[test]
 fn gemm_with_matches_gemm() {
     let mut ws = Workspace::new();
@@ -52,7 +52,7 @@ fn gemm_with_matches_gemm() {
     }
 }
 
-/// `gemm_batched_with` on a `(4, 8, 8, 8)` stack, reusing one workspace, must equal `gemm_batched`.
+/// `gemm_batched_with` on a `(4, 8, 8, 8)` stack, reusing one workspace, must equal `gemm_batched`
 #[test]
 fn gemm_batched_with_matches_gemm_batched() {
     let (batch, m, k, n) = (4usize, 8, 8, 8);
@@ -76,7 +76,7 @@ fn gemm_batched_with_matches_gemm_batched() {
     }
 }
 
-/// `prepack_rhs` + `gemm_packed_b_with` (column-major C) must equal `gemm_packed_b` and `dot`.
+/// `prepack_rhs` + `gemm_packed_b_with` (column-major C) must equal `gemm_packed_b` and `dot`
 #[test]
 fn gemm_packed_b_with_matches() {
     let (m, k, n) = (100usize, 64, 80);
@@ -96,7 +96,7 @@ fn gemm_packed_b_with_matches() {
     }
 }
 
-/// `prepack_lhs` + `gemm_packed_a_with` (row-major C) must equal `gemm_packed_a` and `dot`.
+/// `prepack_lhs` + `gemm_packed_a_with` (row-major C) must equal `gemm_packed_a` and `dot`
 #[test]
 fn gemm_packed_a_with_matches() {
     let (m, k, n) = (96usize, 50, 72);
@@ -116,7 +116,7 @@ fn gemm_packed_a_with_matches() {
     }
 }
 
-/// The `dot` convenience keeps working — a smoke check the shared imports resolve.
+/// The `dot` convenience keeps working: a smoke check the shared imports resolve
 #[test]
 fn dot_still_matches_ndarray() {
     let a = rand2(12, 9, 71);
@@ -124,7 +124,7 @@ fn dot_still_matches_ndarray() {
     assert_relative_eq!(dot(&a, &b), a.dot(&b), max_relative = 1e-10);
 }
 
-/// `gemm_i8_with` (i8 -> i32) reusing a workspace must equal the allocating `gemm_i8`.
+/// `gemm_i8_with` (i8 -> i32) reusing a workspace must equal the allocating `gemm_i8`
 #[cfg(feature = "int8")]
 #[test]
 fn gemm_i8_with_matches_gemm_i8() {
@@ -155,7 +155,7 @@ fn gemm_i8_with_matches_gemm_i8() {
     }
 }
 
-/// `gemm_cplx_with` reusing a workspace must equal `gemm_cplx` for both conjugation flags.
+/// `gemm_cplx_with` reusing a workspace must equal `gemm_cplx` for both conjugation flags
 #[cfg(feature = "complex")]
 #[test]
 fn gemm_cplx_with_matches_gemm_cplx() {
@@ -211,7 +211,7 @@ fn gemm_cplx_with_matches_gemm_cplx() {
     }
 }
 
-/// `gemm_fused_with` reusing a workspace must equal the allocating `gemm_fused` bit-for-bit.
+/// `gemm_fused_with` reusing a workspace must equal the allocating `gemm_fused` bit-for-bit
 #[cfg(feature = "epilogue")]
 #[test]
 fn gemm_fused_with_matches_gemm_fused() {
@@ -259,7 +259,7 @@ fn gemm_fused_with_matches_gemm_fused() {
     }
 }
 
-/// `gemm_batched_fused_with` reusing a workspace must equal the allocating `gemm_batched_fused`.
+/// `gemm_batched_fused_with` reusing a workspace must equal the allocating `gemm_batched_fused`
 #[cfg(feature = "epilogue")]
 #[test]
 fn gemm_batched_fused_with_matches() {
@@ -310,7 +310,7 @@ fn gemm_batched_fused_with_matches() {
 }
 
 /// `gemm_i8_requant_with` / `gemm_i8_requant_u8_with` reusing a workspace must equal the allocating
-/// entries.
+/// entries
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 #[test]
 fn gemm_i8_requant_with_matches() {
@@ -355,7 +355,7 @@ fn gemm_i8_requant_with_matches() {
     }
 }
 
-/// `gemm_cplx_fused_with` reusing a workspace must equal the allocating `gemm_cplx_fused`.
+/// `gemm_cplx_fused_with` reusing a workspace must equal the allocating `gemm_cplx_fused`
 #[cfg(all(feature = "complex", feature = "epilogue"))]
 #[test]
 fn gemm_cplx_fused_with_matches() {

@@ -1,10 +1,10 @@
 //! Mixed-precision (f16/bf16) shapes x layouts, oracle cross-check against the
-//! `gemm` crate, and parallel/serial bit-identity.
+//! `gemm` crate, and parallel/serial bit-identity
 
 use crate::common::*;
 use gemmkit::{MatMut, MatRef, Parallelism, gemm};
 
-/// Shapes for the mixed-precision (`f16`/`bf16`) accuracy and bit-identity tests.
+/// Shapes for the mixed-precision (`f16`/`bf16`) accuracy and bit-identity tests
 #[cfg(feature = "half")]
 fn mixed_dims() -> [(usize, usize, usize); 9] {
     [
@@ -64,12 +64,12 @@ fn correctness_bf16_layouts() {
     }
 }
 
-/// Mixed-precision (`f16`/`bf16`) serial == parallel bit-identity across thread counts —
+/// Mixed-precision (`f16`/`bf16`) serial == parallel bit-identity across thread counts,
 /// same caveat as `parallel_equals_serial_bit_identical`: it holds because narrowing is a
 /// pure per-position function of the f32 result *and* blocking is thread-independent, an
 /// implementation property, not a promised contract. (`bf16` here is the **dot** kernel,
 /// whose serial and parallel paths share one kernel + layout, so they coincide bitwise
-/// even though dot ≠ widen.) Pins current behavior; relax with split-K, as noted there.
+/// even though dot != widen.) Pins current behavior; relax with split-K, as noted there
 #[cfg(feature = "half")]
 #[test]
 fn parallel_equals_serial_mixed() {
@@ -119,22 +119,22 @@ fn parallel_equals_serial_mixed() {
 }
 
 /// Cross-check `f16` against the `gemm` crate (the ecosystem oracle, which also
-/// accumulates `f16` in `f32`): the two must agree to a tight `f16` tolerance.
+/// accumulates `f16` in `f32`): the 2 must agree to a tight `f16` tolerance.
 /// `gemm`'s `f16` *is* `half::f16` *is* `gemmkit::f16`, so the comparison is direct.
-/// Gated out of Miri and wasm (the `gemm` dev-dep is `cfg(all(not(miri), not(wasm)))`).
+/// Gated out of Miri and wasm (the `gemm` dev-dep is `cfg(all(not(miri), not(wasm)))`)
 #[test]
 #[cfg(all(not(miri), not(target_family = "wasm"), feature = "half"))]
 fn mixed_f16_matches_gemm_crate() {
-    // Includes a large-k case (k = 2048 > the f32 kc blocking ≈ 512) to exercise the
+    // Includes a large-k case (k = 2048 > the f32 kc blocking ~= 512) to exercise the
     // mixed-precision single-panel rule: because `Out` (f16) is narrower than `Acc`
     // (f32), the driver forces `kc = k` (`OUT_IS_ACC = false`), so the whole
-    // contraction accumulates in f32 and rounds to f16 exactly ONCE at writeback —
+    // contraction accumulates in f32 and rounds to f16 exactly ONCE at writeback:
     // never between kc panels. (A homogeneous f32 kernel would instead split this k.)
-    // This is what keeps gemmkit matching `gemm`'s whole-k f32 accumulation.
+    // This is what keeps gemmkit matching `gemm`'s whole-k f32 accumulation
     for (m, k, n) in [(64, 48, 40), (96, 65, 72), (33, 17, 19), (64, 2048, 64)] {
         let a = Mat::<gemmkit::f16>::rand(m, k, 0x16A + m as u64);
         let b = Mat::<gemmkit::f16>::rand(k, n, 0x16B + n as u64);
-        // Column-major buffers (gemm's preferred orientation), zero beta.
+        // Column-major buffers (gemm's preferred orientation), zero beta
         let (abuf, rsa, csa) = build_view(&a, Layout::Col);
         let (bbuf, rsb, csb) = build_view(&b, Layout::Col);
         let mut c_kit = vec![gemmkit::f16::from_f64(0.0); m * n];
@@ -148,8 +148,8 @@ fn mixed_f16_matches_gemm_crate() {
             MatMut::from_col_major(&mut c_kit, m, n),
             Parallelism::Serial,
         );
-        // gemm crate: column-major operands → (cs = leading dim, rs = 1), matching
-        // the bench harness; read_dst=false (beta=0).
+        // gemm crate: column-major operands -> (cs = leading dim, rs = 1), matching
+        // the bench harness; read_dst=false (beta=0)
         unsafe {
             gemm::gemm(
                 m,
@@ -175,7 +175,7 @@ fn mixed_f16_matches_gemm_crate() {
         }
         // Both accumulate in f32 then round to f16; allow a few f16 ULPs of slack
         // (the accumulation order differs). `assert_accurate` wants a *row-major*
-        // reference, so transpose the column-major `c_gemm` into one.
+        // reference, so transpose the column-major `c_gemm` into one
         let mut cref = vec![0.0f64; m * n];
         for i in 0..m {
             for j in 0..n {

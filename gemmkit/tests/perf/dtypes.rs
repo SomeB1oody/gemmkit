@@ -1,4 +1,4 @@
-//! f16 / i8 / c32 element-type throughput benches.
+//! f16 / i8 / c32 element-type throughput benches
 
 #[cfg(feature = "half")]
 use crate::harness::fill;
@@ -10,7 +10,7 @@ use gemmkit::gemm;
 use gemmkit::{MatMut, MatRef};
 
 /// f16 GEMM throughput: gemmkit (f32-accumulate mixed kernel) vs the `gemm` crate
-/// (same f16-in-f32-acc convention), reported as a ratio. f16 FLOPs counted like f32.
+/// (same f16-in-f32-acc convention), reported as a ratio. f16 FLOPs counted like f32
 #[cfg(all(feature = "half", not(target_family = "wasm")))]
 fn bench_f16(s: usize, parallel: bool) {
     use gemmkit::f16;
@@ -88,8 +88,8 @@ fn perf_f16() {
     }
 }
 
-/// i8 -> i32 GEMM throughput (no `gemm`-crate baseline — it lacks i8 in 0.18). Just
-/// confirms the widen-and-multiply kernel is SIMD-accelerated, not scalar-bound.
+/// i8 -> i32 GEMM throughput (no `gemm`-crate baseline: it lacks i8 in 0.18). Just
+/// confirms the widen-and-multiply kernel is SIMD-accelerated, not scalar-bound
 #[cfg(all(feature = "int8", not(target_family = "wasm")))]
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
@@ -129,8 +129,8 @@ fn perf_i8() {
 }
 
 /// Complex (c32) GEMM throughput: gemmkit (`gemm_cplx`, no conj) vs the `gemm` crate
-/// (native c32). Complex FLOPs counted as 4× the real count (a complex mul-add is
-/// ~4 real mul + 4 real add), the convention both report.
+/// (native c32). Complex FLOPs counted as 4x the real count (a complex mul-add is
+/// ~4 real mul + 4 real add), the convention both report
 #[cfg(all(feature = "complex", not(target_family = "wasm")))]
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
@@ -165,7 +165,7 @@ fn perf_complex() {
             } else {
                 gemm::Parallelism::None
             };
-            // 4x for the complex flop convention.
+            // 4x for the complex flop convention
             let cflop = |secs: f64| 4.0 * 2.0 * (m * k * n) as f64 / secs / 1e9;
             let sk = measure(m, k, n, || {
                 gemmkit::gemm_cplx(
@@ -202,7 +202,7 @@ fn perf_complex() {
                     gp,
                 );
             });
-            // `measure` already divides by 2*m*n*k; rescale to the complex flop count.
+            // `measure` already divides by 2*m*n*k; rescale to the complex flop count
             let (kit, gem) = (sk.median * 2.0, sg.median * 2.0);
             let mode = if par { "par" } else { "ser" };
             println!(

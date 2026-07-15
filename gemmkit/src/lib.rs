@@ -1,16 +1,16 @@
 //! # gemmkit
 //!
 //! A clean, extensible, high-performance GEMM (general matrix multiply) engine
-//! with **zero ndarray dependency**. It computes `C <- alpha·A·B + beta·C` over
+//! with **zero ndarray dependency**. It computes `C <- alpha*A*B + beta*C` over
 //! data-type-agnostic `&[T]` + stride views (or raw pointers), choosing the best
-//! available x86 instruction set at runtime.
+//! available instruction set at runtime
 //!
 //! ## Quick start
 //!
 //! ```
 //! use gemmkit::{gemm, MatRef, MatMut, Parallelism};
 //!
-//! // 2x3 · 3x2 = 2x2, all row-major.
+//! // 2x3 * 3x2 = 2x2, all row-major
 //! let a = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0];
 //! let b = [7.0_f32, 8.0, 9.0, 10.0, 11.0, 12.0];
 //! let mut c = [0.0_f32; 4];
@@ -25,53 +25,65 @@
 //! assert_eq!(c, [58.0, 64.0, 139.0, 154.0]);
 //! ```
 //!
-//! ## Architecture in one paragraph
+//! ## Architecture in brief
 //!
-//! The variation points are isolated to traits: ISA → [`simd::SimdOps`], element
-//! type → [`scalar::Scalar`], operation family → [`kernel::KernelFamily`]. One
-//! generic five-loop [`driver`] and one generic float microkernel cover every
+//! The variation points are isolated to traits: ISA -> [`simd::SimdOps`], element
+//! type -> [`scalar::Scalar`], operation family -> [`kernel::KernelFamily`]. One
+//! generic 5-loop [`driver`] and one generic float microkernel cover every
 //! `(type, ISA, tile)` combination with no macros and no `transmute`. See
-//! `ARCHITECTURE.md` for the full tour.
+//! `ARCHITECTURE.md` for the full tour
 //!
 //! ## Features
 //!
-//! * `std` (default) — runtime cache/CPU-feature detection, the
+//! * `std` (default): runtime cache/CPU-feature detection, the
 //!   `GEMMKIT_REQUIRE_ISA` and tuning env knobs, and the thread-local workspace
 //!   pool. **With `std` off the crate is `#![no_std]`**, needing only `core` + `alloc`
-//! * `parallel` (default, implies `std`) — rayon multithreading. With it off
-//!   everything still compiles and runs single-threaded.
-//! * `complex` — complex GEMM over `c32`/`c64` with optional conjugation
-//!   ([`gemm_cplx`]); pulls in `num-complex`.
-//! * `half` — `f16`/`bf16` mixed-precision GEMM (`f32` accumulate); pulls in `half`.
-//! * `int8` — `i8 -> i32` integer GEMM ([`gemm_i8`]); no extra dependency.
-//! * `epilogue` — fused epilogues: bias/activation ([`gemm_fused`],
+//! * `parallel` (default, implies `std`): rayon multithreading. With it off
+//!   everything still compiles and runs single-threaded
+//! * `complex`: complex GEMM over `c32`/`c64` with optional conjugation
+//!   ([`gemm_cplx`]); pulls in `num-complex`
+//! * `half`: `f16`/`bf16` mixed-precision GEMM (`f32` accumulate); pulls in `half`
+//! * `int8`: `i8 -> i32` integer GEMM ([`gemm_i8`]); no extra dependency
+//! * `epilogue`: fused epilogues: bias/activation ([`gemm_fused`],
 //!   `gemm_batched_fused*`, and, with `complex`, `gemm_cplx_fused*`) and, with
-//!   `int8`, requantized `i8`/`u8` output (`gemm_i8_requant*`); no extra dependency.
+//!   `int8`, requantized `i8`/`u8` output (`gemm_i8_requant*`); no extra dependency
 //!
-//! These three element-type families are off by default, so a plain `f32`/`f64`
+//! These 3 element-type families are off by default, so a plain `f32`/`f64`
 //! build pays for none of their codegen or dependencies. The `epilogue` capability
-//! is likewise off by default, so a plain-GEMM build pays for none of its codegen.
+//! is likewise off by default, so a plain-GEMM build pays for none of its codegen
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![warn(missing_docs)]
 #![allow(clippy::missing_safety_doc)] // safety documented at the module / contract level
 
 // Heap-backed packing needs `alloc` in both builds; keep it unconditional so
-// downstream `alloc::` imports resolve under `std` too, with no cfg noise.
+// downstream `alloc::` imports resolve under `std` too, with no cfg noise
 extern crate alloc;
 
+// Cache topology detection and BLIS-model analytical blocking (layer L3)
 pub mod cache;
+// Generic 5-loop GEMM driver, generic over kernel family and ISA (layer L4)
 pub mod driver;
+// Kernel families: the operation-family seam (layer L1)
 pub mod kernel;
+// Numeric scalar abstraction: identity constants and accumulator type (layer L0)
 pub mod scalar;
+// SIMD abstraction: ISA tokens and per-type vector ops (layer L0)
 pub mod simd;
+// Unified tuning surface: heuristic thresholds and their env/setter overrides
 pub mod tuning;
 
+// Public core API: safe slice/stride entry points and the raw unchecked engine (layer L8a)
 mod api;
+// Runtime ISA dispatch: cached per-type feature detection (layer L7)
 mod dispatch;
+// Packing primitives shared by every kernel family (layer L2)
 mod pack;
+// Parallelism control and job splitting across workers (layer L5)
 mod parallel;
+// Special-case paths that bypass the driver for shapes it fits poorly (layer L6)
 mod special;
+// Packing-buffer workspace: thread-local pool plus explicit reuse
 mod workspace;
 
 #[cfg(feature = "epilogue")]
@@ -123,21 +135,21 @@ pub use workspace::Workspace;
 pub use cache::{CacheTopology, Machine, topology};
 
 /// Re-exported [`half`] narrow float types (`f16`, `bf16`), so callers need not
-/// depend on `half` directly. They accumulate in `f32` (their [`Scalar::Acc`]).
+/// depend on `half` directly. They accumulate in `f32` (their [`Scalar::Acc`])
 #[cfg(feature = "half")]
 #[doc(no_inline)]
 pub use half::{bf16, f16};
 
 /// Re-exported [`num_complex::Complex`] (and the `c32`/`c64` aliases), so callers
-/// need not depend on `num-complex` directly. Used by [`gemm_cplx`].
+/// need not depend on `num-complex` directly. Used by [`gemm_cplx`]
 #[cfg(feature = "complex")]
 #[doc(no_inline)]
 pub use num_complex::Complex;
-/// `Complex<f32>` — the single-precision complex element type.
+/// `Complex<f32>`: the single-precision complex element type
 #[cfg(feature = "complex")]
 #[allow(non_camel_case_types)]
 pub type c32 = num_complex::Complex<f32>;
-/// `Complex<f64>` — the double-precision complex element type.
+/// `Complex<f64>`: the double-precision complex element type
 #[cfg(feature = "complex")]
 #[allow(non_camel_case_types)]
 pub type c64 = num_complex::Complex<f64>;

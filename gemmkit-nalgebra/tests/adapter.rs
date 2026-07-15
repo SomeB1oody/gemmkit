@@ -1,6 +1,6 @@
 //! nalgebra adapter correctness: accepts owned `DMatrix`, static `SMatrix`, contiguous
 //! views, row-major (strided) views, and non-contiguous stepped views; `dot`/`gemm` match a
-//! naive reference; dimension mismatches and wrong prepacked-C orientations panic.
+//! naive reference; dimension mismatches and wrong prepacked-C orientations panic
 
 use approx::assert_relative_eq;
 use gemmkit::Parallelism;
@@ -8,7 +8,7 @@ use nalgebra::{DMatrix, DMatrixView, DMatrixViewMut, Dim, Matrix, RawStorage, SM
 
 use gemmkit_nalgebra::{dot, gemm, gemm_packed_a, gemm_packed_b, prepack_lhs, prepack_rhs};
 
-/// Deterministic column-major `DMatrix<f64>` fill (xorshift), values in `[-0.5, 0.5)`.
+/// Deterministic column-major `DMatrix<f64>` fill (xorshift), values in `[-0.5, 0.5)`
 fn rand2(r: usize, c: usize, seed: u64) -> DMatrix<f64> {
     let mut s = seed.wrapping_add(0x9E3779B97F4A7C15);
     DMatrix::from_fn(r, c, |_, _| {
@@ -19,8 +19,8 @@ fn rand2(r: usize, c: usize, seed: u64) -> DMatrix<f64> {
     })
 }
 
-/// Naive triple-loop `A·B` reference, independent of nalgebra's own matmul. Reads both operands
-/// through nalgebra indexing, so it honours whatever strides a view carries.
+/// Naive triple-loop `A*B` reference, independent of nalgebra's own matmul. Reads both operands
+/// through nalgebra indexing, so it honours whatever strides a view carries
 fn naive_ref<R1, C1, S1, R2, C2, S2>(
     a: &Matrix<f64, R1, C1, S1>,
     b: &Matrix<f64, R2, C2, S2>,
@@ -38,7 +38,7 @@ where
     DMatrix::from_fn(m, n, |i, j| (0..k).map(|p| a[(i, p)] * b[(p, j)]).sum())
 }
 
-/// Element-wise relative comparison of a matrix of any storage against a dense reference.
+/// Element-wise relative comparison of a matrix of any storage against a dense reference
 fn assert_close<R, C, S>(got: &Matrix<f64, R, C, S>, exp: &DMatrix<f64>, tol: f64)
 where
     R: Dim,
@@ -71,7 +71,7 @@ fn dot_matches_naive() {
 
 #[test]
 fn dot_small_exact() {
-    // The doc example, computed by hand: [[1,2],[3,4]]·[[5,6],[7,8]] = [[19,22],[43,50]].
+    // The doc example, computed by hand: [[1,2],[3,4]]*[[5,6],[7,8]] = [[19,22],[43,50]]
     let a = DMatrix::from_row_slice(2, 2, &[1.0, 2.0, 3.0, 4.0]);
     let b = DMatrix::from_row_slice(2, 2, &[5.0, 6.0, 7.0, 8.0]);
     let c = dot(&a, &b);
@@ -97,7 +97,7 @@ fn row_major_strided_view() {
     let b = rand2(k, n, 6);
 
     // Build a row-major A (nalgebra's non-natural layout): store row-major, view with strides
-    // (k, 1) so |row stride| > |col stride|. Reads straight through, no copy.
+    // (k, 1) so |row stride| > |col stride|. Reads straight through, no copy
     let mut s = 7u64.wrapping_add(0x9E3779B97F4A7C15);
     let data: Vec<f64> = (0..m * k)
         .map(|_| {
@@ -110,10 +110,10 @@ fn row_major_strided_view() {
     let a = DMatrixView::from_slice_with_strides(&data, m, k, k, 1);
     assert_eq!(a.strides(), (k, 1));
 
-    // dot into the natural column-major output.
+    // dot into the natural column-major output
     assert_close(&dot(&a, &b), &naive_ref(&a, &b), 1e-10);
 
-    // gemm accumulate into a row-major C.
+    // gemm accumulate into a row-major C
     let exp = {
         let mut c0 = rand2(m, n, 8);
         let prod = naive_ref(&a, &b);
@@ -134,8 +134,8 @@ fn row_major_strided_view() {
 #[test]
 fn non_contiguous_stepped_view() {
     let (m, k, n) = (10usize, 8, 6);
-    // Source with twice the rows; step 1 selects every other row → row stride 2 (non-contiguous),
-    // and start (1, 0) offsets the base pointer.
+    // Source with twice the rows; step 1 selects every other row -> row stride 2 (non-contiguous),
+    // and start (1, 0) offsets the base pointer
     let big = rand2(2 * m, k, 9);
     let a = big.view_with_steps((1, 0), (m, k), (1, 0));
     assert_eq!(a.strides().0, 2, "row stride should be non-contiguous");
@@ -145,12 +145,12 @@ fn non_contiguous_stepped_view() {
 
 #[test]
 fn static_smatrix_inputs() {
-    // Pure static × static.
+    // Pure static x static
     let a = SMatrix::<f64, 3, 4>::from_fn(|i, j| (i as f64) - 0.5 * (j as f64) + 1.0);
     let b = SMatrix::<f64, 4, 2>::from_fn(|i, j| 0.25 * (i as f64) * (i as f64) - (j as f64));
     assert_close(&dot(&a, &b), &naive_ref(&a, &b), 1e-12);
 
-    // Mixed static A × dynamic B — the independent-Dim generics allow it.
+    // Mixed static A x dynamic B: the independent-Dim generics allow it
     let bd = rand2(4, 5, 12);
     assert_close(&dot(&a, &bd), &naive_ref(&a, &bd), 1e-10);
 }
@@ -189,7 +189,7 @@ fn output_rows_mismatch_panics() {
     gemm(1.0, &a, &b, 0.0, &mut c, Parallelism::Serial);
 }
 
-/// Prepacked RHS (`prepack_rhs` + `gemm_packed_b`) into a column-major C matches the reference.
+/// Prepacked RHS (`prepack_rhs` + `gemm_packed_b`) into a column-major C matches the reference
 #[test]
 fn packed_b_matches_dot() {
     let (m, k, n) = (100usize, 64, 80);
@@ -204,7 +204,7 @@ fn packed_b_matches_dot() {
     }
 }
 
-/// Prepacked LHS (`prepack_lhs` + `gemm_packed_a`) into a row-major C matches the reference.
+/// Prepacked LHS (`prepack_lhs` + `gemm_packed_a`) into a row-major C matches the reference
 #[test]
 fn packed_a_matches_dot() {
     let (m, k, n) = (96usize, 50, 72);
@@ -214,14 +214,14 @@ fn packed_a_matches_dot() {
     let packed = prepack_lhs(&a);
     for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
         let mut data = vec![0.0f64; m * n];
-        // row-major C (packed_a orientation): strides (n, 1).
+        // row-major C (packed_a orientation): strides (n, 1)
         let mut c = DMatrixViewMut::from_slice_with_strides_mut(&mut data, m, n, n, 1);
         gemm_packed_a(1.0, &packed, &b, 0.0, &mut c, par);
         assert_close(&c, &exp, 1e-10);
     }
 }
 
-/// A prepacked RHS cannot serve a row-major C — gemmkit rejects the swapped orientation.
+/// A prepacked RHS cannot serve a row-major C - gemmkit rejects the swapped orientation
 #[test]
 #[should_panic]
 fn packed_b_row_major_c_panics() {
@@ -234,7 +234,7 @@ fn packed_b_row_major_c_panics() {
     gemm_packed_b(1.0, &a, &packed, 0.0, &mut c, Parallelism::Serial);
 }
 
-/// A prepacked LHS cannot serve a column-major C — gemmkit rejects the orientation.
+/// A prepacked LHS cannot serve a column-major C - gemmkit rejects the orientation
 #[test]
 #[should_panic]
 fn packed_a_col_major_c_panics() {
@@ -248,7 +248,7 @@ fn packed_a_col_major_c_panics() {
 
 /// The i8 adapter (`gemm_i8`/`dot_i8`) accumulates `i8` inputs into an `i32` output; checked
 /// against a naive `i32` reference including a strided (row-major) A view. Values stay in range so
-/// the wrapping semantics never fire and the comparison is exact.
+/// the wrapping semantics never fire and the comparison is exact
 #[cfg(feature = "int8")]
 #[test]
 fn i8_matches_reference() {
@@ -276,10 +276,10 @@ fn i8_matches_reference() {
     let a = randi8(m, k, 0x1);
     let b = randi8(k, n, 0x2);
 
-    // dot_i8 == naive product.
+    // dot_i8 == naive product
     assert_eq!(dot_i8(&a, &b), refmul(&a, &b));
 
-    // gemm_i8 with alpha/beta accumulate over a row-major (strided) A view.
+    // gemm_i8 with alpha/beta accumulate over a row-major (strided) A view
     let arm = randi8(m, k, 0x3);
     let adata: Vec<i8> = (0..m * k).map(|idx| arm[(idx / k, idx % k)]).collect();
     let a_view = DMatrixView::from_slice_with_strides(&adata, m, k, k, 1);
@@ -296,7 +296,7 @@ fn i8_matches_reference() {
 }
 
 /// `f16` (a `GemmScalar`) flows through the same generic `dot` with no adapter-specific code;
-/// checked against the `f64` reference at 16-bit tolerance.
+/// checked against the `f64` reference at 16-bit tolerance
 #[cfg(feature = "half")]
 #[test]
 fn dot_f16_matches_reference() {
@@ -320,9 +320,9 @@ fn dot_f16_matches_reference() {
     }
 }
 
-/// Complex adapters `dot_cplx` (plain `A·B`) and `gemm_cplx` (conj + accumulate), checked against a
-/// naive reference — including a conjugated, row-major (strided) A view, the case the raw
-/// `gemm_cplx_unchecked` path exists for.
+/// Complex adapters `dot_cplx` (plain `A*B`) and `gemm_cplx` (conj + accumulate), checked against a
+/// naive reference, including a conjugated, row-major (strided) A view, the case the raw
+/// `gemm_cplx_unchecked` path exists for
 #[cfg(feature = "complex")]
 #[test]
 fn cplx_dot_and_conj_matches_reference() {
@@ -331,14 +331,14 @@ fn cplx_dot_and_conj_matches_reference() {
     use nalgebra::DMatrixView;
 
     type C = Complex<f64>;
-    // `Complex::norm` needs `sqrt`, unavailable via the `no_std` num-complex re-export; use `hypot`.
+    // `Complex::norm` needs `sqrt`, unavailable via the `no_std` num-complex re-export; use `hypot`
     let cabs = |z: C| z.re.hypot(z.im);
     let crand = |r: usize, c: usize, s: u64| -> DMatrix<C> {
         let re = rand2(r, c, s);
         let im = rand2(r, c, s ^ 0xABCD);
         DMatrix::from_fn(r, c, |i, j| Complex::new(re[(i, j)], im[(i, j)]))
     };
-    // Naive reference: C = alpha·op(A)·op(B) + beta·C0.
+    // Naive reference: C = alpha*op(A)*op(B) + beta*C0
     let refgemm = |a: &DMatrix<C>,
                    ca: bool,
                    b: &DMatrix<C>,
@@ -364,7 +364,7 @@ fn cplx_dot_and_conj_matches_reference() {
     let a = crand(m, k, 1);
     let b = crand(k, n, 2);
 
-    // dot_cplx == plain A·B.
+    // dot_cplx == plain A*B
     let got = dot_cplx(&a, &b);
     let zero = DMatrix::from_element(m, n, Complex::new(0.0, 0.0));
     let exp = refgemm(
@@ -385,7 +385,7 @@ fn cplx_dot_and_conj_matches_reference() {
         }
     }
 
-    // gemm_cplx with conj-A on a row-major (strided) A view + beta accumulate.
+    // gemm_cplx with conj-A on a row-major (strided) A view + beta accumulate
     let arm = crand(m, k, 3);
     let adata: Vec<C> = (0..m * k).map(|idx| arm[(idx / k, idx % k)]).collect();
     let a_view = DMatrixView::from_slice_with_strides(&adata, m, k, k, 1);
@@ -416,7 +416,7 @@ fn cplx_dot_and_conj_matches_reference() {
 }
 
 /// `gemm_fused` (a `PerRow` bias + `ReLU`, and the identity `None`/`None` case) is **bit-identical**
-/// to plain `gemm` followed by the same scalar map — gemmkit's `f32`/`f64` fused contract.
+/// to plain `gemm` followed by the same scalar map: gemmkit's `f32`/`f64` fused contract
 #[cfg(feature = "epilogue")]
 #[test]
 fn fused_matches_plain_then_map() {
@@ -428,7 +428,7 @@ fn fused_matches_plain_then_map() {
     let bias: Vec<f64> = (0..m).map(|i| 0.5 * i as f64 - 2.0).collect();
     let (alpha, beta) = (1.3f64, -0.7);
     for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
-        // PerRow bias + ReLU.
+        // PerRow bias + ReLU
         let mut c_fused = c0.clone();
         gemm_fused(
             alpha,
@@ -453,7 +453,7 @@ fn fused_matches_plain_then_map() {
                 );
             }
         }
-        // None/None ≡ plain gemm, bit-for-bit.
+        // None/None == plain gemm, bit-for-bit
         let mut c_id = c0.clone();
         gemm_fused(alpha, &a, &b, beta, &mut c_id, None, None, par);
         let mut c_plain = c0.clone();
@@ -471,7 +471,7 @@ fn fused_matches_plain_then_map() {
 }
 
 /// `gemm_i8_requant` / `gemm_i8_requant_u8` are **bit-exact** against an independent scalar model
-/// (round-half-to-even, clamp) applied to the exact `i32` accumulator from `dot_i8`.
+/// (round-half-to-even, clamp) applied to the exact `i32` accumulator from `dot_i8`
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 #[test]
 fn requant_matches_scalar_model() {
@@ -539,7 +539,7 @@ fn requant_matches_scalar_model() {
 }
 
 /// `gemm_cplx_fused` (a `PerRow` complex bias, with conjugation) is **bit-identical** to
-/// [`gemm_cplx`] followed by the same element-wise bias add.
+/// [`gemm_cplx`] followed by the same element-wise bias add
 #[cfg(all(feature = "complex", feature = "epilogue"))]
 #[test]
 fn cplx_fused_matches_gemm_cplx_then_add() {

@@ -1,11 +1,11 @@
 //! Public API surface that the driver never touches on its own: the [`MatRef`]/[`MatMut`]
 //! dimension accessors, the [`Workspace`] `with_capacity`/`Default` constructors, and the raw
-//! `gemm_unchecked_with` entry (a caller-owned workspace over raw pointers).
+//! `gemm_unchecked_with` entry (a caller-owned workspace over raw pointers)
 #![cfg(all(not(miri), not(target_family = "wasm")))]
 
 use gemmkit::{MatMut, MatRef, Parallelism, Workspace, gemm, gemm_unchecked_with};
 
-/// `MatRef`/`MatMut` expose their shape through `rows()`/`cols()`.
+/// `MatRef`/`MatMut` expose their shape through `rows()`/`cols()`
 #[test]
 fn matref_matmut_accessors() {
     let data = [0.0f32; 12];
@@ -13,7 +13,7 @@ fn matref_matmut_accessors() {
     assert_eq!(r.rows(), 3);
     assert_eq!(r.cols(), 4);
 
-    // Explicit strides + column-major constructor report the same logical shape.
+    // Explicit strides + column-major constructor report the same logical shape
     let r2 = MatRef::new(&data, 4, 3, 1, 4);
     assert_eq!((r2.rows(), r2.cols()), (4, 3));
 
@@ -29,7 +29,7 @@ fn matref_matmut_accessors() {
 
 /// `Workspace::default()` equals `Workspace::new()` (both empty), and a `with_capacity`-primed
 /// workspace produces the same result as a fresh one when threaded through the raw
-/// `gemm_unchecked_with` entry — covering both constructors and the raw workspace path.
+/// `gemm_unchecked_with` entry, covering both constructors and the raw workspace path
 #[test]
 fn workspace_constructors_and_unchecked_with() {
     let (m, k, n) = (48usize, 40, 32);
@@ -38,7 +38,7 @@ fn workspace_constructors_and_unchecked_with() {
     let c0: Vec<f32> = (0..m * n).map(|i| (i % 7) as f32 * 0.05).collect();
     let (alpha, beta) = (1.25f32, -0.5);
 
-    // Reference through the safe, allocating entry.
+    // Reference through the safe, allocating entry
     let mut c_ref = c0.clone();
     gemm(
         alpha,
@@ -49,16 +49,16 @@ fn workspace_constructors_and_unchecked_with() {
         Parallelism::Serial,
     );
 
-    // `default()` is an empty workspace; `with_capacity(0)` must also be empty (no alloc).
+    // `default()` is an empty workspace; `with_capacity(0)` must also be empty (no alloc)
     let mut ws_default = Workspace::default();
     let _ws_zero = Workspace::with_capacity(0);
-    // Pre-sized workspace: avoids the first-call growth, must give an identical result.
+    // Pre-sized workspace: avoids the first-call growth, must give an identical result
     let mut ws_cap = Workspace::with_capacity(1 << 20);
 
     for ws in [&mut ws_default, &mut ws_cap] {
         let mut c = c0.clone();
         // SAFETY: shapes/strides describe valid in-bounds row-major layouts and C aliases neither
-        // A nor B (distinct Vecs).
+        // A nor B (distinct Vecs)
         unsafe {
             gemm_unchecked_with(
                 ws,

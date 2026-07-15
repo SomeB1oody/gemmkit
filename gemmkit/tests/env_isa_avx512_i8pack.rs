@@ -1,11 +1,11 @@
-//! `IntGemm::pack_rhs` — the widen (non-VNNI) i8 kernel's RHS packer. On this AVX-512-VNNI box the
+//! `IntGemm::pack_rhs`: the widen (non-VNNI) i8 kernel's RHS packer. On this AVX-512-VNNI box the
 //! auto i8 path always picks the `vpdpbusd` dot kernel (which packs via `IntGemmVnni::pack_rhs`), so
 //! the widen packer is only reachable when the plain AVX-512 kernel is forced. This binary pins
 //! `GEMMKIT_REQUIRE_ISA=avx512` (its own process, so the memoized `select_i8` is the widen kernel)
-//! and lowers the RHS-pack threshold to `1` so a small `m` still triggers packing — the more robust
+//! and lowers the RHS-pack threshold to `1` so a small `m` still triggers packing, the more robust
 //! route than the `m > 2048` default, since it forces the widen kernel directly rather than relying
 //! on the coverage orchestrator's avx512 pin pass, and keeps the matrix tiny/fast. Skips gracefully
-//! when the host lacks `avx512f` (the pin would otherwise assert).
+//! when the host lacks `avx512f` (the pin would otherwise assert)
 #![cfg(all(
     feature = "std",
     feature = "int8",
@@ -18,7 +18,7 @@ use gemmkit::{MatMut, MatRef, Parallelism, tuning};
 #[test]
 fn widen_i8_pack_rhs_under_avx512_pin() {
     // Pin once, before any i8 dispatch. SAFETY: the only test in this binary, so nothing reads the
-    // environment concurrently with this write.
+    // environment concurrently with this write
     unsafe {
         std::env::set_var("GEMMKIT_REQUIRE_ISA", "avx512");
     }
@@ -26,11 +26,11 @@ fn widen_i8_pack_rhs_under_avx512_pin() {
         eprintln!("skipping: host does not report avx512f");
         return;
     }
-    // Force RHS packing for the widen kernel even at small `m` (`pack_b = m > threshold`).
+    // Force RHS packing for the widen kernel even at small `m` (`pack_b = m > threshold`)
     tuning::set_rhs_pack_threshold(1);
 
     // Driver path (k > small_k gate, m,n > small_mn gate), so RHS packing runs through
-    // `IntGemm::pack_rhs`. Values stay in range so the wrapping semantics never fire.
+    // `IntGemm::pack_rhs`. Values stay in range so the wrapping semantics never fire
     let (m, k, n) = (96usize, 64usize, 64usize);
     let a: Vec<i8> = (0..m * k).map(|i| ((i % 17) as i32 - 8) as i8).collect();
     let b: Vec<i8> = (0..k * n).map(|i| ((i % 13) as i32 - 6) as i8).collect();
@@ -47,7 +47,7 @@ fn widen_i8_pack_rhs_under_avx512_pin() {
         Parallelism::Serial,
     );
 
-    // Naive wrapping-i32 reference.
+    // Naive wrapping-i32 reference
     let mut expect = vec![0i32; m * n];
     for i in 0..m {
         for j in 0..n {

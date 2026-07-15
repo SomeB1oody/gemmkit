@@ -1,21 +1,21 @@
-//! Integer (`i8` -> `i32`) and requantizing (`i8` -> `i8`) GEMM entries.
+//! Integer (`i8` -> `i32`) and requantizing (`i8` -> `i8`) GEMM entries
 use super::*;
 #[cfg(feature = "epilogue")]
 use crate::kernel::epilogue::BiasDim;
 
-/// Integer GEMM: `C <- alpha·A·B + beta·C` with **`i8` inputs accumulated into an
+/// Integer GEMM: `C <- alpha*A*B + beta*C` with **`i8` inputs accumulated into an
 /// `i32` output** (`alpha`/`beta`/`C` are `i32`). Arithmetic wraps on overflow, the
-/// conventional integer-GEMM semantics. Uses the thread-local workspace pool.
+/// conventional integer-GEMM semantics. Uses the thread-local workspace pool
 ///
 /// A separate entry point from [`gemm`] because input and output types differ
-/// (`i8` vs `i32`), which the homogeneous `gemm<T>` surface cannot express.
+/// (`i8` vs `i32`), which the homogeneous `gemm<T>` surface cannot express
 ///
 /// # Panics
 /// Same shape / bounds / aliasing conditions as [`gemm`] (`A.cols == B.rows`,
 /// `A.rows == C.rows`, `B.cols == C.cols`; every view in bounds; `C` addresses each
 /// element uniquely and does not overlap `A`/`B`). Negative-stride / raw-pointer
 /// callers use [`gemm_i8_unchecked`] (the homogeneous [`gemm_unchecked`] cannot
-/// serve `i8 -> i32`).
+/// serve `i8 -> i32`)
 #[cfg(feature = "int8")]
 pub fn gemm_i8(
     alpha: i32,
@@ -28,10 +28,10 @@ pub fn gemm_i8(
     workspace::with_thread_pool(|ws| gemm_i8_with(ws, alpha, a, b, beta, c, par));
 }
 
-/// Like [`gemm_i8`] but reuses a caller-owned [`Workspace`].
+/// Like [`gemm_i8`] but reuses a caller-owned [`Workspace`]
 ///
 /// # Panics
-/// Same conditions as [`gemm_i8`].
+/// Same conditions as [`gemm_i8`]
 #[cfg(feature = "int8")]
 pub fn gemm_i8_with(
     ws: &mut Workspace,
@@ -44,8 +44,8 @@ pub fn gemm_i8_with(
 ) {
     validate_gemm_views(&a, &b, &c);
 
-    // SAFETY: validated above — shapes agree, every stride in bounds, C addresses
-    // each (i,j) uniquely and does not overlap A/B.
+    // SAFETY: validated above, shapes agree, every stride in bounds, C addresses
+    // each (i,j) uniquely and does not overlap A/B
     unsafe {
         dispatch::execute_int(
             dispatch::IntTask {
@@ -70,16 +70,16 @@ pub fn gemm_i8_with(
     }
 }
 
-/// The raw integer engine: `C(i32) <- alpha·A(i8)·B(i8) + beta·C` over pointers and
-/// `isize` strides, with **no** bounds/alias/shape checks — the heterogeneous
+/// The raw integer engine: `C(i32) <- alpha*A(i8)*B(i8) + beta*C` over pointers and
+/// `isize` strides, with **no** bounds/alias/shape checks: the heterogeneous
 /// counterpart of [`gemm_unchecked`] (which is typed for the homogeneous surface and
 /// cannot serve `i8 -> i32`). The escape hatch [`gemm_i8`] points negative-stride /
-/// advanced callers to. Uses the thread-local workspace pool.
+/// advanced callers to. Uses the thread-local workspace pool
 ///
 /// # Safety
 /// The caller guarantees `a`/`b` valid for reads and `c` for read+write over every
 /// `(i,j)` implied by the dimensions and strides; `c` does not alias `a`/`b`; and
-/// when `beta == 0`, `c` need not be initialized.
+/// when `beta == 0`, `c` need not be initialized
 #[cfg(feature = "int8")]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn gemm_i8_unchecked(
@@ -125,10 +125,10 @@ pub unsafe fn gemm_i8_unchecked(
     }
 }
 
-/// As [`gemm_i8_unchecked`] but with a caller-owned [`Workspace`].
+/// As [`gemm_i8_unchecked`] but with a caller-owned [`Workspace`]
 ///
 /// # Safety
-/// See [`gemm_i8_unchecked`].
+/// See [`gemm_i8_unchecked`]
 #[cfg(feature = "int8")]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn gemm_i8_unchecked_with(
@@ -150,7 +150,7 @@ pub unsafe fn gemm_i8_unchecked_with(
     par: Parallelism,
 ) {
     // SAFETY: the caller guarantees `a`/`b` valid for reads and `c` for read+write over the
-    // shape/strides, `c` not aliasing `a`/`b`, and `beta == 0` may leave `c` uninitialized.
+    // shape/strides, `c` not aliasing `a`/`b`, and `beta == 0` may leave `c` uninitialized
     unsafe {
         dispatch::execute_int(
             dispatch::IntTask {
@@ -177,30 +177,30 @@ pub unsafe fn gemm_i8_unchecked_with(
 
 /// The quantization parameters shared by the requantizing entries: a per-tensor `scale` and
 /// integer `zero_point`, plus an optional **per-row** `i32` bias (length `m`, the standard
-/// qlinear layer bias). The output is `C[i,j] = clamp(zero_point + round_ne(scale·(Σ_k A·B +
+/// qlinear layer bias). The output is `C[i,j] = clamp(zero_point + round_ne(scale*(sum_k A*B +
 /// bias[i])), LO, HI)`, with round-half-to-even, where the clamp band `[LO, HI]` is set by the
-/// entry: [`gemm_i8_requant`] → `[-128, 127]` (`i8`), [`gemm_i8_requant_u8`] → `[0, 255]` (`u8`).
+/// entry: [`gemm_i8_requant`] -> `[-128, 127]` (`i8`), [`gemm_i8_requant_u8`] -> `[0, 255]` (`u8`)
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 pub struct Requantize<'a> {
-    /// Per-tensor output scale (`alpha` folds into this; must be finite and `> 0`).
+    /// Per-tensor output scale (`alpha` folds into this; must be finite and `> 0`)
     pub scale: f32,
     /// Output zero-point, joined in integer after rounding. Must lie in the output domain of the
-    /// chosen entry: `[-128, 127]` for [`gemm_i8_requant`], `[0, 255]` for [`gemm_i8_requant_u8`].
+    /// chosen entry: `[-128, 127]` for [`gemm_i8_requant`], `[0, 255]` for [`gemm_i8_requant_u8`]
     pub zero_point: i32,
-    /// Optional per-row `i32` bias (length `m`), added to the accumulator before scaling.
+    /// Optional per-row `i32` bias (length `m`), added to the accumulator before scaling
     pub bias: Option<&'a [i32]>,
 }
 
 /// Requantizing integer GEMM: `i8` inputs multiplied into an `i32` accumulator, then
-/// requantized to an `i8` output in one pass (deleting the full `m·n` `i32` materialization
+/// requantized to an `i8` output in 1 pass (deleting the full `m*n` `i32` materialization
 /// a `gemm_i8` + separate requantize would pay). No `alpha` (folds into `scale`) and no
 /// `beta` (accumulating into a quantized C is ill-defined). Uses the thread-local workspace
-/// pool.
+/// pool
 ///
 /// # Panics
 /// Same shape / bounds / aliasing conditions as [`gemm_i8`], plus: a non-finite or
 /// non-positive `scale`; a `zero_point` outside `[-128, 127]`; or a bias whose length is not
-/// `A.rows` or which overlaps `C`.
+/// `A.rows` or which overlaps `C`
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 pub fn gemm_i8_requant(
     a: MatRef<'_, i8>,
@@ -213,11 +213,11 @@ pub fn gemm_i8_requant(
 }
 
 /// Shared bias validation for the requantizing entries (`i8` and `u8` output): the optional
-/// per-row bias must have length `a_rows` and must not overlap `C` (byte ranges — `C` is a
+/// per-row bias must have length `a_rows` and must not overlap `C` (byte ranges: `C` is a
 /// 1-byte quantized output either way, `size_of::<TO>() == 1`). Returns the raw `(ptr, has_bias)`
-/// the task carries. Panic messages are byte-identical to the historic `i8`-only wording (tests
-/// match the substrings). The `scale` and `zero_point` range checks stay in each entry (the `zp`
-/// band differs between `i8` and `u8`), so this factors only the axis-independent bias check.
+/// the task carries. Panic messages are byte-identical to the `i8`-only wording (tests match the
+/// substrings). The `scale` and `zero_point` range checks stay in each entry (the `zp` band
+/// differs between `i8` and `u8`), so this factors only the axis-independent bias check
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 fn requant_bias<TO>(a_rows: usize, c: &MatMut<'_, TO>, bias: Option<&[i32]>) -> (*const i32, bool) {
     match bias {
@@ -229,7 +229,7 @@ fn requant_bias<TO>(a_rows: usize, c: &MatMut<'_, TO>, bias: Option<&[i32]>) -> 
                 bias.len(),
                 a_rows
             );
-            // bias (i32) must not overlap C (a 1-byte quantized output).
+            // bias (i32) must not overlap C (a 1-byte quantized output)
             if overlaps_bytes(
                 c.data.as_ptr() as *const u8,
                 c.data.len(),
@@ -246,10 +246,10 @@ fn requant_bias<TO>(a_rows: usize, c: &MatMut<'_, TO>, bias: Option<&[i32]>) -> 
     }
 }
 
-/// Like [`gemm_i8_requant`] but reuses a caller-owned [`Workspace`].
+/// Like [`gemm_i8_requant`] but reuses a caller-owned [`Workspace`]
 ///
 /// # Panics
-/// Same conditions as [`gemm_i8_requant`].
+/// Same conditions as [`gemm_i8_requant`]
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 pub fn gemm_i8_requant_with(
     ws: &mut Workspace,
@@ -274,9 +274,9 @@ pub fn gemm_i8_requant_with(
 
     let (bias_ptr, has_bias) = requant_bias(a.rows, &c, req.bias);
 
-    // SAFETY: validated above — shapes agree, strides in bounds, C addresses each (i,j)
+    // SAFETY: validated above, shapes agree, strides in bounds, C addresses each (i,j)
     // uniquely and does not alias A/B or the bias; scale/zp are in range. The bias pointer
-    // (borrowed for this call) stays valid for the whole `execute_int_requant` frame.
+    // (borrowed for this call) stays valid for the whole `execute_int_requant` frame
     unsafe {
         dispatch::execute_int_requant(
             dispatch::RequantTask {
@@ -304,16 +304,16 @@ pub fn gemm_i8_requant_with(
     }
 }
 
-/// The raw requantizing engine: `C(i8) <- clamp(zp + round_ne(scale·(A·B + bias)), -128,
+/// The raw requantizing engine: `C(i8) <- clamp(zp + round_ne(scale*(A*B + bias)), -128,
 /// 127)` over pointers and `isize` strides, with **no** bounds/alias/shape checks. `bias` is
 /// a per-row `i32` pointer enabled by `has_bias` (ignored when `has_bias == false`). Uses the
-/// thread-local workspace pool.
+/// thread-local workspace pool
 ///
 /// # Safety
 /// The caller guarantees `a`/`b` valid for reads and `c` for writes over the shape/strides;
 /// `c` does not alias `a`/`b`; when `has_bias`, `bias` is valid for `m` reads and disjoint
 /// from `c`; and `scale` is finite and `> 0` with `zero_point in [-128, 127]` (the checked
-/// API enforces the last two).
+/// API enforces the last 2)
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn gemm_i8_requant_unchecked(
@@ -335,7 +335,7 @@ pub unsafe fn gemm_i8_requant_unchecked(
     csc: isize,
     par: Parallelism,
 ) {
-    // SAFETY: preconditions forwarded to the caller (see # Safety).
+    // SAFETY: preconditions forwarded to the caller (see # Safety)
     unsafe {
         workspace::with_thread_pool(|ws| {
             gemm_i8_requant_unchecked_with(
@@ -346,10 +346,10 @@ pub unsafe fn gemm_i8_requant_unchecked(
     }
 }
 
-/// As [`gemm_i8_requant_unchecked`] but with a caller-owned [`Workspace`].
+/// As [`gemm_i8_requant_unchecked`] but with a caller-owned [`Workspace`]
 ///
 /// # Safety
-/// See [`gemm_i8_requant_unchecked`].
+/// See [`gemm_i8_requant_unchecked`]
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn gemm_i8_requant_unchecked_with(
@@ -374,7 +374,7 @@ pub unsafe fn gemm_i8_requant_unchecked_with(
 ) {
     // SAFETY: the caller guarantees `a`/`b` valid for reads and `c` for writes over the
     // shape/strides, `c` not aliasing `a`/`b`, when `has_bias` a valid disjoint `m`-length bias,
-    // and `scale`/`zero_point` in range (see [`gemm_i8_requant_unchecked`]).
+    // and `scale`/`zero_point` in range (see [`gemm_i8_requant_unchecked`])
     unsafe {
         dispatch::execute_int_requant(
             dispatch::RequantTask {
@@ -403,21 +403,21 @@ pub unsafe fn gemm_i8_requant_unchecked_with(
 }
 
 /// Requantizing integer GEMM with an **unsigned `u8` output** (ONNX-QLinearMatMul-style
-/// activation): `i8` inputs multiplied into an `i32` accumulator, then requantized in one pass to
-/// `C[i,j] = clamp(zero_point + round_ne(scale·(Σ_k A·B + bias[i])), 0, 255)` with
+/// activation): `i8` inputs multiplied into an `i32` accumulator, then requantized in 1 pass to
+/// `C[i,j] = clamp(zero_point + round_ne(scale*(sum_k A*B + bias[i])), 0, 255)` with
 /// round-half-to-even. The `i8`-output twin of [`gemm_i8_requant`], differing only in the output
 /// domain `[0, 255]` and the `zero_point` range. No `alpha` (folds into `scale`) and no `beta`
-/// (accumulating into a quantized C is ill-defined). Uses the thread-local workspace pool.
+/// (accumulating into a quantized C is ill-defined). Uses the thread-local workspace pool
 ///
 /// # Determinism
 /// The same contracts as [`gemm_i8_requant`]: the `i32` accumulation is exact and ISA-independent,
 /// and the requantize map is **bit-exact across every ISA** (scalar / FMA / AVX-512 / VNNI) and
-/// across the vector and scalar store paths.
+/// across the vector and scalar store paths
 ///
 /// # Panics
 /// Same shape / bounds / aliasing conditions as [`gemm_i8`], plus: a non-finite or non-positive
 /// `scale`; a `zero_point` outside `[0, 255]`; or a bias whose length is not `A.rows` or which
-/// overlaps `C`.
+/// overlaps `C`
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 pub fn gemm_i8_requant_u8(
     a: MatRef<'_, i8>,
@@ -429,10 +429,10 @@ pub fn gemm_i8_requant_u8(
     workspace::with_thread_pool(|ws| gemm_i8_requant_u8_with(ws, a, b, req, c, par));
 }
 
-/// Like [`gemm_i8_requant_u8`] but reuses a caller-owned [`Workspace`].
+/// Like [`gemm_i8_requant_u8`] but reuses a caller-owned [`Workspace`]
 ///
 /// # Panics
-/// Same conditions as [`gemm_i8_requant_u8`].
+/// Same conditions as [`gemm_i8_requant_u8`]
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 pub fn gemm_i8_requant_u8_with(
     ws: &mut Workspace,
@@ -457,9 +457,9 @@ pub fn gemm_i8_requant_u8_with(
 
     let (bias_ptr, has_bias) = requant_bias(a.rows, &c, req.bias);
 
-    // SAFETY: validated above — shapes agree, strides in bounds, C addresses each (i,j)
+    // SAFETY: validated above, shapes agree, strides in bounds, C addresses each (i,j)
     // uniquely and does not alias A/B or the bias; scale/zp are in range. The bias pointer
-    // (borrowed for this call) stays valid for the whole `execute_int_requant` frame.
+    // (borrowed for this call) stays valid for the whole `execute_int_requant` frame
     unsafe {
         dispatch::execute_int_requant(
             dispatch::RequantTask {
@@ -487,16 +487,16 @@ pub fn gemm_i8_requant_u8_with(
     }
 }
 
-/// The raw `u8`-output requantizing engine: `C(u8) <- clamp(zp + round_ne(scale·(A·B + bias)), 0,
-/// 255)` over pointers and `isize` strides, with **no** bounds/alias/shape checks — the unsigned
+/// The raw `u8`-output requantizing engine: `C(u8) <- clamp(zp + round_ne(scale*(A*B + bias)), 0,
+/// 255)` over pointers and `isize` strides, with **no** bounds/alias/shape checks: the unsigned
 /// twin of [`gemm_i8_requant_unchecked`]. `bias` is a per-row `i32` pointer enabled by `has_bias`
-/// (ignored when `has_bias == false`). Uses the thread-local workspace pool.
+/// (ignored when `has_bias == false`). Uses the thread-local workspace pool
 ///
 /// # Safety
 /// The caller guarantees `a`/`b` valid for reads and `c` for writes over the shape/strides;
 /// `c` does not alias `a`/`b`; when `has_bias`, `bias` is valid for `m` reads and disjoint
 /// from `c`; and `scale` is finite and `> 0` with `zero_point in [0, 255]` (the checked
-/// API enforces the last two).
+/// API enforces the last 2)
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn gemm_i8_requant_u8_unchecked(
@@ -518,7 +518,7 @@ pub unsafe fn gemm_i8_requant_u8_unchecked(
     csc: isize,
     par: Parallelism,
 ) {
-    // SAFETY: preconditions forwarded to the caller (see # Safety).
+    // SAFETY: preconditions forwarded to the caller (see # Safety)
     unsafe {
         workspace::with_thread_pool(|ws| {
             gemm_i8_requant_u8_unchecked_with(
@@ -529,10 +529,10 @@ pub unsafe fn gemm_i8_requant_u8_unchecked(
     }
 }
 
-/// As [`gemm_i8_requant_u8_unchecked`] but with a caller-owned [`Workspace`].
+/// As [`gemm_i8_requant_u8_unchecked`] but with a caller-owned [`Workspace`]
 ///
 /// # Safety
-/// See [`gemm_i8_requant_u8_unchecked`].
+/// See [`gemm_i8_requant_u8_unchecked`]
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn gemm_i8_requant_u8_unchecked_with(
@@ -557,7 +557,7 @@ pub unsafe fn gemm_i8_requant_u8_unchecked_with(
 ) {
     // SAFETY: the caller guarantees `a`/`b` valid for reads and `c` for writes over the
     // shape/strides, `c` not aliasing `a`/`b`, when `has_bias` a valid disjoint `m`-length bias,
-    // and `scale`/`zero_point` in range (see [`gemm_i8_requant_u8_unchecked`]).
+    // and `scale`/`zero_point` in range (see [`gemm_i8_requant_u8_unchecked`])
     unsafe {
         dispatch::execute_int_requant(
             dispatch::RequantTask {

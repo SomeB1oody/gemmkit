@@ -1,14 +1,14 @@
 //! faer adapter correctness: accepts owned `Mat` (faer's native column-major layout), a
 //! transposed view, a reversed (negative-stride) view, and an offset sub-matrix; `dot`/`gemm`
 //! match a naive reference independent of faer's own matmul; dimension mismatches and wrong
-//! prepacked-C orientations panic.
+//! prepacked-C orientations panic
 
 use faer::{Mat, MatMut, MatRef};
 use gemmkit::Parallelism;
 
 use gemmkit_faer::{dot, gemm, gemm_packed_a, gemm_packed_b, prepack_lhs, prepack_rhs};
 
-/// Deterministic column-major `Mat<f64>` fill (xorshift), values in `[-0.5, 0.5)`.
+/// Deterministic column-major `Mat<f64>` fill (xorshift), values in `[-0.5, 0.5)`
 fn rand_mat(r: usize, c: usize, seed: u64) -> Mat<f64> {
     let mut s = seed.wrapping_add(0x9E3779B97F4A7C15);
     Mat::from_fn(r, c, |_, _| {
@@ -19,15 +19,15 @@ fn rand_mat(r: usize, c: usize, seed: u64) -> Mat<f64> {
     })
 }
 
-/// Naive triple-loop `A·B` reference, independent of faer's own matmul. Reads both operands
-/// through faer indexing, so it honours whatever strides a view carries.
+/// Naive triple-loop `A*B` reference, independent of faer's own matmul. Reads both operands
+/// through faer indexing, so it honours whatever strides a view carries
 fn naive_ref(a: MatRef<'_, f64>, b: MatRef<'_, f64>) -> Mat<f64> {
     let (m, k) = (a.nrows(), a.ncols());
     let n = b.ncols();
     Mat::from_fn(m, n, |i, j| (0..k).map(|p| a[(i, p)] * b[(p, j)]).sum())
 }
 
-/// Element-wise (relative + absolute) comparison of two views.
+/// Element-wise (relative + absolute) comparison of 2 views
 fn assert_close(got: MatRef<'_, f64>, exp: MatRef<'_, f64>, tol: f64) {
     assert_eq!(
         (got.nrows(), got.ncols()),
@@ -67,7 +67,7 @@ fn dot_matches_naive() {
 
 #[test]
 fn dot_small_exact() {
-    // The doc example, by hand: [[1,2],[3,4]]·[[5,6],[7,8]] = [[19,22],[43,50]].
+    // The doc example, by hand: [[1,2],[3,4]]*[[5,6],[7,8]] = [[19,22],[43,50]]
     let a = Mat::from_fn(2, 2, |i, j| [[1.0_f64, 2.0], [3.0, 4.0]][i][j]);
     let b = Mat::from_fn(2, 2, |i, j| [[5.0_f64, 6.0], [7.0, 8.0]][i][j]);
     let c = dot(a.as_dyn_stride(), b.as_dyn_stride());
@@ -80,12 +80,12 @@ fn dot_small_exact() {
 }
 
 /// A transposed view (`.transpose()` on a column-major matrix yields non-unit row stride) reads
-/// straight through with no copy.
+/// straight through with no copy
 #[test]
 fn transposed_view() {
     let (m, k, n) = (9usize, 7, 5);
-    // `at` is k×m column-major; transposing gives an m×k view whose row stride is `at`'s column
-    // stride (non-unit) — the "row-major A" case.
+    // `at` is k x m column-major; transposing gives an m x k view whose row stride is `at`'s
+    // column stride (non-unit), the "row-major A" case
     let at = rand_mat(k, m, 30);
     let a = at.as_dyn_stride().transpose();
     assert_eq!((a.nrows(), a.ncols()), (m, k));
@@ -103,7 +103,7 @@ fn transposed_view() {
     );
 }
 
-/// A reversed view carries a negative row stride; gemm must honour it (and accumulate with beta).
+/// A reversed view carries a negative row stride; gemm must honour it (and accumulate with beta)
 #[test]
 fn reversed_negative_stride_view() {
     let (m, k, n) = (8usize, 6, 5);
@@ -134,11 +134,11 @@ fn reversed_negative_stride_view() {
     }
 }
 
-/// An offset sub-matrix moves the base pointer and keeps a non-contiguous column stride.
+/// An offset sub-matrix moves the base pointer and keeps a non-contiguous column stride
 #[test]
 fn submatrix_offset_view() {
     let (m, k, n) = (10usize, 8, 6);
-    // A source with twice the rows; take rows 1..1+m → base pointer offset by 1, column stride 2m.
+    // A source with twice the rows; take rows 1..1+m -> base pointer offset by 1, column stride 2m
     let big = rand_mat(2 * m, k, 40);
     let a = big.as_dyn_stride().submatrix(1, 0, m, k);
     assert_eq!((a.nrows(), a.ncols()), (m, k));
@@ -206,7 +206,7 @@ fn output_rows_mismatch_panics() {
     );
 }
 
-/// Prepacked RHS (`prepack_rhs` + `gemm_packed_b`) into a column-major C matches the reference.
+/// Prepacked RHS (`prepack_rhs` + `gemm_packed_b`) into a column-major C matches the reference
 #[test]
 fn packed_b_matches_dot() {
     let (m, k, n) = (100usize, 64, 80);
@@ -228,7 +228,7 @@ fn packed_b_matches_dot() {
     }
 }
 
-/// Prepacked LHS (`prepack_lhs` + `gemm_packed_a`) into a row-major C matches the reference.
+/// Prepacked LHS (`prepack_lhs` + `gemm_packed_a`) into a row-major C matches the reference
 #[test]
 fn packed_a_matches_dot() {
     let (m, k, n) = (96usize, 50, 72);
@@ -239,7 +239,7 @@ fn packed_a_matches_dot() {
     for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
         let mut data = vec![0.0f64; m * n];
         {
-            // row-major C (packed_a orientation): strides (n, 1).
+            // row-major C (packed_a orientation): strides (n, 1)
             let c = MatMut::from_row_major_slice_mut(&mut data, m, n);
             gemm_packed_a(1.0, &packed, b.as_dyn_stride(), 0.0, c, par);
         }
@@ -248,7 +248,7 @@ fn packed_a_matches_dot() {
     }
 }
 
-/// A prepacked RHS cannot serve a row-major C — gemmkit rejects the swapped orientation.
+/// A prepacked RHS cannot serve a row-major C - gemmkit rejects the swapped orientation
 #[test]
 #[should_panic]
 fn packed_b_row_major_c_panics() {
@@ -261,7 +261,7 @@ fn packed_b_row_major_c_panics() {
     gemm_packed_b(1.0, a.as_dyn_stride(), &packed, 0.0, c, Parallelism::Serial);
 }
 
-/// A prepacked LHS cannot serve a column-major C — gemmkit rejects the orientation.
+/// A prepacked LHS cannot serve a column-major C - gemmkit rejects the orientation
 #[test]
 #[should_panic]
 fn packed_a_col_major_c_panics() {
@@ -282,7 +282,7 @@ fn packed_a_col_major_c_panics() {
 
 /// The i8 adapter (`gemm_i8`/`dot_i8`) accumulates `i8` inputs into an `i32` output; checked
 /// against a naive `i32` reference including a transposed (non-unit-stride) A view. Values stay in
-/// range so the wrapping semantics never fire and the comparison is exact.
+/// range so the wrapping semantics never fire and the comparison is exact
 #[cfg(feature = "int8")]
 #[test]
 fn i8_matches_reference() {
@@ -309,7 +309,7 @@ fn i8_matches_reference() {
     let a = randi8(m, k, 0x1);
     let b = randi8(k, n, 0x2);
 
-    // dot_i8 == naive product.
+    // dot_i8 == naive product
     let got = dot_i8(a.as_dyn_stride(), b.as_dyn_stride());
     let exp = refmul(a.as_dyn_stride(), b.as_dyn_stride());
     for i in 0..m {
@@ -318,9 +318,9 @@ fn i8_matches_reference() {
         }
     }
 
-    // gemm_i8 with alpha/beta accumulate over a transposed (non-unit-stride) A view.
+    // gemm_i8 with alpha/beta accumulate over a transposed (non-unit-stride) A view
     let at = randi8(k, m, 0x3);
-    let a_view = at.as_dyn_stride().transpose(); // m×k, non-unit row stride
+    let a_view = at.as_dyn_stride().transpose(); // m x k, non-unit row stride
     let mut c = Mat::<i32>::from_fn(m, n, |i, j| (i * n + j) as i32 - 5);
     let c0 = c.clone();
     let (alpha, beta) = (3i32, -2i32);
@@ -342,7 +342,7 @@ fn i8_matches_reference() {
 }
 
 /// `f16` (a `GemmScalar`) flows through the same generic `dot` with no adapter-specific code;
-/// checked against the `f64` reference at 16-bit tolerance.
+/// checked against the `f64` reference at 16-bit tolerance
 #[cfg(feature = "half")]
 #[test]
 fn dot_f16_matches_reference() {
@@ -366,9 +366,9 @@ fn dot_f16_matches_reference() {
     }
 }
 
-/// Complex adapters `dot_cplx` (plain `A·B`) and `gemm_cplx` (conj + accumulate), checked against a
-/// naive reference — including a conjugated, transposed A view, the case the raw `gemm_cplx`
-/// path exists for.
+/// Complex adapters `dot_cplx` (plain `A*B`) and `gemm_cplx` (conj + accumulate), checked against a
+/// naive reference, including a conjugated, transposed A view, the case the raw `gemm_cplx`
+/// path exists for
 #[cfg(feature = "complex")]
 #[test]
 fn cplx_dot_and_conj_matches_reference() {
@@ -376,14 +376,14 @@ fn cplx_dot_and_conj_matches_reference() {
     use gemmkit_faer::{dot_cplx, gemm_cplx};
 
     type C = Complex<f64>;
-    // `Complex::norm` needs `sqrt`, unavailable via the `no_std` num-complex re-export; use `hypot`.
+    // `Complex::norm` needs `sqrt`, unavailable via the `no_std` num-complex re-export; use `hypot`
     let cabs = |z: C| z.re.hypot(z.im);
     let crand = |r: usize, c: usize, s: u64| -> Mat<C> {
         let re = rand_mat(r, c, s);
         let im = rand_mat(r, c, s ^ 0xABCD);
         Mat::from_fn(r, c, |i, j| Complex::new(re[(i, j)], im[(i, j)]))
     };
-    // Naive reference: C = alpha·op(A)·op(B) + beta·C0.
+    // Naive reference: C = alpha*op(A)*op(B) + beta*C0
     let refgemm = |a: MatRef<'_, C>,
                    ca: bool,
                    b: MatRef<'_, C>,
@@ -409,7 +409,7 @@ fn cplx_dot_and_conj_matches_reference() {
     let a = crand(m, k, 1);
     let b = crand(k, n, 2);
 
-    // dot_cplx == plain A·B.
+    // dot_cplx == plain A*B
     let got = dot_cplx(a.as_dyn_stride(), b.as_dyn_stride());
     let zero = Mat::from_fn(m, n, |_, _| Complex::new(0.0, 0.0));
     let exp = refgemm(
@@ -430,9 +430,9 @@ fn cplx_dot_and_conj_matches_reference() {
         }
     }
 
-    // gemm_cplx with conj-A on a transposed A view + beta accumulate.
+    // gemm_cplx with conj-A on a transposed A view + beta accumulate
     let at = crand(k, m, 3);
-    let a_view = at.as_dyn_stride().transpose(); // m×k
+    let a_view = at.as_dyn_stride().transpose(); // m x k
     let alpha = Complex::new(1.3, -0.4);
     let beta = Complex::new(0.5, 0.7);
     let mut c = crand(m, n, 4);
@@ -467,7 +467,7 @@ fn cplx_dot_and_conj_matches_reference() {
 }
 
 /// `gemm_fused` (a `PerRow` bias + `ReLU`, and the identity `None`/`None` case) is **bit-identical**
-/// to plain `gemm` followed by the same scalar map — gemmkit's `f32`/`f64` fused contract.
+/// to plain `gemm` followed by the same scalar map: gemmkit's `f32`/`f64` fused contract
 #[cfg(feature = "epilogue")]
 #[test]
 fn fused_matches_plain_then_map() {
@@ -479,7 +479,7 @@ fn fused_matches_plain_then_map() {
     let bias: Vec<f64> = (0..m).map(|i| 0.5 * i as f64 - 2.0).collect();
     let (alpha, beta) = (1.3f64, -0.7);
     for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
-        // PerRow bias + ReLU.
+        // PerRow bias + ReLU
         let mut c_fused = c0.clone();
         gemm_fused(
             alpha,
@@ -511,7 +511,7 @@ fn fused_matches_plain_then_map() {
                 );
             }
         }
-        // None/None ≡ plain gemm, bit-for-bit.
+        // None/None == plain gemm, bit-for-bit
         let mut c_id = c0.clone();
         gemm_fused(
             alpha,
@@ -545,8 +545,8 @@ fn fused_matches_plain_then_map() {
 }
 
 /// A reversed (negative-stride) A view through `gemm_fused` must equal plain `gemm` on the **same**
-/// reversed view then the same scalar map, **bit-for-bit**: the fused entry now forwards to gemmkit's
-/// raw engine (no reversed-view rejection), exactly like the plain entry.
+/// reversed view then the same scalar map, **bit-for-bit**: the fused entry forwards to gemmkit's
+/// raw engine with no reversed-view rejection, exactly like the plain entry
 #[cfg(feature = "epilogue")]
 #[test]
 fn fused_reversed_view_matches_plain_then_map() {
@@ -598,7 +598,7 @@ fn fused_reversed_view_matches_plain_then_map() {
 }
 
 /// `gemm_i8_requant` / `gemm_i8_requant_u8` are **bit-exact** against an independent scalar model
-/// (round-half-to-even, clamp) applied to the exact `i32` accumulator from `dot_i8`.
+/// (round-half-to-even, clamp) applied to the exact `i32` accumulator from `dot_i8`
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 #[test]
 fn requant_matches_scalar_model() {
@@ -678,7 +678,7 @@ fn requant_matches_scalar_model() {
 }
 
 /// `gemm_cplx_fused` (a `PerRow` complex bias, with conjugation) is **bit-identical** to
-/// [`gemm_cplx`] followed by the same element-wise bias add.
+/// [`gemm_cplx`] followed by the same element-wise bias add
 #[cfg(all(feature = "complex", feature = "epilogue"))]
 #[test]
 fn cplx_fused_matches_gemm_cplx_then_add() {

@@ -3,23 +3,23 @@
 //! reference for each supported element type. The product kernels only ever call a subset of these
 //! per token (loadu/storeu + mul_add + zero/splat, plus the dot seam), so the integer
 //! `reduce_sum`/`fnma`, the blanket widen seam, and the lane-FMA fallback are otherwise untouched by
-//! any driver run — this sweep exercises them directly.
+//! any driver run: this sweep exercises them directly
 //!
 //! Tokens are constructed directly (bypassing dispatch) and each is guarded behind the matching
 //! runtime feature probe, so the suite runs whatever the host supports and silently skips the rest;
 //! it is independent of `GEMMKIT_REQUIRE_ISA`. All arithmetic is compared against a plain scalar
-//! reference computed here — no platform-specific constants. Runs on wasm too (no proptest dep) so
-//! the compile-time `simd128` token is conformance-tested; the scalar token covers any host.
+//! reference computed here: no platform-specific constants. Runs on wasm too (no proptest dep) so
+//! the compile-time `simd128` token is conformance-tested; the scalar token covers any host
 #![cfg(not(miri))]
 // The lane loops index parallel scratch buffers by lane and print the lane in failure messages;
-// an explicit index is clearer than an enumerate here.
+// an explicit index is clearer than an enumerate here
 #![allow(clippy::needless_range_loop)]
 
 use gemmkit::simd::{KernelSimd, ScalarTok, SimdOps};
 
 /// Generate a conformance check for one floating element type: every `SimdOps<$t>` primitive plus
 /// the `KernelSimd<$t,$t,$t,$t>` blanket, validated lane-by-lane against a scalar reference at a
-/// per-type tolerance (mul_add/fnma fuse a single rounding, so the match is not bitwise).
+/// per-type tolerance (mul_add/fnma fuse a single rounding, so the match is not bitwise)
 macro_rules! float_conformance {
     ($name:ident, $t:ty, $tol:expr) => {
         fn $name<S>(simd: S, label: &str)
@@ -46,12 +46,12 @@ macro_rules! float_conformance {
             };
 
             // SAFETY: guarded by the caller's feature probe; every access below stays within the
-            // 16-element buffers and inside this token's `vectorize` codegen context.
+            // 16-element buffers and inside this token's `vectorize` codegen context
             unsafe {
                 simd.vectorize(|| {
                     let mut out = [0.0 as $t; 16];
 
-                    // zero / splat.
+                    // zero / splat
                     simd.storeu(out.as_mut_ptr(), simd.zero());
                     for l in 0..lanes {
                         assert_eq!(out[l], 0.0 as $t, "{label} zero lane {l}");
@@ -61,7 +61,7 @@ macro_rules! float_conformance {
                         assert_eq!(out[l], 3.5 as $t, "{label} splat lane {l}");
                     }
 
-                    // unaligned load round-trip.
+                    // unaligned load round-trip
                     let vx = simd.loadu(xs.as_ptr());
                     let vy = simd.loadu(ys.as_ptr());
                     let vc = simd.loadu(cs.as_ptr());
@@ -70,7 +70,7 @@ macro_rules! float_conformance {
                         assert_eq!(out[l], xs[l], "{label} loadu/storeu lane {l}");
                     }
 
-                    // mul / add / mul_add / fnma.
+                    // mul / add / mul_add / fnma
                     simd.storeu(out.as_mut_ptr(), simd.mul(vx, vy));
                     for l in 0..lanes {
                         close(out[l], xs[l] * ys[l], "mul", l);
@@ -88,7 +88,7 @@ macro_rules! float_conformance {
                         close(out[l], cs[l] - xs[l] * ys[l], "fnma", l);
                     }
 
-                    // horizontal reduce.
+                    // horizontal reduce
                     let got = simd.reduce_sum(vx);
                     let want: $t = xs[..lanes].iter().copied().sum();
                     assert!(
@@ -96,7 +96,7 @@ macro_rules! float_conformance {
                         "{label} reduce_sum: got {got} want {want}"
                     );
 
-                    // KernelSimd<A,A,A,A> blanket: widen seam collapses to plain loadu/splat/storeu.
+                    // KernelSimd<A,A,A,A> blanket: widen seam collapses to plain loadu/splat/storeu
                     simd.storeu(
                         out.as_mut_ptr(),
                         <S as KernelSimd<$t, $t, $t, $t>>::load_lhs(simd, xs.as_ptr()),
@@ -123,8 +123,8 @@ macro_rules! float_conformance {
                         assert_eq!(out[l], cs[l], "{label} store_out lane {l}");
                     }
 
-                    // Default `fma_bvec`: acc[l][i] = a_regs[i]·bvec[l] + acc[l][i] (splat + mul_add).
-                    // Only NEON overrides it; on x86/scalar this is the portable fallback body.
+                    // Default `fma_bvec`: acc[l][i] = a_regs[i]*bvec[l] + acc[l][i] (splat + mul_add)
+                    // Only NEON overrides it; on x86/scalar this is the portable fallback body
                     let nrows = core::cmp::min(lanes, 3);
                     let a_regs = [vx, vy];
                     let bvec = simd.loadu(bvals.as_ptr());
@@ -150,8 +150,8 @@ float_conformance!(conform_f64, f64, 1e-12);
 
 /// Integer (`i32`) conformance: exact (wrapping) equality against a scalar reference for every
 /// `SimdOps<i32>` primitive plus the `KernelSimd<i32,i32,i32,i32>` blanket. The int kernel only
-/// uses zero/splat/add/mul_add + the dot seam, so load/loadu/store/fnma/reduce_sum are covered
-/// here for the first time.
+/// uses zero/splat/add/mul_add + the dot seam, so load/loadu/store/fnma/reduce_sum are only
+/// directly exercised here
 #[cfg(feature = "int8")]
 fn conform_i32<S>(simd: S, label: &str)
 where
@@ -169,7 +169,7 @@ where
     let bvals: [i32; 16] = core::array::from_fn(|i| i as i32 * 2 + 1);
 
     // SAFETY: guarded by the caller's feature probe; accesses stay within the 16-element buffers
-    // and inside this token's `vectorize` context.
+    // and inside this token's `vectorize` context
     unsafe {
         simd.vectorize(|| {
             let mut out = [0i32; 16];
@@ -321,7 +321,7 @@ fn x86_token_conformance() {
 
 /// Neon is baseline on aarch64 (no runtime probe needed) and is the only token that
 /// overrides `fma_bvec` / sets `LANE_FMA`, so this arm is the sole conformance check of
-/// that seam.
+/// that seam
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn neon_token_conformance() {
@@ -333,7 +333,7 @@ fn neon_token_conformance() {
 }
 
 /// Simd128 is a compile-time token (`+simd128`, no runtime probe) and deviates from the
-/// FMA tokens (`mul_add` emulated as `mul + add`), so it needs its own conformance arm.
+/// FMA tokens (`mul_add` emulated as `mul + add`), so it needs its own conformance arm
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 #[test]
 fn simd128_token_conformance() {

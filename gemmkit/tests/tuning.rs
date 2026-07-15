@@ -1,28 +1,28 @@
 //! Tuning-surface behavior. Isolated in its own test binary because it mutates
 //! process-global thresholds; since the harness runs these tests concurrently, every one that
 //! sets a knob holds [`KNOB_LOCK`] (via [`knob_guard`]) for its whole body and restores what it
-//! changed, so no mutation is observed by another test.
+//! changed, so no mutation is observed by another test
 
 use gemmkit::{
     MatMut, MatRef, Parallelism, gemm, gemm_batched, gemm_packed_b, prepack_rhs, tuning,
 };
 
-/// Serializes **every** test that mutates a `tuning::set_*` knob. The knobs are process-global and
+/// Serializes every test that mutates a `tuning::set_*` knob. The knobs are process-global and
 /// the harness runs the tests in this binary concurrently, so without a shared lock one test's
-/// set/restore can interleave with another's gemm — flipping a route (or the serial/parallel gate)
+/// set/restore can interleave with another's gemm: flipping a route (or the serial/parallel gate)
 /// mid-run and breaking a bit-identity or consistency assertion. Every knob-touching test holds this
 /// via [`knob_guard`] for its whole body, and each restores the knobs it changed, so no mutation is
-/// observed outside the test that made it.
+/// observed outside the test that made it
 static KNOB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Acquire [`KNOB_LOCK`] for the calling test's duration. Recovers a poisoned lock so one panicking
-/// test does not cascade into spurious failures across the rest.
+/// test does not cascade into spurious failures across the rest
 fn knob_guard() -> std::sync::MutexGuard<'static, ()> {
     KNOB_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Naive `C = A·B` for column-major `f64` operands, returned column-major. The reference
-/// the route/knob tests compare against.
+/// Naive `C = A*B` for column-major `f64` operands, returned column-major. The reference
+/// the route/knob tests compare against
 fn naive_col(a: &[f64], b: &[f64], m: usize, k: usize, n: usize) -> Vec<f64> {
     let mut c = vec![0.0; m * n];
     for j in 0..n {
@@ -38,7 +38,7 @@ fn naive_col(a: &[f64], b: &[f64], m: usize, k: usize, n: usize) -> Vec<f64> {
 }
 
 /// `usize::MAX` must not collide with the internal "unset" sentinel: setting the
-/// maximum should take effect (clamped to `usize::MAX - 1`), not be ignored.
+/// maximum should take effect (clamped to `usize::MAX - 1`), not be ignored
 #[test]
 fn max_value_threshold_takes_effect() {
     let _g = knob_guard();
@@ -60,7 +60,7 @@ fn max_value_threshold_takes_effect() {
 
 /// Both the packed and the in-place (unpacked) RHS paths must be correct,
 /// including partial column tiles (n not a multiple of NR). Toggle the gate to
-/// force each mode and compare to a naive reference.
+/// force each mode and compare to a naive reference
 #[test]
 fn rhs_packing_both_modes_correct() {
     let _g = knob_guard();
@@ -84,12 +84,12 @@ fn rhs_packing_both_modes_correct() {
 }
 
 /// `gemv_threshold` is a live knob: setting it to 0 disables the dedicated gemv
-/// path, which then falls through to the general driver and stays correct.
+/// path, which then falls through to the general driver and stays correct
 #[test]
 fn gemv_threshold_disables_path_but_stays_correct() {
     let _g = knob_guard();
     tuning::set_gemv_threshold(0);
-    // m == 1 row-vector times 5x4 matrix.
+    // m == 1 row-vector times 5x4 matrix
     let a = [1.0f64, 2.0, 3.0, 4.0, 5.0]; // 1x5
     let bm = [
         1.0f64, 0.0, 1.0, 0.0, // row 0
@@ -107,7 +107,7 @@ fn gemv_threshold_disables_path_but_stays_correct() {
         MatMut::from_row_major(&mut c, 1, 4),
         Parallelism::Serial,
     );
-    // Reference: c[j] = sum_k a[k]*B[k,j].
+    // Reference: c[j] = sum_k a[k]*B[k,j]
     let mut expect = [0.0f64; 4];
     for j in 0..4 {
         for k in 0..5 {
@@ -127,12 +127,12 @@ fn gemv_threshold_disables_path_but_stays_correct() {
 /// Both LHS paths must be correct under parallelism: packed (forced by a zero-byte
 /// stride gate, so every column-major A packs) and read-in-place (gate disabled).
 /// Exercises the dynamic scheduler's whole-row-block ("packed") grain plus partial
-/// row/column tiles, against a naive reference.
+/// row/column tiles, against a naive reference
 #[test]
 fn lhs_packing_both_modes_correct() {
     let _g = knob_guard();
-    // 1 = always pack a column-major A (csa*sizeof >= 1); MAX = never via stride.
-    // (0 would mean "auto" — derive from page size — so it is not an extreme here.)
+    // 1 = always pack a column-major A (csa*sizeof >= 1); MAX = never via stride
+    // (0 would mean "auto" - derive from page size - so it is not an extreme here)
     for &stride in &[1usize, usize::MAX] {
         tuning::set_lhs_pack_stride(stride);
         for &(m, k, n) in &[(97, 64, 80), (160, 48, 133), (200, 96, 175), (33, 17, 19)] {
@@ -153,8 +153,8 @@ fn lhs_packing_both_modes_correct() {
 }
 
 /// `parallel_oversample` is a live knob: 0 (clamped to 1), 1, and an adversarially
-/// huge value must each yield a correct parallel result with no panic — the latter
-/// proves the grain computation's saturating multiply guards against overflow.
+/// huge value must each yield a correct parallel result with no panic - the latter
+/// proves the grain computation's saturating multiply guards against overflow
 #[test]
 fn parallel_oversample_extremes_stay_correct() {
     let _g = knob_guard();
@@ -178,12 +178,12 @@ fn parallel_oversample_extremes_stay_correct() {
 
 /// `small_k_threshold` is a live knob: forcing every shape onto the in-place small-`k`
 /// route (`usize::MAX`) or onto the register-tiling driver (`0`) must both stay correct,
-/// across `k` values on both sides of the calibrated crossover and with partial tiles.
+/// across `k` values on both sides of the calibrated crossover and with partial tiles
 #[test]
 fn small_k_threshold_route_correct() {
     let _g = knob_guard();
     let prev = tuning::small_k_threshold();
-    // MAX = every k takes the in-place small-k route; 0 = every k takes the driver.
+    // MAX = every k takes the in-place small-k route; 0 = every k takes the driver
     for &force in &[usize::MAX, 0] {
         tuning::set_small_k_threshold(force);
         for &(m, k, n) in &[
@@ -217,8 +217,8 @@ fn small_k_threshold_route_correct() {
 }
 
 /// `gemv_parallel_bytes` is a live knob: the byte floor forced to `1` (parallelize any gemv)
-/// or `usize::MAX` (never) must both produce the correct matrix·vector result. (`0` is *auto*
-/// — an LLC-derived floor — not an extreme, so it is not exercised here.)
+/// or `usize::MAX` (never) must both produce the correct matrix*vector result. (`0` is *auto*,
+/// an LLC-derived floor, not an extreme, so it is not exercised here)
 #[test]
 fn gemv_parallel_bytes_route_correct() {
     let _g = knob_guard();
@@ -250,14 +250,14 @@ fn gemv_parallel_bytes_route_correct() {
 
 /// `gemv_thread_cap` is a live knob: capping the bandwidth-bound worker count at `1`
 /// (single worker) or a large value (many) must leave a parallel gemv both correct against
-/// a naive reference and bit-identical to the serial run (output-partitioning is exact).
+/// a naive reference and bit-identical to the serial run (output-partitioning is exact)
 #[test]
 fn gemv_thread_cap_stays_correct() {
     let _g = knob_guard();
     let prev = tuning::gemv_thread_cap();
     // Drop the byte floor so this modest gemv clears it and the cap actually bites (the
     // assertions are correctness/bit-identity, which hold at any worker count, so racing the
-    // floor knob with its own test cannot flake). Restored at the end.
+    // floor knob with its own test cannot flake). Restored at the end
     let prev_floor = tuning::gemv_parallel_bytes();
     tuning::set_gemv_parallel_bytes(1);
     let (m, k, n) = (200_000usize, 3usize, 1usize);
@@ -311,7 +311,7 @@ fn gemv_gevv_serial_parallel_consistent() {
     // (the LLC-derived auto floor would keep them serial on a large-cache host)
     let prev_floor = tuning::gemv_parallel_bytes();
     tuning::set_gemv_parallel_bytes(1);
-    // gemv: m·k large enough to split across workers; `m` deliberately not a multiple of the
+    // gemv: m*k large enough to split across workers; `m` deliberately not a multiple of the
     // register-block width, so the sub-lane scalar tail is exercised
     let (m, k) = (300_007usize, 5usize);
     let a = mkvec(m * k, 1);
@@ -335,7 +335,7 @@ fn gemv_gevv_serial_parallel_consistent() {
     );
 
     // gevv / skinny GEMM: enough C bytes that the ramp gives several workers; dims not
-    // multiples of MR/NR so partial tiles are exercised.
+    // multiples of MR/NR so partial tiles are exercised
     let (gm, gk, gn) = (1201usize, 3usize, 1199usize);
     let ga = mkvec(gm * gk, 3);
     let gb = mkvec(gk * gn, 4);
@@ -359,9 +359,9 @@ fn gemv_gevv_serial_parallel_consistent() {
     tuning::set_gemv_parallel_bytes(prev_floor);
 }
 
-/// Naive `C = A·B` for **row-major A + column-major B**, returned column-major — the small-`m,n`
+/// Naive `C = A*B` for **row-major A + column-major B**, returned column-major: the small-`m,n`
 /// horizontal route's contiguous-along-`k` layout. `A[i,p] = a[i*k+p]`, `B[p,j] = b[j*k+p]`,
-/// `C[i,j] = c[j*m+i]`.
+/// `C[i,j] = c[j*m+i]`
 fn naive_rowa_colb(a: &[f64], b: &[f64], m: usize, k: usize, n: usize) -> Vec<f64> {
     let mut c = vec![0.0; m * n];
     for j in 0..n {
@@ -377,14 +377,14 @@ fn naive_rowa_colb(a: &[f64], b: &[f64], m: usize, k: usize, n: usize) -> Vec<f6
 }
 
 /// `small_mn_dim` is a live knob: forcing every small-`m,n` shape onto the horizontal route
-/// (`usize::MAX`) or off (`0` → the driver) must both stay correct, across `k` (all above the
+/// (`usize::MAX`) or off (`0` -> the driver) must both stay correct, across `k` (all above the
 /// default `small_k_threshold`, so the route's `k > threshold` gate fires) with partial tiles
-/// (`m,n,k` not multiples of the register tile) and a non-trivial `alpha`/`beta`.
+/// (`m,n,k` not multiples of the register tile) and a non-trivial `alpha`/`beta`
 #[test]
 fn small_mn_route_correct() {
     let _g = knob_guard();
     let pmn = tuning::small_mn_dim();
-    // MAX = every small-m,n shape takes the horizontal route; 0 = the driver.
+    // MAX = every small-m,n shape takes the horizontal route; 0 = the driver
     for &smn in &[usize::MAX, 0usize] {
         tuning::set_small_mn_dim(smn);
         for &(m, k, n) in &[
@@ -398,7 +398,7 @@ fn small_mn_route_correct() {
             let a: Vec<f64> = (0..m * k).map(|x| (x % 23) as f64 * 0.1 - 1.0).collect();
             let b: Vec<f64> = (0..k * n).map(|x| (x % 19) as f64 * 0.2 - 1.5).collect();
             let ab = naive_rowa_colb(&a, &b, m, k, n);
-            // alpha/beta epilogue over a pre-filled column-major C.
+            // alpha/beta epilogue over a pre-filled column-major C
             let (alpha, beta) = (2.5f64, -0.5f64);
             let mut cc: Vec<f64> = (0..m * n).map(|x| (x % 7) as f64 * 0.3 - 0.9).collect();
             let cref: Vec<f64> = (0..m * n)
@@ -424,8 +424,8 @@ fn small_mn_route_correct() {
 }
 
 /// The mixed-precision (f16, f32-accumulate) horizontal route must be correct forced on
-/// (`usize::MAX`) and off (`0` → the widen driver), across `k` with partial tiles. Compared to an
-/// f32 reference with a tolerance (the narrow output rounds once in the epilogue).
+/// (`usize::MAX`) and off (`0` -> the widen driver), across `k` with partial tiles. Compared to an
+/// f32 reference with a tolerance (the narrow output rounds once in the epilogue)
 #[cfg(feature = "half")]
 #[test]
 fn small_mn_mixed_route_correct() {
@@ -439,7 +439,7 @@ fn small_mn_mixed_route_correct() {
             let bf: Vec<f32> = (0..k * n).map(|x| (x % 19) as f32 * 0.2 - 1.5).collect();
             let a: Vec<f16> = af.iter().map(|&x| f16::from_f32(x)).collect();
             let b: Vec<f16> = bf.iter().map(|&x| f16::from_f32(x)).collect();
-            // f32 reference over the widened inputs (row-major A, col-major B → col-major C).
+            // f32 reference over the widened inputs (row-major A, col-major B -> col-major C)
             let cref: Vec<f32> = {
                 let mut c = vec![0.0f32; m * n];
                 for j in 0..n {
@@ -476,7 +476,7 @@ fn small_mn_mixed_route_correct() {
 
 /// The horizontal route output-partitions disjoint tiles with no cross-thread reduction, so a
 /// parallel run must equal the serial run **bit-for-bit**. Force the route on and drop the
-/// bandwidth floor so a `16×16` output actually splits across workers.
+/// bandwidth floor so a `16x16` output actually splits across workers
 #[test]
 fn small_mn_serial_parallel_bit_identical() {
     let _g = knob_guard();
@@ -509,9 +509,9 @@ fn small_mn_serial_parallel_bit_identical() {
     tuning::set_gemv_parallel_bytes(pfloor);
 }
 
-// ---- Promoted calibration knobs: each forces an extreme + the default and checks correctness ----
+// Promoted calibration knobs: each forces an extreme + the default and checks correctness
 
-/// Assert `got` matches a naive reference to a tight relative tolerance, with a labelled message.
+/// Assert `got` matches a naive reference to a tight relative tolerance, with a labelled message
 fn assert_close(got: &[f64], expect: &[f64], label: &str) {
     assert_eq!(got.len(), expect.len(), "{label}: length mismatch");
     for (g, e) in got.iter().zip(expect) {
@@ -522,7 +522,7 @@ fn assert_close(got: &[f64], expect: &[f64], label: &str) {
     }
 }
 
-/// Deterministic column-major `f64` operands for a knob test.
+/// Deterministic column-major `f64` operands for a knob test
 fn mkmats(m: usize, k: usize, n: usize) -> (Vec<f64>, Vec<f64>) {
     let a: Vec<f64> = (0..m * k).map(|x| (x % 23) as f64 * 0.1 - 1.0).collect();
     let b: Vec<f64> = (0..k * n).map(|x| (x % 19) as f64 * 0.2 - 1.5).collect();
@@ -531,14 +531,14 @@ fn mkmats(m: usize, k: usize, n: usize) -> (Vec<f64>, Vec<f64>) {
 
 /// `k_stream_max` gates the axpy-gemv output register-blocking strategy. Forcing it to `0` (never
 /// register-block) or `usize::MAX` (always, when the output spills L2) must both give the correct
-/// gemv result. `n == 1` selects the axpy gemv path.
+/// gemv result. `n == 1` selects the axpy gemv path
 #[test]
 fn k_stream_max_route_correct() {
     let _g = knob_guard();
     let prev = tuning::k_stream_max();
     // A large output (spills L2 on typical machines, so the register-block path is actually taken
     // for the non-zero setting) and a small `k` (register-block eligible). Correctness holds either
-    // way.
+    // way
     let (m, k, n) = (300_000usize, 5usize, 1usize);
     let (a, b) = mkmats(m, k, n);
     let cref = naive_col(&a, &b, m, k, n);
@@ -560,7 +560,7 @@ fn k_stream_max_route_correct() {
 
 /// `seq_internal_bytes_per_worker` selects the aarch64 batched-GEMM split plan (inert on other
 /// targets). Forcing it to `1` or `usize::MAX` must leave a batched GEMM correct against a naive
-/// per-element reference.
+/// per-element reference
 #[test]
 fn seq_internal_bytes_batched_correct() {
     let _g = knob_guard();
@@ -572,7 +572,7 @@ fn seq_internal_bytes_batched_correct() {
     let b: Vec<f64> = (0..batch * k * n)
         .map(|x| (x % 19) as f64 * 0.2 - 1.5)
         .collect();
-    // Per-element naive reference (each element is an independent col-major product).
+    // Per-element naive reference (each element is an independent col-major product)
     let mut cref = vec![0.0f64; batch * m * n];
     for bi in 0..batch {
         let (ao, bo, co) = (bi * m * k, bi * k * n, bi * m * n);
@@ -599,14 +599,14 @@ fn seq_internal_bytes_batched_correct() {
     tuning::set_seq_internal_bytes_per_worker(prev);
 }
 
-/// `packed_oversample` sets the packed-LHS dynamic-scheduling grain — a row-major A takes that
-/// path. Forcing it to `0` (→1), `1`, or a huge value must each give a correct parallel result.
+/// `packed_oversample` sets the packed-LHS dynamic-scheduling grain - a row-major A takes that
+/// path. Forcing it to `0` (-> 1), `1`, or a huge value must each give a correct parallel result
 #[test]
 fn packed_oversample_extremes_stay_correct() {
     let _g = knob_guard();
     let prev = tuning::packed_oversample();
     // `m` large enough that the row-block count reaches the worker count on typical machines, so
-    // `packed_block_grain` is actually consulted; correctness holds regardless.
+    // `packed_block_grain` is actually consulted; correctness holds regardless
     let (m, k, n) = (4096usize, 64usize, 96usize);
     let (a, b) = mkmats(m, k, n); // A read row-major, B col-major -> col-major C
     let cref = naive_rowa_colb(&a, &b, m, k, n);
@@ -627,7 +627,7 @@ fn packed_oversample_extremes_stay_correct() {
 }
 
 /// `mc_reg_panels` caps the A macro-panel height. Forcing it to `1` (minimal MC) or a huge value
-/// (MC bounded only by `m`) must keep a general GEMM correct.
+/// (MC bounded only by `m`) must keep a general GEMM correct
 #[test]
 fn mc_reg_panels_stays_correct() {
     let _g = knob_guard();
@@ -653,7 +653,7 @@ fn mc_reg_panels_stays_correct() {
 }
 
 /// `nc_no_l3_panels` caps the no-L3 column block (inert where an L3 exists). Forcing it to `1` or a
-/// huge value must keep a general GEMM correct on any machine.
+/// huge value must keep a general GEMM correct on any machine
 #[test]
 fn nc_no_l3_panels_stays_correct() {
     let _g = knob_guard();
@@ -678,9 +678,9 @@ fn nc_no_l3_panels_stays_correct() {
 }
 
 /// `tiny_block_dim` gates the small-matrix blocking shortcut. Forcing every shape onto the tiny
-/// branch (`usize::MAX`) or off it (`0`) must keep a plain GEMM correct — and, because the prepack
+/// branch (`usize::MAX`) or off it (`0`) must keep a plain GEMM correct, and, because the prepack
 /// paths derive their branch-dodging sentinel from this knob, a prepacked-B GEMM must stay correct
-/// even when the knob would otherwise route the shape into the tiny branch.
+/// even when the knob would otherwise route the shape into the tiny branch
 #[test]
 fn tiny_block_dim_route_correct() {
     let _g = knob_guard();
@@ -704,7 +704,7 @@ fn tiny_block_dim_route_correct() {
     }
     // Prepack coupling: with the gate forced huge, a normal `gemm()` on this shape would take the
     // tiny branch, but the prepack sentinel (`gate + 1`) still dodges it so the prepacked geometry
-    // is valid.
+    // is valid
     tuning::set_tiny_block_dim(usize::MAX);
     let (m, k, n) = (32usize, 33usize, 28usize);
     let (a, b) = mkmats(m, k, n);
@@ -724,7 +724,7 @@ fn tiny_block_dim_route_correct() {
 }
 
 /// `kc` caps the tiny-branch depth block. On a small-matrix shape (which takes the tiny branch),
-/// forcing it to `1` (many depth panels) or a huge value (`kc == k`) must both stay correct.
+/// forcing it to `1` (many depth panels) or a huge value (`kc == k`) must both stay correct
 #[test]
 fn kc_tiny_ceiling_stays_correct() {
     let _g = knob_guard();
@@ -749,7 +749,7 @@ fn kc_tiny_ceiling_stays_correct() {
 }
 
 /// `kc_min` floors the main-model depth block. On a general shape, forcing it to `1` (the L1
-/// estimate stands) or a huge value (`kc == k`) must both stay correct.
+/// estimate stands) or a huge value (`kc == k`) must both stay correct
 #[test]
 fn kc_min_floor_stays_correct() {
     let _g = knob_guard();
@@ -774,9 +774,9 @@ fn kc_min_floor_stays_correct() {
 }
 
 /// `pack_transpose_tile` sets the strip length of the cache-blocked transpose in the strided
-/// packing path — only the copy order changes, not the packed bytes. A prepacked-B GEMM (which
+/// packing path: only the copy order changes, not the packed bytes. A prepacked-B GEMM (which
 /// always runs that packer for a column-major B) must be correct at `1`, the default, and a huge
-/// strip length.
+/// strip length
 #[test]
 fn pack_transpose_tile_stays_correct() {
     let _g = knob_guard();
@@ -801,9 +801,9 @@ fn pack_transpose_tile_stays_correct() {
     tuning::set_pack_transpose_tile(prev);
 }
 
-/// `i8_vnni_min_par_mnk` gates the VNNI→widen small-parallel fallback. Forcing it to `0` (always
+/// `i8_vnni_min_par_mnk` gates the VNNI->widen small-parallel fallback. Forcing it to `0` (always
 /// keep VNNI) or `usize::MAX` (always fall back to widen for a multi-threaded run) must both give
-/// the correct i32 product; the two kernels are exact, so they must also agree bit-for-bit.
+/// the correct i32 product; the 2 kernels are exact, so they must also agree bit-for-bit
 #[cfg(feature = "int8")]
 #[test]
 fn i8_vnni_min_par_mnk_route_correct() {
@@ -848,7 +848,7 @@ fn i8_vnni_min_par_mnk_route_correct() {
 
 /// Assert a serial and a parallel result agree to a tight relative tolerance. Within one route
 /// they are bit-identical (output-partitioning reorders nothing); the tolerance only absorbs
-/// the last-ULP gap when a raced routing knob lands the two runs on different paths
+/// the last-ULP gap when a raced routing knob lands the 2 runs on different paths
 fn assert_consistent(serial: &[f32], parallel: &[f32], what: &str) {
     assert_eq!(serial.len(), parallel.len(), "{what}: length mismatch");
     for (i, (&s, &p)) in serial.iter().zip(parallel).enumerate() {
@@ -861,7 +861,7 @@ fn assert_consistent(serial: &[f32], parallel: &[f32], what: &str) {
 }
 
 /// Small deterministic `f32` fill (a xorshift, so the values are not all equal and the
-/// reductions are non-trivial) for the consistency test.
+/// reductions are non-trivial) for the consistency test
 fn mkvec(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed | 1;
     (0..n)

@@ -1,9 +1,9 @@
-//! AVX2 + FMA ISA token (x86 / x86-64).
+//! AVX2 + FMA ISA token (x86 / x86-64)
 //!
-//! `f32` → 256-bit registers (8 lanes), `f64` → 256-bit (4 lanes). The whole
+//! `f32` -> 256-bit registers (8 lanes), `f64` -> 256-bit (4 lanes). The whole
 //! file is one `#[target_feature(enable = "avx2,fma")]` trampoline plus thin
-//! `#[inline(always)]` intrinsic wrappers — that is the *entire* per-ISA cost of
-//! a new instruction set in this design.
+//! `#[inline(always)]` intrinsic wrappers: that is the *entire* per-ISA cost of
+//! a new instruction set in this design
 
 #[cfg(target_arch = "x86")]
 use core::arch::x86::*;
@@ -17,7 +17,7 @@ use half::{bf16, f16};
 use super::KernelSimd;
 use super::{Simd, SimdOps};
 
-/// AVX2 + FMA ISA token.
+/// AVX2 + FMA ISA token
 #[derive(Copy, Clone, Default)]
 pub struct Fma;
 
@@ -28,14 +28,14 @@ impl Simd for Fma {
         // has F16C, which the `f16` path needs for its `vcvtph2ps`/`vcvtps2ph`
         // conversions. The dispatcher still checks `f16c` before picking this token
         // for an `f16` GEMM; the f32/f64/bf16 paths emit no F16C, so enabling it is
-        // harmless if some AVX2-without-F16C part existed.
+        // harmless if some AVX2-without-F16C part existed
         #[target_feature(enable = "avx2,fma,f16c")]
         unsafe fn inner<R>(f: impl FnOnce() -> R) -> R {
             f()
         }
         // SAFETY: the caller of `vectorize` (the runtime dispatcher) guarantees
         // the CPU supports avx2+fma(+f16c); `inner` then establishes the codegen
-        // context, and `f` inlines into it.
+        // context, and `f` inlines into it
         unsafe { inner(f) }
     }
 }
@@ -74,13 +74,13 @@ impl SimdOps<f32> for Fma {
     }
     #[inline(always)]
     unsafe fn fnma(self, a: Self::Reg, b: Self::Reg, c: Self::Reg) -> Self::Reg {
-        // `_mm256_fnmadd_ps(a, b, c)` == `c - a*b`.
+        // `_mm256_fnmadd_ps(a, b, c)` == `c - a*b`
         unsafe { _mm256_fnmadd_ps(a, b, c) }
     }
     #[inline(always)]
     unsafe fn max(self, a: Self::Reg, b: Self::Reg) -> Self::Reg {
         // x86 MAXPS returns the second operand on an unordered compare, so a `NaN` `a`
-        // returns `b` — the `max`/`min` NaN-in-`a` contract.
+        // returns `b`: the `max`/`min` NaN-in-`a` contract
         unsafe { _mm256_max_ps(a, b) }
     }
     #[inline(always)]
@@ -136,12 +136,12 @@ impl SimdOps<f64> for Fma {
     }
     #[inline(always)]
     unsafe fn fnma(self, a: Self::Reg, b: Self::Reg, c: Self::Reg) -> Self::Reg {
-        // `_mm256_fnmadd_pd(a, b, c)` == `c - a*b`.
+        // `_mm256_fnmadd_pd(a, b, c)` == `c - a*b`
         unsafe { _mm256_fnmadd_pd(a, b, c) }
     }
     #[inline(always)]
     unsafe fn max(self, a: Self::Reg, b: Self::Reg) -> Self::Reg {
-        // x86 MAXPD returns the second operand when unordered (NaN `a` -> `b`).
+        // x86 MAXPD returns the second operand when unordered (NaN `a` -> `b`)
         unsafe { _mm256_max_pd(a, b) }
     }
     #[inline(always)]
@@ -161,10 +161,10 @@ impl SimdOps<f64> for Fma {
     }
 }
 
-// ---- mixed precision: f16 / bf16 inputs, f32 accumulator (8-wide __m256) ----
+// Mixed precision: f16 / bf16 inputs, f32 accumulator (8-wide __m256)
 
 /// `f16` via F16C: 8 lanes widen with `vcvtph2ps`, narrow with `vcvtps2ph`
-/// (round-to-nearest-even, matching `half::f16::from_f32`).
+/// (round-to-nearest-even, matching `half::f16::from_f32`)
 #[cfg(feature = "half")]
 impl KernelSimd<f16, f16, f32, f16> for Fma {
     #[inline(always)]
@@ -180,7 +180,7 @@ impl KernelSimd<f16, f16, f32, f16> for Fma {
     }
     #[inline(always)]
     unsafe fn load_out(self, p: *const f16) -> __m256 {
-        // C (== Out == Lhs == f16) is widened exactly like an A panel.
+        // C (== Out == Lhs == f16) is widened exactly like an A panel
         unsafe { self.load_lhs(p) }
     }
     #[inline(always)]
@@ -189,7 +189,7 @@ impl KernelSimd<f16, f16, f32, f16> for Fma {
             // `_MM_FROUND_TO_NEAREST_INT` (0) = round-to-nearest-even, matching
             // `half::f16::from_f32`. NOT OR in `_MM_FROUND_NO_EXC`:
             // 256-bit F16C `vcvtps2ph` has no suppress-all-exceptions field (that is EVEX-only)
-            // and the intrinsic rejects the bit at compile time.
+            // and the intrinsic rejects the bit at compile time
             let h = _mm256_cvtps_ph::<_MM_FROUND_TO_NEAREST_INT>(v);
             _mm_storeu_si128(p as *mut __m128i, h);
         }
@@ -199,15 +199,15 @@ impl KernelSimd<f16, f16, f32, f16> for Fma {
 /// `bf16` via integer ops: widen is a 16-bit left shift into `f32`; narrow is the
 /// round-to-nearest-even bias trick (`+ ((bits>>16)&1) + 0x7FFF`, then `>>16`).
 /// The **narrowing** is bit-identical to `half::bf16::from_f32`, including NaN (mapped to
-/// `(bits>>16) | 0x0040`) — so the bf16 *conversion* matches the scalar path exactly. (Its
-/// MAC matches scalar too; the `vdpbf16ps` dot kernel's fused 2-term MAC does not — only
-/// its conversion does. Conversion bit-identity keeps full and edge tiles consistent.)
+/// `(bits>>16) | 0x0040`), so the bf16 *conversion* matches the scalar path exactly. (Its
+/// MAC matches scalar too; the `vdpbf16ps` dot kernel's fused 2-term MAC does not: only
+/// its conversion does. Conversion bit-identity keeps full and edge tiles consistent)
 #[cfg(feature = "half")]
 impl KernelSimd<bf16, bf16, f32, bf16> for Fma {
     #[inline(always)]
     unsafe fn load_lhs(self, p: *const bf16) -> __m256 {
         unsafe {
-            let w = _mm_loadu_si128(p as *const __m128i); // 8 × u16
+            let w = _mm_loadu_si128(p as *const __m128i); // 8 x u16
             _mm256_castsi256_ps(_mm256_slli_epi32::<16>(_mm256_cvtepu16_epi32(w)))
         }
     }
@@ -223,16 +223,16 @@ impl KernelSimd<bf16, bf16, f32, bf16> for Fma {
     unsafe fn store_out(self, p: *mut bf16, v: __m256) {
         unsafe {
             let bits = _mm256_castps_si256(v);
-            // RNE round-and-truncate for finite values.
+            // RNE round-and-truncate for finite values
             let lsb = _mm256_and_si256(_mm256_srli_epi32::<16>(bits), _mm256_set1_epi32(1));
             let bias = _mm256_add_epi32(lsb, _mm256_set1_epi32(0x7FFF));
             let rounded = _mm256_srli_epi32::<16>(_mm256_add_epi32(bits, bias));
-            // NaN lanes (|bits| > 0x7F80_0000): half forces `(bits>>16) | 0x0040`.
+            // NaN lanes (|bits| > 0x7F80_0000): half forces `(bits>>16) | 0x0040`
             let abs = _mm256_and_si256(bits, _mm256_set1_epi32(0x7FFF_FFFFu32 as i32));
             let is_nan = _mm256_cmpgt_epi32(abs, _mm256_set1_epi32(0x7F80_0000));
             let nan_out = _mm256_or_si256(_mm256_srli_epi32::<16>(bits), _mm256_set1_epi32(0x0040));
             let out = _mm256_blendv_epi8(rounded, nan_out, is_nan);
-            // Pack 8 × u32 (each < 0x10000) into 8 contiguous u16 (order preserved).
+            // Pack 8 x u32 (each < 0x10000) into 8 contiguous u16 (order preserved)
             let lo = _mm256_castsi256_si128(out);
             let hi = _mm256_extracti128_si256::<1>(out);
             _mm_storeu_si128(p as *mut __m128i, _mm_packus_epi32(lo, hi));
@@ -240,7 +240,7 @@ impl KernelSimd<bf16, bf16, f32, bf16> for Fma {
     }
 }
 
-// ---- integer: i8 inputs, i32 accumulator (8-wide __m256i, AVX2 integer ops) ----
+// Integer: i8 inputs, i32 accumulator (8-wide __m256i, AVX2 integer ops)
 
 #[cfg(feature = "int8")]
 impl SimdOps<i32> for Fma {
@@ -278,7 +278,7 @@ impl SimdOps<i32> for Fma {
     #[inline(always)]
     unsafe fn fnma(self, a: __m256i, b: __m256i, c: __m256i) -> __m256i {
         // `c - a*b` (wrapping i32). Present only to satisfy the trait; the integer
-        // kernel never calls it.
+        // kernel never calls it
         unsafe { _mm256_sub_epi32(c, _mm256_mullo_epi32(a, b)) }
     }
     #[inline(always)]
@@ -298,12 +298,12 @@ impl SimdOps<i32> for Fma {
 /// Requantize one quad (4 `i32` lanes as `__m128i`) of a `__m256i` accumulator to 4 integral
 /// `i32` in `[lo, hi]`, following the exact scalar map: widen `i32 -> f64`, multiply by
 /// `scale` (both exact), round-to-nearest-even in hardware, add `zp`, clamp `[lo, hi]`,
-/// convert back to `i32` (exact — the clamped value is integral). `#[inline(always)]`, so the
-/// intrinsics fold into the caller's `#[target_feature]` context.
+/// convert back to `i32` (exact: the clamped value is integral). `#[inline(always)]`, so the
+/// intrinsics fold into the caller's `#[target_feature]` context
 ///
 /// `_mm256_round_pd` with `_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC` is
-/// round-to-nearest-even with the precision exception suppressed — the 256-bit VEX `vroundpd`
-/// *does* accept the suppress bit (unlike the 128/256-bit F16C `vcvtps2ph`, which rejects it).
+/// round-to-nearest-even with the precision exception suppressed: the 256-bit VEX `vroundpd`
+/// *does* accept the suppress bit (unlike the 128/256-bit F16C `vcvtps2ph`, which rejects it)
 #[cfg(feature = "int8")]
 #[inline(always)]
 unsafe fn requant_quad_fma(
@@ -325,15 +325,15 @@ unsafe fn requant_quad_fma(
 }
 
 /// Vectorized `i32 -> i8` requantize store for [`Fma`] (see the [`KernelSimd::requant_store`]
-/// contract for the bit-for-bit equivalence with the scalar map): split the 8 `i32` into two
+/// contract for the bit-for-bit equivalence with the scalar map): split the 8 `i32` into 2
 /// `__m128i` quads, requantize each in `f64` ([`requant_quad_fma`]), then gather the **low
 /// byte** of each of the 8 integral, pre-clamped lanes into 8 contiguous output bytes. This is
 /// a TRUNCATION (a byte gather), NOT a saturating `packs`/`packus`: the lanes are already in
 /// `[lo, hi]`, so only the byte-gather matters, and a saturating pack would be wrong for the
-/// `u8`/`[0, 255]` phase.
+/// `u8`/`[0, 255]` phase
 ///
 /// # Safety
-/// `dst` valid for 8 byte writes; run inside [`Fma`]'s `avx2,fma` [`Simd::vectorize`] context.
+/// `dst` valid for 8 byte writes; run inside [`Fma`]'s `avx2,fma` [`Simd::vectorize`] context
 #[cfg(feature = "int8")]
 #[inline(always)]
 unsafe fn requant_store_fma(dst: *mut i8, v: __m256i, scale: f64, zp: i32, lo: i32, hi: i32) {
@@ -345,19 +345,19 @@ unsafe fn requant_store_fma(dst: *mut i8, v: __m256i, scale: f64, zp: i32, lo: i
         let i_lo = requant_quad_fma(_mm256_castsi256_si128(v), scale_v, zp_v, lo_v, hi_v);
         let i_hi = requant_quad_fma(_mm256_extracti128_si256::<1>(v), scale_v, zp_v, lo_v, hi_v);
         // `pshufb` mask gathering source bytes {0,4,8,12} (the low byte of each i32 lane) into
-        // the low 4 output bytes; the high 12 mask bytes are negative, so those lanes zero.
+        // the low 4 output bytes; the high 12 mask bytes are negative, so those lanes zero
         let mask = _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 12, 8, 4, 0);
         let lo_u32 = _mm_cvtsi128_si32(_mm_shuffle_epi8(i_lo, mask)) as u32;
         let hi_u32 = _mm_cvtsi128_si32(_mm_shuffle_epi8(i_hi, mask)) as u32;
         // x86 is little-endian, so byte `l` of `packed` is output lane `l`: lanes 0..4 from the
-        // low quad, 4..8 from the high quad.
+        // low quad, 4..8 from the high quad
         let packed = (lo_u32 as u64) | ((hi_u32 as u64) << 32);
         core::ptr::write_unaligned(dst as *mut u64, packed);
     }
 }
 
 /// `i8 -> i32`: sign-extend 8 LHS bytes on load, broadcast a sign-extended RHS byte;
-/// `Out == Acc == i32`, so `load_out`/`store_out` are plain `i32` load/store.
+/// `Out == Acc == i32`, so `load_out`/`store_out` are plain `i32` load/store
 #[cfg(feature = "int8")]
 impl KernelSimd<i8, i8, i32, i32> for Fma {
     #[inline(always)]
@@ -385,7 +385,7 @@ impl KernelSimd<i8, i8, i32, i32> for Fma {
 }
 
 // Complex (AVX2): real `Reg` is the f32/f64 register; `LANES` is the real lane count
-// (8 / 4). Complex GEMM routes through the shared SoA `soa_microkernel`.
+// (8 / 4). Complex GEMM routes through the shared SoA `soa_microkernel`
 #[cfg(feature = "complex")]
 impl_complex_simd!(Fma, f32, __m256, 8);
 #[cfg(feature = "complex")]

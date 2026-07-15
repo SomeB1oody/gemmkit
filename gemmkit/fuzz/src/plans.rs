@@ -1,4 +1,4 @@
-//! Valid-by-construction plans and entries for fuzz_gemm / fuzz_knobs / fuzz_batched / fuzz_prepack.
+//! Valid-by-construction plans and entries for fuzz_gemm / fuzz_knobs / fuzz_batched / fuzz_prepack
 
 use arbitrary::{Arbitrary, Result, Unstructured};
 
@@ -9,9 +9,7 @@ use crate::differential::{
 };
 use gemmkit::{Parallelism, bf16, c32, c64, f16, tuning};
 
-// ===========================================================================
 // fuzz_gemm
-// ===========================================================================
 
 #[derive(Debug, Clone, Copy)]
 pub enum TypeTag {
@@ -61,7 +59,7 @@ impl<'a> Arbitrary<'a> for GemmPlan {
         Ok(GemmPlan {
             ty,
             // m,n cross the AVX-512 f32 tile edges (MR=32, NR=12); k crosses the
-            // bf16/VNNI DEPTH_MULTIPLE padding and partial-depth panels.
+            // bf16/VNNI DEPTH_MULTIPLE padding and partial-depth panels
             m: u.int_in_range(0usize..=48)?,
             k: u.int_in_range(0usize..=130)?,
             n: u.int_in_range(0usize..=48)?,
@@ -159,12 +157,10 @@ pub fn run_gemm(p: GemmPlan) {
     }
 }
 
-// ===========================================================================
 // fuzz_knobs
-// ===========================================================================
 
 /// Every `set_*` compiled on x86_64 + `std,parallel,complex,half,int8`
-/// (`gemmkit/src/tuning.rs`); `set_wasm_threads` is wasm-gated and excluded.
+/// (`gemmkit/src/tuning.rs`); `set_wasm_threads` is wasm-gated and excluded
 pub(crate) const KNOB_SETTERS: &[(&str, fn(usize))] = &[
     ("parallel_threshold", tuning::set_parallel_threshold),
     ("rhs_pack_threshold", tuning::set_rhs_pack_threshold),
@@ -195,8 +191,9 @@ pub(crate) const KNOB_SETTERS: &[(&str, fn(usize))] = &[
 
 pub(crate) const N_KNOBS: usize = KNOB_SETTERS.len();
 
-/// The knob-value classes from the brief. Setters store unconditionally and clamp
-/// `usize::MAX` to `MAX-1` (the UNSET sentinel), so `MAX` exercises the clamp too.
+/// Knob-value classes exercising the setters' boundary behavior. Setters store
+/// unconditionally and clamp `usize::MAX` to `MAX-1` (the UNSET sentinel), so `MAX`
+/// exercises the clamp too
 pub(crate) fn knob_value(u: &mut Unstructured) -> Result<usize> {
     Ok(match u.int_in_range(0u8..=8)? {
         0 => 0, // 0 = auto convention on several knobs
@@ -269,9 +266,9 @@ impl<'a> Arbitrary<'a> for KnobsPlan {
 }
 
 pub fn run_knobs(p: KnobsPlan) {
-    // Set all 22 knobs every input: setters store unconditionally, so each exec fully
-    // overwrites the knob set — no state leaks between libFuzzer execs, making every
-    // crash artifact self-contained/replayable.
+    // Set every knob on every input: setters store unconditionally, so each exec fully
+    // overwrites the knob set - no state leaks between libFuzzer execs, making every
+    // crash artifact self-contained/replayable
     for (i, (_, setter)) in KNOB_SETTERS.iter().enumerate() {
         setter(p.values[i]);
     }
@@ -331,9 +328,7 @@ pub fn run_knobs(p: KnobsPlan) {
     }
 }
 
-// ===========================================================================
 // fuzz_batched
-// ===========================================================================
 
 #[derive(Debug)]
 pub struct BatchedPlan {
@@ -427,9 +422,7 @@ pub fn run_batched(p: BatchedPlan) {
     }
 }
 
-// ===========================================================================
 // fuzz_prepack
-// ===========================================================================
 
 #[derive(Debug)]
 pub struct PrepackPlan {
@@ -455,7 +448,7 @@ impl<'a> Arbitrary<'a> for PrepackPlan {
         Ok(PrepackPlan {
             ty,
             // dims from 1..=48 (crossing tile edges); 0 excluded so the orientation
-            // invariant of the packed C holds for empty views too.
+            // invariant of the packed C holds for empty views too
             m: u.int_in_range(1usize..=48)?,
             k: u.int_in_range(1usize..=48)?,
             n: u.int_in_range(1usize..=48)?,

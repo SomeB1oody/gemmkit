@@ -1,8 +1,8 @@
-//! Scalar fallback ISA token: `LANES == 1`, no intrinsics, works everywhere.
+//! Scalar fallback ISA token: `LANES == 1`, no intrinsics, works everywhere
 //!
 //! This is the portability floor and the Miri-checkable reference path. It is
 //! also what makes the `SimdOps` abstraction honest: the exact same generic
-//! kernel that drives AVX-512 drives this token with a one-element "register".
+//! kernel that drives AVX-512 drives this token with a one-element "register"
 
 #[cfg(feature = "half")]
 use half::{bf16, f16};
@@ -13,14 +13,14 @@ use super::{Simd, SimdOps};
 #[cfg(feature = "half")]
 use crate::scalar::NarrowFloat;
 
-/// The scalar (1-lane) ISA token. Always available.
+/// The scalar (1-lane) ISA token. Always available
 #[derive(Copy, Clone, Default)]
 pub struct ScalarTok;
 
 impl Simd for ScalarTok {
     #[inline(always)]
     unsafe fn vectorize<R>(self, f: impl FnOnce() -> R) -> R {
-        // No target feature needed; nothing to enable.
+        // No target feature needed; nothing to enable
         f()
     }
 }
@@ -58,13 +58,13 @@ macro_rules! impl_scalar_ops {
             #[inline(always)]
             unsafe fn mul_add(self, a: Self::Reg, b: Self::Reg, c: Self::Reg) -> Self::Reg {
                 // Plain `a*b + c` keeps the scalar path reproducible and in
-                // agreement with `Float::mul_add` used by the epilogue.
+                // agreement with `Float::mul_add` used by the epilogue
                 a * b + c
             }
             #[inline(always)]
             unsafe fn fnma(self, a: Self::Reg, b: Self::Reg, c: Self::Reg) -> Self::Reg {
                 // Plain `c - a*b` (the scalar reference for the SoA complex kernel's
-                // `acc_re -= a_im·b_im` step).
+                // `acc_re -= a_im*b_im` step)
                 c - a * b
             }
             #[inline(always)]
@@ -73,7 +73,7 @@ macro_rules! impl_scalar_ops {
             }
             #[inline(always)]
             unsafe fn max(self, a: Self::Reg, b: Self::Reg) -> Self::Reg {
-                // `NaN > b` is false, so a `NaN` `a` returns `b` (the contract).
+                // `NaN > b` is false, so a `NaN` `a` returns `b` (the contract)
                 if a > b { a } else { b }
             }
             #[inline(always)]
@@ -89,7 +89,7 @@ impl_scalar_ops!(f64);
 
 // Mixed-precision (scalar fallback): `f16`/`bf16` widen to `f32` on load and round
 // back on store, one element at a time (`Reg` is a bare `f32`). Miri-checked
-// reference for the narrow types.
+// reference for the narrow types
 #[cfg(feature = "half")]
 impl KernelSimd<f16, f16, f32, f16> for ScalarTok {
     #[inline(always)]
@@ -112,7 +112,7 @@ impl KernelSimd<f16, f16, f32, f16> for ScalarTok {
 
 // Integer GEMM (scalar fallback): `i32` accumulator ops and the `i8 -> i32`
 // widen-load, one element at a time. Wrapping arithmetic gives conventional
-// integer overflow semantics. Miri-checked reference for the integer path.
+// integer overflow semantics. Miri-checked reference for the integer path
 #[cfg(feature = "int8")]
 impl SimdOps<i32> for ScalarTok {
     type Reg = i32;
@@ -197,7 +197,7 @@ impl KernelSimd<bf16, bf16, f32, bf16> for ScalarTok {
 }
 
 // Complex (scalar fallback): the Miri-checked SoA reference. `LANES = 1`, the real `Reg`
-// is the scalar itself; complex GEMM routes through the shared `soa_microkernel`.
+// is the scalar itself; complex GEMM routes through the shared `soa_microkernel`
 #[cfg(feature = "complex")]
 impl_complex_simd!(ScalarTok, f32, f32, 1);
 #[cfg(feature = "complex")]

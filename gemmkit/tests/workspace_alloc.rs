@@ -1,7 +1,7 @@
-//! §7.4: reusing a `Workspace` performs **zero heap allocations** after warmup.
+//! Section 7.4: reusing a `Workspace` performs **zero heap allocations** after warmup
 //!
-//! A counting global allocator wraps the system allocator; we assert that the
-//! second and later `gemm_with` calls of the same size allocate nothing.
+//! A counting global allocator wraps the system allocator to verify that the
+//! 2nd and later `gemm_with` calls of the same size allocate nothing
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -49,11 +49,11 @@ fn gemm_with_reuses_workspace_zero_alloc() {
     };
 
     // Warm up: grows the workspace, primes the dispatch OnceLocks and the cache
-    // topology — all the one-time allocations happen here.
+    // topology - all the one-time allocations happen here
     call(&mut ws, &mut c);
     call(&mut ws, &mut c);
 
-    // Now steady state: every further call must allocate nothing.
+    // Now steady state: every further call must allocate nothing
     for iter in 0..50 {
         let before = ALLOCS.load(Ordering::Relaxed);
         call(&mut ws, &mut c);

@@ -3,8 +3,8 @@
 //! A thin [`ndarray`] adapter over the [`gemmkit`] GEMM engine. It accepts
 //! `&ArrayBase<S, Ix2>` for any storage `S: Data` (so both `ArrayView2` and
 //! `&Array2` work), pulls the pointer and strides straight out of the array, and
-//! forwards to gemmkit's raw engine — so C-order, F-order, general-stride, and
-//! reversed (negative-stride) views all work without copying.
+//! forwards to gemmkit's raw engine, so C-order, F-order, general-stride, and
+//! reversed (negative-stride) views all work without copying
 //!
 //! ```
 //! use ndarray::array;
@@ -16,30 +16,30 @@
 //!
 //! [`gemm`]/[`gemm_with`]/[`dot`] are generic over [`gemmkit::GemmScalar`]: `f32`/`f64`
 //! always, plus `f16`/`bf16` under the `half` feature. [`gemm_batched`]/[`gemm_batched_with`]/
-//! [`dot_batched`] extend the same idea to a stack of matrices — a 3-D array with the batch on
-//! axis 0 — and [`prepack_rhs`]/[`prepack_lhs`] (with their [`gemm_packed_b`]/[`gemm_packed_a`]
+//! [`dot_batched`] extend the same idea to a stack of matrices (a 3-D array with the batch on
+//! axis 0) and [`prepack_rhs`]/[`prepack_lhs`] (with their [`gemm_packed_b`]/[`gemm_packed_a`]
 //! consumers) pre-pack one reused operand for the fixed-weight loop. Complex
 //! (`Complex<f32>`/`Complex<f64>`, with optional conjugation) needs the separate
 //! [`gemm_cplx`]/[`gemm_cplx_with`]/[`dot_cplx`] under the `complex` feature, since the
 //! conj flags don't fit the homogeneous surface. The integer (`i8 -> i32`) path likewise gets its
-//! own [`gemm_i8`]/[`gemm_i8_with`]/[`dot_i8`] under the `int8` feature (`i8` inputs, `i32` output).
+//! own [`gemm_i8`]/[`gemm_i8_with`]/[`dot_i8`] under the `int8` feature (`i8` inputs, `i32` output)
 //!
 //! Under the `epilogue` feature the fused-epilogue entries mirror gemmkit's own:
-//! [`gemm_fused`]/[`gemm_fused_with`] (`C <- act(alpha·A·B + beta·C + bias)` in one pass, an
+//! [`gemm_fused`]/[`gemm_fused_with`] (`C <- act(alpha*A*B + beta*C + bias)` in 1 pass, an
 //! optional [`Bias`] plus an optional [`Activation`]) and their batched twins
 //! [`gemm_batched_fused`]/[`gemm_batched_fused_with`] (one shared bias/activation over every element
 //! of the stack). `f16`/`bf16` ride the same generic when `half` is on. Requantized output needs
 //! `int8` + `epilogue`: [`gemm_i8_requant`]/[`gemm_i8_requant_with`] (and the `u8`-output
 //! [`gemm_i8_requant_u8`]/[`gemm_i8_requant_u8_with`]) take a [`Requantize`] and fuse the requantize
 //! into a quantized `i8` (resp. `u8`) output. Complex-fused needs `complex` + `epilogue`: the
-//! bias-only [`gemm_cplx_fused`]/[`gemm_cplx_fused_with`] (no activation — undefined on `ℂ`).
+//! bias-only [`gemm_cplx_fused`]/[`gemm_cplx_fused_with`] (no activation: undefined on complex numbers)
 
 /// The requantization parameters for the `int8` fused entries, re-exported so callers of
-/// [`gemm_i8_requant`] need not depend on `gemmkit` directly.
+/// [`gemm_i8_requant`] need not depend on `gemmkit` directly
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 pub use gemmkit::Requantize;
 /// The fused-epilogue selectors, re-exported so callers of [`gemm_fused`] need not depend on
-/// `gemmkit` directly.
+/// `gemmkit` directly
 #[cfg(feature = "epilogue")]
 pub use gemmkit::{Activation, Bias};
 #[cfg(feature = "epilogue")]
@@ -56,7 +56,7 @@ use gemmkit::{
     prepack_rhs_unchecked,
 };
 /// The prepacked-operand handles, re-exported so callers of [`prepack_rhs`] / [`prepack_lhs`] need
-/// not depend on `gemmkit` directly.
+/// not depend on `gemmkit` directly
 pub use gemmkit::{PackedLhs, PackedRhs};
 #[cfg(all(feature = "complex", feature = "epilogue"))]
 use gemmkit::{gemm_cplx_fused_unchecked, gemm_cplx_fused_unchecked_with};
@@ -76,13 +76,13 @@ fn dims_strides<T, S: Data<Elem = T>>(a: &ArrayBase<S, Ix2>) -> (usize, usize, i
     (r, c, s[0], s[1])
 }
 
-/// The half-open byte range `[lo, hi)` a strided C view based at `cp` (element `(0, …, 0)`) actually
+/// The half-open byte range `[lo, hi)` a strided C view based at `cp` (element `(0, ..., 0)`) actually
 /// touches, from the raw pointer plus `(dim, element-stride)` pairs. Strides may be negative
 /// (reversed views), so a negative axis extends `lo` below the base and a positive one extends `hi`
-/// above it; an empty (`dim == 0`) axis yields an empty range. **Raw pointer arithmetic only** — no
+/// above it; an empty (`dim == 0`) axis yields an empty range. **Raw pointer arithmetic only**: no
 /// reference is ever formed over the (possibly gappy / partly-uninitialized) span, which is exactly
 /// why the fused entries forward raw parts to gemmkit's `_unchecked` engine instead of fabricating a
-/// slice here.
+/// slice here
 #[cfg(feature = "epilogue")]
 #[inline]
 fn c_byte_range<T>(cp: *const T, dims: &[(usize, isize)]) -> (usize, usize) {
@@ -108,9 +108,9 @@ fn c_byte_range<T>(cp: *const T, dims: &[(usize, isize)]) -> (usize, usize) {
 }
 
 /// `true` if the `bias` slice (`len` elements of `TB`) overlaps the byte range the strided C view
-/// touches — the raw-pointer replication of gemmkit's own byte-range overlap test (`a0 < b1 && b0 <
+/// touches: the raw-pointer replication of gemmkit's own byte-range overlap test (`a0 < b1 && b0 <
 /// a1`), so the adapter reproduces the core checked entry's bias-vs-`C` rejection without ever
-/// fabricating a `C` slice.
+/// fabricating a `C` slice
 #[cfg(feature = "epilogue")]
 #[inline]
 fn bias_overlaps_c<TC, TB>(
@@ -128,10 +128,10 @@ fn bias_overlaps_c<TC, TB>(
     c_lo < b_hi && b_lo < c_hi
 }
 
-/// Validate a fused `Option<Bias>` against the output shape and `C`'s footprint — replicating the
-/// core checked entry's `validate_bias` (byte-identical panic wording) — and lower it to the raw
+/// Validate a fused `Option<Bias>` against the output shape and `C`'s footprint, replicating the
+/// core checked entry's `validate_bias` (byte-identical panic wording), and lower it to the raw
 /// `(ptr, BiasDim, has_bias)` triple the `_unchecked` core entries take. `cp`/`c_dims` describe `C`
-/// for the overlap test via [`bias_overlaps_c`] (raw pointer math; `C` is never referenced).
+/// for the overlap test via [`bias_overlaps_c`] (raw pointer math; `C` is never referenced)
 #[cfg(feature = "epilogue")]
 fn lower_bias<T>(
     bias: Option<Bias<'_, T>>,
@@ -171,10 +171,10 @@ fn lower_bias<T>(
     }
 }
 
-/// Validate a requantize per-row bias against `A.rows` and `C`'s footprint — replicating the core
-/// `requant_bias` (byte-identical panic wording) — and lower it to the raw `(ptr, has_bias)` the
+/// Validate a requantize per-row bias against `A.rows` and `C`'s footprint, replicating the core
+/// `requant_bias` (byte-identical panic wording), and lower it to the raw `(ptr, has_bias)` the
 /// `_unchecked` requant entries take. `cp`/`c_dims` describe the (`i8`/`u8`) `C` for the overlap
-/// test; raw pointer math only.
+/// test; raw pointer math only
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 fn requant_bias<TC>(
     m: usize,
@@ -200,10 +200,10 @@ fn requant_bias<TC>(
     }
 }
 
-/// `C <- alpha·A·B + beta·C`.
+/// `C <- alpha*A*B + beta*C`
 ///
 /// # Panics
-/// If the inner dimensions disagree.
+/// If the inner dimensions disagree
 pub fn gemm<T, S1, S2, SC>(
     alpha: T,
     a: &ArrayBase<S1, Ix2>,
@@ -220,10 +220,10 @@ pub fn gemm<T, S1, S2, SC>(
     gemm_common(None, alpha, a, b, beta, c, par);
 }
 
-/// Like [`gemm`] but reuses a caller-owned [`Workspace`].
+/// Like [`gemm`] but reuses a caller-owned [`Workspace`]
 ///
 /// # Panics
-/// If the inner dimensions disagree.
+/// If the inner dimensions disagree
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_with<T, S1, S2, SC>(
     ws: &mut Workspace,
@@ -268,7 +268,7 @@ fn gemm_common<T, S1, S2, SC>(
     let cp = c.as_mut_ptr();
 
     // SAFETY: dims validated; ndarray guarantees the pointer/strides describe a
-    // valid in-bounds layout, and `c` (a `&mut` borrow) cannot alias `a`/`b`.
+    // valid in-bounds layout, and `c` (a `&mut` borrow) cannot alias `a`/`b`
     unsafe {
         match ws {
             Some(ws) => gemm_unchecked_with(
@@ -310,7 +310,7 @@ fn gemm_common<T, S1, S2, SC>(
     }
 }
 
-/// `A·B` into a fresh row-major [`Array2`] — the `.dot()`-style convenience.
+/// `A*B` into a fresh row-major [`Array2`]: the `.dot()`-style convenience
 pub fn dot<T, S1, S2>(a: &ArrayBase<S1, Ix2>, b: &ArrayBase<S2, Ix2>) -> Array2<T>
 where
     T: GemmScalar,
@@ -319,23 +319,23 @@ where
 {
     let (m, _) = a.dim();
     let (_, n) = b.dim();
-    // beta == 0, so the initial fill is never read.
+    // beta == 0, so the initial fill is never read
     let mut c = Array2::from_elem((m, n), T::ZERO);
     gemm(T::ONE, a, b, T::ZERO, &mut c, Parallelism::default());
     c
 }
 
-/// `C <- act(alpha·A·B + beta·C + bias)` in one fused pass — the ndarray adapter over gemmkit's
+/// `C <- act(alpha*A*B + beta*C + bias)` in 1 fused pass: the ndarray adapter over gemmkit's
 /// [`gemmkit::gemm_fused`]. The optional [`Bias`] is [`Bias::PerRow`] (length `A.rows`) or
 /// [`Bias::PerCol`] (length `B.cols`) and the optional [`Activation`] is applied last;
 /// `bias == None && act == None` is exactly [`gemm`]. `T` is `f32`/`f64` (plus `f16`/`bf16` under
 /// `half`, whose epilogue applies in `f32` before the single narrowing). Like [`gemm`], it reads the
 /// pointer/strides directly and forwards to gemmkit's raw engine, so C-order, F-order,
-/// general-stride, transposed, and reversed (negative-stride) views all work without copying.
+/// general-stride, transposed, and reversed (negative-stride) views all work without copying
 ///
 /// # Panics
 /// If the inner dimensions disagree, or on a bias/activation the adapter rejects (a `PerRow`/`PerCol`
-/// bias of the wrong length, a bias slice overlapping `C`, or a non-finite `LeakyRelu` slope).
+/// bias of the wrong length, a bias slice overlapping `C`, or a non-finite `LeakyRelu` slope)
 #[cfg(feature = "epilogue")]
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_fused<T, S1, S2, SC>(
@@ -356,10 +356,10 @@ pub fn gemm_fused<T, S1, S2, SC>(
     gemm_fused_common(None, alpha, a, b, beta, c, bias, act, par);
 }
 
-/// Like [`gemm_fused`] but reuses a caller-owned [`Workspace`].
+/// Like [`gemm_fused`] but reuses a caller-owned [`Workspace`]
 ///
 /// # Panics
-/// Same conditions as [`gemm_fused`].
+/// Same conditions as [`gemm_fused`]
 #[cfg(feature = "epilogue")]
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_fused_with<T, S1, S2, SC>(
@@ -410,8 +410,8 @@ fn gemm_fused_common<T, S1, S2, SC>(
     let cp = c.as_mut_ptr();
 
     // Fused-epilogue validation, replicating gemmkit's checked entry (byte-identical wording): the
-    // bias length matches its axis and does not overlap C (raw pointer math — C is never
-    // referenced), and a LeakyRelu slope is finite.
+    // bias length matches its axis and does not overlap C (raw pointer math, C is never
+    // referenced), and a LeakyRelu slope is finite
     let (bias_ptr, bias_dim, has_bias) = lower_bias(bias, m, n, cp, &[(cm, rsc), (cn, csc)]);
     if let Some(Activation::LeakyRelu(s)) = &act {
         assert!(T::finite(*s), "gemmkit: LeakyRelu slope must be finite");
@@ -419,7 +419,7 @@ fn gemm_fused_common<T, S1, S2, SC>(
 
     // SAFETY: dims validated; ndarray guarantees the pointer/strides describe a valid in-bounds
     // layout and `c` (a `&mut` borrow) can't alias `a`/`b`; the bias was validated disjoint from C
-    // above. Negative (reversed) strides forward straight through, exactly as the plain entry.
+    // above. Negative (reversed) strides forward straight through, exactly as the plain entry
     unsafe {
         match ws {
             Some(ws) => gemm_fused_unchecked_with(
@@ -478,14 +478,14 @@ fn dims_strides3<T, S: Data<Elem = T>>(
     (b, r, c, s[0], s[1], s[2])
 }
 
-/// Strided-batched `C_e <- alpha·A_e·B_e + beta·C_e`, batch on **axis 0**: `a` is `(batch, m, k)`,
+/// Strided-batched `C_e <- alpha*A_e*B_e + beta*C_e`, batch on **axis 0**: `a` is `(batch, m, k)`,
 /// `b` is `(batch, k, n)`, `c` is `(batch, m, n)`. The axis-0 stride is each operand's batch stride
-/// and axes 1/2 the element strides — read directly, so C-order, F-order, and general-stride 3-D
+/// and axes 1/2 the element strides, read directly, so C-order, F-order, and general-stride 3-D
 /// views all work without copying. Parallelizes across the batch (each element serial on one
-/// worker), so the result reproduces a loop of [`gemm`] calls.
+/// worker), so the result reproduces a loop of [`gemm`] calls
 ///
 /// # Panics
-/// If the batch sizes or inner dimensions disagree.
+/// If the batch sizes or inner dimensions disagree
 pub fn gemm_batched<T, S1, S2, SC>(
     alpha: T,
     a: &ArrayBase<S1, Ix3>,
@@ -502,11 +502,11 @@ pub fn gemm_batched<T, S1, S2, SC>(
     gemm_batched_common(None, alpha, a, b, beta, c, par);
 }
 
-/// Like [`gemm_batched`] but reuses a caller-owned [`Workspace`] — zero heap allocation after the
-/// first sufficiently large call, for a stream of batched products.
+/// Like [`gemm_batched`] but reuses a caller-owned [`Workspace`]: zero heap allocation after the
+/// 1st sufficiently large call, for a stream of batched products
 ///
 /// # Panics
-/// Same conditions as [`gemm_batched`].
+/// Same conditions as [`gemm_batched`]
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_batched_with<T, S1, S2, SC>(
     ws: &mut Workspace,
@@ -557,8 +557,8 @@ fn gemm_batched_common<T, S1, S2, SC>(
     let cp = c.as_mut_ptr();
 
     // SAFETY: ndarray guarantees each element's pointer/strides describe a valid in-bounds layout;
-    // `c` (a `&mut` borrow) can't alias `a`/`b`, and its batch elements — distinct axis-0 slices of
-    // a real array — are pairwise disjoint.
+    // `c` (a `&mut` borrow) can't alias `a`/`b`, and its batch elements (distinct axis-0 slices of
+    // a real array) are pairwise disjoint
     unsafe {
         match ws {
             Some(ws) => gemm_batched_unchecked_with(
@@ -608,8 +608,8 @@ fn gemm_batched_common<T, S1, S2, SC>(
     }
 }
 
-/// `A_e · B_e` for each batch element into a fresh row-major `(batch, m, n)` [`Array3`] — the
-/// batched analogue of [`dot`].
+/// `A_e * B_e` for each batch element into a fresh row-major `(batch, m, n)` [`Array3`]: the
+/// batched analogue of [`dot`]
 pub fn dot_batched<T, S1, S2>(a: &ArrayBase<S1, Ix3>, b: &ArrayBase<S2, Ix3>) -> Array3<T>
 where
     T: GemmScalar,
@@ -618,25 +618,25 @@ where
 {
     let (batch, m, _) = a.dim();
     let (_, _, n) = b.dim();
-    // beta == 0, so the initial fill is never read.
+    // beta == 0, so the initial fill is never read
     let mut c = Array3::from_elem((batch, m, n), T::ZERO);
     gemm_batched(T::ONE, a, b, T::ZERO, &mut c, Parallelism::default());
     c
 }
 
-/// Strided-batched `C_e <- act(alpha·A_e·B_e + beta·C_e + bias)`, batch on **axis 0** with **one
-/// shared** [`Bias`]/[`Activation`] applied to every element (the batched-linear-layer case) — the
+/// Strided-batched `C_e <- act(alpha*A_e*B_e + beta*C_e + bias)`, batch on **axis 0** with **one
+/// shared** [`Bias`]/[`Activation`] applied to every element (the batched-linear-layer case): the
 /// ndarray adapter over gemmkit's [`gemmkit::gemm_batched_fused`]. Shapes match [`gemm_batched`]
 /// (`a` is `(batch, m, k)`, `b` `(batch, k, n)`, `c` `(batch, m, n)`); the bias is sized for a
 /// **single** element (`PerRow` length `m`, `PerCol` length `n`), not the whole batch. Each element
 /// reproduces a [`gemm_fused`] call, so `bias == None && act == None` is exactly [`gemm_batched`].
 /// Reads the pointers/strides directly and forwards to gemmkit's raw engine, so general-stride and
-/// reversed (negative-stride) 3-D views all work without copying.
+/// reversed (negative-stride) 3-D views all work without copying
 ///
 /// # Panics
 /// If the batch sizes or inner dimensions disagree, or on a bias/activation the adapter rejects (a
 /// `PerRow`/`PerCol` bias of the wrong length, a bias slice overlapping `C`, or a non-finite
-/// `LeakyRelu` slope).
+/// `LeakyRelu` slope)
 #[cfg(feature = "epilogue")]
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_batched_fused<T, S1, S2, SC>(
@@ -657,10 +657,10 @@ pub fn gemm_batched_fused<T, S1, S2, SC>(
     gemm_batched_fused_common(None, alpha, a, b, beta, c, bias, act, par);
 }
 
-/// Like [`gemm_batched_fused`] but reuses a caller-owned [`Workspace`].
+/// Like [`gemm_batched_fused`] but reuses a caller-owned [`Workspace`]
 ///
 /// # Panics
-/// Same conditions as [`gemm_batched_fused`].
+/// Same conditions as [`gemm_batched_fused`]
 #[cfg(feature = "epilogue")]
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_batched_fused_with<T, S1, S2, SC>(
@@ -717,9 +717,9 @@ fn gemm_batched_fused_common<T, S1, S2, SC>(
     let cp = c.as_mut_ptr();
 
     // Fused-epilogue validation, replicating gemmkit's checked entry (byte-identical wording): the
-    // one shared bias is sized for a single element (length m/n, not batch·axis) and must not
-    // overlap C's whole-stack footprint (raw pointer math — C is never referenced); a LeakyRelu
-    // slope is finite.
+    // one shared bias is sized for a single element (length m/n, not batch*axis) and must not
+    // overlap C's whole-stack footprint (raw pointer math, C is never referenced); a LeakyRelu
+    // slope is finite
     let (bias_ptr, bias_dim, has_bias) =
         lower_bias(bias, m, n, cp, &[(cb, cs0), (cm, cs1), (cn, cs2)]);
     if let Some(Activation::LeakyRelu(s)) = &act {
@@ -728,7 +728,7 @@ fn gemm_batched_fused_common<T, S1, S2, SC>(
 
     // SAFETY: dims validated; ndarray guarantees each element's layout is valid in-bounds and `c`
     // (a `&mut` borrow) can't alias `a`/`b`, its batch elements being pairwise-disjoint axis-0
-    // slices; the shared bias was validated disjoint from C above. Reversed strides forward through.
+    // slices; the shared bias was validated disjoint from C above. Reversed strides forward through
     unsafe {
         match ws {
             Some(ws) => gemm_batched_fused_unchecked_with(
@@ -788,23 +788,23 @@ fn gemm_batched_fused_common<T, S1, S2, SC>(
 
 /// Pre-pack a 2-D RHS `B` into a reusable [`PackedRhs`] (gemmkit's fixed-weight reuse path): pack
 /// once here, then skip the per-call repack across many [`gemm_packed_b`] calls that share this
-/// `B`. Reads B's pointer/strides directly, so any layout works without copying.
+/// `B`. Reads B's pointer/strides directly, so any layout works without copying
 pub fn prepack_rhs<T, S>(b: &ArrayBase<S, Ix2>) -> PackedRhs<T>
 where
     T: GemmScalar,
     S: Data<Elem = T>,
 {
     let (k, n, rsb, csb) = dims_strides(b);
-    // SAFETY: ndarray guarantees B's pointer/strides describe a valid in-bounds layout.
+    // SAFETY: ndarray guarantees B's pointer/strides describe a valid in-bounds layout
     unsafe { prepack_rhs_unchecked(b.as_ptr(), rsb, csb, k, n) }
 }
 
-/// `C <- alpha·A·B + beta·C` reusing a prepacked `B` ([`prepack_rhs`]). `C` must be
-/// column-major-ish (`|col stride| >= |row stride|`) — a row-major `C` would swap A/B and invalidate
-/// the prepacked RHS, which gemmkit rejects; use [`gemm`] for that layout.
+/// `C <- alpha*A*B + beta*C` reusing a prepacked `B` ([`prepack_rhs`]). `C` must be
+/// column-major-ish (`|col stride| >= |row stride|`): a row-major `C` would swap A/B and invalidate
+/// the prepacked RHS, which gemmkit rejects; use [`gemm`] for that layout
 ///
 /// # Panics
-/// If the dimensions disagree, or if `C` is not column-major-ish.
+/// If the dimensions disagree, or if `C` is not column-major-ish
 pub fn gemm_packed_b<T, S1, SC>(
     alpha: T,
     a: &ArrayBase<S1, Ix2>,
@@ -820,10 +820,10 @@ pub fn gemm_packed_b<T, S1, SC>(
     gemm_packed_b_common(None, alpha, a, packed, beta, c, par);
 }
 
-/// Like [`gemm_packed_b`] but reuses a caller-owned [`Workspace`] — the fixed-cost inference loop.
+/// Like [`gemm_packed_b`] but reuses a caller-owned [`Workspace`]: the fixed-cost inference loop
 ///
 /// # Panics
-/// Same conditions as [`gemm_packed_b`].
+/// Same conditions as [`gemm_packed_b`]
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_packed_b_with<T, S1, SC>(
     ws: &mut Workspace,
@@ -873,7 +873,7 @@ fn gemm_packed_b_common<T, S1, SC>(
     let (rsc, csc) = (cs[0], cs[1]);
     let cp = c.as_mut_ptr();
     // SAFETY: ndarray guarantees A/C layouts are valid in-bounds; `c` (a `&mut` borrow) can't alias
-    // A, and the prepacked B is a separate owned buffer.
+    // A, and the prepacked B is a separate owned buffer
     unsafe {
         match ws {
             Some(ws) => gemm_packed_b_unchecked_with(
@@ -909,23 +909,23 @@ fn gemm_packed_b_common<T, S1, SC>(
 
 /// Pre-pack a 2-D LHS `A` into a reusable [`PackedLhs`] (a fixed `A` against a stream of right
 /// operands): pack once, then skip the per-call repack across many [`gemm_packed_a`] calls. Reads
-/// A's pointer/strides directly, so any layout works without copying.
+/// A's pointer/strides directly, so any layout works without copying
 pub fn prepack_lhs<T, S>(a: &ArrayBase<S, Ix2>) -> PackedLhs<T>
 where
     T: GemmScalar,
     S: Data<Elem = T>,
 {
     let (m, k, rsa, csa) = dims_strides(a);
-    // SAFETY: ndarray guarantees A's pointer/strides describe a valid in-bounds layout.
+    // SAFETY: ndarray guarantees A's pointer/strides describe a valid in-bounds layout
     unsafe { prepack_lhs_unchecked(a.as_ptr(), rsa, csa, m, k) }
 }
 
-/// `C <- alpha·A·B + beta·C` reusing a prepacked `A` ([`prepack_lhs`]). `C` must be row-major-ish
-/// (`|col stride| <= |row stride|`) — a column-major `C` would keep A in the LHS role and
-/// invalidate the prepacked LHS, which gemmkit rejects; use [`gemm`] for that layout.
+/// `C <- alpha*A*B + beta*C` reusing a prepacked `A` ([`prepack_lhs`]). `C` must be row-major-ish
+/// (`|col stride| <= |row stride|`): a column-major `C` would keep A in the LHS role and
+/// invalidate the prepacked LHS, which gemmkit rejects; use [`gemm`] for that layout
 ///
 /// # Panics
-/// If the dimensions disagree, or if `C` is not row-major-ish.
+/// If the dimensions disagree, or if `C` is not row-major-ish
 pub fn gemm_packed_a<T, S2, SC>(
     alpha: T,
     packed: &PackedLhs<T>,
@@ -941,10 +941,10 @@ pub fn gemm_packed_a<T, S2, SC>(
     gemm_packed_a_common(None, alpha, packed, b, beta, c, par);
 }
 
-/// Like [`gemm_packed_a`] but reuses a caller-owned [`Workspace`].
+/// Like [`gemm_packed_a`] but reuses a caller-owned [`Workspace`]
 ///
 /// # Panics
-/// Same conditions as [`gemm_packed_a`].
+/// Same conditions as [`gemm_packed_a`]
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_packed_a_with<T, S2, SC>(
     ws: &mut Workspace,
@@ -994,7 +994,7 @@ fn gemm_packed_a_common<T, S2, SC>(
     let (rsc, csc) = (cs[0], cs[1]);
     let cp = c.as_mut_ptr();
     // SAFETY: ndarray guarantees B/C layouts are valid in-bounds; `c` (a `&mut` borrow) can't alias
-    // B, and the prepacked A is a separate owned buffer.
+    // B, and the prepacked A is a separate owned buffer
     unsafe {
         match ws {
             Some(ws) => gemm_packed_a_unchecked_with(
@@ -1028,14 +1028,14 @@ fn gemm_packed_a_common<T, S2, SC>(
     }
 }
 
-/// Integer `C(i32) <- alpha·A(i8)·B(i8) + beta·C`, the ndarray adapter over gemmkit's
+/// Integer `C(i32) <- alpha*A(i8)*B(i8) + beta*C`, the ndarray adapter over gemmkit's
 /// [`gemmkit::gemm_i8`]. `i8` inputs accumulate into an `i32` output (`alpha`/`beta`/`C` are `i32`);
 /// arithmetic wraps on overflow, the conventional integer-GEMM semantics. A separate entry from
 /// [`gemm`] because input (`i8`) and output (`i32`) types differ. Reads pointers/strides directly,
-/// so transposed / F-order / general-stride views work without copying.
+/// so transposed / F-order / general-stride views work without copying
 ///
 /// # Panics
-/// If the inner dimensions disagree.
+/// If the inner dimensions disagree
 #[cfg(feature = "int8")]
 pub fn gemm_i8<S1, S2, SC>(
     alpha: i32,
@@ -1052,11 +1052,11 @@ pub fn gemm_i8<S1, S2, SC>(
     gemm_i8_common(None, alpha, a, b, beta, c, par);
 }
 
-/// Like [`gemm_i8`] but reuses a caller-owned [`Workspace`] — the fixed-cost quantized-inference
-/// loop.
+/// Like [`gemm_i8`] but reuses a caller-owned [`Workspace`]: the fixed-cost quantized-inference
+/// loop
 ///
 /// # Panics
-/// Same conditions as [`gemm_i8`].
+/// Same conditions as [`gemm_i8`]
 #[cfg(feature = "int8")]
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_i8_with<S1, S2, SC>(
@@ -1100,7 +1100,7 @@ fn gemm_i8_common<S1, S2, SC>(
     let (rsc, csc) = (cs[0], cs[1]);
     let cp = c.as_mut_ptr();
     // SAFETY: dims validated; ndarray guarantees valid in-bounds layouts; `c` (a `&mut i32` borrow)
-    // can't alias `a`/`b` (`&i8`) — different element types over distinct storage.
+    // can't alias `a`/`b` (`&i8`): different element types over distinct storage
     unsafe {
         match ws {
             Some(ws) => gemm_i8_unchecked_with(
@@ -1142,7 +1142,7 @@ fn gemm_i8_common<S1, S2, SC>(
     }
 }
 
-/// `A(i8)·B(i8)` into a fresh row-major `Array2<i32>` — the i8 analogue of [`dot`].
+/// `A(i8)*B(i8)` into a fresh row-major `Array2<i32>`: the i8 analogue of [`dot`]
 #[cfg(feature = "int8")]
 pub fn dot_i8<S1, S2>(a: &ArrayBase<S1, Ix2>, b: &ArrayBase<S2, Ix2>) -> Array2<i32>
 where
@@ -1151,23 +1151,23 @@ where
 {
     let (m, _) = a.dim();
     let (_, n) = b.dim();
-    // beta == 0, so the initial fill is never read.
+    // beta == 0, so the initial fill is never read
     let mut c = Array2::<i32>::zeros((m, n));
     gemm_i8(1, a, b, 0, &mut c, Parallelism::default());
     c
 }
 
 /// Requantizing integer GEMM: `i8` inputs multiplied into an `i32` accumulator, then requantized to
-/// an `i8` output in one pass — the ndarray adapter over gemmkit's [`gemmkit::gemm_i8_requant`]. The
+/// an `i8` output in 1 pass: the ndarray adapter over gemmkit's [`gemmkit::gemm_i8_requant`]. The
 /// [`Requantize`] carries the per-tensor `scale`, `zero_point`, and an optional per-row `i32` bias;
 /// there is no `alpha` (folds into `scale`) or `beta`. Reads the pointers/strides directly and
 /// forwards to gemmkit's raw engine, so transposed, general-stride, and reversed (negative-stride)
-/// views all work without copying.
+/// views all work without copying
 ///
 /// # Panics
 /// If the inner dimensions disagree, or on the requant parameters the adapter rejects (a non-finite
 /// or non-positive `scale`, a `zero_point` outside `[-128, 127]`, or a bias whose length is not
-/// `A.rows` or which overlaps `C`).
+/// `A.rows` or which overlaps `C`)
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 pub fn gemm_i8_requant<S1, S2, SC>(
     a: &ArrayBase<S1, Ix2>,
@@ -1183,11 +1183,11 @@ pub fn gemm_i8_requant<S1, S2, SC>(
     gemm_i8_requant_common(None, a, b, req, c, par);
 }
 
-/// Like [`gemm_i8_requant`] but reuses a caller-owned [`Workspace`] — the fixed-cost quantized
-/// inference loop.
+/// Like [`gemm_i8_requant`] but reuses a caller-owned [`Workspace`]: the fixed-cost quantized
+/// inference loop
 ///
 /// # Panics
-/// Same conditions as [`gemm_i8_requant`].
+/// Same conditions as [`gemm_i8_requant`]
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 pub fn gemm_i8_requant_with<S1, S2, SC>(
     ws: &mut Workspace,
@@ -1228,7 +1228,7 @@ fn gemm_i8_requant_common<S1, S2, SC>(
     let cp = c.as_mut_ptr();
     // Requantize validation, replicating gemmkit's checked entry (byte-identical wording): finite,
     // positive scale; zero_point in the i8 band; a per-row bias of length A.rows disjoint from C
-    // (raw pointer math — C is never referenced).
+    // (raw pointer math, C is never referenced)
     assert!(
         req.scale.is_finite() && req.scale > 0.0,
         "gemmkit: requantize scale ({}) must be finite and > 0",
@@ -1243,7 +1243,7 @@ fn gemm_i8_requant_common<S1, S2, SC>(
 
     // SAFETY: dims validated; ndarray guarantees valid in-bounds layouts; `c` (a `&mut i8` borrow)
     // can't alias `a`/`b`, and the bias was validated disjoint from C above. Reversed strides
-    // forward straight through, exactly as the plain entry.
+    // forward straight through, exactly as the plain entry
     unsafe {
         match ws {
             Some(ws) => gemm_i8_requant_unchecked_with(
@@ -1290,14 +1290,14 @@ fn gemm_i8_requant_common<S1, S2, SC>(
 }
 
 /// Requantizing integer GEMM with an **unsigned `u8` output** (ONNX-QLinearMatMul-style
-/// activation) — the ndarray adapter over gemmkit's [`gemmkit::gemm_i8_requant_u8`]. The `i8`-output
+/// activation): the ndarray adapter over gemmkit's [`gemmkit::gemm_i8_requant_u8`]. The `i8`-output
 /// twin of [`gemm_i8_requant`], differing only in the output domain `[0, 255]` and the `zero_point`
-/// range.
+/// range
 ///
 /// # Panics
 /// If the inner dimensions disagree, or on the requant parameters the adapter rejects (a non-finite
 /// or non-positive `scale`, a `zero_point` outside `[0, 255]`, or a bias whose length is not
-/// `A.rows` or which overlaps `C`).
+/// `A.rows` or which overlaps `C`)
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 pub fn gemm_i8_requant_u8<S1, S2, SC>(
     a: &ArrayBase<S1, Ix2>,
@@ -1313,10 +1313,10 @@ pub fn gemm_i8_requant_u8<S1, S2, SC>(
     gemm_i8_requant_u8_common(None, a, b, req, c, par);
 }
 
-/// Like [`gemm_i8_requant_u8`] but reuses a caller-owned [`Workspace`].
+/// Like [`gemm_i8_requant_u8`] but reuses a caller-owned [`Workspace`]
 ///
 /// # Panics
-/// Same conditions as [`gemm_i8_requant_u8`].
+/// Same conditions as [`gemm_i8_requant_u8`]
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 pub fn gemm_i8_requant_u8_with<S1, S2, SC>(
     ws: &mut Workspace,
@@ -1357,7 +1357,7 @@ fn gemm_i8_requant_u8_common<S1, S2, SC>(
     let cp = c.as_mut_ptr();
     // Requantize validation, replicating gemmkit's checked entry (byte-identical wording): finite,
     // positive scale; zero_point in the u8 band; a per-row bias of length A.rows disjoint from C
-    // (raw pointer math — C is never referenced).
+    // (raw pointer math, C is never referenced)
     assert!(
         req.scale.is_finite() && req.scale > 0.0,
         "gemmkit: requantize scale ({}) must be finite and > 0",
@@ -1372,7 +1372,7 @@ fn gemm_i8_requant_u8_common<S1, S2, SC>(
 
     // SAFETY: dims validated; ndarray guarantees valid in-bounds layouts; `c` (a `&mut u8` borrow)
     // can't alias `a`/`b`, and the bias was validated disjoint from C above. Reversed strides
-    // forward straight through, exactly as the plain entry.
+    // forward straight through, exactly as the plain entry
     unsafe {
         match ws {
             Some(ws) => gemm_i8_requant_u8_unchecked_with(
@@ -1418,13 +1418,13 @@ fn gemm_i8_requant_u8_common<S1, S2, SC>(
     }
 }
 
-/// Complex `C <- alpha·op(A)·op(B) + beta·C`, with `op(A) = A̅` when `conj_a` (resp.
-/// `B̅` when `conj_b`). `T` is `Complex<f32>`/`Complex<f64>`; needs the `complex`
+/// Complex `C <- alpha*op(A)*op(B) + beta*C`, with `op(A) = conj(A)` when `conj_a` (resp.
+/// `conj(B)` when `conj_b`). `T` is `Complex<f32>`/`Complex<f64>`; needs the `complex`
 /// feature. Like [`gemm`], it reads pointer/strides directly, so transposed, F-order,
-/// and negative-stride views work without copying.
+/// and negative-stride views work without copying
 ///
 /// # Panics
-/// If the inner dimensions disagree.
+/// If the inner dimensions disagree
 #[cfg(feature = "complex")]
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_cplx<T, S1, S2, SC>(
@@ -1445,10 +1445,10 @@ pub fn gemm_cplx<T, S1, S2, SC>(
     gemm_cplx_common(None, alpha, a, conj_a, b, conj_b, beta, c, par);
 }
 
-/// Like [`gemm_cplx`] but reuses a caller-owned [`Workspace`].
+/// Like [`gemm_cplx`] but reuses a caller-owned [`Workspace`]
 ///
 /// # Panics
-/// If the inner dimensions disagree.
+/// If the inner dimensions disagree
 #[cfg(feature = "complex")]
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_cplx_with<T, S1, S2, SC>(
@@ -1499,7 +1499,7 @@ fn gemm_cplx_common<T, S1, S2, SC>(
     let cp = c.as_mut_ptr();
 
     // SAFETY: dims validated; ndarray guarantees the pointer/strides describe a
-    // valid in-bounds layout, and `c` (a `&mut` borrow) cannot alias `a`/`b`.
+    // valid in-bounds layout, and `c` (a `&mut` borrow) cannot alias `a`/`b`
     unsafe {
         match ws {
             Some(ws) => gemm_cplx_unchecked_with(
@@ -1545,9 +1545,9 @@ fn gemm_cplx_common<T, S1, S2, SC>(
     }
 }
 
-/// Non-conjugated complex `A·B` into a fresh row-major [`Array2`] — the complex
+/// Non-conjugated complex `A*B` into a fresh row-major [`Array2`]: the complex
 /// analogue of [`dot`]. For conjugated products use [`gemm_cplx`]. Needs the
-/// `complex` feature.
+/// `complex` feature
 #[cfg(feature = "complex")]
 pub fn dot_cplx<T, S1, S2>(a: &ArrayBase<S1, Ix2>, b: &ArrayBase<S2, Ix2>) -> Array2<T>
 where
@@ -1557,7 +1557,7 @@ where
 {
     let (m, _) = a.dim();
     let (_, n) = b.dim();
-    // beta == 0, so the initial fill is never read.
+    // beta == 0, so the initial fill is never read
     let mut c = Array2::from_elem((m, n), T::ZERO);
     gemm_cplx(
         T::ONE,
@@ -1572,17 +1572,17 @@ where
     c
 }
 
-/// Complex `C <- alpha·op(A)·op(B) + beta·C + bias` in one fused pass, with `op(A) = A̅` when
-/// `conj_a` (resp. `B̅` when `conj_b`) — the ndarray adapter over gemmkit's
+/// Complex `C <- alpha*op(A)*op(B) + beta*C + bias` in 1 fused pass, with `op(A) = conj(A)` when
+/// `conj_a` (resp. `conj(B)` when `conj_b`): the ndarray adapter over gemmkit's
 /// [`gemmkit::gemm_cplx_fused`]. The optional [`Bias`] is [`Bias::PerRow`] (length `A.rows`) or
 /// [`Bias::PerCol`] (length `B.cols`), added verbatim (never conjugated); `bias == None` is exactly
-/// [`gemm_cplx`]. There is **no** activation parameter — an ordering activation is undefined on
+/// [`gemm_cplx`]. There is **no** activation parameter: an ordering activation is undefined on
 /// complex numbers. Like [`gemm_cplx`], it reads the pointer/strides directly and forwards to
-/// gemmkit's raw engine, so transposed and reversed (negative-stride) views all work without copying.
+/// gemmkit's raw engine, so transposed and reversed (negative-stride) views all work without copying
 ///
 /// # Panics
 /// If the inner dimensions disagree, or on a bias the adapter rejects (a `PerRow`/`PerCol` bias of
-/// the wrong length, or a bias slice overlapping `C`).
+/// the wrong length, or a bias slice overlapping `C`)
 #[cfg(all(feature = "complex", feature = "epilogue"))]
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_cplx_fused<T, S1, S2, SC>(
@@ -1604,10 +1604,10 @@ pub fn gemm_cplx_fused<T, S1, S2, SC>(
     gemm_cplx_fused_common(None, alpha, a, conj_a, b, conj_b, beta, c, bias, par);
 }
 
-/// Like [`gemm_cplx_fused`] but reuses a caller-owned [`Workspace`].
+/// Like [`gemm_cplx_fused`] but reuses a caller-owned [`Workspace`]
 ///
 /// # Panics
-/// Same conditions as [`gemm_cplx_fused`].
+/// Same conditions as [`gemm_cplx_fused`]
 #[cfg(all(feature = "complex", feature = "epilogue"))]
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_cplx_fused_with<T, S1, S2, SC>(
@@ -1659,13 +1659,13 @@ fn gemm_cplx_fused_common<T, S1, S2, SC>(
     let (rsc, csc) = (cs[0], cs[1]);
     let cp = c.as_mut_ptr();
     // Fused-bias validation, replicating gemmkit's checked entry (byte-identical wording): the bias
-    // length matches its axis and does not overlap C (raw pointer math — C is never referenced).
-    // Complex has no activation (undefined on ℂ), so there is no slope check.
+    // length matches its axis and does not overlap C (raw pointer math, C is never referenced)
+    // Complex has no activation (undefined on complex numbers), so there is no slope check
     let (bias_ptr, bias_dim, has_bias) = lower_bias(bias, m, n, cp, &[(cm, rsc), (cn, csc)]);
 
     // SAFETY: dims validated; ndarray guarantees the pointer/strides describe a valid in-bounds
     // layout and `c` (a `&mut` borrow) can't alias `a`/`b`; the bias was validated disjoint from C
-    // above. Negative (reversed) strides forward straight through, exactly as the plain entry.
+    // above. Negative (reversed) strides forward straight through, exactly as the plain entry
     unsafe {
         match ws {
             Some(ws) => gemm_cplx_fused_unchecked_with(

@@ -1,10 +1,10 @@
 //! `GEMMKIT_REQUIRE_ISA` pin parsing plus the memoized ISA-selection plumbing
-//! (`x86_isa_detected!` / `memoized_select!`) shared by every family's `select_*` ladder.
+//! (`x86_isa_detected!` / `memoized_select!`) shared by every family's `select_*` ladder
 
 /// x86 ISA probe for the `select_*` ladders: the runtime `is_x86_feature_detected!`
-/// with `std`, else a compile-time `cfg!(target_feature = …)` — off `std` there is no
+/// with `std`, else a compile-time `cfg!(target_feature = ...)`: off `std` there is no
 /// runtime CPU detection (`raw-cpuid` is `std`-gated), so a no_std build runs whatever
-/// its compile-time target-features guarantee.
+/// its compile-time target-features guarantee
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
 macro_rules! x86_isa_detected {
     ($feat:tt) => {
@@ -18,16 +18,16 @@ macro_rules! x86_isa_detected {
     };
 }
 
-/// An explicitly requested kernel, parsed from `GEMMKIT_REQUIRE_ISA`.
+/// An explicitly requested kernel, parsed from `GEMMKIT_REQUIRE_ISA`
 ///
 /// The non-`Auto` variants are constructed only by the `std` `forced_isa` (env-var
 /// parsing); the no-`std` `forced_isa` always yields `Auto`. The `select_*` ladders
-/// still match on every variant, so they must remain in the type — hence the
-/// `dead_code` allowance for the no-`std` build rather than `#[cfg]`-ing them out.
+/// still match on every variant, so they must remain in the type, hence the
+/// `dead_code` allowance for the no-`std` build rather than `#[cfg]`-ing them out
 #[cfg_attr(not(feature = "std"), allow(dead_code))]
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub(super) enum ForcedIsa {
-    /// No override: auto-select the best available ISA (the default).
+    /// No override: auto-select the best available ISA (the default)
     Auto,
     /// Scalar: the fallback path when no other ISA is available
     Scalar,
@@ -43,13 +43,13 @@ pub(super) enum ForcedIsa {
     Neon,
     /// WebAssembly `simd128`. Baseline-by-cfg like `Neon`, but `simd128` is an easily-forgotten
     /// compile-time `-C target-feature=+simd128`; pinning it makes a build **assert** the SIMD
-    /// path is live (panics if absent) instead of silently falling back to scalar.
+    /// path is live (panics if absent) instead of silently falling back to scalar
     Simd128,
 }
 
-/// Parse the `GEMMKIT_REQUIRE_ISA` pin. Unset/empty ⇒ [`ForcedIsa::Auto`]; an
+/// Parse the `GEMMKIT_REQUIRE_ISA` pin. Unset/empty -> [`ForcedIsa::Auto`]; an
 /// unrecognized value is a hard error (catches typos in CI config). Read once,
-/// since the selection is memoized in the per-type `OnceLock`.
+/// since the selection is memoized in the per-type `OnceLock`
 #[cfg(feature = "std")]
 pub(super) fn forced_isa() -> ForcedIsa {
     match std::env::var("GEMMKIT_REQUIRE_ISA") {
@@ -86,10 +86,10 @@ pub(super) fn forced_isa() -> ForcedIsa {
 }
 
 /// Emit the memoized dispatch accessor for one element type: a `#[cfg(std)]`
-/// `OnceLock<$ty>` plus a `fn $accessor() -> $ty` that runs `$select` **once** under `std`
+/// `OnceLock<$ty>` plus a `fn $accessor() -> $ty` that runs `$select` once under `std`
 /// (feature detection is memoized) and directly on each call without `std`. The optional
 /// trailing `$feat` additionally gates the accessor and the `OnceLock` on that feature (the
-/// static is always further gated by `std`). Every `dispatched_*` slot shares this shape.
+/// static is always further gated by `std`). Every `dispatched_*` slot shares this shape
 macro_rules! memoized_select {
     ($static:ident, $accessor:ident, $ty:ty, $select:ident, $doc:literal) => {
         #[cfg(feature = "std")]

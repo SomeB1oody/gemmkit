@@ -1,4 +1,4 @@
-//! Shared bench harness: BENCH_GUARD, fill/measure/Stat, native-ISA token.
+//! Shared bench harness: BENCH_GUARD, fill/measure/Stat, native-ISA token
 
 use std::time::Instant;
 
@@ -9,10 +9,10 @@ use gemmkit::simd::Neon;
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 use gemmkit::simd::Simd128;
 
-/// Serializes the two core-saturating `#[ignore]` benches so the default
+/// Serializes the 2 core-saturating `#[ignore]` benches so the default
 /// multi-threaded test harness can't run them concurrently (which would make every
-/// GFLOP/s figure meaningless). Poisoning is ignored — a panicking bench must not
-/// wedge the other.
+/// GFLOP/s figure meaningless). Poisoning is ignored: a panicking bench must not
+/// wedge the other
 pub(crate) static BENCH_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub(crate) fn fill(n: usize, seed: u64) -> Vec<f32> {
@@ -27,12 +27,12 @@ pub(crate) fn fill(n: usize, seed: u64) -> Vec<f32> {
         .collect()
 }
 
-/// Reps and per-batch target for the robust estimator below.
+/// Reps and per-batch target for the robust estimator below
 const REPS: usize = 9;
 const BATCH_SECS: f64 = 0.07;
 
 /// A throughput sample: median GFLOP/s plus the min/max so run-to-run spread is
-/// *visible* and tuning decisions are not made on noise.
+/// *visible* and tuning decisions are not made on noise
 pub(crate) struct Stat {
     pub(crate) median: f64,
     pub(crate) min: f64,
@@ -47,7 +47,7 @@ impl Stat {
 
 /// Robust throughput estimate: warm up, auto-calibrate the batch size to
 /// ~`BATCH_SECS`, then report the median GFLOP/s (and spread) over `REPS`
-/// batches. Far steadier than a single fixed-iter timing.
+/// batches. Far steadier than a single fixed-iter timing
 pub(crate) fn measure<F: FnMut()>(m: usize, k: usize, n: usize, mut f: F) -> Stat {
     for _ in 0..3 {
         f();
@@ -80,8 +80,8 @@ fn gflops(m: usize, k: usize, n: usize, secs: f64) -> f64 {
 /// Byte-for-byte sibling of [`measure`] for **bandwidth-bound** shapes: same warmup,
 /// batch calibration, REPS, and median machinery, but each batch reports moved-bytes
 /// throughput `bytes / secs / 1e9` (GB/s) instead of GFLOP/s. `measure` has already
-/// divided by seconds, so a GFLOP/s `Stat` cannot be post-scaled into GB/s — this is
-/// the parallel estimator, not a wrapper. `bytes` is the total traffic of one `f()`.
+/// divided by seconds, so a GFLOP/s `Stat` cannot be post-scaled into GB/s: this is
+/// the parallel estimator, not a wrapper. `bytes` is the total traffic of one `f()`
 pub(crate) fn measure_gbps<F: FnMut()>(bytes: usize, mut f: F) -> Stat {
     for _ in 0..3 {
         f();
@@ -109,7 +109,7 @@ pub(crate) fn measure_gbps<F: FnMut()>(bytes: usize, mut f: F) -> Stat {
 
 // The native single-ISA token + microkernel tile, matching the production
 // dispatch choice for this architecture (see `dispatch.rs`). Used by the
-// equal-ISA comparison below so gemmkit and the `gemm` crate run the same ISA.
+// equal-ISA comparison below so gemmkit and the `gemm` crate run the same ISA
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub(crate) type NativeTok = Fma;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]

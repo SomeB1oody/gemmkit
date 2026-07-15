@@ -1,4 +1,4 @@
-//! wasm simd128 vs scalar-token throughput.
+//! wasm simd128 vs scalar-token throughput
 
 use crate::harness::{BENCH_GUARD, NATIVE_LABEL, NATIVE_MR, NATIVE_NR, NativeTok, fill, measure};
 use gemmkit::kernel::FloatGemm;

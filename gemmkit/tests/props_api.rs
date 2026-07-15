@@ -1,9 +1,10 @@
 //! Property-based tests for the safe public GEMM API: oracle accuracy, run-to-run
 //! determinism, serial==parallel, beta==0 overwrite, broadcast inputs, batched, and
 //! the documented panic guarantees. Never mutates knobs or env. See props_common for
-//! the shared strategies and accuracy bars.
+//! the shared strategies and accuracy bars
 #![cfg(all(not(miri), not(target_family = "wasm")))]
 
+// Shared proptest strategies, oracle references, and accuracy gates
 mod props_common;
 
 use gemmkit::{MatMut, MatRef, Parallelism, Workspace, gemm, gemm_batched, gemm_with};
@@ -11,9 +12,7 @@ use props_common::*;
 use proptest::prelude::*;
 use std::panic::AssertUnwindSafe;
 
-// ---------------------------------------------------------------------------
-// P1/P2/P3/P5 — random oracle: run-to-run BIT determinism + frob vs the f64 reference
-// ---------------------------------------------------------------------------
+// P1/P2/P3/P5 random oracle: run-to-run BIT determinism + frob vs the f64 reference
 
 #[allow(clippy::too_many_arguments)]
 fn oracle_float<T: Elem>(
@@ -120,9 +119,7 @@ proptest! {
     }
 }
 
-// ---------------------------------------------------------------------------
-// P4 — full-range i8 -> i32 vs the wrapping-i32 reference (exact)
-// ---------------------------------------------------------------------------
+// P4 full-range i8 -> i32 vs the wrapping-i32 reference (exact)
 
 #[cfg(feature = "int8")]
 fn fill_i32(n: usize, seed: u64) -> Vec<i32> {
@@ -186,9 +183,7 @@ proptest! {
     }
 }
 
-// ---------------------------------------------------------------------------
-// P5 — complex (c32/c64), conj variants: run-to-run BIT + frob(16*k*eps)
-// ---------------------------------------------------------------------------
+// P5 complex (c32/c64), conj variants: run-to-run BIT + frob(16*k*eps)
 
 #[cfg(feature = "complex")]
 #[allow(clippy::too_many_arguments)]
@@ -265,19 +260,18 @@ proptest! {
     }
 }
 
-// ---------------------------------------------------------------------------
-// P6 — serial == parallel, bit-identical (weighted-large dims so Rayon really splits)
-// ---------------------------------------------------------------------------
+// P6 serial == parallel, bit-identical (weighted-large dims so Rayon really splits)
 
 proptest! {
     #![proptest_config(ProptestConfig { cases: cases(48), ..ProptestConfig::default() })]
 
-    // Serial and parallel runs are bit-identical **under the current thread-independent
-    // blocking** — float add isn't associative, so this holds only because every thread
+    // Serial and parallel runs are bit-identical under the current thread-independent
+    // blocking - float add isn't associative, so this holds only because every thread
     // count reduces in the same order, not because the library promises it (see the
-    // canonical caveat on `parallel_equals_serial_mixed` in tests/correctness/mixed.rs). Kept as the strongest net against
-    // an accidental reduction-order divergence; relax to determinism + tolerance only if
-    // blocking ever becomes parallelism-dependent (e.g. split-K).
+    // canonical caveat on `parallel_equals_serial_mixed` in tests/correctness/mixed.rs)
+    // Kept as the strongest net against an accidental reduction-order divergence; relax
+    // to determinism + tolerance only if blocking ever becomes parallelism-dependent
+    // (e.g. split-K)
     #[test]
     fn prop_serial_equals_parallel(
         m in 48usize..=200, n in 48usize..=200, k in 32usize..=160,
@@ -317,9 +311,7 @@ proptest! {
     }
 }
 
-// ---------------------------------------------------------------------------
-// P7 — beta == 0 must overwrite, never read C (NaN-seeded C proves it)
-// ---------------------------------------------------------------------------
+// P7 beta == 0 must overwrite, never read C (NaN-seeded C proves it)
 
 fn beta_zero_overwrites<T: Elem>(
     m: usize,
@@ -332,7 +324,7 @@ fn beta_zero_overwrites<T: Elem>(
 ) {
     let a = Mat::<T>::rand(m, k, seed);
     let b = Mat::<T>::rand(k, n, seed ^ 0xB);
-    // Reference uses a *zeroed* C0 with beta = 0 (mirrors `beta_zero_does_not_read_c` in tests/correctness/float.rs).
+    // Reference uses a *zeroed* C0 with beta = 0 (mirrors `beta_zero_does_not_read_c` in tests/correctness/float.rs)
     let zero_c0 = Mat {
         v: vec![T::from_f64(0.0); m * n],
         rows: m,
@@ -341,7 +333,7 @@ fn beta_zero_overwrites<T: Elem>(
     let cref = reference(&a, &b, &zero_c0, al, 0.0);
     let (abuf, rsa, csa) = build_view(&a, la);
     let (bbuf, rsb, csb) = build_view(&b, PLayout::Col { pad: 0 });
-    // C seeded all-NaN in whatever layout `lc` picks.
+    // C seeded all-NaN in whatever layout `lc` picks
     let nan = Mat {
         v: vec![T::from_f64(f64::NAN); m * n],
         rows: m,
@@ -400,9 +392,7 @@ proptest! {
     }
 }
 
-// ---------------------------------------------------------------------------
-// P8 — batched GEMM reproduces a loop of single gemm(Serial) calls (bit-identical)
-// ---------------------------------------------------------------------------
+// P8 batched GEMM reproduces a loop of single gemm(Serial) calls (bit-identical)
 
 proptest! {
     #![proptest_config(ProptestConfig { cases: cases(96), ..ProptestConfig::default() })]
@@ -418,9 +408,9 @@ proptest! {
         seed in any::<u64>(),
     ) {
         let (alpha, beta) = (al as f32, be as f32);
-        // Column-major element extents.
+        // Column-major element extents
         let (ea, eb, ec) = (m * k, k * n, m * n);
-        // A or B may broadcast (batch stride 0, shared across the batch) — legal per api.rs:322-324.
+        // A or B may broadcast (batch stride 0, shared across the batch); legal per api.rs:322-324
         let (a_bs, b_bs) = match broadcast {
             1 => (0isize, (eb + b_pad) as isize),
             2 => ((ea + a_pad) as isize, 0isize),
@@ -437,7 +427,7 @@ proptest! {
         let b_at = |bi: usize| (bi as isize * b_bs) as usize;
         let c_at = |bi: usize| (bi as isize * c_bs) as usize;
 
-        // Reference: an independent single gemm(Serial) per element on its own window.
+        // Reference: an independent single gemm(Serial) per element on its own window
         let mut c_ref = c0.clone();
         for bi in 0..batch {
             let (ao, bo, co) = (a_at(bi), b_at(bi), c_at(bi));
@@ -471,9 +461,7 @@ proptest! {
     }
 }
 
-// ---------------------------------------------------------------------------
-// P9 — broadcast inputs (rs = 0 on A or cs = 0 on B) drive the full pipeline
-// ---------------------------------------------------------------------------
+// P9 broadcast inputs (rs = 0 on A or cs = 0 on B) drive the full pipeline
 
 proptest! {
     #![proptest_config(ProptestConfig { cases: cases(64), ..ProptestConfig::default() })]
@@ -486,20 +474,20 @@ proptest! {
     ) {
         // Materialize the logical (broadcast) operand for the reference, but present it to
         // gemm through a compact buffer with a zero stride (legal for read-only A/B,
-        // api.rs:193-207 + 269-271).
+        // api.rs:193-207 + 269-271)
         let c0 = Mat::<f32>::rand(m, n, seed ^ 0xC);
         let (cbase, rsc, csc) = build_view(&c0, lc);
         let (alpha, beta) = (al as f32, be as f32);
 
         let (a, b, abuf, rsa, csa, bbuf, rsb, csb) = if which {
-            // Broadcast A: every row equals `base` (k values), rs = 0.
+            // Broadcast A: every row equals `base` (k values), rs = 0
             let base = rand_vec::<f32>(k, seed);
             let full_a = Mat { v: (0..m).flat_map(|_| base.clone()).collect(), rows: m, cols: k };
             let b = Mat::<f32>::rand(k, n, seed ^ 0xB);
             let (bbuf, rsb, csb) = build_view(&b, PLayout::Col { pad: 0 });
             (full_a, b, base, 0isize, 1isize, bbuf, rsb, csb)
         } else {
-            // Broadcast B: every column equals `base` (k values), cs = 0.
+            // Broadcast B: every column equals `base` (k values), cs = 0
             let a = Mat::<f32>::rand(m, k, seed);
             let base = rand_vec::<f32>(k, seed ^ 0xB);
             let full_b = Mat { v: (0..k).flat_map(|p2| core::iter::repeat_n(base[p2], n)).collect(), rows: k, cols: n };
@@ -521,9 +509,7 @@ proptest! {
     }
 }
 
-// ---------------------------------------------------------------------------
-// P11 — cross-library oracle: gemmkit vs the `gemm` crate (col-major, beta=0, serial)
-// ---------------------------------------------------------------------------
+// P11 cross-library oracle: gemmkit vs the `gemm` crate (col-major, beta=0, serial)
 
 proptest! {
     #![proptest_config(ProptestConfig { cases: cases(64), ..ProptestConfig::default() })]
@@ -534,7 +520,7 @@ proptest! {
     ) {
         let a = Mat::<f32>::rand(m, k, seed);
         let b = Mat::<f32>::rand(k, n, seed ^ 0xB);
-        // Column-major buffers (gemm's orientation), zero beta.
+        // Column-major buffers (gemm's orientation), zero beta
         let (abuf, _, _) = build_view(&a, PLayout::Col { pad: 0 });
         let (bbuf, _, _) = build_view(&b, PLayout::Col { pad: 0 });
         let mut c_kit = vec![0.0f32; m * n];
@@ -547,7 +533,7 @@ proptest! {
             MatMut::from_col_major(&mut c_kit, m, n),
             Parallelism::Serial,
         );
-        // SAFETY: distinct in-bounds column-major buffers; read_dst=false (beta=0).
+        // SAFETY: distinct in-bounds column-major buffers; read_dst=false (beta=0)
         unsafe {
             gemm::gemm(
                 m, n, k,
@@ -558,7 +544,7 @@ proptest! {
                 gemm::Parallelism::None,
             );
         }
-        // Build a row-major f64 reference from the column-major `gemm` output.
+        // Build a row-major f64 reference from the column-major `gemm` output
         let mut cref = vec![0.0f64; m * n];
         for i in 0..m {
             for j in 0..n {
@@ -569,12 +555,10 @@ proptest! {
     }
 }
 
-// ---------------------------------------------------------------------------
-// P10 — safe-API panic guarantees (adversarial): each class must panic with its
+// P10 safe-API panic guarantees (adversarial): each class must panic with its
 // documented message. `catch_unwind` + downcast; no `set_hook` (it is process-global
 // and would race the other concurrently-running tests). `AssertUnwindSafe` because the
-// `&mut` C buffers are not `UnwindSafe`.
-// ---------------------------------------------------------------------------
+// `&mut` C buffers are not `UnwindSafe`
 
 fn catch_msg<F: FnOnce()>(f: F) -> Option<String> {
     match std::panic::catch_unwind(AssertUnwindSafe(f)) {
@@ -601,7 +585,7 @@ fn assert_panics_with<F: FnOnce()>(f: F, needle: &str, ctx: &str) {
 proptest! {
     #![proptest_config(ProptestConfig { cases: cases(48), ..ProptestConfig::default() })]
 
-    // (a) shape mismatch: A.cols != B.rows.
+    // (a) shape mismatch: A.cols != B.rows
     #[test]
     fn prop_panic_shape_mismatch(m in 1usize..=8, k in 1usize..=8, n in 1usize..=8, d in 1usize..=4) {
         let a = vec![0.0f32; m * k];
@@ -621,7 +605,7 @@ proptest! {
         );
     }
 
-    // (b) undersized slice for A -> "needs".
+    // (b) undersized slice for A -> "needs"
     #[test]
     fn prop_panic_undersized(m in 2usize..=8, k in 2usize..=8, n in 1usize..=8, short in 1usize..=3) {
         let full = m * k;
@@ -642,7 +626,7 @@ proptest! {
         );
     }
 
-    // (c) self-aliasing C (rsc = 0 collapses distinct rows) -> "aliases itself".
+    // (c) self-aliasing C (rsc = 0 collapses distinct rows) -> "aliases itself"
     #[test]
     fn prop_panic_self_aliasing_c(m in 2usize..=8, k in 1usize..=8, n in 2usize..=8, p in par()) {
         let a = vec![0.0f32; m * k];
@@ -662,7 +646,7 @@ proptest! {
         );
     }
 
-    // (d) negative stride on a safe A view -> "negative strides or is too large".
+    // (d) negative stride on a safe A view -> "negative strides or is too large"
     #[test]
     fn prop_panic_negative_stride(m in 2usize..=8, k in 2usize..=8, n in 1usize..=8) {
         let a = vec![0.0f32; m * k];
@@ -686,7 +670,7 @@ proptest! {
     // isize, extent() is None and check_view panics "too large to address"; when it fits
     // but the huge need exceeds the 1-element slice, it panics "needs". Both branches are
     // reachable here (small rows + huge rs -> "needs"; big rows -> "too large"); the
-    // generator computes which side it lands on.
+    // generator computes which side it lands on
     #[test]
     fn prop_panic_extent_overflow(
         rows in proptest::sample::select(&[2usize, 3, (1usize << (isize::BITS / 2 + 1)) + 1][..]),
@@ -696,7 +680,7 @@ proptest! {
         let a = vec![0.0f32; 1];
         let b = vec![0.0f32; 1];
         let mut c = vec![0.0f32; 1];
-        // Mirror extent(): (rows-1) * rs overflowing isize is the "too large" branch.
+        // Mirror extent(): (rows-1) * rs overflowing isize is the "too large" branch
         let overflows = isize::try_from(rows)
             .ok()
             .and_then(|r| r.checked_sub(1))
@@ -718,14 +702,12 @@ proptest! {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Batched-validation panics (adversarial sibling of P10 for gemm_batched)
-// ---------------------------------------------------------------------------
 
 proptest! {
     #![proptest_config(ProptestConfig { cases: cases(48), ..ProptestConfig::default() })]
 
-    // Negative batch stride -> "must be non-negative" (api.rs:169-171).
+    // Negative batch stride -> "must be non-negative" (api.rs:169-171)
     #[test]
     fn prop_batched_panic_negative_batch_stride(batch in 2usize..=4, m in 1usize..=6, k in 1usize..=6, n in 1usize..=6) {
         let a = rand_vec::<f32>(batch * m * k, 1);
@@ -745,7 +727,7 @@ proptest! {
         );
     }
 
-    // C batch stride below the element extent -> "stay disjoint" (api.rs:455-460).
+    // C batch stride below the element extent -> "stay disjoint" (api.rs:455-460)
     #[test]
     fn prop_batched_panic_overlapping_c(batch in 2usize..=4, m in 2usize..=6, n in 2usize..=6, deficit in 1usize..=3) {
         let a = rand_vec::<f32>(batch * m * m, 1);
@@ -766,7 +748,7 @@ proptest! {
         );
     }
 
-    // Per-element shape mismatch -> "!= B.rows" (api.rs:395-399).
+    // Per-element shape mismatch -> "!= B.rows" (api.rs:395-399)
     #[test]
     fn prop_batched_panic_shape_mismatch(batch in 1usize..=4, m in 1usize..=6, k in 1usize..=6, n in 1usize..=6, d in 1usize..=3) {
         let a = rand_vec::<f32>(batch * m * k, 1);
@@ -787,10 +769,8 @@ proptest! {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Stateful workspace reuse: a sequence of random-shaped gemm_with() calls through one
-// grown-only Workspace, each BIT-compared against a fresh pool-allocating gemm().
-// ---------------------------------------------------------------------------
+// grown-only Workspace, each BIT-compared against a fresh pool-allocating gemm()
 
 proptest! {
     #![proptest_config(ProptestConfig { cases: cases(48), ..ProptestConfig::default() })]
@@ -840,14 +820,14 @@ proptest! {
 }
 
 /// Regression: on the mixed-precision (f16/bf16) path the depth panel is the whole `k`,
-/// and a broadcast (zero-stride) operand passes validation with a logically huge `k` —
+/// and a broadcast (zero-stride) operand passes validation with a logically huge `k`:
 /// the pack sizing must fail closed rather than wrap into an undersized workspace the pack
 /// writes past. `k = isize::MAX` overflows the pack element-count product for every tile
 /// geometry (so the "too large" guard fires on every ISA). The narrower band where the
-/// element product fits `usize` but the element→byte conversion overflows is exercised
-/// tile-independently by `workspace::region_bytes` unit tests — an end-to-end `k` that hits
+/// element product fits `usize` but the element->byte conversion overflows is exercised
+/// tile-independently by `workspace::region_bytes` unit tests; an end-to-end `k` that hits
 /// that band is tile-size-dependent (a smaller tile just requests a huge-but-representable
-/// allocation, which is a safe OOM abort, not the checked "too large" panic).
+/// allocation, which is a safe OOM abort, not the checked "too large" panic)
 #[cfg(feature = "half")]
 #[test]
 fn mixed_huge_k_fails_closed() {

@@ -1,9 +1,9 @@
 //! Complex fused-bias suite (`gemm_cplx_fused`): the contract is `gemm_cplx_fused == gemm_cplx`
 //! then the same element-wise bias add, **bitwise** on both the real and imaginary parts, for
 //! every shape and every conj combination. There is **no activation** on the complex frame
-//! (ordering-based activations are undefined on `ℂ`), so this suite exercises bias only. All fills
-//! are deterministic and platform-independent; `c32` and `c64` are covered via a generic `Cx`
-//! element trait.
+//! (ordering-based activations are undefined on complex values), so this suite exercises bias only.
+//! All fills are deterministic and platform-independent; `c32` and `c64` are covered via a generic
+//! `Cx` element trait
 
 use crate::common::Rng;
 use gemmkit::{
@@ -11,7 +11,7 @@ use gemmkit::{
 };
 
 /// The complex element under test (`c32` / `c64`): deterministic construction and per-part bit
-/// compare. Complex bitwise equality means both the `re` and `im` bit patterns match.
+/// compare. Complex bitwise equality means both the `re` and `im` bit patterns match
 trait Cx: gemmkit::ComplexScalar {
     fn of(re: f64, im: f64) -> Self;
     fn bits(self) -> (u64, u64);
@@ -40,7 +40,7 @@ impl Cx for Complex<f64> {
     }
 }
 
-/// Deterministic complex fill (re/im each in ~`[-2, 2)`).
+/// Deterministic complex fill (re/im each in ~`[-2, 2)`)
 fn fill<T: Cx>(rng: &mut Rng, n: usize) -> Vec<T> {
     (0..n)
         .map(|_| T::of(rng.unit() * 2.0, rng.unit() * 2.0))
@@ -51,7 +51,7 @@ fn fill<T: Cx>(rng: &mut Rng, n: usize) -> Vec<T> {
 /// bias kind, `beta`, and C layout (column- or row-major, the latter forcing the orientation swap
 /// that flips the bias axis). Assert **bitwise** equality (re/im `to_bits`) at every element. A/B
 /// are column-major; the reference reads back plain `gemm_cplx`'s output and adds the same bias
-/// term with the same complex `+`, so any divergence in the fused store or its post-pass is caught.
+/// term with the same complex `+`, so any divergence in the fused store or its post-pass is caught
 #[allow(clippy::too_many_arguments)]
 fn check_fused_bitwise<T: Cx>(
     rng: &mut Rng,
@@ -77,7 +77,7 @@ fn check_fused_bitwise<T: Cx>(
         (1isize, m as isize)
     };
 
-    // --- fused ---
+    // fused
     let mut c_fused = c0.clone();
     {
         let mut ws = Workspace::new();
@@ -103,7 +103,7 @@ fn check_fused_bitwise<T: Cx>(
         );
     }
 
-    // --- oracle: plain gemm_cplx then element-wise bias add (user frame) ---
+    // oracle: plain gemm_cplx then element-wise bias add (user frame)
     let mut c_ref = c0.clone();
     {
         let ar = MatRef::new(&a, m, k, 1, m as isize);
@@ -125,7 +125,7 @@ fn check_fused_bitwise<T: Cx>(
         }
     }
 
-    // --- bitwise compare (re + im) ---
+    // bitwise compare (re + im)
     for j in 0..n {
         for i in 0..m {
             let idx = (i as isize * rsc + j as isize * csc) as usize;
@@ -140,9 +140,7 @@ fn check_fused_bitwise<T: Cx>(
     }
 }
 
-// ---------------------------------------------------------------------------
-// a. general driver: every conj combo × bias kind × beta × C layout, bitwise
-// ---------------------------------------------------------------------------
+// a. general driver: every conj combo x bias kind x beta x C layout, bitwise
 
 fn cplx_fused_bitwise_for<T: Cx>() {
     let mut rng = Rng::new(0x00CF_15ED);
@@ -175,15 +173,13 @@ fn cplx_fused_bitwise() {
     cplx_fused_bitwise_for::<Complex<f64>>();
 }
 
-// ---------------------------------------------------------------------------
 // checked/unchecked twin equivalence: gemm_cplx_fused_unchecked(_with)
-// ---------------------------------------------------------------------------
 
 /// `gemm_cplx_fused` and its raw twins `gemm_cplx_fused_unchecked` (pool) / `_with` (caller-owned
-/// `Workspace`) are **parallel** entry points — the checked one does not delegate to the raw one, so
+/// `Workspace`) are **parallel** entry points: the checked one does not delegate to the raw one, so
 /// a divergence in the `(ptr, BiasDim, has_bias)` lowering would go undetected. Exercise both raw
 /// forms against the checked twin bit-for-bit (re + im) on a driver shape, across both bias axes,
-/// `has_bias = false`, and a conjugated combination.
+/// `has_bias = false`, and a conjugated combination
 fn cplx_fused_unchecked_for<T: Cx>() {
     use gemmkit::{
         BiasDim, gemm_cplx_fused, gemm_cplx_fused_unchecked, gemm_cplx_fused_unchecked_with,
@@ -226,7 +222,7 @@ fn cplx_fused_unchecked_for<T: Cx>() {
             let mut c_ws = c0.clone();
             let mut ws = Workspace::new();
             // SAFETY: valid in-bounds col-major layouts; C aliases neither A/B nor the bias, and the
-            // bias (when present) is the right length for its axis.
+            // bias (when present) is the right length for its axis
             unsafe {
                 gemm_cplx_fused_unchecked(
                     m,
@@ -299,13 +295,11 @@ fn cplx_fused_unchecked_matches_checked() {
     cplx_fused_unchecked_for::<Complex<f64>>();
 }
 
-// ---------------------------------------------------------------------------
 // b. multi depth-panel: proves the last_k gating (intermediate partials untouched)
-// ---------------------------------------------------------------------------
 
 /// `k = 2048` with the default `KC = 512` splits the contraction into ~4 depth panels (complex is
 /// `OUT_IS_ACC = true`, so the driver re-reads C between panels). The bias must fire exactly once,
-/// on the completed sum — intermediate panels keep their raw partials. Bitwise vs `gemm_cplx`-then-add.
+/// on the completed sum: intermediate panels keep their raw partials. Bitwise vs `gemm_cplx`-then-add
 #[test]
 fn cplx_fused_multi_panel() {
     fn go<T: Cx>() {
@@ -332,9 +326,7 @@ fn cplx_fused_multi_panel() {
     go::<Complex<f64>>();
 }
 
-// ---------------------------------------------------------------------------
 // c. serial == parallel bit-identity through the fused route
-// ---------------------------------------------------------------------------
 
 fn check_par_eq<T: Cx>(rng: &mut Rng, m: usize, k: usize, n: usize, ca: bool, cb: bool) {
     let a = fill::<T>(rng, m * k);
@@ -389,9 +381,7 @@ fn cplx_fused_parallel_bitwise() {
     go::<Complex<f64>>();
 }
 
-// ---------------------------------------------------------------------------
 // d. bias None delegates to gemm_cplx bitwise (zero-cost identity)
-// ---------------------------------------------------------------------------
 
 #[test]
 fn cplx_fused_identity_delegates() {
@@ -444,14 +434,12 @@ fn cplx_fused_identity_delegates() {
     go::<Complex<f64>>();
 }
 
-// ---------------------------------------------------------------------------
-// e. degenerate (k == 0 / alpha == 0) with bias: C <- beta·C + bias
-// ---------------------------------------------------------------------------
+// e. degenerate (k == 0 / alpha == 0) with bias: C <- beta*C + bias
 
-/// The `A·B` term vanishes (`k == 0` or `alpha == 0`): `C <- beta·C + bias`, in the user frame.
-/// conj is set `true` on both operands on purpose — with no product to conjugate it must be
+/// The `A*B` term vanishes (`k == 0` or `alpha == 0`): `C <- beta*C + bias`, in the user frame.
+/// conj is set `true` on both operands on purpose: with no product to conjugate it must be
 /// ignored. Compared against a scalar model, bitwise. `beta` is `{0, 1, other}`, exactly the
-/// special-cases of the engine's degenerate path.
+/// special-cases of the engine's degenerate path
 #[allow(clippy::too_many_arguments)]
 fn check_degenerate<T: Cx>(
     rng: &mut Rng,
@@ -494,8 +482,8 @@ fn check_degenerate<T: Cx>(
         );
     }
 
-    // Scalar model (col-major): mirrors the engine's `beta ∈ {0, 1, other}` special-casing exactly,
-    // then the bias add.
+    // Scalar model (col-major): mirrors the engine's `beta in {0, 1, other}` special-casing exactly,
+    // then the bias add
     let zero = T::of(0.0, 0.0);
     let one = T::of(1.0, 0.0);
     for j in 0..n {
@@ -531,9 +519,9 @@ fn cplx_fused_degenerate() {
         let (m, n) = (20, 14);
         for bias_kind in 1u8..=2 {
             for &beta in &[T::of(0.0, 0.0), T::of(1.0, 0.0), T::of(0.5, 0.7)] {
-                // k == 0 (alpha nonzero): the A·B term vanishes structurally.
+                // k == 0 (alpha nonzero): the A*B term vanishes structurally
                 check_degenerate::<T>(&mut rng, m, 0, n, T::of(1.1, -0.4), bias_kind, beta, "k0");
-                // alpha == 0 (k != 0): the scale-only path.
+                // alpha == 0 (k != 0): the scale-only path
                 check_degenerate::<T>(
                     &mut rng,
                     m,
@@ -551,9 +539,7 @@ fn cplx_fused_degenerate() {
     go::<Complex<f64>>();
 }
 
-// ---------------------------------------------------------------------------
 // f. validation panics
-// ---------------------------------------------------------------------------
 
 #[test]
 #[should_panic(expected = "PerRow bias length")]
@@ -609,7 +595,7 @@ fn cplx_fused_bias_overlaps_c() {
     let b = vec![Complex::new(1.0f32, 0.0); k * n];
     let mut buf = vec![Complex::new(0.0f32, 0.0); m * n];
     // A bias slice aliasing C's storage. It is raw-derived (its lifetime is not tied to `buf`), so
-    // `&mut buf` still type-checks; the overlap check panics before any element is read or written.
+    // `&mut buf` still type-checks; the overlap check panics before any element is read or written
     let bias: &[Complex<f32>] = unsafe { core::slice::from_raw_parts(buf.as_ptr(), m) };
     let mut ws = Workspace::new();
     gemm_cplx_fused_with(

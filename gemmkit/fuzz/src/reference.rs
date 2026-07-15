@@ -1,10 +1,8 @@
-//! Naive dense references and the tolerance/exact result gates.
+//! Naive dense references and the tolerance/exact result gates
 
 use crate::common::{CplxElem, RealElem};
 
-// ---------------------------------------------------------------------------
 // dense materialization + references
-// ---------------------------------------------------------------------------
 
 pub(crate) fn dense_real<T: RealElem>(
     buf: &[T],
@@ -49,7 +47,7 @@ pub(crate) fn dense_i32(buf: &[i32], rows: usize, cols: usize, rs: isize, cs: is
 }
 
 /// Materialize a complex view row-major in f64, applying `conj` to the imaginary part
-/// (mirrors `api.rs::gemm_cplx`, which conjugates the *operand* before the product).
+/// (mirrors `api.rs::gemm_cplx`, which conjugates the *operand* before the product)
 pub(crate) fn dense_cplx<T: CplxElem>(
     buf: &[T],
     rows: usize,
@@ -72,8 +70,8 @@ pub(crate) fn frob(v: &[f64]) -> f64 {
     v.iter().map(|x| x * x).sum::<f64>().sqrt()
 }
 
-/// f64 reference `C <- beta·C0 + alpha·A·B` with the `beta == 0` "C not read" rule
-/// (`reference` in tests/correctness/common.rs), so a NaN-seeded C (the beta==0 fuzz) never taints it.
+/// f64 reference `C <- beta*C0 + alpha*A*B` with the `beta == 0` "C not read" rule
+/// (`reference` in tests/correctness/common.rs), so a NaN-seeded C (the beta==0 fuzz) never taints it
 pub(crate) fn ref_gemm_real(
     da: &[f64],
     db: &[f64],
@@ -103,7 +101,7 @@ pub(crate) fn ref_gemm_real(
 }
 
 /// Exact wrapping-i32 reference; `i32` accumulation is associative mod 2^32, so every
-/// blocking/threading/ISA schedule reproduces it bit-for-bit (the `assert_eq!` bar).
+/// blocking/threading/ISA schedule reproduces it bit-for-bit (the `assert_eq!` bar)
 pub(crate) fn ref_gemm_i8(
     da: &[i32],
     db: &[i32],
@@ -132,8 +130,8 @@ pub(crate) fn ref_gemm_i8(
     out
 }
 
-/// f64 complex reference (conj already baked into `da`/`db`) with the beta==0 rule —
-/// `ref_cplx` in the suite has no such rule, so this closes the NaN-C false positive.
+/// f64 complex reference (conj already baked into `da`/`db`) with the beta==0 rule:
+/// `ref_cplx` in the suite has no such rule, so this closes the NaN-C false positive
 pub(crate) fn ref_gemm_cplx(
     da: &[(f64, f64)],
     db: &[(f64, f64)],
@@ -166,19 +164,17 @@ pub(crate) fn ref_gemm_cplx(
     out
 }
 
-// ---------------------------------------------------------------------------
 // tolerance / exact gates (panic == the libFuzzer report channel)
-// ---------------------------------------------------------------------------
 
-/// Relative-Frobenius gate. The denominator is the `8·k·EPS` gate of
-/// `assert_accurate` (tests/correctness/common.rs), `||A||·||B||`, augmented with the
-/// `|alpha|` product scale and the `|beta|·||C0||` epilogue scale. The suite's gate
-/// omits both because its inputs are always `k >= 1` with O(1) alpha/non-empty A·B; the
-/// fuzzer reaches `k == 0` (empty operands, `||A||·||B|| == 0`) and `|alpha| = 2.5`,
-/// where the epilogue/product rounding — correct in the type but higher-precision in the
-/// f64 reference — would otherwise blow up a zero denominator. `denom` is precomputed by
+/// Relative-Frobenius gate. The denominator is the `8*k*EPS` gate of
+/// `assert_accurate` (tests/correctness/common.rs), `||A||*||B||`, augmented with the
+/// `|alpha|` product scale and the `|beta|*||C0||` epilogue scale. The suite's gate
+/// omits both because its inputs are always `k >= 1` with O(1) alpha/non-empty A*B; the
+/// fuzzer reaches `k == 0` (empty operands, `||A||*||B|| == 0`) and `|alpha| = 2.5`,
+/// where the epilogue/product rounding (correct in the type but higher-precision in the
+/// f64 reference) would otherwise blow up a zero denominator. `denom` is precomputed by
 /// the caller (with the `||C0||` term dropped when `beta == 0`, so a NaN-seeded C0 can't
-/// taint it).
+/// taint it)
 pub(crate) fn real_gate<T: RealElem>(
     cbuf: &[T],
     rsc: isize,
@@ -209,8 +205,8 @@ pub(crate) fn real_gate<T: RealElem>(
     }
 }
 
-/// The gate denominator: `|alpha|·||A||·||B|| + |beta|·||C0|| + tiny`. `nc0` must be `0`
-/// when `beta == 0` (the C0 term is dropped and C0 may be NaN-seeded).
+/// The gate denominator: `|alpha|*||A||*||B|| + |beta|*||C0|| + tiny`. `nc0` must be `0`
+/// when `beta == 0` (the C0 term is dropped and C0 may be NaN-seeded)
 pub(crate) fn real_denom(alpha_f: f64, na: f64, nb: f64, beta_f: f64, nc0: f64) -> f64 {
     alpha_f.abs() * na * nb + beta_f.abs() * nc0 + 1e-30
 }

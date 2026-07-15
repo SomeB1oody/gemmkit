@@ -1,8 +1,8 @@
-//! f32 sgemm vs gemm crate / matrixmultiply, thread-scaling, knob-neutrality probe.
+//! f32 sgemm vs gemm crate / matrixmultiply, thread-scaling, knob-neutrality probe
 
 use crate::harness::{BENCH_GUARD, fill, measure, measure_gbps};
 // Driver-level imports are used only by the equal-ISA bench; gate them to its
-// architectures so other targets stay warning-clean.
+// architectures so other targets stay warning-clean
 #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
 use crate::harness::{NATIVE_LABEL, NATIVE_MR, NATIVE_NR, NativeTok};
 #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
@@ -13,8 +13,8 @@ use gemmkit::driver;
 use gemmkit::kernel::FloatGemm;
 use gemmkit::{MatMut, MatRef, Parallelism, gemm, gemm_batched};
 
-// gemmkit best-ISA vs the `gemm` crate + `matrixmultiply` — external crates that do
-// not build for wasm, so this bench (and its `perf_sgemm` caller) is gated off wasm.
+// gemmkit best-ISA vs the `gemm` crate + `matrixmultiply`: external crates that do
+// not build for wasm, so this bench (and its `perf_sgemm` caller) is gated off wasm
 #[cfg(not(target_family = "wasm"))]
 fn bench_one(s: usize, parallel: bool) {
     let (m, k, n) = (s, s, s);
@@ -106,7 +106,7 @@ fn bench_one(s: usize, parallel: bool) {
 
 /// Equal-ISA comparison: gemmkit's native single-ISA path (forced via the
 /// driver) vs gemm's default (the same ISA on stable). Single-threaded,
-/// column-major.
+/// column-major
 #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
 fn bench_native_equal_isa(s: usize) {
     let (m, k, n) = (s, s, s);
@@ -195,7 +195,7 @@ fn perf_sgemm() {
 /// hoisted per-call knob read is free (it is one relaxed atomic load per call, never per element).
 /// Covers the general driver (mc/nc/kc/kc_min/tiny-block knobs), a tiny shape, gemv register-block
 /// (k_stream_max), the packed-LHS path (packed_oversample + the transpose packer's strip knob, both
-/// hit by a row-major A), batched GEMM (seq_internal_bytes), and i8 (i8_vnni_min_par_mnk).
+/// hit by a row-major A), batched GEMM (seq_internal_bytes), and i8 (i8_vnni_min_par_mnk)
 #[cfg(not(target_family = "wasm"))]
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
@@ -203,7 +203,7 @@ fn perf_knob_neutral() {
     let _guard = BENCH_GUARD.lock().unwrap_or_else(|e| e.into_inner());
     println!("\nknob-indirection neutrality probe (gemmkit only):");
 
-    // General register-tiling driver, serial + parallel.
+    // General register-tiling driver, serial + parallel
     for &s in &[256usize, 512, 1024] {
         let a = fill(s * s, 1);
         let b = fill(s * s, 2);
@@ -227,7 +227,7 @@ fn perf_knob_neutral() {
         }
     }
 
-    // Tiny shape (tiny-block branch + its kc ceiling).
+    // Tiny shape (tiny-block branch + its kc ceiling)
     {
         let (m, k, n) = (48usize, 512usize, 48usize);
         let a = fill(m * k, 1);
@@ -250,7 +250,7 @@ fn perf_knob_neutral() {
         );
     }
 
-    // gemv register-block (k_stream_max), serial, output spilling L2.
+    // gemv register-block (k_stream_max), serial, output spilling L2
     {
         let (m, k) = (65536usize, 64usize);
         let a = fill(m * k, 1);
@@ -274,7 +274,7 @@ fn perf_knob_neutral() {
         );
     }
 
-    // Packed-LHS path (row-major A forces both the packed-block grain and the transpose packer).
+    // Packed-LHS path (row-major A forces both the packed-block grain and the transpose packer)
     {
         let (m, k, n) = (2048usize, 256usize, 256usize);
         let a = fill(m * k, 1);
@@ -297,7 +297,7 @@ fn perf_knob_neutral() {
         );
     }
 
-    // Batched GEMM (seq_internal_bytes_per_worker; inert on x86 but exercises resolve_batch).
+    // Batched GEMM (seq_internal_bytes_per_worker; inert on x86 but exercises resolve_batch)
     {
         let (batch, m, k, n) = (64usize, 96usize, 96usize, 96usize);
         let a = fill(batch * m * k, 1);
@@ -324,7 +324,7 @@ fn perf_knob_neutral() {
         );
     }
 
-    // i8 (i8_vnni_min_par_mnk fallback gate), serial + parallel.
+    // i8 (i8_vnni_min_par_mnk fallback gate), serial + parallel
     #[cfg(feature = "int8")]
     {
         let s = 512usize;
@@ -351,14 +351,12 @@ fn perf_knob_neutral() {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Parallel thread-scaling diagnostic (the mid-size-parallel gap)
-// ---------------------------------------------------------------------------
 
-/// The (MR, NR) tile the default `gemm()` dispatch uses on this target — used
+/// The (MR, NR) tile the default `gemm()` dispatch uses on this target, used
 /// only to *estimate* the per-region job count (the parallel work granularity).
 /// Assumes the best available x86 ISA is AVX-512; if the box only has AVX2 the
-/// real tile is 16x6 and the printed job estimate is a lower bound.
+/// real tile is 16x6 and the printed job estimate is a lower bound
 #[cfg(not(target_family = "wasm"))]
 fn native_default_tile() -> (usize, usize) {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -376,11 +374,11 @@ fn native_default_tile() -> (usize, usize) {
 }
 
 /// Print gemmkit's parallel *self*-scaling (and gemm's, for reference) at a fixed
-/// size across thread counts, so we can see *where* scaling breaks: poor speedup
+/// size across thread counts, showing *where* scaling breaks: poor speedup
 /// already at 2-4 threads => per-call fork/join + atomics overhead dominates the
 /// tiny work; a plateau after 8-16 => memory bandwidth or job starvation (compare
 /// against the printed ~jobs/region). Throughput is the median of `REPS`
-/// calibrated batches; the spread column flags differences smaller than the noise.
+/// calibrated batches; the spread column flags differences smaller than the noise
 #[cfg(not(target_family = "wasm"))]
 fn bench_scaling(s: usize) {
     let (m, k, n) = (s, s, s);
@@ -434,7 +432,7 @@ fn bench_scaling(s: usize) {
     });
 
     // The t=1 row is the serial `base`/`gbase` already measured (Rayon(1) resolves
-    // to the same single-worker path), so reuse them instead of re-measuring.
+    // to the same single-worker path), so reuse them instead of re-measuring
     println!(
         "      1 | {:9.1}  1.0x 100% | {:5.0}% | {:8.1}  1.0x",
         base.median,
@@ -481,8 +479,8 @@ fn bench_scaling(s: usize) {
         });
         let spd = sk.median / base.median.max(1e-9);
         // Effective workers = what resolve() actually grants (capped by cores and
-        // the per-region job count), not the requested t — else eff% reads low
-        // where n_jobs throttles below t and masquerades as a bandwidth wall.
+        // the per-region job count), not the requested t, else eff% reads low
+        // where n_jobs throttles below t and masquerades as a bandwidth wall
         let workers = t.min(avail).min(n_jobs).max(1);
         println!(
             "    {t:3} | {:9.1} {:4.1}x {:3.0}% | {:5.0}% | {:8.1} {:4.1}x",
@@ -498,7 +496,7 @@ fn bench_scaling(s: usize) {
     // Auto row: the forced-t curve above never exercises the default `Rayon(0)`
     // path production uses, so this is the only line that shows what the auto ramp
     // actually selects and delivers. `auto_w` mirrors `resolve`'s auto branch
-    // (cbrt(mnk).div_ceil(stride), capped) for sizes above the serial gate.
+    // (cbrt(mnk).div_ceil(stride), capped) for sizes above the serial gate
     let auto_w = (((m * k * n) as f64).cbrt() as usize)
         .div_ceil(gemmkit::tuning::thread_dim_stride())
         .min(avail)
