@@ -58,9 +58,9 @@ pub(crate) use complex::execute_complex;
 #[cfg(all(feature = "complex", feature = "epilogue"))]
 pub(crate) use complex::execute_complex_fused;
 #[cfg(feature = "epilogue")]
-pub use float::FusedScalar;
+pub use float::{FusedScalar, MapScalar};
 #[cfg(feature = "epilogue")]
-pub(crate) use float::execute_fused;
+pub(crate) use float::{execute_fused, execute_map, execute_packed_fused};
 #[cfg(feature = "int8")]
 pub(crate) use int::{IntTask, execute_int};
 #[cfg(all(feature = "int8", feature = "epilogue"))]
@@ -282,6 +282,26 @@ pub trait GemmScalar: Scalar {
     #[cfg(feature = "epilogue")]
     unsafe fn dispatch_fused(
         task: Task<Self>,
+        epi: FusedEpi<Self>,
+        par: Parallelism,
+        ws: &mut Workspace,
+    );
+
+    /// Run the ISA-dispatched **prepacked-RHS fused-epilogue** kernel for this type: the fused
+    /// twin of [`GemmScalar::dispatch_packed`], threading `epi` into the prepacked driver entry
+    /// (via `driver::run_packed_rhs_epilogue`). Every fused element type provides one (the real
+    /// floats via `float`, the narrow floats via `mixed`); the [`FusedScalar`](super::FusedScalar)
+    /// bound on the public packed-fused API admits exactly these 4 types. `epi` is already in the
+    /// prepacked buffer's (oriented) frame: the packed path never re-orients in the driver, and the
+    /// `gemm_packed_a_fused` entry pre-flips the bias axis when it builds the transposed consume
+    ///
+    /// # Safety
+    /// As [`GemmScalar::dispatch_packed`], plus `epi`'s bias valid for the problem's `m`/`n` and
+    /// disjoint from `c` (validated by the API layer)
+    #[doc(hidden)]
+    #[cfg(feature = "epilogue")]
+    unsafe fn dispatch_packed_fused(
+        req: PackedConsume<Self>,
         epi: FusedEpi<Self>,
         par: Parallelism,
         ws: &mut Workspace,

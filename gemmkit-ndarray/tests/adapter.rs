@@ -396,6 +396,47 @@ fn fused_matches_plain_then_map() {
     }
 }
 
+/// `gemm_map` (and its `_with` twin) is **bit-identical** to plain `gemm` followed by the same
+/// per-element closure. The closure is asymmetric in `(r, c)` and captures a lookup table by
+/// reference, so it exercises the user-frame coordinates and the environment capture through the
+/// adapter; a transposed B view exercises the raw-stride forwarding
+#[cfg(feature = "epilogue")]
+#[test]
+fn map_matches_plain_then_map() {
+    use gemmkit::Workspace;
+    use gemmkit_ndarray::{gemm_map, gemm_map_with};
+    let (m, k, n) = (12usize, 9, 7);
+    let a = rand2(m, k, 111);
+    let bt = rand2(n, k, 112); // transposed B storage; `.t()` gives a k x n general-stride view
+    let b = bt.t();
+    let c0 = rand2(m, n, 113);
+    let lut: Vec<f64> = (0..5).map(|i| 0.5 + 0.3 * i as f64).collect();
+    let (alpha, beta) = (1.3f64, -0.7);
+    // asymmetric, position- and value-dependent, in f64 so the compare is bitwise-meaningful
+    let f = |v: f64, r: usize, c: usize| v.mul_add(lut[r % lut.len()], r as f64 - 0.25 * c as f64);
+    for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
+        let mut c_map = c0.clone();
+        gemm_map(alpha, &a, &b, beta, &mut c_map, &f, par);
+        let mut c_with = c0.clone();
+        let mut ws = Workspace::new();
+        gemm_map_with(&mut ws, alpha, &a, &b, beta, &mut c_with, &f, par);
+        // oracle: plain gemm then the same closure in the user frame
+        let mut c_ref = c0.clone();
+        gemm(alpha, &a, &b, beta, &mut c_ref, par);
+        for i in 0..m {
+            for j in 0..n {
+                let want = f(c_ref[(i, j)], i, j);
+                assert_eq!(c_map[(i, j)].to_bits(), want.to_bits(), "map ({i},{j})");
+                assert_eq!(
+                    c_with[(i, j)].to_bits(),
+                    want.to_bits(),
+                    "map_with ({i},{j})"
+                );
+            }
+        }
+    }
+}
+
 /// A reversed (negative-stride) A view through `gemm_fused` must equal plain `gemm` on the **same**
 /// reversed view then the same scalar map, **bit-for-bit**: the fused entry forwards to gemmkit's
 /// raw engine with no reversed-view rejection, exactly like the plain entry
@@ -498,7 +539,7 @@ fn batched_fused_matches_loop_of_gemm_fused() {
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 #[test]
 fn requant_matches_scalar_model() {
-    use gemmkit_ndarray::{Requantize, dot_i8, gemm_i8_requant, gemm_i8_requant_u8};
+    use gemmkit_ndarray::{RequantScale, Requantize, dot_i8, gemm_i8_requant, gemm_i8_requant_u8};
 
     let randi8 = |r: usize, c: usize, seed: u64| -> Array2<i8> {
         let mut s = seed | 1;
@@ -525,12 +566,14 @@ fn requant_matches_scalar_model() {
     let acc = dot_i8(&a, &b);
     let bias: Vec<i32> = (0..m).map(|i| 40 * i as i32 - 200).collect();
     let (scale, zp_i8, zp_u8) = (0.05f32, -7i32, 30i32);
+    // per-row (per-channel) scales, all finite and > 0
+    let scales: Vec<f32> = (0..m).map(|i| 0.01 * (1 + i % 5) as f32).collect();
 
     for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
         // i8 output, with bias
         let mut c = Array2::<i8>::zeros((m, n));
         let req = Requantize {
-            scale,
+            scale: RequantScale::PerTensor(scale),
             zero_point: zp_i8,
             bias: Some(&bias),
         };
@@ -547,7 +590,7 @@ fn requant_matches_scalar_model() {
         // u8 output, no bias
         let mut cu = Array2::<u8>::zeros((m, n));
         let requ = Requantize {
-            scale,
+            scale: RequantScale::PerTensor(scale),
             zero_point: zp_u8,
             bias: None,
         };
@@ -558,6 +601,45 @@ fn requant_matches_scalar_model() {
                     cu[(i, j)],
                     ref_u8(acc[(i, j)], 0, scale, zp_u8),
                     "requant u8 ({i},{j})"
+                );
+            }
+        }
+        // per-row scales vs the same model with `scales[i]` (i8 with bias, u8 without)
+        let mut cr = Array2::<i8>::zeros((m, n));
+        gemm_i8_requant(
+            &a,
+            &b,
+            Requantize {
+                scale: RequantScale::PerRow(&scales),
+                zero_point: zp_i8,
+                bias: Some(&bias),
+            },
+            &mut cr,
+            par,
+        );
+        let mut cru = Array2::<u8>::zeros((m, n));
+        gemm_i8_requant_u8(
+            &a,
+            &b,
+            Requantize {
+                scale: RequantScale::PerRow(&scales),
+                zero_point: zp_u8,
+                bias: None,
+            },
+            &mut cru,
+            par,
+        );
+        for i in 0..m {
+            for j in 0..n {
+                assert_eq!(
+                    cr[(i, j)],
+                    ref_i8(acc[(i, j)], bias[i], scales[i], zp_i8),
+                    "requant per-row i8 ({i},{j})"
+                );
+                assert_eq!(
+                    cru[(i, j)],
+                    ref_u8(acc[(i, j)], 0, scales[i], zp_u8),
+                    "requant per-row u8 ({i},{j})"
                 );
             }
         }
@@ -625,6 +707,117 @@ fn cplx_fused_matches_gemm_cplx_then_add() {
                     c_fused[(i, j)].im.to_bits(),
                     want.im.to_bits(),
                     "cplx_fused im conj=({conj_a},{conj_b}) ({i},{j})"
+                );
+            }
+        }
+    }
+}
+
+/// `gemm_packed_b_fused` (a `PerRow` bias + `ReLU`) is **bit-identical** to the plain
+/// `gemm_packed_b` off the same handle followed by the same scalar map: gemmkit's packed-fused
+/// contract, mirrored through the adapter. Also exercises the `_with` (caller-owned `Workspace`) twin
+#[cfg(feature = "epilogue")]
+#[test]
+fn packed_b_fused_matches_packed_then_map() {
+    use gemmkit::Workspace;
+    use gemmkit_ndarray::{
+        Activation, Bias, gemm_packed_b, gemm_packed_b_fused, gemm_packed_b_fused_with, prepack_rhs,
+    };
+    use ndarray::ShapeBuilder;
+    let (m, k, n) = (100usize, 64, 80);
+    let a = rand2(m, k, 151);
+    let b = rand2(k, n, 152);
+    // column-major C (packed_b orientation), seeded with a base so `beta` matters
+    let mut c0 = Array2::<f64>::zeros((m, n).f());
+    c0.assign(&rand2(m, n, 153));
+    let bias: Vec<f64> = (0..m).map(|i| 0.5 * i as f64 - 2.0).collect();
+    let (alpha, beta) = (1.3f64, -0.7);
+    let packed = prepack_rhs(&b);
+    for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
+        // allocating entry
+        let mut c_fused = c0.clone();
+        gemm_packed_b_fused(
+            alpha,
+            &a,
+            &packed,
+            beta,
+            &mut c_fused,
+            Some(Bias::PerRow(&bias)),
+            Some(Activation::Relu),
+            par,
+        );
+        // _with entry, same args
+        let mut c_with = c0.clone();
+        let mut ws = Workspace::new();
+        gemm_packed_b_fused_with(
+            &mut ws,
+            alpha,
+            &a,
+            &packed,
+            beta,
+            &mut c_with,
+            Some(Bias::PerRow(&bias)),
+            Some(Activation::Relu),
+            par,
+        );
+        // oracle: plain packed then the scalar map
+        let mut c_ref = c0.clone();
+        gemm_packed_b(alpha, &a, &packed, beta, &mut c_ref, par);
+        for i in 0..m {
+            for j in 0..n {
+                let v = c_ref[(i, j)] + bias[i];
+                let want = if v > 0.0 { v } else { 0.0 };
+                assert_eq!(
+                    c_fused[(i, j)].to_bits(),
+                    want.to_bits(),
+                    "packed_b_fused ({i},{j})"
+                );
+                assert_eq!(
+                    c_with[(i, j)].to_bits(),
+                    want.to_bits(),
+                    "packed_b_fused_with ({i},{j})"
+                );
+            }
+        }
+    }
+}
+
+/// `gemm_packed_a_fused` (a `PerRow` bias + `ReLU`) is **bit-identical** to the plain
+/// `gemm_packed_a` off the same handle then the same scalar map, into a row-major C (the packed_a
+/// orientation). The user-frame bias axis rides the packed-A transpose (a wrong flip diverges)
+#[cfg(feature = "epilogue")]
+#[test]
+fn packed_a_fused_matches_packed_then_map() {
+    use gemmkit_ndarray::{Activation, Bias, gemm_packed_a, gemm_packed_a_fused, prepack_lhs};
+    let (m, k, n) = (96usize, 50, 72);
+    let a = rand2(m, k, 161);
+    let b = rand2(k, n, 162);
+    let c0 = rand2(m, n, 163); // row-major (packed_a orientation)
+    let bias: Vec<f64> = (0..m).map(|i| 0.3 * i as f64 - 1.5).collect();
+    let (alpha, beta) = (0.9f64, 0.7);
+    let packed = prepack_lhs(&a);
+    for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
+        let mut c_fused = c0.clone();
+        gemm_packed_a_fused(
+            alpha,
+            &packed,
+            &b,
+            beta,
+            &mut c_fused,
+            Some(Bias::PerRow(&bias)),
+            Some(Activation::Relu),
+            par,
+        );
+        let mut c_ref = c0.clone();
+        gemm_packed_a(alpha, &packed, &b, beta, &mut c_ref, par);
+        for i in 0..m {
+            for j in 0..n {
+                let v = c_ref[(i, j)] + bias[i];
+                let want = if v > 0.0 { v } else { 0.0 };
+                assert_eq!(
+                    c_fused[(i, j)].to_bits(),
+                    want.to_bits(),
+                    "packed_a_fused ({i},{j})"
                 );
             }
         }

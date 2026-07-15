@@ -158,6 +158,22 @@ pub(crate) enum BiasSpec<T> {
     Col(Ptr<T>),
 }
 
+/// An output scale in the driver (oriented) frame: a single per-tensor value, or a per-row /
+/// per-col `f32` vector (the per-channel quantized-inference convention). Mirrors [`BiasSpec`];
+/// the dispatch layer flips the per-row / per-col axis on an orientation swap, in lockstep with
+/// the bias axis (they are the same user axis). `Ptr` is the `Send + Sync` raw-pointer shim (the
+/// scale slice outlives the call; the borrow is erased to `Ptr` in the live call frame)
+#[cfg(all(feature = "int8", feature = "epilogue"))]
+#[derive(Copy, Clone)]
+pub(crate) enum ScaleSpec {
+    /// 1 per-tensor scale (applied to every element)
+    Tensor(f32),
+    /// 1 scale per output row (applied to every column of that row)
+    Row(Ptr<f32>),
+    /// 1 scale per output column (applied to every row of that column)
+    Col(Ptr<f32>),
+}
+
 /// The activation applied after the bias add
 #[cfg(feature = "epilogue")]
 #[derive(Copy, Clone)]
@@ -243,6 +259,118 @@ impl<T: Float<Acc = T> + PartialOrd> Epilogue<FloatGemm<T>> for FusedEpi<T> {
         }
     }
 }
+
+/// A user-defined per-element epilogue: the closure `f` applied to each stored output element at
+/// its final value, `C[r, c] <- f(alpha*(A*B)[r, c] + beta*C[r, c], r, c)`, with `(r, c)` in the
+/// **user** frame of `C`. The public [`crate::gemm_map`] entry (feature `epilogue`, `f32`/`f64`)
+/// lowers to this
+///
+/// It applies the closure **scalar, per output element** (one indirect call per element, amortized
+/// by the `O(k)` FLOPs, one monomorphization per `(T, ISA)` not per closure - the reason the seam is
+/// a borrowed trait object rather than a generic `F`), but it sets `VECTOR = true` so the kernel
+/// takes the **same path selection plain `gemm` does**: the vector fast path for a full column-major
+/// tile, the scratch/scalar path for an edge/strided tile (the `E::IS_IDENTITY || E::VECTOR` guard is
+/// identical for `Identity` and this epilogue, so `gemm` and `gemm_map` route every element the same
+/// way). The value handed to `f` is therefore **bitwise** the value plain `gemm` writes on *every*
+/// path - crucially the fast path's *fused* `beta*C + alpha*AB` store, which the scalar path's
+/// *unfused* [`crate::scalar::Float::mul_add`] does **not** reproduce for `beta != 0, 1` (so a
+/// scratch-only `VECTOR = false` epilogue would diverge from `gemm` by 1 ULP there). On the fast path
+/// [`Epilogue::apply_reg`] drains the register to a stack buffer and calls the same scalar `apply` on
+/// each lane, so it agrees with the scratch path bit-for-bit - hence `gemm_map` is `gemm()` then the
+/// per-element `f`, bit-for-bit, for every shape and route
+///
+/// The closure is a shared reference `&'u (dyn Fn + Sync)`, **not** erased to a `Ptr` shim: the
+/// reference is `Copy` and its referent is `Sync`, so `MapEpi` is `Copy + Send + Sync` (the
+/// [`Epilogue`] supertrait bounds) with **no** `'static` bound, and it is captured by value into the
+/// scoped parallel workers (a blocking rayon `for_each`, which joins before the borrow ends), so a
+/// non-`'static` borrow is sound - a closure may capture its environment by reference
+///
+/// `swapped` restores the user frame for `f`: the driver / small-`m,n` / small-`k` routes run in the
+/// **oriented** frame (a row-major-ish C makes the engine compute `C^T = B^T*A^T`, swapping
+/// `m<->n`), so when the orientation swap fired their `(row, col)` are transposed and `apply` flips
+/// them back to `(col, row)` before calling `f`. gemv routes before orientation, so it leaves
+/// `swapped = false` and its own `swap_rc` already yields user-frame coordinates. (This is the
+/// closure analogue of [`FusedEpi`]'s per-axis bias flip: relabelling an axis suffices for a bias,
+/// but a coordinate-dependent closure needs the full `(r, c)` transpose)
+///
+/// Like [`FusedEpi`] it is a `pub` type with crate-private fields (constructed only by the API
+/// layer, from a borrowed closure), so it can appear in the dispatch slot's function-pointer type
+/// and the `MapScalar` dispatch methods without leaking its internals or being externally
+/// constructible
+#[cfg(feature = "epilogue")]
+pub struct MapEpi<'u, T> {
+    /// The user closure `f(value, row, col) -> value`, borrowed for the call. The `+ Sync` makes
+    /// the shared reference `Send + Sync`, so `MapEpi` threads through the scoped workers
+    pub(crate) f: &'u (dyn Fn(T, usize, usize) -> T + Sync),
+    /// Whether the orientation swap fired: then `apply` transposes `(row, col)` to restore the user
+    /// frame for `f`
+    pub(crate) swapped: bool,
+}
+
+// `#[derive(Copy, Clone)]` would demand `T: Copy`/`T: Clone`; `MapEpi`'s only fields (a shared
+// reference and a `bool`) are `Copy` for **any** `T`, so implement both by hand without that bound
+#[cfg(feature = "epilogue")]
+impl<T> Copy for MapEpi<'_, T> {}
+#[cfg(feature = "epilogue")]
+impl<T> Clone for MapEpi<'_, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+// Real-float (`f32`/`f64`) only, matching the public `MapScalar` seal: the narrow types would
+// double-round a `T`-domain closure after the `f32` accumulate, and complex/int have no `apply` seam
+// wired. `Float<Acc = T>` selects exactly `f32`/`f64` (the same reasoning as the `FusedEpi` impl)
+#[cfg(feature = "epilogue")]
+impl<T: Float<Acc = T>> Epilogue<FloatGemm<T>> for MapEpi<'_, T> {
+    // `VECTOR = true` so the kernel keeps the fast vector path for a full column-major tile (the exact
+    // path plain `gemm` takes), then applies the closure per-lane in `apply_reg`. This matters for the
+    // *store* rounding: the fast path fuses `beta*C + alpha*AB` (hardware FMA), which the scalar
+    // path's unfused `Float::mul_add` does not reproduce for `beta != 0, 1`; forcing scratch would
+    // therefore diverge from plain `gemm` by 1 ULP. The closure itself is still applied scalar,
+    // per element (no vectorized closure)
+    const VECTOR: bool = true;
+
+    #[inline]
+    unsafe fn apply(&self, v: T, r: usize, c: usize) -> T {
+        // Restore the user frame for the closure: the oriented routes transposed `(r, c)` on a swap
+        if self.swapped {
+            (self.f)(v, c, r)
+        } else {
+            (self.f)(v, r, c)
+        }
+    }
+
+    #[inline]
+    unsafe fn apply_reg<S>(&self, s: S, v: S::Reg, r: usize, c: usize) -> S::Reg
+    where
+        S: KernelSimd<T, T, T, T>,
+    {
+        unsafe {
+            let lanes = <S as SimdOps<T>>::LANES;
+            debug_assert!(
+                lanes <= MAP_REG_LANES,
+                "map apply_reg buffer holds MAP_REG_LANES lanes"
+            );
+            // Drain the `LANES` consecutive rows `[r, r + lanes)` at column `c` to a stack buffer,
+            // apply the scalar `apply` (identical coordinate transform) to each, and reload. `v` is
+            // the fast-path *fused* `beta*C + alpha*AB` store - the exact bits plain `gemm` writes -
+            // so `f` sees the plain-`gemm` store value, and this per-lane form agrees with the
+            // scratch-path `apply` bit-for-bit (same closure, same coordinates, exact drain/reload)
+            let mut buf = [T::ZERO; MAP_REG_LANES];
+            s.storeu(buf.as_mut_ptr(), v);
+            for (l, slot) in buf.iter_mut().enumerate().take(lanes) {
+                *slot = self.apply(*slot, r + l, c);
+            }
+            s.loadu(buf.as_ptr())
+        }
+    }
+}
+
+/// Stack-buffer width for [`MapEpi::apply_reg`]'s per-lane drain: an upper bound on any float
+/// [`crate::simd::SimdOps`] lane count (`f32` on AVX-512 is the widest at 16)
+#[cfg(feature = "epilogue")]
+const MAP_REG_LANES: usize = 16;
 
 // Narrow-family (`f16`/`bf16`) blanket: bias/slope are the narrow type `N`, widened exactly
 // to `f32` (both are a subset of `f32`); the epilogue applies in `f32` to the accumulator, then
@@ -399,23 +527,29 @@ impl QuantOut for u8 {
 }
 
 /// The requantizing epilogue: `C[r, c] = clamp(zp + round_ne(scale*(acc + bias)), LO, HI)`,
-/// with an optional per-row / per-col `i32` bias joined in integer before the single f64
-/// rounding. The clamp band `[LO, HI]` is the output domain, chosen per output type by
-/// [`QuantOut`]: `i8` -> `[-128, 127]` (signed) and `u8` -> `[0, 255]` (the ONNX-QLinearMatMul
-/// activation output). The struct itself carries no `Out`: one value drives both, the domain
-/// coming from the `Fam::Out` the [`Epilogue`] impl is monomorphized for
+/// where `scale` is per-tensor or per-row / per-col ([`ScaleSpec`], the per-channel
+/// quantized-inference convention) and `bias` is an optional per-row / per-col `i32` joined in
+/// integer before the single f64 rounding. The clamp band `[LO, HI]` is the output domain, chosen
+/// per output type by [`QuantOut`]: `i8` -> `[-128, 127]` (signed) and `u8` -> `[0, 255]` (the
+/// ONNX-QLinearMatMul activation output). The struct itself carries no `Out`: one value drives
+/// both, the domain coming from the `Fam::Out` the [`Epilogue`] impl is monomorphized for
 ///
 /// Every tile drains its `i32` accumulators to scratch (vectorized), then maps each element to
 /// the output byte. The map itself is split: on requant-vector-capable tokens (x86:
-/// [`KRequantize::apply_store`] via [`crate::simd::KernelSimd::requant_store`]) a full lane-run is
-/// vectorized in `f64`; the row tail, a strided `C`, the `k == 0` degenerate fill, and non-vector
-/// ISAs (scalar / NEON / wasm) take the scalar [`KRequantize::apply`]. The 2 are **bit-identical**
-/// (the `requant_store` equivalence contract), so a single matrix mixes them freely. Either way
-/// this beats the unfused flow, which materializes a full `m*n` `i32` C
+/// [`KRequantize::apply_store`] via [`crate::simd::KernelSimd::requant_store`]) a full lane-run
+/// whose scale is constant across the run (per-tensor, or per-col in the driver frame) is
+/// vectorized in `f64`; a per-row scale (which varies per lane) plus the row tail, a strided `C`,
+/// the `k == 0` degenerate fill, and non-vector ISAs (scalar / NEON / wasm) take the scalar
+/// [`KRequantize::apply`]. All paths are **bit-identical** (the `requant_store` equivalence
+/// contract), so a single matrix mixes them freely. Either way this beats the unfused flow, which
+/// materializes a full `m*n` `i32` C
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 #[derive(Copy, Clone)]
 pub(crate) struct KRequantize {
-    pub scale: f32,
+    /// Per-tensor / per-row / per-col output scale in the driver (oriented) frame; the dispatch
+    /// layer flips the per-row / per-col axis (`Row` <-> `Col`) on a swap, in lockstep with the
+    /// bias axis (the same user axis)
+    pub scale: ScaleSpec,
     pub zp: i32,
     /// Optional per-row / per-col `i32` bias in the driver (oriented) frame; the dispatch
     /// layer flips the axis (`Row` <-> `Col`) on a swap
@@ -437,13 +571,21 @@ impl<O: QuantOut, Fam: KernelFamily<Acc = i32, Out = O>> Epilogue<Fam> for KRequ
             BiasSpec::Row(p) => unsafe { *p.0.add(r) },
             BiasSpec::Col(p) => unsafe { *p.0.add(c) },
         };
+        // Resolve the scale at `(r, c)`: a per-tensor constant, or a per-row / per-col lookup.
+        // `ScaleSpec::Tensor(s)` and `ScaleSpec::Row(p)` therefore feed the identical `f64`
+        // arithmetic below (only the lookup differs), so they are bitwise-equal
+        let scale = match self.scale {
+            ScaleSpec::Tensor(s) => s,
+            ScaleSpec::Row(p) => unsafe { *p.0.add(r) },
+            ScaleSpec::Col(p) => unsafe { *p.0.add(c) },
+        };
         // `i32` and `f32` are exactly representable in `f64`, so this is 1 rounding step
         // total. `zp` joins in integer (round-half-to-even is not shift-invariant, so it
         // must not be folded into the pre-round expression). The `f64 -> i64` cast
         // saturates, and `saturating_add`/`clamp` keep the whole map panic-free and
         // bit-exact across every ISA. `O::LO`/`O::HI` select the output band (`i8` or `u8`);
         // `from_clamped` then reinterprets the already-clamped low byte
-        let scaled = round_ne_f64(f64::from(v.wrapping_add(b)) * f64::from(self.scale));
+        let scaled = round_ne_f64(f64::from(v.wrapping_add(b)) * f64::from(scale));
         let q = (scaled as i64).saturating_add(i64::from(self.zp));
         O::from_clamped(q.clamp(i64::from(O::LO), i64::from(O::HI)))
     }
@@ -454,6 +596,18 @@ impl<O: QuantOut, Fam: KernelFamily<Acc = i32, Out = O>> Epilogue<Fam> for KRequ
         S: KernelSimd<Fam::Lhs, Fam::Rhs, i32, O>,
     {
         unsafe {
+            // A per-row scale varies per lane, so the single-`f64`-scale vector store cannot serve
+            // it: fall to a per-lane scalar map straight over the raw accumulators in `src`. Since
+            // it defers to `apply` (which resolves bias and the `Row` scale at `row + l`), it is
+            // trivially bit-identical to the scalar path the caller freely mixes with (the row
+            // tail, strided `C`, `k == 0` fill)
+            if let ScaleSpec::Row(_) = self.scale {
+                let lanes = <S as SimdOps<i32>>::LANES;
+                for l in 0..lanes {
+                    *dst.add(l) = <Self as Epilogue<Fam>>::apply(self, *src.add(l), row + l, col);
+                }
+                return;
+            }
             // `LANES` consecutive-row `i32` accumulators from contiguous scratch
             let v = simd.loadu(src);
             // Bias add in integer: SIMD `i32` add is wrapping (`paddd`), matching `apply`'s
@@ -465,21 +619,23 @@ impl<O: QuantOut, Fam: KernelFamily<Acc = i32, Out = O>> Epilogue<Fam> for KRequ
                 BiasSpec::Row(p) => simd.add(v, simd.loadu(p.0.add(row))),
                 BiasSpec::Col(p) => simd.add(v, simd.splat(*p.0.add(col))),
             };
+            // The scale is constant across this `LANES`-row run: a per-tensor value, or a per-col
+            // value fixed at `col`. Widen it `f32 -> f64` exactly and take the single-scale vector
+            // store, keeping the fast path for the common swapped (row-major C) `Col` orientation
+            let scale = match self.scale {
+                ScaleSpec::Tensor(s) => f64::from(s),
+                ScaleSpec::Col(p) => f64::from(*p.0.add(col)),
+                // `Row` handled by the per-lane branch above
+                ScaleSpec::Row(_) => unreachable!("per-row scale takes the per-lane path"),
+            };
             // The vector `f64` map, bit-identical to `apply` (the `requant_store` contract):
-            // scale widens `f32 -> f64` exactly; `O::LO`/`O::HI` are the output clamp band
+            // `O::LO`/`O::HI` are the output clamp band
             //
             // The `*mut O -> *mut i8` cast is sound and value-correct: `requant_store` writes the
             // low byte of each pre-clamped lane, and for any `x` in `[-128, 255]` the bytes of
             // `(x as i8)` and `(x as u8)` are identical, so the byte written equals the scalar
             // `O::from_clamped` result whether `O = i8` or `O = u8`
-            simd.requant_store(
-                dst as *mut i8,
-                v,
-                f64::from(self.scale),
-                self.zp,
-                O::LO,
-                O::HI,
-            );
+            simd.requant_store(dst as *mut i8, v, scale, self.zp, O::LO, O::HI);
         }
     }
 }

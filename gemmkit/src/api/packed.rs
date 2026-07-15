@@ -1,6 +1,10 @@
 //! Prepacked-operand (`PackedLhs`/`PackedRhs`) entries
 use super::*;
+#[cfg(feature = "epilogue")]
+use crate::dispatch::FusedScalar;
 use crate::dispatch::PackedConsume;
+#[cfg(feature = "epilogue")]
+use crate::kernel::epilogue::{BiasDim, BiasSpec, FusedEpi};
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -309,6 +313,280 @@ pub unsafe fn gemm_packed_b_unchecked_with<T: GemmScalar>(
     }
 }
 
+/// `C <- act(alpha*A*(prepacked B) + beta*C + bias)` in 1 pass: a **fused** epilogue over a reused
+/// [`PackedRhs`], via the thread-local workspace pool. The fused twin of [`gemm_packed_b`]: the
+/// bias is added by 1 IEEE add after the final `beta`-fold, then the activation is applied, fused
+/// into the store the packed kernel already runs. `bias == None && act == None` reproduces
+/// [`gemm_packed_b`] bit-for-bit
+///
+/// The **same** [`PackedRhs`] handle serves both [`gemm_packed_b`] and this fused entry: the
+/// epilogue is store-side only, so the pack (and its recorded geometry) is untouched. For
+/// `f32`/`f64` the result is **bit-identical** to [`gemm_packed_b`] followed by the same scalar map,
+/// for every valid shape/stride; for `f16`/`bf16` the epilogue applies in `f32` before the single
+/// narrowing (more precise than, so not bitwise-equal to, packed-gemm-then-map). Unlike plain
+/// [`gemm_fused`], the packed path is **not** rerouted to gemv / small-`m,n` / small-`k`: it always
+/// drives the general prepacked kernel (the special-path divergence the plain packed entries
+/// document), and it never orientation-swaps, so the user-frame per-row / per-col bias passes
+/// straight through
+///
+/// # Panics
+/// Same conditions as [`gemm_packed_b`], plus the fused conditions of [`gemm_fused`]: a `PerRow`
+/// bias whose length is not `A.rows` (or a `PerCol` bias not `B.cols`); a bias slice overlapping
+/// `C`; or a non-finite `LeakyRelu` slope
+#[cfg(feature = "epilogue")]
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_packed_b_fused<T: FusedScalar>(
+    alpha: T,
+    a: MatRef<'_, T>,
+    packed: &PackedRhs<T>,
+    beta: T,
+    c: MatMut<'_, T>,
+    bias: Option<Bias<'_, T>>,
+    act: Option<Activation<T>>,
+    par: Parallelism,
+) {
+    workspace::with_thread_pool(|ws| {
+        gemm_packed_b_fused_with(ws, alpha, a, packed, beta, c, bias, act, par)
+    });
+}
+
+/// Like [`gemm_packed_b_fused`] but reuses a caller-owned [`Workspace`]
+///
+/// # Panics
+/// Same conditions as [`gemm_packed_b_fused`]
+#[cfg(feature = "epilogue")]
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_packed_b_fused_with<T: FusedScalar>(
+    ws: &mut Workspace,
+    alpha: T,
+    a: MatRef<'_, T>,
+    packed: &PackedRhs<T>,
+    beta: T,
+    c: MatMut<'_, T>,
+    bias: Option<Bias<'_, T>>,
+    act: Option<Activation<T>>,
+    par: Parallelism,
+) {
+    // The exact validation `gemm_packed_b_with` runs (byte-identical messages)
+    assert_eq!(
+        a.cols, packed.k,
+        "gemmkit: A.cols ({}) != packed B.rows ({})",
+        a.cols, packed.k
+    );
+    assert_eq!(
+        packed.n, c.cols,
+        "gemmkit: packed B.cols ({}) != C.cols ({})",
+        packed.n, c.cols
+    );
+    assert_eq!(
+        a.rows, c.rows,
+        "gemmkit: A.rows ({}) != C.rows ({})",
+        a.rows, c.rows
+    );
+
+    check_view(a.data, a.rows, a.cols, a.rs, a.cs, "A");
+    check_view(c.data, c.rows, c.cols, c.rs, c.cs, "C");
+
+    if self_aliases(c.rows, c.cols, c.rs, c.cs) {
+        panic!(
+            "gemmkit: C view aliases itself (strides {},{} map distinct elements to the same \
+             memory); C must address each (i,j) uniquely",
+            c.rs, c.cs
+        );
+    }
+
+    let cp = c.data.as_ptr();
+    let cl = c.data.len();
+    if overlaps(cp, cl, a.data.as_ptr(), a.data.len()) {
+        panic!("gemmkit: C aliases A");
+    }
+
+    // Fused-epilogue validation (shared wording with `gemm_fused`): the bias length matches its
+    // axis (PerRow == A.rows, PerCol == packed B.cols == C.cols) and does not overlap C; a
+    // LeakyRelu slope is finite. The packed path never swaps, so the user-frame bias is passed
+    // straight through (no axis flip)
+    validate_bias(&bias, a.rows, packed.n, &c);
+    if let Some(Activation::LeakyRelu(s)) = &act {
+        assert!(T::finite(*s), "gemmkit: LeakyRelu slope must be finite");
+    }
+
+    let epi = to_fused_epi(bias, act);
+
+    // SAFETY: validated above; A/C strides are in bounds, C addresses each (i,j) uniquely and does
+    // not alias A, the prepacked B is a separate owned buffer, and the bias (borrowed for this
+    // call) is the right length for its axis and disjoint from C. The bias pointer stays valid for
+    // the whole `execute_packed_fused` frame
+    unsafe {
+        packed_b_fused_impl(
+            Some(ws),
+            alpha,
+            a.rows,
+            a.data.as_ptr(),
+            a.rs,
+            a.cs,
+            packed,
+            beta,
+            c.data.as_mut_ptr(),
+            c.rs,
+            c.cs,
+            epi,
+            par,
+        );
+    }
+}
+
+/// As [`gemm_packed_b_fused`] but over raw `A`/`C` pointers + strides, with **no** bounds/alias
+/// checks. `bias` is a `(ptr, dim)` pair enabled by `has_bias` (ignored when `has_bias == false`),
+/// in the user frame (the packed path never swaps, so no axis flip); `act` is applied last. Uses
+/// the thread-local workspace pool
+///
+/// # Safety
+/// As [`gemm_packed_b_unchecked`], plus: when `has_bias`, `bias` is valid for reads of `m`
+/// (`PerRow`) or `packed.cols()` (`PerCol`) elements and does not alias `c`; and a non-finite
+/// `LeakyRelu` slope is the caller's responsibility (the checked API rejects it)
+///
+/// # Panics
+/// As [`gemm_packed_b_unchecked`] (a non-column-major-ish C)
+#[cfg(feature = "epilogue")]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gemm_packed_b_fused_unchecked<T: FusedScalar>(
+    alpha: T,
+    m: usize,
+    a: *const T,
+    rsa: isize,
+    csa: isize,
+    packed: &PackedRhs<T>,
+    beta: T,
+    c: *mut T,
+    rsc: isize,
+    csc: isize,
+    bias: *const T,
+    bias_dim: BiasDim,
+    has_bias: bool,
+    act: Option<Activation<T>>,
+    par: Parallelism,
+) {
+    let epi = to_fused_epi_raw(bias, bias_dim, has_bias, act);
+    // SAFETY: preconditions forwarded to the caller (see # Safety)
+    unsafe {
+        packed_b_fused_impl(
+            None, alpha, m, a, rsa, csa, packed, beta, c, rsc, csc, epi, par,
+        );
+    }
+}
+
+/// As [`gemm_packed_b_fused_unchecked`] but with a caller-owned [`Workspace`]
+///
+/// # Safety
+/// See [`gemm_packed_b_fused_unchecked`]
+///
+/// # Panics
+/// See [`gemm_packed_b_fused_unchecked`]
+#[cfg(feature = "epilogue")]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gemm_packed_b_fused_unchecked_with<T: FusedScalar>(
+    ws: &mut Workspace,
+    alpha: T,
+    m: usize,
+    a: *const T,
+    rsa: isize,
+    csa: isize,
+    packed: &PackedRhs<T>,
+    beta: T,
+    c: *mut T,
+    rsc: isize,
+    csc: isize,
+    bias: *const T,
+    bias_dim: BiasDim,
+    has_bias: bool,
+    act: Option<Activation<T>>,
+    par: Parallelism,
+) {
+    let epi = to_fused_epi_raw(bias, bias_dim, has_bias, act);
+    // SAFETY: preconditions forwarded to the caller (see # Safety)
+    unsafe {
+        packed_b_fused_impl(
+            Some(ws),
+            alpha,
+            m,
+            a,
+            rsa,
+            csa,
+            packed,
+            beta,
+            c,
+            rsc,
+            csc,
+            epi,
+            par,
+        );
+    }
+}
+
+/// Shared lowering for the 4 fused B-packed entries: assert the packed-B orientation (the
+/// byte-identical panic `gemm_packed_b_unchecked_with` raises), build the [`PackedConsume`], and
+/// dispatch the prepacked-fused engine over either a caller-owned [`Workspace`] (`ws = Some`) or the
+/// thread-local pool (`ws = None`). The bias/activation are already lowered into `epi`. The packed-B
+/// consume frame is the user frame (no swap), so `epi` is passed through unflipped
+///
+/// # Safety
+/// As [`gemm_packed_b_fused_unchecked`]: `a` valid for reads and `c` for read+write over the shape /
+/// strides, `c` not aliasing `a`, and `epi`'s bias (if any) valid for `m`/`packed.cols()` reads and
+/// disjoint from `c`
+#[cfg(feature = "epilogue")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn packed_b_fused_impl<T: FusedScalar>(
+    ws: Option<&mut Workspace>,
+    alpha: T,
+    m: usize,
+    a: *const T,
+    rsa: isize,
+    csa: isize,
+    packed: &PackedRhs<T>,
+    beta: T,
+    c: *mut T,
+    rsc: isize,
+    csc: isize,
+    epi: FusedEpi<T>,
+    par: Parallelism,
+) {
+    // A prepacked B is only valid for the no-swap orientation (same assert + message as
+    // `gemm_packed_b_unchecked_with`)
+    assert!(
+        csc.unsigned_abs() >= rsc.unsigned_abs(),
+        "gemmkit: gemm_packed_b requires column-major-ish C (|csc| >= |rsc|); a row-major C \
+         would swap A/B and invalidate the prepacked RHS — use gemm() for that layout"
+    );
+    let req = PackedConsume {
+        m,
+        k: packed.k,
+        n: packed.n,
+        alpha,
+        a,
+        rsa,
+        csa,
+        packed: packed.buf.as_ptr(),
+        nr: packed.nr,
+        kc: packed.kc,
+        nc: packed.nc,
+        beta,
+        c,
+        rsc,
+        csc,
+    };
+    // SAFETY: caller guarantees A/C validity and that C does not alias A; the packed buffer (owned
+    // by `packed`, read-only) outlives the call and matches its recorded geometry; `epi`'s bias is
+    // valid and disjoint from C (see # Safety)
+    unsafe {
+        match ws {
+            Some(ws) => dispatch::execute_packed_fused(req, epi, par, ws),
+            None => {
+                workspace::with_thread_pool(|ws| dispatch::execute_packed_fused(req, epi, par, ws))
+            }
+        }
+    }
+}
+
 /// A left-hand-side matrix pre-packed once into gemmkit's internal
 /// micropanel-major layout, for reuse across many products that share the same
 /// `A` (a fixed weight matrix `A` against a stream of differently-shaped right
@@ -572,5 +850,294 @@ pub unsafe fn gemm_packed_a_unchecked_with<T: GemmScalar>(
             par,
             ws,
         );
+    }
+}
+
+/// `C <- act(alpha*(prepacked A)*B + beta*C + bias)` in 1 pass: a **fused** epilogue over a reused
+/// [`PackedLhs`], via the thread-local workspace pool. The fused twin of [`gemm_packed_a`]: the bias
+/// is added by 1 IEEE add after the final `beta`-fold, then the activation is applied, fused into
+/// the store the packed kernel already runs. `bias == None && act == None` reproduces
+/// [`gemm_packed_a`] bit-for-bit
+///
+/// The **same** [`PackedLhs`] handle serves both [`gemm_packed_a`] and this fused entry: the
+/// epilogue is store-side only, so the pack is untouched. For `f32`/`f64` the result is
+/// **bit-identical** to [`gemm_packed_a`] followed by the same scalar map, for every valid
+/// shape/stride; for `f16`/`bf16` the epilogue applies in `f32` before the single narrowing (more
+/// precise than, so not bitwise-equal to, packed-gemm-then-map). Like [`gemm_packed_b_fused`] the
+/// packed path is **not** rerouted to a special path (always the general prepacked kernel) and the
+/// per-row / per-col bias is specified in the **user** frame (a `PerRow` bias of length `A.rows`,
+/// added to every column of that row): the engine's internal transpose of the packed-A product is
+/// handled inside, so the user never sees an axis flip
+///
+/// # Panics
+/// Same conditions as [`gemm_packed_a`], plus the fused conditions of [`gemm_fused`]: a `PerRow`
+/// bias whose length is not `A.rows` (or a `PerCol` bias not `B.cols`); a bias slice overlapping
+/// `C`; or a non-finite `LeakyRelu` slope
+#[cfg(feature = "epilogue")]
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_packed_a_fused<T: FusedScalar>(
+    alpha: T,
+    packed: &PackedLhs<T>,
+    b: MatRef<'_, T>,
+    beta: T,
+    c: MatMut<'_, T>,
+    bias: Option<Bias<'_, T>>,
+    act: Option<Activation<T>>,
+    par: Parallelism,
+) {
+    workspace::with_thread_pool(|ws| {
+        gemm_packed_a_fused_with(ws, alpha, packed, b, beta, c, bias, act, par)
+    });
+}
+
+/// Like [`gemm_packed_a_fused`] but reuses a caller-owned [`Workspace`]
+///
+/// # Panics
+/// Same conditions as [`gemm_packed_a_fused`]
+#[cfg(feature = "epilogue")]
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_packed_a_fused_with<T: FusedScalar>(
+    ws: &mut Workspace,
+    alpha: T,
+    packed: &PackedLhs<T>,
+    b: MatRef<'_, T>,
+    beta: T,
+    c: MatMut<'_, T>,
+    bias: Option<Bias<'_, T>>,
+    act: Option<Activation<T>>,
+    par: Parallelism,
+) {
+    // The exact validation `gemm_packed_a_with` runs (byte-identical messages)
+    assert_eq!(
+        packed.k, b.rows,
+        "gemmkit: packed A.cols ({}) != B.rows ({})",
+        packed.k, b.rows
+    );
+    assert_eq!(
+        packed.m, c.rows,
+        "gemmkit: packed A.rows ({}) != C.rows ({})",
+        packed.m, c.rows
+    );
+    assert_eq!(
+        b.cols, c.cols,
+        "gemmkit: B.cols ({}) != C.cols ({})",
+        b.cols, c.cols
+    );
+
+    check_view(b.data, b.rows, b.cols, b.rs, b.cs, "B");
+    check_view(c.data, c.rows, c.cols, c.rs, c.cs, "C");
+
+    if self_aliases(c.rows, c.cols, c.rs, c.cs) {
+        panic!(
+            "gemmkit: C view aliases itself (strides {},{} map distinct elements to the same \
+             memory); C must address each (i,j) uniquely",
+            c.rs, c.cs
+        );
+    }
+
+    let cp = c.data.as_ptr();
+    let cl = c.data.len();
+    if overlaps(cp, cl, b.data.as_ptr(), b.data.len()) {
+        panic!("gemmkit: C aliases B");
+    }
+
+    // Fused-epilogue validation (shared wording with `gemm_fused`): the bias length matches its
+    // USER axis (PerRow == packed A.rows == C.rows, PerCol == B.cols) and does not overlap C; a
+    // LeakyRelu slope is finite. The bias stays in the user frame here; `packed_a_fused_impl` flips
+    // the axis to match the transposed consume the packed-A path drives
+    validate_bias(&bias, packed.m, b.cols, &c);
+    if let Some(Activation::LeakyRelu(s)) = &act {
+        assert!(T::finite(*s), "gemmkit: LeakyRelu slope must be finite");
+    }
+
+    let epi = to_fused_epi(bias, act);
+
+    // SAFETY: validated above; B/C strides are in bounds, C addresses each (i,j) uniquely and does
+    // not alias B, the prepacked A is a separate owned buffer, and the bias (borrowed for this
+    // call) is the right length for its axis and disjoint from C. The bias pointer stays valid for
+    // the whole `execute_packed_fused` frame
+    unsafe {
+        packed_a_fused_impl(
+            Some(ws),
+            alpha,
+            packed,
+            b.cols,
+            b.data.as_ptr(),
+            b.rs,
+            b.cs,
+            beta,
+            c.data.as_mut_ptr(),
+            c.rs,
+            c.cs,
+            epi,
+            par,
+        );
+    }
+}
+
+/// As [`gemm_packed_a_fused`] but over raw `B`/`C` pointers + strides, with **no** bounds/alias
+/// checks. `bias` is a `(ptr, dim)` pair enabled by `has_bias` (ignored when `has_bias == false`),
+/// in the **user** frame (a `PerRow` bias indexes `A.rows` = `C.rows`); `act` is applied last. Uses
+/// the thread-local workspace pool
+///
+/// # Safety
+/// As [`gemm_packed_a_unchecked`], plus: when `has_bias`, `bias` is valid for reads of
+/// `packed.rows()` (`PerRow`) or `n` (`PerCol`) elements and does not alias `c`; and a non-finite
+/// `LeakyRelu` slope is the caller's responsibility (the checked API rejects it)
+///
+/// # Panics
+/// As [`gemm_packed_a_unchecked`] (a non-row-major-ish C)
+#[cfg(feature = "epilogue")]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gemm_packed_a_fused_unchecked<T: FusedScalar>(
+    alpha: T,
+    packed: &PackedLhs<T>,
+    n: usize,
+    b: *const T,
+    rsb: isize,
+    csb: isize,
+    beta: T,
+    c: *mut T,
+    rsc: isize,
+    csc: isize,
+    bias: *const T,
+    bias_dim: BiasDim,
+    has_bias: bool,
+    act: Option<Activation<T>>,
+    par: Parallelism,
+) {
+    let epi = to_fused_epi_raw(bias, bias_dim, has_bias, act);
+    // SAFETY: preconditions forwarded to the caller (see # Safety)
+    unsafe {
+        packed_a_fused_impl(
+            None, alpha, packed, n, b, rsb, csb, beta, c, rsc, csc, epi, par,
+        );
+    }
+}
+
+/// As [`gemm_packed_a_fused_unchecked`] but with a caller-owned [`Workspace`]
+///
+/// # Safety
+/// See [`gemm_packed_a_fused_unchecked`]
+///
+/// # Panics
+/// See [`gemm_packed_a_fused_unchecked`]
+#[cfg(feature = "epilogue")]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gemm_packed_a_fused_unchecked_with<T: FusedScalar>(
+    ws: &mut Workspace,
+    alpha: T,
+    packed: &PackedLhs<T>,
+    n: usize,
+    b: *const T,
+    rsb: isize,
+    csb: isize,
+    beta: T,
+    c: *mut T,
+    rsc: isize,
+    csc: isize,
+    bias: *const T,
+    bias_dim: BiasDim,
+    has_bias: bool,
+    act: Option<Activation<T>>,
+    par: Parallelism,
+) {
+    let epi = to_fused_epi_raw(bias, bias_dim, has_bias, act);
+    // SAFETY: preconditions forwarded to the caller (see # Safety)
+    unsafe {
+        packed_a_fused_impl(
+            Some(ws),
+            alpha,
+            packed,
+            n,
+            b,
+            rsb,
+            csb,
+            beta,
+            c,
+            rsc,
+            csc,
+            epi,
+            par,
+        );
+    }
+}
+
+/// Shared lowering for the 4 fused A-packed entries: assert the packed-A orientation (the
+/// byte-identical panic `gemm_packed_a_unchecked_with` raises), **flip the user-frame bias axis**
+/// to the transposed consume frame the packed-A path drives, build the transposed [`PackedConsume`]
+/// (exactly as `gemm_packed_a_unchecked_with` does), and dispatch the prepacked-fused engine over
+/// either a caller-owned [`Workspace`] (`ws = Some`) or the thread-local pool (`ws = None`)
+///
+/// By the engine's A/B symmetry the packed-A product is driven as the transposed problem
+/// `C^T = B^T*A^T` (m<->n swapped in the consume frame), so a user per-row bias (indexed by the user
+/// output row) becomes per-col in the consume frame and vice versa: the same field-write flip
+/// `run_typed_fused` applies on a dynamic orientation swap, here baked into the always-transposed
+/// packed-A path so the user bias axis is honoured
+///
+/// # Safety
+/// As [`gemm_packed_a_fused_unchecked`]: `b` valid for reads and `c` for read+write over the shape /
+/// strides, `c` not aliasing `b`, and `epi`'s bias (if any) valid for `packed.rows()`/`n` reads and
+/// disjoint from `c`
+#[cfg(feature = "epilogue")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn packed_a_fused_impl<T: FusedScalar>(
+    ws: Option<&mut Workspace>,
+    alpha: T,
+    packed: &PackedLhs<T>,
+    n: usize,
+    b: *const T,
+    rsb: isize,
+    csb: isize,
+    beta: T,
+    c: *mut T,
+    rsc: isize,
+    csc: isize,
+    mut epi: FusedEpi<T>,
+    par: Parallelism,
+) {
+    // A prepacked A is only valid for the row-major-ish orientation (same assert + message as
+    // `gemm_packed_a_unchecked_with`)
+    assert!(
+        csc.unsigned_abs() <= rsc.unsigned_abs(),
+        "gemmkit: gemm_packed_a requires row-major-ish C (|csc| <= |rsc|); a column-major C \
+         would keep A in the LHS role and invalidate the prepacked LHS — use gemm() for that layout"
+    );
+    // The packed-A path drives the transposed product, so the user bias axis flips to the consume
+    // (oriented) frame: user per-row -> per-col and vice versa. `execute_packed_fused` (compute and
+    // degenerate) then applies `epi` in that consume frame, which maps back to the user axis
+    epi.bias = match epi.bias {
+        BiasSpec::None => BiasSpec::None,
+        BiasSpec::Row(p) => BiasSpec::Col(p),
+        BiasSpec::Col(p) => BiasSpec::Row(p),
+    };
+    // The transposed consume `gemm_packed_a_unchecked_with` builds (m<->n, A=B, strides swapped)
+    let req = PackedConsume {
+        m: n,
+        k: packed.k,
+        n: packed.m,
+        alpha,
+        a: b,
+        rsa: csb,
+        csa: rsb,
+        packed: packed.buf.as_ptr(),
+        nr: packed.nr,
+        kc: packed.kc,
+        nc: packed.nc,
+        beta,
+        c,
+        rsc: csc,
+        csc: rsc,
+    };
+    // SAFETY: caller guarantees B/C validity and that C does not alias B; the packed buffer (owned
+    // by `packed`, read-only) outlives the call and matches its recorded geometry; `epi`'s bias is
+    // valid and disjoint from C (see # Safety)
+    unsafe {
+        match ws {
+            Some(ws) => dispatch::execute_packed_fused(req, epi, par, ws),
+            None => {
+                workspace::with_thread_pool(|ws| dispatch::execute_packed_fused(req, epi, par, ws))
+            }
+        }
     }
 }

@@ -470,12 +470,49 @@ fn fused_matches_plain_then_map() {
     }
 }
 
+/// `gemm_map` (and its `_with` twin) is **bit-identical** to plain `gemm` followed by the same
+/// per-element closure. The closure is asymmetric in `(r, c)` and captures a lookup table by
+/// reference, exercising the user-frame coordinates and environment capture through the adapter
+#[cfg(feature = "epilogue")]
+#[test]
+fn map_matches_plain_then_map() {
+    use gemmkit::Workspace;
+    use gemmkit_nalgebra::{gemm_map, gemm_map_with};
+    let (m, k, n) = (12usize, 9, 7);
+    let a = rand2(m, k, 111);
+    let b = rand2(k, n, 112);
+    let c0 = rand2(m, n, 113);
+    let lut: Vec<f64> = (0..5).map(|i| 0.5 + 0.3 * i as f64).collect();
+    let (alpha, beta) = (1.3f64, -0.7);
+    let f = |v: f64, r: usize, c: usize| v.mul_add(lut[r % lut.len()], r as f64 - 0.25 * c as f64);
+    for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
+        let mut c_map = c0.clone();
+        gemm_map(alpha, &a, &b, beta, &mut c_map, &f, par);
+        let mut c_with = c0.clone();
+        let mut ws = Workspace::new();
+        gemm_map_with(&mut ws, alpha, &a, &b, beta, &mut c_with, &f, par);
+        let mut c_ref = c0.clone();
+        gemm(alpha, &a, &b, beta, &mut c_ref, par);
+        for i in 0..m {
+            for j in 0..n {
+                let want = f(c_ref[(i, j)], i, j);
+                assert_eq!(c_map[(i, j)].to_bits(), want.to_bits(), "map ({i},{j})");
+                assert_eq!(
+                    c_with[(i, j)].to_bits(),
+                    want.to_bits(),
+                    "map_with ({i},{j})"
+                );
+            }
+        }
+    }
+}
+
 /// `gemm_i8_requant` / `gemm_i8_requant_u8` are **bit-exact** against an independent scalar model
 /// (round-half-to-even, clamp) applied to the exact `i32` accumulator from `dot_i8`
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 #[test]
 fn requant_matches_scalar_model() {
-    use gemmkit_nalgebra::{Requantize, dot_i8, gemm_i8_requant, gemm_i8_requant_u8};
+    use gemmkit_nalgebra::{RequantScale, Requantize, dot_i8, gemm_i8_requant, gemm_i8_requant_u8};
 
     let randi8 = |r: usize, c: usize, seed: u64| -> DMatrix<i8> {
         let mut s = seed | 1;
@@ -501,11 +538,13 @@ fn requant_matches_scalar_model() {
     let acc = dot_i8(&a, &b);
     let bias: Vec<i32> = (0..m).map(|i| 40 * i as i32 - 200).collect();
     let (scale, zp_i8, zp_u8) = (0.05f32, -7i32, 30i32);
+    // per-row (per-channel) scales, all finite and > 0
+    let scales: Vec<f32> = (0..m).map(|i| 0.01 * (1 + i % 5) as f32).collect();
 
     for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
         let mut c = DMatrix::from_element(m, n, 0i8);
         let req = Requantize {
-            scale,
+            scale: RequantScale::PerTensor(scale),
             zero_point: zp_i8,
             bias: Some(&bias),
         };
@@ -521,7 +560,7 @@ fn requant_matches_scalar_model() {
         }
         let mut cu = DMatrix::from_element(m, n, 0u8);
         let requ = Requantize {
-            scale,
+            scale: RequantScale::PerTensor(scale),
             zero_point: zp_u8,
             bias: None,
         };
@@ -532,6 +571,45 @@ fn requant_matches_scalar_model() {
                     cu[(i, j)],
                     ref_u8(acc[(i, j)], 0, scale, zp_u8),
                     "requant u8 ({i},{j})"
+                );
+            }
+        }
+        // per-row scales vs the same model with `scales[i]` (i8 with bias, u8 without)
+        let mut cr = DMatrix::from_element(m, n, 0i8);
+        gemm_i8_requant(
+            &a,
+            &b,
+            Requantize {
+                scale: RequantScale::PerRow(&scales),
+                zero_point: zp_i8,
+                bias: Some(&bias),
+            },
+            &mut cr,
+            par,
+        );
+        let mut cru = DMatrix::from_element(m, n, 0u8);
+        gemm_i8_requant_u8(
+            &a,
+            &b,
+            Requantize {
+                scale: RequantScale::PerRow(&scales),
+                zero_point: zp_u8,
+                bias: None,
+            },
+            &mut cru,
+            par,
+        );
+        for i in 0..m {
+            for j in 0..n {
+                assert_eq!(
+                    cr[(i, j)],
+                    ref_i8(acc[(i, j)], bias[i], scales[i], zp_i8),
+                    "requant per-row i8 ({i},{j})"
+                );
+                assert_eq!(
+                    cru[(i, j)],
+                    ref_u8(acc[(i, j)], 0, scales[i], zp_u8),
+                    "requant per-row u8 ({i},{j})"
                 );
             }
         }
@@ -599,6 +677,123 @@ fn cplx_fused_matches_gemm_cplx_then_add() {
                     c_fused[(i, j)].im.to_bits(),
                     want.im.to_bits(),
                     "cplx_fused im conj=({conj_a},{conj_b}) ({i},{j})"
+                );
+            }
+        }
+    }
+}
+
+/// `gemm_packed_b_fused` (a `PerRow` bias + `ReLU`) is **bit-identical** to plain `gemm_packed_b`
+/// off the same handle then the same scalar map, into a column-major C. Also covers the `_with` twin
+#[cfg(feature = "epilogue")]
+#[test]
+fn packed_b_fused_matches_packed_then_map() {
+    use gemmkit::Workspace;
+    use gemmkit_nalgebra::{
+        Activation, Bias, gemm_packed_b, gemm_packed_b_fused, gemm_packed_b_fused_with, prepack_rhs,
+    };
+    let (m, k, n) = (100usize, 64, 80);
+    let a = rand2(m, k, 251);
+    let b = rand2(k, n, 252);
+    let c0 = rand2(m, n, 253); // column-major (DMatrix default = packed_b orientation)
+    let bias: Vec<f64> = (0..m).map(|i| 0.5 * i as f64 - 2.0).collect();
+    let (alpha, beta) = (1.3f64, -0.7);
+    let packed = prepack_rhs(&b);
+    for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
+        let mut c_fused = c0.clone();
+        gemm_packed_b_fused(
+            alpha,
+            &a,
+            &packed,
+            beta,
+            &mut c_fused,
+            Some(Bias::PerRow(&bias)),
+            Some(Activation::Relu),
+            par,
+        );
+        let mut c_with = c0.clone();
+        let mut ws = Workspace::new();
+        gemm_packed_b_fused_with(
+            &mut ws,
+            alpha,
+            &a,
+            &packed,
+            beta,
+            &mut c_with,
+            Some(Bias::PerRow(&bias)),
+            Some(Activation::Relu),
+            par,
+        );
+        let mut c_ref = c0.clone();
+        gemm_packed_b(alpha, &a, &packed, beta, &mut c_ref, par);
+        for i in 0..m {
+            for j in 0..n {
+                let v = c_ref[(i, j)] + bias[i];
+                let want = if v > 0.0 { v } else { 0.0 };
+                assert_eq!(
+                    c_fused[(i, j)].to_bits(),
+                    want.to_bits(),
+                    "b_fused ({i},{j})"
+                );
+                assert_eq!(
+                    c_with[(i, j)].to_bits(),
+                    want.to_bits(),
+                    "b_fused_with ({i},{j})"
+                );
+            }
+        }
+    }
+}
+
+/// `gemm_packed_a_fused` (a `PerRow` bias + `ReLU`) is **bit-identical** to plain `gemm_packed_a`
+/// off the same handle then the same scalar map, into a row-major C (the packed_a orientation)
+#[cfg(feature = "epilogue")]
+#[test]
+fn packed_a_fused_matches_packed_then_map() {
+    use gemmkit_nalgebra::{Activation, Bias, gemm_packed_a, gemm_packed_a_fused, prepack_lhs};
+    use nalgebra::DMatrixViewMut;
+    let (m, k, n) = (96usize, 50, 72);
+    let a = rand2(m, k, 261);
+    let b = rand2(k, n, 262);
+    let c0 = rand2(m, n, 263);
+    // row-major base data (element (i,j) at i*n + j)
+    let mut base = vec![0.0f64; m * n];
+    for i in 0..m {
+        for j in 0..n {
+            base[i * n + j] = c0[(i, j)];
+        }
+    }
+    let bias: Vec<f64> = (0..m).map(|i| 0.3 * i as f64 - 1.5).collect();
+    let (alpha, beta) = (0.9f64, 0.7);
+    let packed = prepack_lhs(&a);
+    for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
+        let mut data_f = base.clone();
+        {
+            let mut c = DMatrixViewMut::from_slice_with_strides_mut(&mut data_f, m, n, n, 1);
+            gemm_packed_a_fused(
+                alpha,
+                &packed,
+                &b,
+                beta,
+                &mut c,
+                Some(Bias::PerRow(&bias)),
+                Some(Activation::Relu),
+                par,
+            );
+        }
+        let mut data_r = base.clone();
+        {
+            let mut c = DMatrixViewMut::from_slice_with_strides_mut(&mut data_r, m, n, n, 1);
+            gemm_packed_a(alpha, &packed, &b, beta, &mut c, par);
+        }
+        for i in 0..m {
+            for j in 0..n {
+                let v = data_r[i * n + j] + bias[i];
+                let want = if v > 0.0 { v } else { 0.0 };
+                assert_eq!(
+                    data_f[i * n + j].to_bits(),
+                    want.to_bits(),
+                    "a_fused ({i},{j})"
                 );
             }
         }

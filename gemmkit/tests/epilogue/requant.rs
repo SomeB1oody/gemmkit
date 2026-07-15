@@ -4,7 +4,8 @@
 
 use crate::common::Rng;
 use gemmkit::{
-    MatMut, MatRef, Parallelism, Requantize, gemm_i8, gemm_i8_requant, gemm_i8_requant_u8,
+    MatMut, MatRef, Parallelism, RequantScale, Requantize, gemm_i8, gemm_i8_requant,
+    gemm_i8_requant_u8,
 };
 
 /// The reference requantize map. The rounding uses the std `round_ties_even` (an
@@ -68,7 +69,7 @@ fn check_requant(
         let br = MatRef::new(&b, k, n, 1, k as isize);
         let cm = MatMut::new(&mut c, m, n, rsc, csc);
         let req = Requantize {
-            scale,
+            scale: RequantScale::PerTensor(scale),
             zero_point: zp,
             bias: if has_bias { Some(&bias) } else { None },
         };
@@ -133,7 +134,7 @@ fn requant_unchecked_matches_checked() {
         let br = MatRef::new(&b, k, n, 1, k as isize);
         let cm = MatMut::new(&mut c_checked, m, n, rsc, csc);
         let req = Requantize {
-            scale,
+            scale: RequantScale::PerTensor(scale),
             zero_point: zp,
             bias: Some(&bias),
         };
@@ -155,6 +156,8 @@ fn requant_unchecked_matches_checked() {
             1,
             k as isize,
             scale,
+            core::ptr::null(),
+            false,
             zp,
             bias.as_ptr(),
             true,
@@ -195,7 +198,7 @@ fn requant_unchecked_with_matches_checked() {
         let br = MatRef::new(&b, k, n, 1, k as isize);
         let cm = MatMut::new(&mut c_checked, m, n, rsc, csc);
         let req = Requantize {
-            scale,
+            scale: RequantScale::PerTensor(scale),
             zero_point: zp,
             bias: Some(&bias),
         };
@@ -219,6 +222,8 @@ fn requant_unchecked_with_matches_checked() {
             1,
             k as isize,
             scale,
+            core::ptr::null(),
+            false,
             zp,
             bias.as_ptr(),
             true,
@@ -249,7 +254,7 @@ fn requant_ties_even_exact() {
         MatRef::from_col_major(&a, 6, 1),
         MatRef::from_col_major(&b, 1, 1),
         Requantize {
-            scale: 0.5,
+            scale: RequantScale::PerTensor(0.5),
             zero_point: 0,
             bias: None,
         },
@@ -345,7 +350,7 @@ fn run_requant(
     let br = MatRef::new(b, k, n, 1, k as isize);
     let cm = MatMut::new(&mut c, m, n, rsc, csc);
     let req = Requantize {
-        scale,
+        scale: RequantScale::PerTensor(scale),
         zero_point: zp,
         bias,
     };
@@ -450,7 +455,7 @@ fn requant_vector_ties() {
             ar,
             br,
             Requantize {
-                scale,
+                scale: RequantScale::PerTensor(scale),
                 zero_point: zp,
                 bias: None,
             },
@@ -545,7 +550,7 @@ fn requant_degenerate_k0() {
         let br = MatRef::new(&b, 0, n, 1, 0);
         let cm = MatMut::new(&mut c, m, n, 1, m as isize);
         let req = Requantize {
-            scale,
+            scale: RequantScale::PerTensor(scale),
             zero_point: zp,
             bias: Some(&bias),
         };
@@ -566,7 +571,7 @@ fn requant_bad_scale() {
     let b = vec![0i8; 16];
     let mut c = vec![0i8; 16];
     let req = Requantize {
-        scale: 0.0,
+        scale: RequantScale::PerTensor(0.0),
         zero_point: 0,
         bias: None,
     };
@@ -586,7 +591,7 @@ fn requant_bad_zp() {
     let b = vec![0i8; 16];
     let mut c = vec![0i8; 16];
     let req = Requantize {
-        scale: 1.0,
+        scale: RequantScale::PerTensor(1.0),
         zero_point: 200,
         bias: None,
     };
@@ -607,7 +612,7 @@ fn requant_bad_bias_len() {
     let mut c = vec![0i8; 16];
     let bias = vec![0i32; 3];
     let req = Requantize {
-        scale: 1.0,
+        scale: RequantScale::PerTensor(1.0),
         zero_point: 0,
         bias: Some(&bias),
     };
@@ -655,7 +660,7 @@ fn run_requant_u8(
     let br = MatRef::new(b, k, n, 1, k as isize);
     let cm = MatMut::new(&mut c, m, n, rsc, csc);
     let req = Requantize {
-        scale,
+        scale: RequantScale::PerTensor(scale),
         zero_point: zp,
         bias,
     };
@@ -753,7 +758,7 @@ fn requant_u8_unchecked_matches_checked() {
         let br = MatRef::new(&b, k, n, 1, k as isize);
         let cm = MatMut::new(&mut c_checked, m, n, rsc, csc);
         let req = Requantize {
-            scale,
+            scale: RequantScale::PerTensor(scale),
             zero_point: zp,
             bias: Some(&bias),
         };
@@ -775,6 +780,8 @@ fn requant_u8_unchecked_matches_checked() {
             1,
             k as isize,
             scale,
+            core::ptr::null(),
+            false,
             zp,
             bias.as_ptr(),
             true,
@@ -815,7 +822,7 @@ fn requant_u8_unchecked_with_matches_checked() {
         let br = MatRef::new(&b, k, n, 1, k as isize);
         let cm = MatMut::new(&mut c_checked, m, n, rsc, csc);
         let req = Requantize {
-            scale,
+            scale: RequantScale::PerTensor(scale),
             zero_point: zp,
             bias: Some(&bias),
         };
@@ -839,6 +846,8 @@ fn requant_u8_unchecked_with_matches_checked() {
             1,
             k as isize,
             scale,
+            core::ptr::null(),
+            false,
             zp,
             bias.as_ptr(),
             true,
@@ -866,7 +875,7 @@ fn requant_u8_saturates() {
         MatRef::from_col_major(&a, 8, 1),
         MatRef::from_col_major(&b, 1, 1),
         Requantize {
-            scale: 1000.0,
+            scale: RequantScale::PerTensor(1000.0),
             zero_point: 0,
             bias: None,
         },
@@ -897,7 +906,7 @@ fn requant_u8_ties_even_exact() {
         MatRef::from_col_major(&a, 6, 1),
         MatRef::from_col_major(&b, 1, 1),
         Requantize {
-            scale: 0.5,
+            scale: RequantScale::PerTensor(0.5),
             zero_point: 10,
             bias: None,
         },
@@ -1005,7 +1014,7 @@ fn requant_u8_zero_k_degenerate() {
             let br = MatRef::new(&b, 0, n, 1, 0);
             let cm = MatMut::new(&mut c, m, n, 1, m as isize);
             let req = Requantize {
-                scale,
+                scale: RequantScale::PerTensor(scale),
                 zero_point: zp,
                 bias: bias_opt,
             };
@@ -1032,7 +1041,7 @@ fn requant_u8_bad_zp_high() {
     let b = vec![0i8; 16];
     let mut c = vec![0u8; 16];
     let req = Requantize {
-        scale: 1.0,
+        scale: RequantScale::PerTensor(1.0),
         zero_point: 256,
         bias: None,
     };
@@ -1052,7 +1061,7 @@ fn requant_u8_bad_zp_low() {
     let b = vec![0i8; 16];
     let mut c = vec![0u8; 16];
     let req = Requantize {
-        scale: 1.0,
+        scale: RequantScale::PerTensor(1.0),
         zero_point: -1,
         bias: None,
     };
@@ -1073,7 +1082,7 @@ fn requant_u8_bad_bias_len() {
     let mut c = vec![0u8; 16];
     let bias = vec![0i32; 3];
     let req = Requantize {
-        scale: 1.0,
+        scale: RequantScale::PerTensor(1.0),
         zero_point: 0,
         bias: Some(&bias),
     };
@@ -1082,6 +1091,433 @@ fn requant_u8_bad_bias_len() {
         MatRef::from_col_major(&b, 4, 4),
         req,
         MatMut::from_col_major(&mut c, 4, 4),
+        Parallelism::Serial,
+    );
+}
+
+// Per-channel (per-row) requantize scales: `RequantScale::PerRow`. Same bit-exactness bar as the
+// per-tensor path (the `i32` accumulation is exact and ISA-independent), so every oracle below
+// holds bitwise under every `GEMMKIT_REQUIRE_ISA` pin, on both output types and both C
+// orientations. The scale resolves per row exactly as the bias does; a `PerTensor(s)` and a
+// `PerRow([s; m])` feed identical f64 arithmetic (only the lookup differs), hence are bitwise-equal
+
+/// Run `gemm_i8_requant` (col-major `mxk` A, `kxn` B) with an explicit [`RequantScale`] into a C
+/// with the given strides, returning the (possibly padded) `i8` buffer of length `buflen`
+fn run_requant_scale(
+    a: &[i8],
+    b: &[i8],
+    m: usize,
+    k: usize,
+    n: usize,
+    scale: RequantScale<'_>,
+    zp: i32,
+    bias: Option<&[i32]>,
+    rsc: isize,
+    csc: isize,
+    buflen: usize,
+    par: Parallelism,
+) -> Vec<i8> {
+    let mut c = vec![0i8; buflen];
+    let ar = MatRef::new(a, m, k, 1, m as isize);
+    let br = MatRef::new(b, k, n, 1, k as isize);
+    let cm = MatMut::new(&mut c, m, n, rsc, csc);
+    let req = Requantize {
+        scale,
+        zero_point: zp,
+        bias,
+    };
+    gemm_i8_requant(ar, br, req, cm, par);
+    c
+}
+
+/// The `u8`-output twin of [`run_requant_scale`]
+fn run_requant_u8_scale(
+    a: &[i8],
+    b: &[i8],
+    m: usize,
+    k: usize,
+    n: usize,
+    scale: RequantScale<'_>,
+    zp: i32,
+    bias: Option<&[i32]>,
+    rsc: isize,
+    csc: isize,
+    buflen: usize,
+    par: Parallelism,
+) -> Vec<u8> {
+    let mut c = vec![0u8; buflen];
+    let ar = MatRef::new(a, m, k, 1, m as isize);
+    let br = MatRef::new(b, k, n, 1, k as isize);
+    let cm = MatMut::new(&mut c, m, n, rsc, csc);
+    let req = Requantize {
+        scale,
+        zero_point: zp,
+        bias,
+    };
+    gemm_i8_requant_u8(ar, br, req, cm, par);
+    c
+}
+
+/// Per-row scales vs the independent scalar model (`ref_requant` / `ref_requant_u8`, std
+/// `round_ties_even`) applied with the per-row `scales[i]`, bit-exact for `i8` and `u8`, with and
+/// without bias. `m >= LANES` guarantees full lane-runs. The 2 orientations hit different store
+/// paths (the orientation swap fires on `|csc| < |rsc|`):
+/// * column-major C (`rsc == 1`, `csc == m`): NO swap, so the user `PerRow` stays a driver-frame
+///   `Row` scale -> the per-lane scalar branch of `apply_store` (varies per lane);
+/// * row-major C (`rsc == n`, `csc == 1`, `n > 1`): swap, so the user `PerRow` becomes a
+///   driver-frame `Col` scale (constant across the lane-run) -> the single-scale vector store on
+///   requant-vector ISAs
+fn check_per_row(
+    rng: &mut Rng,
+    m: usize,
+    k: usize,
+    n: usize,
+    zp_i8: i32,
+    zp_u8: i32,
+    has_bias: bool,
+    row_major_c: bool,
+    par: Parallelism,
+    tag: &str,
+) {
+    let a = make_i8(rng, m * k);
+    let b = make_i8(rng, k * n);
+    let bias: Vec<i32> = if has_bias {
+        (0..m)
+            .map(|_| (rng.next_u64() % 2001) as i64 as i32 - 1000)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // per-row scales: a spread of magnitudes, all finite and > 0
+    let scales: Vec<f32> = (0..m)
+        .map(|i| match i % 6 {
+            0 => 0.003,
+            1 => 0.5,
+            2 => 1.0,
+            3 => 7.25,
+            4 => 0.0078125,
+            _ => 0.1,
+        })
+        .collect();
+    let (rsc, csc) = if row_major_c {
+        (n as isize, 1isize)
+    } else {
+        (1isize, m as isize)
+    };
+
+    // exact i32 accumulator via gemm_i8, in the same (rsc, csc) layout
+    let mut acc = vec![0i32; m * n];
+    {
+        let ar = MatRef::new(&a, m, k, 1, m as isize);
+        let br = MatRef::new(&b, k, n, 1, k as isize);
+        let cm = MatMut::new(&mut acc, m, n, rsc, csc);
+        gemm_i8(1, ar, br, 0, cm, par);
+    }
+
+    let bias_opt = if has_bias {
+        Some(bias.as_slice())
+    } else {
+        None
+    };
+    let ci8 = run_requant_scale(
+        &a,
+        &b,
+        m,
+        k,
+        n,
+        RequantScale::PerRow(&scales),
+        zp_i8,
+        bias_opt,
+        rsc,
+        csc,
+        m * n,
+        par,
+    );
+    let cu8 = run_requant_u8_scale(
+        &a,
+        &b,
+        m,
+        k,
+        n,
+        RequantScale::PerRow(&scales),
+        zp_u8,
+        bias_opt,
+        rsc,
+        csc,
+        m * n,
+        par,
+    );
+
+    for j in 0..n {
+        for i in 0..m {
+            let idx = (i as isize * rsc + j as isize * csc) as usize;
+            let bterm = if has_bias { bias[i] } else { 0 };
+            assert_eq!(
+                ci8[idx],
+                ref_requant(acc[idx], bterm, scales[i], zp_i8),
+                "{tag} i8 per-row ({i},{j}) acc={} [m={m} k={k} n={n} row_major={row_major_c}]",
+                acc[idx],
+            );
+            assert_eq!(
+                cu8[idx],
+                ref_requant_u8(i64::from(acc[idx]), bterm, scales[i], zp_u8),
+                "{tag} u8 per-row ({i},{j}) acc={} [m={m} k={k} n={n} row_major={row_major_c}]",
+                acc[idx],
+            );
+        }
+    }
+}
+
+/// Per-row scales, both output types, both orientations, with / without bias, serial and parallel.
+/// `m = 48 (>= LANES on every ISA)` so full lane-runs occur on both store paths
+#[test]
+fn requant_per_row_matrix() {
+    let mut rng = Rng::new(0x00C0_FFEE);
+    for &(m, k, n) in &[(48usize, 20usize, 19usize), (48, 300, 33), (64, 37, 9)] {
+        for has_bias in [false, true] {
+            for row_major in [false, true] {
+                for par in [Parallelism::Serial, Parallelism::Rayon(8)] {
+                    check_per_row(
+                        &mut rng, m, k, n, -7, 30, has_bias, row_major, par, "per-row",
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `PerTensor(s)` must be **bitwise** identical to `PerRow(&[s; m])` for any `s` (same f64
+/// arithmetic, only the lookup differs). Swept for `i8` and `u8`, both orientations, both bias
+/// states, over a wide `s` range including the f64 saturation corners `1e30` / `1e-30`. `m = 48
+/// (>= LANES)` so full lane-runs occur on both store paths
+#[test]
+fn requant_per_tensor_eq_per_row_uniform() {
+    let mut rng = Rng::new(0x5CA1_AB1E);
+    let (m, k, n) = (48usize, 37usize, 20usize);
+    let a = make_i8(&mut rng, m * k);
+    let b = make_i8(&mut rng, k * n);
+    let bias: Vec<i32> = (0..m).map(|i| i as i32 * 37 - 400).collect();
+    for &s in &[0.003f32, 0.5, 1.0, 7.25, 1e30, 1e-30] {
+        let scales = vec![s; m];
+        for row_major in [false, true] {
+            let (rsc, csc) = if row_major {
+                (n as isize, 1isize)
+            } else {
+                (1isize, m as isize)
+            };
+            for has_bias in [false, true] {
+                let bias_opt = if has_bias {
+                    Some(bias.as_slice())
+                } else {
+                    None
+                };
+                let ct = run_requant_scale(
+                    &a,
+                    &b,
+                    m,
+                    k,
+                    n,
+                    RequantScale::PerTensor(s),
+                    5,
+                    bias_opt,
+                    rsc,
+                    csc,
+                    m * n,
+                    Parallelism::Serial,
+                );
+                let cr = run_requant_scale(
+                    &a,
+                    &b,
+                    m,
+                    k,
+                    n,
+                    RequantScale::PerRow(&scales),
+                    5,
+                    bias_opt,
+                    rsc,
+                    csc,
+                    m * n,
+                    Parallelism::Serial,
+                );
+                assert_eq!(
+                    ct, cr,
+                    "i8 PerTensor != PerRow[s; m] s={s} row_major={row_major} has_bias={has_bias}"
+                );
+                let ut = run_requant_u8_scale(
+                    &a,
+                    &b,
+                    m,
+                    k,
+                    n,
+                    RequantScale::PerTensor(s),
+                    128,
+                    bias_opt,
+                    rsc,
+                    csc,
+                    m * n,
+                    Parallelism::Serial,
+                );
+                let ur = run_requant_u8_scale(
+                    &a,
+                    &b,
+                    m,
+                    k,
+                    n,
+                    RequantScale::PerRow(&scales),
+                    128,
+                    bias_opt,
+                    rsc,
+                    csc,
+                    m * n,
+                    Parallelism::Serial,
+                );
+                assert_eq!(
+                    ut, ur,
+                    "u8 PerTensor != PerRow[s; m] s={s} row_major={row_major} has_bias={has_bias}"
+                );
+            }
+        }
+    }
+}
+
+/// Degenerate `k == 0` with per-row scales: C fills with `clamp(zp + round_ne(scale_i * bias_i))`
+/// (the scalar `apply` on a zero accumulator; the degenerate path is in the user frame, so per-row
+/// scales index by row `i`). Checked for `i8` and `u8`, with a per-row bias
+#[test]
+fn requant_per_row_degenerate_k0() {
+    let (m, n) = (48usize, 10usize);
+    let bias: Vec<i32> = (0..m).map(|i| i as i32 * 40 - 200).collect();
+    let scales: Vec<f32> = (0..m).map(|i| 0.01 * (1 + i % 7) as f32).collect();
+    let a: Vec<i8> = Vec::new();
+    let b: Vec<i8> = Vec::new();
+    let (zp_i8, zp_u8) = (7i32, 20i32);
+    let ci8 = run_requant_scale(
+        &a,
+        &b,
+        m,
+        0,
+        n,
+        RequantScale::PerRow(&scales),
+        zp_i8,
+        Some(&bias),
+        1,
+        m as isize,
+        m * n,
+        Parallelism::Serial,
+    );
+    let cu8 = run_requant_u8_scale(
+        &a,
+        &b,
+        m,
+        0,
+        n,
+        RequantScale::PerRow(&scales),
+        zp_u8,
+        Some(&bias),
+        1,
+        m as isize,
+        m * n,
+        Parallelism::Serial,
+    );
+    for j in 0..n {
+        for i in 0..m {
+            assert_eq!(
+                ci8[i + j * m],
+                ref_requant(0, bias[i], scales[i], zp_i8),
+                "i8 per-row degenerate ({i},{j})"
+            );
+            assert_eq!(
+                cu8[i + j * m],
+                ref_requant_u8(0, bias[i], scales[i], zp_u8),
+                "u8 per-row degenerate ({i},{j})"
+            );
+        }
+    }
+}
+
+#[test]
+#[should_panic(expected = "scales length")]
+fn requant_per_row_bad_len() {
+    let a = vec![0i8; 16];
+    let b = vec![0i8; 16];
+    let mut c = vec![0i8; 16];
+    let scales = vec![1.0f32; 3]; // != A.rows (4)
+    let req = Requantize {
+        scale: RequantScale::PerRow(&scales),
+        zero_point: 0,
+        bias: None,
+    };
+    gemm_i8_requant(
+        MatRef::from_col_major(&a, 4, 4),
+        MatRef::from_col_major(&b, 4, 4),
+        req,
+        MatMut::from_col_major(&mut c, 4, 4),
+        Parallelism::Serial,
+    );
+}
+
+#[test]
+#[should_panic(expected = "must be finite and > 0")]
+fn requant_per_row_non_finite() {
+    let a = vec![0i8; 16];
+    let b = vec![0i8; 16];
+    let mut c = vec![0i8; 16];
+    let scales = vec![1.0f32, f32::NAN, 0.5, 2.0]; // one non-finite element
+    let req = Requantize {
+        scale: RequantScale::PerRow(&scales),
+        zero_point: 0,
+        bias: None,
+    };
+    gemm_i8_requant(
+        MatRef::from_col_major(&a, 4, 4),
+        MatRef::from_col_major(&b, 4, 4),
+        req,
+        MatMut::from_col_major(&mut c, 4, 4),
+        Parallelism::Serial,
+    );
+}
+
+#[test]
+#[should_panic(expected = "must be finite and > 0")]
+fn requant_per_row_non_positive() {
+    let a = vec![0i8; 16];
+    let b = vec![0i8; 16];
+    let mut c = vec![0i8; 16];
+    let scales = vec![1.0f32, 0.5, -0.5, 2.0]; // one non-positive element
+    let req = Requantize {
+        scale: RequantScale::PerRow(&scales),
+        zero_point: 0,
+        bias: None,
+    };
+    gemm_i8_requant(
+        MatRef::from_col_major(&a, 4, 4),
+        MatRef::from_col_major(&b, 4, 4),
+        req,
+        MatMut::from_col_major(&mut c, 4, 4),
+        Parallelism::Serial,
+    );
+}
+
+#[test]
+#[should_panic(expected = "scales overlap C")]
+fn requant_per_row_overlaps_c() {
+    let a = vec![0i8; 16];
+    let b = vec![0i8; 16];
+    let mut buf = vec![0i8; 16]; // C (4x4, 16 bytes)
+    // A scales slice aliasing C's storage. It is raw-derived (its lifetime is not tied to `buf`),
+    // so `&mut buf` still type-checks; the overlap check panics before any element is read, so no
+    // aliased access occurs (4 f32 = 16 bytes, exactly C's footprint)
+    let scales: &[f32] = unsafe { core::slice::from_raw_parts(buf.as_ptr() as *const f32, 4) };
+    let req = Requantize {
+        scale: RequantScale::PerRow(scales),
+        zero_point: 0,
+        bias: None,
+    };
+    gemm_i8_requant(
+        MatRef::from_col_major(&a, 4, 4),
+        MatRef::from_col_major(&b, 4, 4),
+        req,
+        MatMut::from_col_major(&mut buf, 4, 4),
         Parallelism::Serial,
     );
 }

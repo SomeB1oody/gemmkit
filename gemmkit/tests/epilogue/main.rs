@@ -30,9 +30,13 @@ mod batched;
 mod cplx;
 // general-driver fused-epilogue tests (f32/f64)
 mod float;
+// user-defined per-element map-epilogue tests (gemm_map, f32/f64)
+mod map;
 // narrow-float (f16/bf16) fused-epilogue tests
 #[cfg(feature = "half")]
 mod mixed;
+// prepacked-operand fused-epilogue tests (gemm_packed_{a,b}_fused)
+mod packed;
 // i8 -> i8/u8 requantize epilogue tests
 #[cfg(feature = "int8")]
 mod requant;

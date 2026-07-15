@@ -40,9 +40,12 @@ gemmkit_ndarray::gemm(1.5, &a.view(), &b, 2.0, &mut c, Parallelism::Rayon(0));
 
 - `parallel` (default) — forwards to `gemmkit/parallel` (rayon).
 - `half`, `complex`, `int8` — forward to the matching `gemmkit` feature.
-- `epilogue` — fused epilogues: `gemm_fused` / `gemm_batched_fused` (bias/activation in one pass);
-  requant `gemm_i8_requant` / `gemm_i8_requant_u8` needs `int8` + `epilogue`, complex-fused
-  `gemm_cplx_fused` needs `complex` + `epilogue`, and `f16`/`bf16` fused ride `half`.
+- `epilogue` — fused epilogues: `gemm_fused` / `gemm_batched_fused` and the prepacked
+  `gemm_packed_b_fused` / `gemm_packed_a_fused` (bias/activation in one pass over a reused pack
+  handle), plus the user-defined per-element `gemm_map` / `gemm_map_with` (`f32`/`f64`, an arbitrary
+  closure `f(value, row, col)`); requant `gemm_i8_requant` / `gemm_i8_requant_u8` needs
+  `int8` + `epilogue`, complex-fused `gemm_cplx_fused` needs `complex` + `epilogue`, and `f16`/`bf16`
+  fused ride `half`.
 
 ## License
 

@@ -45,7 +45,9 @@
 //! * `half`: `f16`/`bf16` mixed-precision GEMM (`f32` accumulate); pulls in `half`
 //! * `int8`: `i8 -> i32` integer GEMM ([`gemm_i8`]); no extra dependency
 //! * `epilogue`: fused epilogues: bias/activation ([`gemm_fused`],
-//!   `gemm_batched_fused*`, and, with `complex`, `gemm_cplx_fused*`) and, with
+//!   `gemm_batched_fused*`, the prepacked `gemm_packed_a_fused*` / `gemm_packed_b_fused*`,
+//!   and, with `complex`, `gemm_cplx_fused*`); a user-defined
+//!   per-element closure ([`gemm_map`], `f32`/`f64`); and, with
 //!   `int8`, requantized `i8`/`u8` output (`gemm_i8_requant*`); no extra dependency
 //!
 //! These 3 element-type families are off by default, so a plain `f32`/`f64`
@@ -90,7 +92,10 @@ mod workspace;
 pub use api::{
     Activation, Bias, gemm_batched_fused, gemm_batched_fused_unchecked,
     gemm_batched_fused_unchecked_with, gemm_batched_fused_with, gemm_fused, gemm_fused_unchecked,
-    gemm_fused_unchecked_with, gemm_fused_with,
+    gemm_fused_unchecked_with, gemm_fused_with, gemm_map, gemm_map_unchecked,
+    gemm_map_unchecked_with, gemm_map_with, gemm_packed_a_fused, gemm_packed_a_fused_unchecked,
+    gemm_packed_a_fused_unchecked_with, gemm_packed_a_fused_with, gemm_packed_b_fused,
+    gemm_packed_b_fused_unchecked, gemm_packed_b_fused_unchecked_with, gemm_packed_b_fused_with,
 };
 pub use api::{
     BatchProblem, MatMut, MatRef, PackedLhs, PackedRhs, gemm, gemm_batched,
@@ -102,7 +107,7 @@ pub use api::{
 };
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 pub use api::{
-    Requantize, gemm_i8_requant, gemm_i8_requant_u8, gemm_i8_requant_u8_unchecked,
+    RequantScale, Requantize, gemm_i8_requant, gemm_i8_requant_u8, gemm_i8_requant_u8_unchecked,
     gemm_i8_requant_u8_unchecked_with, gemm_i8_requant_u8_with, gemm_i8_requant_unchecked,
     gemm_i8_requant_unchecked_with, gemm_i8_requant_with,
 };
@@ -117,10 +122,10 @@ pub use api::{
 pub use api::{gemm_i8, gemm_i8_unchecked, gemm_i8_unchecked_with, gemm_i8_with};
 #[cfg(feature = "complex")]
 pub use dispatch::ComplexScalar;
-#[cfg(feature = "epilogue")]
-pub use dispatch::FusedScalar;
 pub use dispatch::GemmProblem;
 pub use dispatch::GemmScalar;
+#[cfg(feature = "epilogue")]
+pub use dispatch::{FusedScalar, MapScalar};
 #[cfg(feature = "epilogue")]
 pub use kernel::epilogue::BiasDim;
 pub use parallel::Parallelism;

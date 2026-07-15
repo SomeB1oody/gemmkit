@@ -31,6 +31,9 @@ mod fused;
 // integer (i8 -> i32) and requantizing (i8 -> i8) GEMM entries
 #[cfg(feature = "int8")]
 mod int8;
+// user-defined per-element map-epilogue GEMM entries
+#[cfg(feature = "epilogue")]
+mod map;
 // prepacked-operand (PackedLhs/PackedRhs) entries
 mod packed;
 
@@ -56,16 +59,24 @@ pub use fused::{
 };
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 pub use int8::{
-    Requantize, gemm_i8_requant, gemm_i8_requant_u8, gemm_i8_requant_u8_unchecked,
+    RequantScale, Requantize, gemm_i8_requant, gemm_i8_requant_u8, gemm_i8_requant_u8_unchecked,
     gemm_i8_requant_u8_unchecked_with, gemm_i8_requant_u8_with, gemm_i8_requant_unchecked,
     gemm_i8_requant_unchecked_with, gemm_i8_requant_with,
 };
 #[cfg(feature = "int8")]
 pub use int8::{gemm_i8, gemm_i8_unchecked, gemm_i8_unchecked_with, gemm_i8_with};
+#[cfg(feature = "epilogue")]
+pub use map::{gemm_map, gemm_map_unchecked, gemm_map_unchecked_with, gemm_map_with};
 pub use packed::{
     PackedLhs, PackedRhs, gemm_packed_a, gemm_packed_a_unchecked, gemm_packed_a_unchecked_with,
     gemm_packed_a_with, gemm_packed_b, gemm_packed_b_unchecked, gemm_packed_b_unchecked_with,
     gemm_packed_b_with, prepack_lhs, prepack_lhs_unchecked, prepack_rhs, prepack_rhs_unchecked,
+};
+#[cfg(feature = "epilogue")]
+pub use packed::{
+    gemm_packed_a_fused, gemm_packed_a_fused_unchecked, gemm_packed_a_fused_unchecked_with,
+    gemm_packed_a_fused_with, gemm_packed_b_fused, gemm_packed_b_fused_unchecked,
+    gemm_packed_b_fused_unchecked_with, gemm_packed_b_fused_with,
 };
 
 /// An immutable strided matrix view over a slice

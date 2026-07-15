@@ -175,15 +175,30 @@ pub unsafe fn gemm_i8_unchecked_with(
     }
 }
 
-/// The quantization parameters shared by the requantizing entries: a per-tensor `scale` and
-/// integer `zero_point`, plus an optional **per-row** `i32` bias (length `m`, the standard
-/// qlinear layer bias). The output is `C[i,j] = clamp(zero_point + round_ne(scale*(sum_k A*B +
-/// bias[i])), LO, HI)`, with round-half-to-even, where the clamp band `[LO, HI]` is set by the
-/// entry: [`gemm_i8_requant`] -> `[-128, 127]` (`i8`), [`gemm_i8_requant_u8`] -> `[0, 255]` (`u8`)
+/// The output scale of the requantizing entries: a single per-tensor value, or 1 value per
+/// output row / output channel (the per-channel quantized-inference convention). Every scale must
+/// be finite and `> 0`
+#[cfg(all(feature = "int8", feature = "epilogue"))]
+#[derive(Copy, Clone)]
+pub enum RequantScale<'a> {
+    /// 1 per-tensor scale applied to every output element (`alpha` folds into this)
+    PerTensor(f32),
+    /// 1 scale per output **row** / output channel (length `A.rows == m`): the standard
+    /// per-channel quantized-inference convention, `C[i,j]` scaled by `scale_i`
+    PerRow(&'a [f32]),
+}
+
+/// The quantization parameters shared by the requantizing entries: a per-tensor or per-row
+/// [`RequantScale`] and integer `zero_point`, plus an optional **per-row** `i32` bias (length `m`,
+/// the standard qlinear layer bias). The output is `C[i,j] = clamp(zero_point + round_ne(scale *
+/// (sum_k A*B + bias[i])), LO, HI)`, with round-half-to-even, where `scale` is the per-tensor value
+/// or the per-row `scale_i`, and the clamp band `[LO, HI]` is set by the entry:
+/// [`gemm_i8_requant`] -> `[-128, 127]` (`i8`), [`gemm_i8_requant_u8`] -> `[0, 255]` (`u8`)
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 pub struct Requantize<'a> {
-    /// Per-tensor output scale (`alpha` folds into this; must be finite and `> 0`)
-    pub scale: f32,
+    /// Output scale: per-tensor or per-row / per-channel ([`RequantScale`]; each value must be
+    /// finite and `> 0`)
+    pub scale: RequantScale<'a>,
     /// Output zero-point, joined in integer after rounding. Must lie in the output domain of the
     /// chosen entry: `[-128, 127]` for [`gemm_i8_requant`], `[0, 255]` for [`gemm_i8_requant_u8`]
     pub zero_point: i32,
@@ -199,8 +214,9 @@ pub struct Requantize<'a> {
 ///
 /// # Panics
 /// Same shape / bounds / aliasing conditions as [`gemm_i8`], plus: a non-finite or
-/// non-positive `scale`; a `zero_point` outside `[-128, 127]`; or a bias whose length is not
-/// `A.rows` or which overlaps `C`
+/// non-positive `scale` (per-tensor or any per-row element); a per-row scale slice whose length
+/// is not `A.rows` or which overlaps `C`; a `zero_point` outside `[-128, 127]`; or a bias whose
+/// length is not `A.rows` or which overlaps `C`
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 pub fn gemm_i8_requant(
     a: MatRef<'_, i8>,
@@ -246,6 +262,58 @@ fn requant_bias<TO>(a_rows: usize, c: &MatMut<'_, TO>, bias: Option<&[i32]>) -> 
     }
 }
 
+/// Shared scale validation + lowering for the requantizing entries (`i8` and `u8` output). A
+/// [`RequantScale::PerTensor`] must be finite and `> 0` (the historic wording verbatim); a
+/// [`RequantScale::PerRow`] must have length `a_rows`, every element finite and `> 0` (the same
+/// per-element wording), and its `f32` slice must not overlap `C` (a 1-byte quantized output,
+/// `size_of::<TO>() == 1`). Returns the raw `(scale, row_scales_ptr, has_row_scales)` the task
+/// carries: `PerTensor(s) -> (s, null, false)`, `PerRow(p) -> (0.0, p, true)`. Panic messages are
+/// byte-stable (tests match the substrings)
+#[cfg(all(feature = "int8", feature = "epilogue"))]
+fn requant_scale<TO>(
+    a_rows: usize,
+    c: &MatMut<'_, TO>,
+    scale: RequantScale<'_>,
+) -> (f32, *const f32, bool) {
+    match scale {
+        RequantScale::PerTensor(s) => {
+            assert!(
+                s.is_finite() && s > 0.0,
+                "gemmkit: requantize scale ({s}) must be finite and > 0"
+            );
+            (s, core::ptr::null(), false)
+        }
+        RequantScale::PerRow(scales) => {
+            assert_eq!(
+                scales.len(),
+                a_rows,
+                "gemmkit: requantize scales length ({}) != A.rows ({})",
+                scales.len(),
+                a_rows
+            );
+            // scales (f32) must not overlap C (a 1-byte quantized output); checked before reading
+            // any element so an aliasing slice panics before a single deref
+            if overlaps_bytes(
+                c.data.as_ptr() as *const u8,
+                c.data.len(),
+                core::mem::size_of::<TO>(),
+                scales.as_ptr() as *const u8,
+                scales.len(),
+                4,
+            ) {
+                panic!("gemmkit: requantize scales overlap C");
+            }
+            for &s in scales {
+                assert!(
+                    s.is_finite() && s > 0.0,
+                    "gemmkit: requantize scale ({s}) must be finite and > 0"
+                );
+            }
+            (0.0, scales.as_ptr(), true)
+        }
+    }
+}
+
 /// Like [`gemm_i8_requant`] but reuses a caller-owned [`Workspace`]
 ///
 /// # Panics
@@ -261,11 +329,7 @@ pub fn gemm_i8_requant_with(
 ) {
     validate_gemm_views(&a, &b, &c);
 
-    assert!(
-        req.scale.is_finite() && req.scale > 0.0,
-        "gemmkit: requantize scale ({}) must be finite and > 0",
-        req.scale
-    );
+    let (scale, row_scales, has_row_scales) = requant_scale(a.rows, &c, req.scale);
     assert!(
         (-128..=127).contains(&req.zero_point),
         "gemmkit: requantize zero_point ({}) out of i8 range [-128, 127]",
@@ -275,8 +339,9 @@ pub fn gemm_i8_requant_with(
     let (bias_ptr, has_bias) = requant_bias(a.rows, &c, req.bias);
 
     // SAFETY: validated above, shapes agree, strides in bounds, C addresses each (i,j)
-    // uniquely and does not alias A/B or the bias; scale/zp are in range. The bias pointer
-    // (borrowed for this call) stays valid for the whole `execute_int_requant` frame
+    // uniquely and does not alias A/B or the bias/scales; scale/zp are in range. The bias and
+    // per-row scale pointers (borrowed for this call) stay valid for the whole
+    // `execute_int_requant` frame
     unsafe {
         dispatch::execute_int_requant(
             dispatch::RequantTask {
@@ -292,7 +357,9 @@ pub fn gemm_i8_requant_with(
                 c: c.data.as_mut_ptr(),
                 rsc: c.rs,
                 csc: c.cs,
-                scale: req.scale,
+                scale,
+                row_scales,
+                has_row_scales,
                 zp: req.zero_point,
                 bias: bias_ptr,
                 has_bias,
@@ -306,14 +373,17 @@ pub fn gemm_i8_requant_with(
 
 /// The raw requantizing engine: `C(i8) <- clamp(zp + round_ne(scale*(A*B + bias)), -128,
 /// 127)` over pointers and `isize` strides, with **no** bounds/alias/shape checks. `bias` is
-/// a per-row `i32` pointer enabled by `has_bias` (ignored when `has_bias == false`). Uses the
-/// thread-local workspace pool
+/// a per-row `i32` pointer enabled by `has_bias` (ignored when `has_bias == false`). The scale is
+/// per-tensor (`scale`) unless `has_row_scales` is set, in which case `scale` is ignored and
+/// `row_scales` supplies 1 `f32` per output row (length `m`). Uses the thread-local workspace
+/// pool
 ///
 /// # Safety
 /// The caller guarantees `a`/`b` valid for reads and `c` for writes over the shape/strides;
 /// `c` does not alias `a`/`b`; when `has_bias`, `bias` is valid for `m` reads and disjoint
-/// from `c`; and `scale` is finite and `> 0` with `zero_point in [-128, 127]` (the checked
-/// API enforces the last 2)
+/// from `c`; when `has_row_scales`, `row_scales` is valid for `m` reads and disjoint from `c`
+/// (else `scale` is used and `row_scales` may be null/dangling); and every applied scale is
+/// finite and `> 0` with `zero_point in [-128, 127]` (the checked API enforces the last 2)
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn gemm_i8_requant_unchecked(
@@ -327,6 +397,8 @@ pub unsafe fn gemm_i8_requant_unchecked(
     rsb: isize,
     csb: isize,
     scale: f32,
+    row_scales: *const f32,
+    has_row_scales: bool,
     zero_point: i32,
     bias: *const i32,
     has_bias: bool,
@@ -339,8 +411,26 @@ pub unsafe fn gemm_i8_requant_unchecked(
     unsafe {
         workspace::with_thread_pool(|ws| {
             gemm_i8_requant_unchecked_with(
-                ws, m, k, n, a, rsa, csa, b, rsb, csb, scale, zero_point, bias, has_bias, c, rsc,
-                csc, par,
+                ws,
+                m,
+                k,
+                n,
+                a,
+                rsa,
+                csa,
+                b,
+                rsb,
+                csb,
+                scale,
+                row_scales,
+                has_row_scales,
+                zero_point,
+                bias,
+                has_bias,
+                c,
+                rsc,
+                csc,
+                par,
             );
         });
     }
@@ -364,6 +454,8 @@ pub unsafe fn gemm_i8_requant_unchecked_with(
     rsb: isize,
     csb: isize,
     scale: f32,
+    row_scales: *const f32,
+    has_row_scales: bool,
     zero_point: i32,
     bias: *const i32,
     has_bias: bool,
@@ -374,7 +466,8 @@ pub unsafe fn gemm_i8_requant_unchecked_with(
 ) {
     // SAFETY: the caller guarantees `a`/`b` valid for reads and `c` for writes over the
     // shape/strides, `c` not aliasing `a`/`b`, when `has_bias` a valid disjoint `m`-length bias,
-    // and `scale`/`zero_point` in range (see [`gemm_i8_requant_unchecked`])
+    // when `has_row_scales` a valid disjoint `m`-length scale vector, and `scale`/`zero_point` in
+    // range (see [`gemm_i8_requant_unchecked`])
     unsafe {
         dispatch::execute_int_requant(
             dispatch::RequantTask {
@@ -391,6 +484,8 @@ pub unsafe fn gemm_i8_requant_unchecked_with(
                 rsc,
                 csc,
                 scale,
+                row_scales,
+                has_row_scales,
                 zp: zero_point,
                 bias,
                 has_bias,
@@ -405,9 +500,10 @@ pub unsafe fn gemm_i8_requant_unchecked_with(
 /// Requantizing integer GEMM with an **unsigned `u8` output** (ONNX-QLinearMatMul-style
 /// activation): `i8` inputs multiplied into an `i32` accumulator, then requantized in 1 pass to
 /// `C[i,j] = clamp(zero_point + round_ne(scale*(sum_k A*B + bias[i])), 0, 255)` with
-/// round-half-to-even. The `i8`-output twin of [`gemm_i8_requant`], differing only in the output
-/// domain `[0, 255]` and the `zero_point` range. No `alpha` (folds into `scale`) and no `beta`
-/// (accumulating into a quantized C is ill-defined). Uses the thread-local workspace pool
+/// round-half-to-even, where `scale` is the per-tensor value or the per-row `scale_i`. The
+/// `i8`-output twin of [`gemm_i8_requant`], differing only in the output domain `[0, 255]` and the
+/// `zero_point` range. No `alpha` (folds into `scale`) and no `beta` (accumulating into a
+/// quantized C is ill-defined). Uses the thread-local workspace pool
 ///
 /// # Determinism
 /// The same contracts as [`gemm_i8_requant`]: the `i32` accumulation is exact and ISA-independent,
@@ -416,8 +512,9 @@ pub unsafe fn gemm_i8_requant_unchecked_with(
 ///
 /// # Panics
 /// Same shape / bounds / aliasing conditions as [`gemm_i8`], plus: a non-finite or non-positive
-/// `scale`; a `zero_point` outside `[0, 255]`; or a bias whose length is not `A.rows` or which
-/// overlaps `C`
+/// `scale` (per-tensor or any per-row element); a per-row scale slice whose length is not `A.rows`
+/// or which overlaps `C`; a `zero_point` outside `[0, 255]`; or a bias whose length is not
+/// `A.rows` or which overlaps `C`
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 pub fn gemm_i8_requant_u8(
     a: MatRef<'_, i8>,
@@ -444,11 +541,7 @@ pub fn gemm_i8_requant_u8_with(
 ) {
     validate_gemm_views(&a, &b, &c);
 
-    assert!(
-        req.scale.is_finite() && req.scale > 0.0,
-        "gemmkit: requantize scale ({}) must be finite and > 0",
-        req.scale
-    );
+    let (scale, row_scales, has_row_scales) = requant_scale(a.rows, &c, req.scale);
     assert!(
         (0..=255).contains(&req.zero_point),
         "gemmkit: requantize zero_point ({}) out of u8 range [0, 255]",
@@ -458,8 +551,9 @@ pub fn gemm_i8_requant_u8_with(
     let (bias_ptr, has_bias) = requant_bias(a.rows, &c, req.bias);
 
     // SAFETY: validated above, shapes agree, strides in bounds, C addresses each (i,j)
-    // uniquely and does not alias A/B or the bias; scale/zp are in range. The bias pointer
-    // (borrowed for this call) stays valid for the whole `execute_int_requant` frame
+    // uniquely and does not alias A/B or the bias/scales; scale/zp are in range. The bias and
+    // per-row scale pointers (borrowed for this call) stay valid for the whole
+    // `execute_int_requant` frame
     unsafe {
         dispatch::execute_int_requant(
             dispatch::RequantTask {
@@ -475,7 +569,9 @@ pub fn gemm_i8_requant_u8_with(
                 c: c.data.as_mut_ptr(),
                 rsc: c.rs,
                 csc: c.cs,
-                scale: req.scale,
+                scale,
+                row_scales,
+                has_row_scales,
                 zp: req.zero_point,
                 bias: bias_ptr,
                 has_bias,
@@ -490,13 +586,16 @@ pub fn gemm_i8_requant_u8_with(
 /// The raw `u8`-output requantizing engine: `C(u8) <- clamp(zp + round_ne(scale*(A*B + bias)), 0,
 /// 255)` over pointers and `isize` strides, with **no** bounds/alias/shape checks: the unsigned
 /// twin of [`gemm_i8_requant_unchecked`]. `bias` is a per-row `i32` pointer enabled by `has_bias`
-/// (ignored when `has_bias == false`). Uses the thread-local workspace pool
+/// (ignored when `has_bias == false`). The scale is per-tensor (`scale`) unless `has_row_scales`
+/// is set, in which case `scale` is ignored and `row_scales` supplies 1 `f32` per output row
+/// (length `m`). Uses the thread-local workspace pool
 ///
 /// # Safety
 /// The caller guarantees `a`/`b` valid for reads and `c` for writes over the shape/strides;
 /// `c` does not alias `a`/`b`; when `has_bias`, `bias` is valid for `m` reads and disjoint
-/// from `c`; and `scale` is finite and `> 0` with `zero_point in [0, 255]` (the checked
-/// API enforces the last 2)
+/// from `c`; when `has_row_scales`, `row_scales` is valid for `m` reads and disjoint from `c`
+/// (else `scale` is used and `row_scales` may be null/dangling); and every applied scale is
+/// finite and `> 0` with `zero_point in [0, 255]` (the checked API enforces the last 2)
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn gemm_i8_requant_u8_unchecked(
@@ -510,6 +609,8 @@ pub unsafe fn gemm_i8_requant_u8_unchecked(
     rsb: isize,
     csb: isize,
     scale: f32,
+    row_scales: *const f32,
+    has_row_scales: bool,
     zero_point: i32,
     bias: *const i32,
     has_bias: bool,
@@ -522,8 +623,26 @@ pub unsafe fn gemm_i8_requant_u8_unchecked(
     unsafe {
         workspace::with_thread_pool(|ws| {
             gemm_i8_requant_u8_unchecked_with(
-                ws, m, k, n, a, rsa, csa, b, rsb, csb, scale, zero_point, bias, has_bias, c, rsc,
-                csc, par,
+                ws,
+                m,
+                k,
+                n,
+                a,
+                rsa,
+                csa,
+                b,
+                rsb,
+                csb,
+                scale,
+                row_scales,
+                has_row_scales,
+                zero_point,
+                bias,
+                has_bias,
+                c,
+                rsc,
+                csc,
+                par,
             );
         });
     }
@@ -547,6 +666,8 @@ pub unsafe fn gemm_i8_requant_u8_unchecked_with(
     rsb: isize,
     csb: isize,
     scale: f32,
+    row_scales: *const f32,
+    has_row_scales: bool,
     zero_point: i32,
     bias: *const i32,
     has_bias: bool,
@@ -557,7 +678,8 @@ pub unsafe fn gemm_i8_requant_u8_unchecked_with(
 ) {
     // SAFETY: the caller guarantees `a`/`b` valid for reads and `c` for writes over the
     // shape/strides, `c` not aliasing `a`/`b`, when `has_bias` a valid disjoint `m`-length bias,
-    // and `scale`/`zero_point` in range (see [`gemm_i8_requant_u8_unchecked`])
+    // when `has_row_scales` a valid disjoint `m`-length scale vector, and `scale`/`zero_point` in
+    // range (see [`gemm_i8_requant_u8_unchecked`])
     unsafe {
         dispatch::execute_int_requant(
             dispatch::RequantTask {
@@ -574,6 +696,8 @@ pub unsafe fn gemm_i8_requant_u8_unchecked_with(
                 rsc,
                 csc,
                 scale,
+                row_scales,
+                has_row_scales,
                 zp: zero_point,
                 bias,
                 has_bias,

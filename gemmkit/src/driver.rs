@@ -205,6 +205,71 @@ pub unsafe fn run_packed_rhs<Fam, S, const MR_REG: usize, const NR: usize>(
     }
 }
 
+/// Run a GEMM whose RHS is already prepacked by [`pack_rhs_full`], applying the
+/// fused [`Epilogue`] `E` to each output element as it is stored. The prepacked twin
+/// of [`run_epilogue`]: it is exactly [`run_packed_rhs`] with a non-identity `E`
+/// instead of `Identity`, riding the same `run_inner` engine (the buffer is
+/// supplied whole, the per-call B-pack is skipped, `kc`/`nc` are used verbatim). The
+/// engine (blocking, scheduling, the panel bytes read) is epilogue-independent, so
+/// the pre-epilogue store is identical to plain [`run_packed_rhs`] and the fused
+/// result equals a plain prepacked GEMM then a scalar map. The epilogue fires on the
+/// final depth panel (the `last_k` gate in `run_inner`)
+///
+/// # Safety
+/// As [`run_packed_rhs`], plus `epi`'s interior pointers must be valid for the
+/// problem's `m`/`n`
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn run_packed_rhs_epilogue<Fam, S, E, const MR_REG: usize, const NR: usize>(
+    simd: S,
+    m: usize,
+    k: usize,
+    n: usize,
+    alpha: Fam::Acc,
+    a: *const Fam::Lhs,
+    rsa: isize,
+    csa: isize,
+    packed_b: *const Fam::Rhs,
+    kc: usize,
+    nc: usize,
+    beta: Fam::Acc,
+    c: *mut Fam::Out,
+    rsc: isize,
+    csc: isize,
+    epi: &E,
+    par: Parallelism,
+    ws: &mut Workspace,
+) where
+    Fam: KernelFamily,
+    S: KernelSimd<Fam::Lhs, Fam::Rhs, Fam::Acc, Fam::Out>,
+    E: Epilogue<Fam>,
+{
+    // SAFETY: forwarded with the prepacked buffer and its packed (kc, nc) plus the
+    // caller's epilogue; `rsb`/`csb` are unused on the prepacked path
+    unsafe {
+        run_inner::<Fam, S, MR_REG, NR, E>(
+            simd,
+            m,
+            k,
+            n,
+            alpha,
+            a,
+            rsa,
+            csa,
+            packed_b,
+            0,
+            0,
+            beta,
+            c,
+            rsc,
+            csc,
+            par,
+            ws,
+            Some((packed_b, kc, nc)),
+            epi,
+        )
+    }
+}
+
 /// Pack the entire RHS of a fixed `(k, n)` problem into one micropanel-major
 /// buffer, in the exact order [`run_packed_rhs`] reads panels: `jc` blocks
 /// outermost, then depth slices, then the panels of each slice (cursor

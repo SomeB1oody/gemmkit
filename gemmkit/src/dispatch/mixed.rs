@@ -339,6 +339,54 @@ unsafe fn run_packed_typed_mixed<N, Fam, S, const MR_REG: usize, const NR: usize
     }
 }
 
+/// **Fused-epilogue** prepacked-RHS mixed-precision entry (mirror of [`run_typed_mixed_packed_fused`]'s
+/// float sibling `run_typed_packed_fused`, and of [`run_packed_typed_mixed`] with the epilogue
+/// threaded): no swap, `alpha`/`beta` widened to `f32`, the [`FusedEpi`] applied in `f32` before the
+/// single narrowing on store. No small-`m,n` / small-`k` reroute exists on the prepacked path, so
+/// only `FusedEpi<N>: Epilogue<Fam>` is needed (not the extra `Epilogue<MixedGemm<N>>` the
+/// general-driver mixed-fused entry names for its reroutes)
+///
+/// # Safety
+/// As [`run_packed_typed_mixed`], plus `epi`'s interior pointers valid for the problem's `m`/`n`
+#[cfg(all(feature = "half", feature = "epilogue"))]
+#[inline]
+unsafe fn run_typed_mixed_packed_fused<N, Fam, S, const MR_REG: usize, const NR: usize>(
+    simd: S,
+    req: PackedConsume<N>,
+    epi: FusedEpi<N>,
+    par: Parallelism,
+    ws: &mut Workspace,
+) where
+    N: NarrowFloat,
+    Fam: KernelFamily<Lhs = N, Rhs = N, Acc = f32, Out = N>,
+    S: KernelSimd<N, N, f32, N>,
+    FusedEpi<N>: Epilogue<Fam>,
+{
+    unsafe {
+        debug_assert_eq!(NR, req.nr, "prepacked RHS panel width != kernel NR");
+        driver::run_packed_rhs_epilogue::<Fam, S, FusedEpi<N>, MR_REG, NR>(
+            simd,
+            req.m,
+            req.k,
+            req.n,
+            req.alpha.widen(),
+            req.a,
+            req.rsa,
+            req.csa,
+            req.packed,
+            req.kc,
+            req.nc,
+            req.beta.widen(),
+            req.c,
+            req.rsc,
+            req.csc,
+            &epi,
+            par,
+            ws,
+        );
+    }
+}
+
 // mixed-precision (f16 / bf16) entry points: same tiles as f32 (the
 // accumulator is f32, so the register budget matches)
 
@@ -589,12 +637,179 @@ unsafe fn gemm_bf16_simd128_fused(
     }
 }
 
+// prepacked-RHS fused-epilogue mixed entry points: same tiles as the plain prepacked wrappers.
+// Each is cfg-gated exactly like its plain prepacked sibling plus `epilogue`; the small_mn / small_k
+// reroute question does not arise on the prepacked path, so the bf16 dot variant drives `Bf16DotGemm`
+// throughout
+
+#[cfg(all(feature = "half", feature = "epilogue"))]
+unsafe fn gemm_f16_scalar_packed_fused(
+    r: PackedConsume<f16>,
+    epi: FusedEpi<f16>,
+    par: Parallelism,
+    ws: &mut Workspace,
+) {
+    unsafe {
+        run_typed_mixed_packed_fused::<f16, MixedGemm<f16>, ScalarTok, 4, 4>(
+            ScalarTok, r, epi, par, ws,
+        )
+    }
+}
+#[cfg(all(feature = "half", feature = "epilogue"))]
+unsafe fn gemm_bf16_scalar_packed_fused(
+    r: PackedConsume<bf16>,
+    epi: FusedEpi<bf16>,
+    par: Parallelism,
+    ws: &mut Workspace,
+) {
+    unsafe {
+        run_typed_mixed_packed_fused::<bf16, MixedGemm<bf16>, ScalarTok, 4, 4>(
+            ScalarTok, r, epi, par, ws,
+        )
+    }
+}
+#[cfg(all(
+    feature = "half",
+    feature = "epilogue",
+    any(target_arch = "x86", target_arch = "x86_64")
+))]
+unsafe fn gemm_f16_fma_packed_fused(
+    r: PackedConsume<f16>,
+    epi: FusedEpi<f16>,
+    par: Parallelism,
+    ws: &mut Workspace,
+) {
+    unsafe { run_typed_mixed_packed_fused::<f16, MixedGemm<f16>, Fma, 2, 6>(Fma, r, epi, par, ws) }
+}
+#[cfg(all(
+    feature = "half",
+    feature = "epilogue",
+    any(target_arch = "x86", target_arch = "x86_64")
+))]
+unsafe fn gemm_bf16_fma_packed_fused(
+    r: PackedConsume<bf16>,
+    epi: FusedEpi<bf16>,
+    par: Parallelism,
+    ws: &mut Workspace,
+) {
+    unsafe {
+        run_typed_mixed_packed_fused::<bf16, MixedGemm<bf16>, Fma, 2, 6>(Fma, r, epi, par, ws)
+    }
+}
+#[cfg(all(
+    feature = "half",
+    feature = "epilogue",
+    any(target_arch = "x86", target_arch = "x86_64")
+))]
+unsafe fn gemm_f16_avx512_packed_fused(
+    r: PackedConsume<f16>,
+    epi: FusedEpi<f16>,
+    par: Parallelism,
+    ws: &mut Workspace,
+) {
+    unsafe {
+        run_typed_mixed_packed_fused::<f16, MixedGemm<f16>, Avx512, 2, 12>(Avx512, r, epi, par, ws)
+    }
+}
+#[cfg(all(
+    feature = "half",
+    feature = "epilogue",
+    any(target_arch = "x86", target_arch = "x86_64")
+))]
+unsafe fn gemm_bf16_avx512_packed_fused(
+    r: PackedConsume<bf16>,
+    epi: FusedEpi<bf16>,
+    par: Parallelism,
+    ws: &mut Workspace,
+) {
+    unsafe {
+        run_typed_mixed_packed_fused::<bf16, MixedGemm<bf16>, Avx512, 2, 12>(
+            Avx512, r, epi, par, ws,
+        )
+    }
+}
+#[cfg(all(
+    feature = "half",
+    feature = "epilogue",
+    any(target_arch = "x86", target_arch = "x86_64")
+))]
+unsafe fn gemm_bf16_avx512_dot_packed_fused(
+    r: PackedConsume<bf16>,
+    epi: FusedEpi<bf16>,
+    par: Parallelism,
+    ws: &mut Workspace,
+) {
+    unsafe {
+        run_typed_mixed_packed_fused::<bf16, Bf16DotGemm, Avx512Bf16, 2, 12>(
+            Avx512Bf16, r, epi, par, ws,
+        )
+    }
+}
+#[cfg(all(feature = "half", feature = "epilogue", target_arch = "aarch64"))]
+unsafe fn gemm_f16_neon_packed_fused(
+    r: PackedConsume<f16>,
+    epi: FusedEpi<f16>,
+    par: Parallelism,
+    ws: &mut Workspace,
+) {
+    unsafe {
+        run_typed_mixed_packed_fused::<f16, MixedGemm<f16>, Neon, 4, 4>(Neon, r, epi, par, ws)
+    }
+}
+#[cfg(all(feature = "half", feature = "epilogue", target_arch = "aarch64"))]
+unsafe fn gemm_bf16_neon_packed_fused(
+    r: PackedConsume<bf16>,
+    epi: FusedEpi<bf16>,
+    par: Parallelism,
+    ws: &mut Workspace,
+) {
+    unsafe {
+        run_typed_mixed_packed_fused::<bf16, MixedGemm<bf16>, Neon, 4, 4>(Neon, r, epi, par, ws)
+    }
+}
+#[cfg(all(
+    feature = "half",
+    feature = "epilogue",
+    target_arch = "wasm32",
+    target_feature = "simd128"
+))]
+unsafe fn gemm_f16_simd128_packed_fused(
+    r: PackedConsume<f16>,
+    epi: FusedEpi<f16>,
+    par: Parallelism,
+    ws: &mut Workspace,
+) {
+    unsafe {
+        run_typed_mixed_packed_fused::<f16, MixedGemm<f16>, Simd128, 2, 4>(Simd128, r, epi, par, ws)
+    }
+}
+#[cfg(all(
+    feature = "half",
+    feature = "epilogue",
+    target_arch = "wasm32",
+    target_feature = "simd128"
+))]
+unsafe fn gemm_bf16_simd128_packed_fused(
+    r: PackedConsume<bf16>,
+    epi: FusedEpi<bf16>,
+    par: Parallelism,
+    ws: &mut Workspace,
+) {
+    unsafe {
+        run_typed_mixed_packed_fused::<bf16, MixedGemm<bf16>, Simd128, 2, 4>(
+            Simd128, r, epi, par, ws,
+        )
+    }
+}
+
 #[cfg(feature = "half")]
 const DISP_F16_SCALAR: Dispatched<f16> = Dispatched {
     run: gemm_f16_scalar,
     run_packed: gemm_f16_scalar_packed,
     #[cfg(feature = "epilogue")]
     run_fused: gemm_f16_scalar_fused,
+    #[cfg(feature = "epilogue")]
+    run_packed_fused: gemm_f16_scalar_packed_fused,
     mr: 4,
     nr: 4,
     depth_multiple: 1,
@@ -605,6 +820,8 @@ const DISP_BF16_SCALAR: Dispatched<bf16> = Dispatched {
     run_packed: gemm_bf16_scalar_packed,
     #[cfg(feature = "epilogue")]
     run_fused: gemm_bf16_scalar_fused,
+    #[cfg(feature = "epilogue")]
+    run_packed_fused: gemm_bf16_scalar_packed_fused,
     mr: 4,
     nr: 4,
     depth_multiple: 1,
@@ -616,6 +833,8 @@ const DISP_F16_FMA: Dispatched<f16> = Dispatched {
     run_packed: gemm_f16_fma_packed,
     #[cfg(feature = "epilogue")]
     run_fused: gemm_f16_fma_fused,
+    #[cfg(feature = "epilogue")]
+    run_packed_fused: gemm_f16_fma_packed_fused,
     mr: 16,
     nr: 6,
     depth_multiple: 1,
@@ -626,6 +845,8 @@ const DISP_BF16_FMA: Dispatched<bf16> = Dispatched {
     run_packed: gemm_bf16_fma_packed,
     #[cfg(feature = "epilogue")]
     run_fused: gemm_bf16_fma_fused,
+    #[cfg(feature = "epilogue")]
+    run_packed_fused: gemm_bf16_fma_packed_fused,
     mr: 16,
     nr: 6,
     depth_multiple: 1,
@@ -637,6 +858,8 @@ const DISP_F16_AVX512: Dispatched<f16> = Dispatched {
     run_packed: gemm_f16_avx512_packed,
     #[cfg(feature = "epilogue")]
     run_fused: gemm_f16_avx512_fused,
+    #[cfg(feature = "epilogue")]
+    run_packed_fused: gemm_f16_avx512_packed_fused,
     mr: 32,
     nr: 12,
     depth_multiple: 1,
@@ -647,6 +870,8 @@ const DISP_BF16_AVX512: Dispatched<bf16> = Dispatched {
     run_packed: gemm_bf16_avx512_packed,
     #[cfg(feature = "epilogue")]
     run_fused: gemm_bf16_avx512_fused,
+    #[cfg(feature = "epilogue")]
+    run_packed_fused: gemm_bf16_avx512_packed_fused,
     mr: 32,
     nr: 12,
     depth_multiple: 1,
@@ -657,6 +882,8 @@ const DISP_BF16_AVX512_DOT: Dispatched<bf16> = Dispatched {
     run_packed: gemm_bf16_avx512_dot_packed,
     #[cfg(feature = "epilogue")]
     run_fused: gemm_bf16_avx512_dot_fused,
+    #[cfg(feature = "epilogue")]
+    run_packed_fused: gemm_bf16_avx512_dot_packed_fused,
     mr: 32,
     nr: 12,
     // k-pair-interleaved pack -> the prepack buffer rounds its depth up to 2
@@ -669,6 +896,8 @@ const DISP_F16_NEON: Dispatched<f16> = Dispatched {
     run_packed: gemm_f16_neon_packed,
     #[cfg(feature = "epilogue")]
     run_fused: gemm_f16_neon_fused,
+    #[cfg(feature = "epilogue")]
+    run_packed_fused: gemm_f16_neon_packed_fused,
     mr: 16,
     nr: 4,
     depth_multiple: 1,
@@ -679,6 +908,8 @@ const DISP_BF16_NEON: Dispatched<bf16> = Dispatched {
     run_packed: gemm_bf16_neon_packed,
     #[cfg(feature = "epilogue")]
     run_fused: gemm_bf16_neon_fused,
+    #[cfg(feature = "epilogue")]
+    run_packed_fused: gemm_bf16_neon_packed_fused,
     mr: 16,
     nr: 4,
     depth_multiple: 1,
@@ -690,6 +921,8 @@ const DISP_F16_SIMD128: Dispatched<f16> = Dispatched {
     run_packed: gemm_f16_simd128_packed,
     #[cfg(feature = "epilogue")]
     run_fused: gemm_f16_simd128_fused,
+    #[cfg(feature = "epilogue")]
+    run_packed_fused: gemm_f16_simd128_packed_fused,
     mr: 8,
     nr: 4,
     depth_multiple: 1,
@@ -700,6 +933,8 @@ const DISP_BF16_SIMD128: Dispatched<bf16> = Dispatched {
     run_packed: gemm_bf16_simd128_packed,
     #[cfg(feature = "epilogue")]
     run_fused: gemm_bf16_simd128_fused,
+    #[cfg(feature = "epilogue")]
+    run_packed_fused: gemm_bf16_simd128_packed_fused,
     mr: 8,
     nr: 4,
     depth_multiple: 1,
@@ -912,6 +1147,16 @@ impl GemmScalar for f16 {
     ) {
         unsafe { (dispatched_f16().run_fused)(t, epi, par, ws) }
     }
+    #[cfg(feature = "epilogue")]
+    #[inline]
+    unsafe fn dispatch_packed_fused(
+        req: PackedConsume<f16>,
+        epi: FusedEpi<f16>,
+        par: Parallelism,
+        ws: &mut Workspace,
+    ) {
+        unsafe { (dispatched_f16().run_packed_fused)(req, epi, par, ws) }
+    }
     #[inline]
     fn rhs_tile() -> (usize, usize) {
         let d = dispatched_f16();
@@ -967,6 +1212,16 @@ impl GemmScalar for bf16 {
         ws: &mut Workspace,
     ) {
         unsafe { (dispatched_bf16().run_fused)(t, epi, par, ws) }
+    }
+    #[cfg(feature = "epilogue")]
+    #[inline]
+    unsafe fn dispatch_packed_fused(
+        req: PackedConsume<bf16>,
+        epi: FusedEpi<bf16>,
+        par: Parallelism,
+        ws: &mut Workspace,
+    ) {
+        unsafe { (dispatched_bf16().run_packed_fused)(req, epi, par, ws) }
     }
     #[inline]
     fn rhs_tile() -> (usize, usize) {

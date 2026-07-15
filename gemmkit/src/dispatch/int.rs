@@ -17,7 +17,7 @@ use crate::kernel::IntGemmVnni;
 use crate::kernel::IntGemmVnniQ;
 use crate::kernel::KernelFamily;
 #[cfg(feature = "epilogue")]
-use crate::kernel::epilogue::{BiasDim, BiasSpec, Epilogue, KRequantize, QuantOut};
+use crate::kernel::epilogue::{BiasDim, BiasSpec, Epilogue, KRequantize, QuantOut, ScaleSpec};
 use crate::parallel::Parallelism;
 #[cfg(feature = "epilogue")]
 use crate::parallel::Ptr;
@@ -354,9 +354,11 @@ memoized_select!(
 
 /// A fully described integer requantizing GEMM: `i8` inputs, `i32` accumulator, `O` output
 /// (`i8` signed `[-128, 127]` or `u8` `[0, 255]`). No `alpha` (folds into `scale`) and no
-/// `beta` (accumulating into a quantized C is ill-defined). `bias` is an optional per-row /
-/// per-col `i32` vector (`bias_dim` in the user frame; the dispatch flips it on an orientation
-/// swap)
+/// `beta` (accumulating into a quantized C is ill-defined). The output scale is per-tensor
+/// (`scale`, used when `has_row_scales == false`) or per-row / per-col (`row_scales`, a length-`m`
+/// `f32` vector enabled by `has_row_scales`, the per-channel convention). `bias` is an optional
+/// per-row / per-col `i32` vector. `bias_dim` carries the shared per-row / per-col axis (user
+/// frame) of BOTH the scales and the bias; the dispatch flips it on an orientation swap
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 #[derive(Copy, Clone)]
 pub(crate) struct RequantTask<O> {
@@ -373,6 +375,8 @@ pub(crate) struct RequantTask<O> {
     pub rsc: isize,
     pub csc: isize,
     pub scale: f32,
+    pub row_scales: *const f32,
+    pub has_row_scales: bool,
     pub zp: i32,
     pub bias: *const i32,
     pub has_bias: bool,
@@ -427,6 +431,24 @@ fn requant_bias_spec<O>(t: &RequantTask<O>) -> BiasSpec<i32> {
     }
 }
 
+/// Build the `KRequantize` scale spec from a task's (already axis-flipped) scale fields:
+/// `has_row_scales == false` maps to the per-tensor `Tensor(scale)`, else the `Row` / `Col`
+/// variant selected by `bias_dim` (the scales share the bias's user axis, so the same flipped
+/// `bias_dim` selects both). Shared by both construction sites so the encoding lives in one place
+#[cfg(all(feature = "int8", feature = "epilogue"))]
+#[inline]
+fn requant_scale_spec<O>(t: &RequantTask<O>) -> ScaleSpec {
+    if t.has_row_scales {
+        let p = Ptr(t.row_scales as *mut f32);
+        match t.bias_dim {
+            BiasDim::PerRow => ScaleSpec::Row(p),
+            BiasDim::PerCol => ScaleSpec::Col(p),
+        }
+    } else {
+        ScaleSpec::Tensor(t.scale)
+    }
+}
+
 /// `k == 0` fill: `C[i,j] = clamp(zp + round_ne(scale*bias[i or j]), O::LO, O::HI)` (= `zp`
 /// clamped into the output band, without bias). Uses the same `KRequantize::apply` as the
 /// kernel, applied to a zero accumulator, so it is bit-identical to a `k > 0` run whose
@@ -434,7 +456,7 @@ fn requant_bias_spec<O>(t: &RequantTask<O>) -> BiasSpec<i32> {
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 unsafe fn requant_degenerate<O: QuantOut>(t: &RequantTask<O>) {
     let epi = KRequantize {
-        scale: t.scale,
+        scale: requant_scale_spec(t),
         zp: t.zp,
         bias: requant_bias_spec(t),
     };
@@ -476,14 +498,15 @@ unsafe fn run_typed_int_requant<Fam, S, O, const MR_REG: usize, const NR: usize>
             &mut t.rsc, &mut t.csc,
         );
         if swap {
-            // C^T = B^T*A^T makes a per-row bias per-col in the driver frame (and vice versa)
+            // C^T = B^T*A^T makes a per-row bias per-col in the driver frame (and vice versa). The
+            // per-row scales live on the same user axis, so this one flip re-orients both
             t.bias_dim = match t.bias_dim {
                 BiasDim::PerRow => BiasDim::PerCol,
                 BiasDim::PerCol => BiasDim::PerRow,
             };
         }
         let epi = KRequantize {
-            scale: t.scale,
+            scale: requant_scale_spec(&t),
             zp: t.zp,
             bias: requant_bias_spec(&t),
         };

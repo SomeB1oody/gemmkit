@@ -319,7 +319,7 @@ fn gemm_fused_with_matches_gemm_fused() {
 #[test]
 fn gemm_i8_requant_with_matches() {
     use gemmkit_faer::{
-        Requantize, gemm_i8_requant, gemm_i8_requant_u8, gemm_i8_requant_u8_with,
+        RequantScale, Requantize, gemm_i8_requant, gemm_i8_requant_u8, gemm_i8_requant_u8_with,
         gemm_i8_requant_with,
     };
 
@@ -337,11 +337,13 @@ fn gemm_i8_requant_with_matches() {
     let b = randi8(k, n, 0x2);
     let bias: Vec<i32> = (0..m).map(|i| 30 * i as i32 - 100).collect();
     let (scale, zp_i8, zp_u8) = (0.05f32, -7i32, 30i32);
+    // per-row (per-channel) scales, all finite and > 0, exercised through the `_with` twin too
+    let scales: Vec<f32> = (0..m).map(|i| 0.01 * (1 + i % 5) as f32).collect();
 
     let mut ws = Workspace::new();
     for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
         let mk = |zp: i32| Requantize {
-            scale,
+            scale: RequantScale::PerTensor(scale),
             zero_point: zp,
             bias: Some(&bias),
         };
@@ -388,6 +390,61 @@ fn gemm_i8_requant_with_matches() {
         for i in 0..m {
             for j in 0..n {
                 assert_eq!(cu_with[(i, j)], cu_ref[(i, j)], "requant_with u8 ({i},{j})");
+            }
+        }
+
+        // per-row scales: `_with` must equal the allocating entry bit-for-bit as well
+        let mk_row = |zp: i32| Requantize {
+            scale: RequantScale::PerRow(&scales),
+            zero_point: zp,
+            bias: Some(&bias),
+        };
+        let mut cr_with = Mat::<i8>::from_fn(m, n, |_, _| 0);
+        gemm_i8_requant_with(
+            &mut ws,
+            a.as_dyn_stride(),
+            b.as_dyn_stride(),
+            mk_row(zp_i8),
+            cr_with.as_dyn_stride_mut(),
+            par,
+        );
+        let mut cr_ref = Mat::<i8>::from_fn(m, n, |_, _| 0);
+        gemm_i8_requant(
+            a.as_dyn_stride(),
+            b.as_dyn_stride(),
+            mk_row(zp_i8),
+            cr_ref.as_dyn_stride_mut(),
+            par,
+        );
+        let mut cru_with = Mat::<u8>::from_fn(m, n, |_, _| 0);
+        gemm_i8_requant_u8_with(
+            &mut ws,
+            a.as_dyn_stride(),
+            b.as_dyn_stride(),
+            mk_row(zp_u8),
+            cru_with.as_dyn_stride_mut(),
+            par,
+        );
+        let mut cru_ref = Mat::<u8>::from_fn(m, n, |_, _| 0);
+        gemm_i8_requant_u8(
+            a.as_dyn_stride(),
+            b.as_dyn_stride(),
+            mk_row(zp_u8),
+            cru_ref.as_dyn_stride_mut(),
+            par,
+        );
+        for i in 0..m {
+            for j in 0..n {
+                assert_eq!(
+                    cr_with[(i, j)],
+                    cr_ref[(i, j)],
+                    "per-row requant_with i8 ({i},{j})"
+                );
+                assert_eq!(
+                    cru_with[(i, j)],
+                    cru_ref[(i, j)],
+                    "per-row requant_with u8 ({i},{j})"
+                );
             }
         }
     }

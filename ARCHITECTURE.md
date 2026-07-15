@@ -288,17 +288,19 @@ a separate narrow map (which rounds to the narrow type, widens back, then rounds
 narrow types `gemm_fused` is **not** bitwise-equal to `gemm`-then-map — the every-shape bitwise
 contract holds for `f32`/`f64` only. Within a fused run the vector and scratch paths still agree
 bit-for-bit (both round once), and serial ≡ parallel is unchanged. `KRequantize` (`i8 -> i8` or
-`i8 -> u8`, scale + zero-point + optional integer bias) keeps `VECTOR = false` (no float-style
-in-register path) but sets `VECTOR_STORE = true`: every tile drains to `i32` scratch, then the
-`i32 -> {i8,u8}` map is **vectorized in f64** on x86 (`apply_store` → the
-`KernelSimd::requant_store` seam, with `REQUANT_VECTOR = true` on `Fma`/`Avx512`/`Avx512Vnni`; a
-NEON override is deferred pending device validation). The output domain — its clamp band `[LO, HI]`
+`i8 -> u8`, a per-tensor/per-row/per-col `ScaleSpec` scale + zero-point + optional integer bias)
+keeps `VECTOR = false` (no float-style in-register path) but sets `VECTOR_STORE = true`: every tile
+drains to `i32` scratch, then the `i32 -> {i8,u8}` map is **vectorized in f64** on x86 (`apply_store`
+→ the `KernelSimd::requant_store` seam, with `REQUANT_VECTOR = true` on `Fma`/`Avx512`/`Avx512Vnni`;
+a NEON override is deferred pending device validation). The output domain — its clamp band `[LO, HI]`
 and the final low-byte narrowing — is chosen per output type by the `QuantOut` trait (`i8` →
 `[-128, 127]`, `u8` → `[0, 255]`, the ONNX-QLinearMatMul activation); the vector store writes the
 same low byte either way (a value clamped into `[-128, 255]` has identical bytes read as `i8` or
-`u8`), so one `requant_store` serves both. A full lane-run of a unit-stride tile takes that vector
-store; the sub-lane row tail, a strided `C`, the `k == 0` fill, and non-vector ISAs take the scalar
-`apply` — and the two are **bit-identical**, so one output mixes them freely. Either way it deletes
+`u8`), so one `requant_store` serves both. A full lane-run of a unit-stride tile whose scale is
+constant across the run (per-tensor, or per-col in the driver frame after a swap) takes that vector
+store; a per-row scale (which varies per lane) plus the sub-lane row tail, a strided `C`, the
+`k == 0` fill, and non-vector ISAs take the scalar `apply` — and all paths are **bit-identical**, so
+one output mixes them freely. Either way it deletes
 the full `m·n` `i32` materialization a `gemm_i8` + separate pass would pay. Its rounding is a single
 correctly-rounded f64 multiply with round-half-to-even (scalar: the `no_std`-safe `2^52` trick;
 vector: the hardware round-to-nearest-even, which equals it), joining the zero-point in integer —
@@ -321,10 +323,21 @@ others consume the orientation-flipped `epi`. The narrow (`f16`/`bf16`) fused pa
 small-`m,n` / small-`k` reroutes (through `MixedGemm<N>`, as the plain mixed path) and the same
 bias-axis flip — with the pre-narrow `f32` epilogue semantics above (more precise than, not
 bitwise-equal to, `gemm`-then-map). The `FusedScalar` bound admits exactly these four types; each
-supplies `dispatch_fused` and a `fused_degenerate` (the `C <- act(β·C + bias)` map when `A·B`
-vanishes — real floats in `T`, narrow types in `f32`, narrowing once). `gemm_i8_requant` still covers the general driver
+supplies `dispatch_fused`, a `dispatch_packed_fused`, and a `fused_degenerate` (the
+`C <- act(β·C + bias)` map when `A·B` vanishes — real floats in `T`, narrow types in `f32`, narrowing
+once). `gemm_i8_requant` still covers the general driver
 path only (the integer special paths keep the identity seam and adopt `E` later behind the same
-API); prepacked-RHS likewise keeps `Identity`.
+API). The **prepacked** operands also fuse: `gemm_packed_b_fused` / `gemm_packed_a_fused` reuse the
+same `PackedRhs` / `PackedLhs` handle (the epilogue is store-side only, so packing is untouched) and
+ride the driver's `run_packed_rhs_epilogue` — `run_packed_rhs` with a non-identity `E` on the same
+`run_inner`, so the pre-epilogue store is byte-identical to a plain prepacked GEMM and the fused
+result is `gemm_packed_* == gemm_packed_*()`-then-map bit-for-bit for `f32`/`f64`. Unlike `gemm_fused`
+these never reroute to a special path (always the general prepacked kernel, the packed divergence the
+plain packed entries document) and never orientation-swap in the driver; the RHS-packed consume is the
+user frame (bias unflipped), while the LHS-packed path always drives the transposed product, so its
+entry flips the user bias axis once when it builds the transposed consume (the same field-write flip
+`gemm_fused` applies dynamically, here baked into the always-transposed packed-A path). The `A·B`-vanishes
+degenerate rides `execute_packed_fused` (mirroring `execute_packed`) with the already-oriented `epi`.
 
 The **complex** family fuses a **bias only**: `gemm_cplx_fused` computes
 `C <- α·op(A)·op(B) + β·C + bias` in one pass (per-row / per-col complex bias), reusing the same
@@ -336,6 +349,29 @@ swaps both the conj flags and the bias axis on the orientation swap; the degener
 map is bias-only (`C <- β·C + bias`, conj irrelevant). Like the real-float fused entry, it exposes a
 raw `gemm_cplx_fused_unchecked`/`_with` tier (bias as a `(ptr, BiasDim, has_bias)` triple, no
 activation) the adapters forward to.
+
+**User-defined map** (`gemm_map`, `f32`/`f64`). For epilogues the library ships no fast path (GELU,
+sigmoid, clamps, position-dependent transforms) `gemm_map` applies a caller closure
+`f(value, row, col) -> value` to each element at its final value, `(row, col)` in the user frame,
+fired once. We deliberately do **not** unseal the internal `Epilogue` trait — that would freeze the
+L0/L1 seam types (`S::Reg`, `KernelSimd`) into the public API — so instead a `dyn`-closure entry lowers
+to an internal `MapEpi<'u, T>` epilogue (a borrowed `&'u (dyn Fn + Sync)`, so a closure captures its
+environment by reference; `Copy + Send + Sync` with **no** `'static` bound, captured by value into the
+scoped rayon workers that join before the borrow ends — no `Box`, no leak). One indirect call per
+element, amortized by the `O(k)` FLOPs, one monomorphization per `(T, ISA)` not per closure (the reason
+for `dyn` over a generic `F` — the fn-pointer dispatch table cannot hold a generic `F`). It threads the
+same `run_typed_map` routing as `run_typed_fused` (gemv pre-orientation, then the orientation flip, then
+small-`m,n` / small-`k` / driver) but rides a **separate** memoized table (`MAP_F32`/`MAP_F64`) rather
+than the shared `Dispatched<T>`, since the narrow types are out of scope (a `T`-domain closure after the
+`f32` accumulate would double-round). `MapEpi` sets `VECTOR = true` so the kernel routes every element
+through the *same* fast/scratch path plain `gemm` does (the guard is identical for `Identity` and a
+`VECTOR` epilogue), draining the fast-path register to scalars in `apply_reg` to apply the closure per
+lane — the fast path's *fused* β·C store is what a scratch-only path would fail to reproduce for
+`β ∉ {0,1}`, so this keeps `gemm_map == gemm()`-then-`f` **bit-for-bit** for every `f32`/`f64` shape and
+route. The `MapScalar` bound (sealed, `f32`/`f64`) admits exactly those two; the raw
+`gemm_map_unchecked`/`_with` tier the adapters forward to takes the closure and the standard view checks
+(no bias, nothing epilogue-specific to validate). Batched, complex, integer, and prepacked map entries
+are out of scope for v1.
 
 [`Epilogue<Fam>`]: gemmkit::kernel::epilogue::Epilogue
 
@@ -558,7 +594,13 @@ call.
 - **Packed** ([`prepack_rhs`]/[`gemm_packed_b`], [`prepack_lhs`]/[`gemm_packed_a`]): pre-pack one
   reused operand once into the micropanel layout, then skip the per-call repack across many products
   (the fixed-weight inference pattern). RHS-packed needs column-major-ish C, LHS-packed
-  row-major-ish — the no-swap orientation the prepacked operand was laid out for.
+  row-major-ish — the no-swap orientation the prepacked operand was laid out for. Under `epilogue`
+  a **fused** twin combines the two — `gemm_packed_b_fused` / `gemm_packed_a_fused` (and their
+  `_with` / `_unchecked` tiers) fuse a `Bias`/`Activation` epilogue into the reused-handle store
+  (`C <- act(α·A·B + β·C + bias)`), bit-identical to the plain packed entry then the scalar map for
+  `f32`/`f64`; they share the *same* `PackedRhs`/`PackedLhs` handle (the epilogue is store-side only),
+  keep the same no-swap orientation constraint, and, like the plain packed path, do not reroute to a
+  special path.
 - **Fused** ([`gemm_fused`] / `gemm_fused_with`; `epilogue` feature): `C <- act(α·A·B + β·C + bias)`
   in one pass, with
   an optional per-row/per-col `Bias` and an optional `Activation` (ReLU/LeakyReLU) — the fused L1
@@ -570,14 +612,20 @@ call.
   the result is bit-identical to `gemm` then the scalar map for **every** `f32`/`f64` shape (the L6
   special paths — gemv, small-`m,n`, small-`k` — are fused too, so a fused shape routes exactly as
   `gemm`). A strided-batched twin (`gemm_batched_fused` / `gemm_batched_fused_with`, above) applies
-  one shared bias + activation per element, and a complex sibling (`gemm_cplx_fused`) fuses a bias
-  only (an ordering-based activation is undefined on `ℂ`); both reuse the same `FusedEpi` epilogue.
+  one shared bias + activation per element, a **prepacked** twin
+  (`gemm_packed_b_fused` / `gemm_packed_a_fused`, above) fuses over a reused pack handle under the same
+  no-swap orientation constraint, and a complex sibling (`gemm_cplx_fused`) fuses a bias
+  only (an ordering-based activation is undefined on `ℂ`); all reuse the same `FusedEpi` epilogue.
 - **Requantize** ([`gemm_i8_requant`] / `gemm_i8_requant_with` → `i8` output; `gemm_i8_requant_u8` /
   `gemm_i8_requant_u8_with` → `u8` output, ONNX-QLinearMatMul-style; `int8` + `epilogue` features): `i8·i8 -> i8`/`u8`
-  with a per-tensor `Requantize { scale, zero_point, bias }` (`zero_point` in `[-128, 127]` for `i8`,
+  with a `Requantize { scale, zero_point, bias }` (`zero_point` in `[-128, 127]` for `i8`,
   `[0, 255]` for `u8`), fusing the `i32 -> {i8,u8}` requantize into the store (deleting the `m·n` `i32`
-  materialization). Bit-exact across ISAs and serial ≡ parallel; the two outputs share one
-  `KRequantize` epilogue and one requant-store seam, parametrized by the `QuantOut` output domain.
+  materialization). The `scale` is a `RequantScale`: per-tensor (`PerTensor(f32)`) or **per-channel**
+  (`PerRow(&[f32])`, one scale per output row / channel, the quantized-inference convention), lowered
+  to a `ScaleSpec` that flips per-row↔per-col on the orientation swap in lockstep with the bias axis.
+  Bit-exact across ISAs and serial ≡ parallel (a `PerTensor(s)` is bitwise-identical to a
+  `PerRow([s; m])`); the two outputs share one `KRequantize` epilogue and one requant-store seam,
+  parametrized by the `QuantOut` output domain.
 - **Unchecked** ([`gemm_unchecked`], plus a raw-pointer sibling for every safe entry:
   `gemm_batched_unchecked`, `prepack_rhs_unchecked`/`gemm_packed_b_unchecked`,
   `prepack_lhs_unchecked`/`gemm_packed_a_unchecked`, `gemm_i8_unchecked`, `gemm_cplx_unchecked`, and
