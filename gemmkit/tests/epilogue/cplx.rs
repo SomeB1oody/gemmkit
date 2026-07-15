@@ -176,6 +176,130 @@ fn cplx_fused_bitwise() {
 }
 
 // ---------------------------------------------------------------------------
+// checked/unchecked twin equivalence: gemm_cplx_fused_unchecked(_with)
+// ---------------------------------------------------------------------------
+
+/// `gemm_cplx_fused` and its raw twins `gemm_cplx_fused_unchecked` (pool) / `_with` (caller-owned
+/// `Workspace`) are **parallel** entry points — the checked one does not delegate to the raw one, so
+/// a divergence in the `(ptr, BiasDim, has_bias)` lowering would go undetected. Exercise both raw
+/// forms against the checked twin bit-for-bit (re + im) on a driver shape, across both bias axes,
+/// `has_bias = false`, and a conjugated combination.
+fn cplx_fused_unchecked_for<T: Cx>() {
+    use gemmkit::{
+        BiasDim, gemm_cplx_fused, gemm_cplx_fused_unchecked, gemm_cplx_fused_unchecked_with,
+    };
+
+    let mut rng = Rng::new(0x00CF_11ED);
+    let (m, k, n) = (33usize, 24usize, 40usize);
+    let a = fill::<T>(&mut rng, m * k);
+    let b = fill::<T>(&mut rng, k * n);
+    let c0 = fill::<T>(&mut rng, m * n);
+    let bias_row = fill::<T>(&mut rng, m);
+    let bias_col = fill::<T>(&mut rng, n);
+    let alpha = T::of(1.1, -0.4);
+    let beta = T::of(0.5, 0.7);
+    let (rsc, csc) = (1isize, m as isize);
+    let par = Parallelism::Serial;
+
+    for &(ca, cb) in &[(true, false), (false, true)] {
+        for bias_kind in 0u8..=2 {
+            let bias_checked = match bias_kind {
+                1 => Some(Bias::PerRow(&bias_row)),
+                2 => Some(Bias::PerCol(&bias_col)),
+                _ => None,
+            };
+            let (bptr, bdim, has_bias) = match bias_kind {
+                1 => (bias_row.as_ptr(), BiasDim::PerRow, true),
+                2 => (bias_col.as_ptr(), BiasDim::PerCol, true),
+                _ => (core::ptr::null(), BiasDim::PerRow, false),
+            };
+
+            let mut c_checked = c0.clone();
+            {
+                let ar = MatRef::new(&a, m, k, 1, m as isize);
+                let br = MatRef::new(&b, k, n, 1, k as isize);
+                let cm = MatMut::new(&mut c_checked, m, n, rsc, csc);
+                gemm_cplx_fused(alpha, ar, ca, br, cb, beta, cm, bias_checked, par);
+            }
+
+            let mut c_pool = c0.clone();
+            let mut c_ws = c0.clone();
+            let mut ws = Workspace::new();
+            // SAFETY: valid in-bounds col-major layouts; C aliases neither A/B nor the bias, and the
+            // bias (when present) is the right length for its axis.
+            unsafe {
+                gemm_cplx_fused_unchecked(
+                    m,
+                    k,
+                    n,
+                    alpha,
+                    a.as_ptr(),
+                    1,
+                    m as isize,
+                    ca,
+                    b.as_ptr(),
+                    1,
+                    k as isize,
+                    cb,
+                    beta,
+                    c_pool.as_mut_ptr(),
+                    rsc,
+                    csc,
+                    bptr,
+                    bdim,
+                    has_bias,
+                    par,
+                );
+                gemm_cplx_fused_unchecked_with(
+                    &mut ws,
+                    m,
+                    k,
+                    n,
+                    alpha,
+                    a.as_ptr(),
+                    1,
+                    m as isize,
+                    ca,
+                    b.as_ptr(),
+                    1,
+                    k as isize,
+                    cb,
+                    beta,
+                    c_ws.as_mut_ptr(),
+                    rsc,
+                    csc,
+                    bptr,
+                    bdim,
+                    has_bias,
+                    par,
+                );
+            }
+
+            for idx in 0..m * n {
+                assert_eq!(
+                    c_checked[idx].bits(),
+                    c_pool[idx].bits(),
+                    "{} cplx fused unchecked != checked at {idx} [ca={ca} cb={cb} bias_kind={bias_kind}]",
+                    T::name(),
+                );
+                assert_eq!(
+                    c_checked[idx].bits(),
+                    c_ws[idx].bits(),
+                    "{} cplx fused unchecked_with != checked at {idx} [ca={ca} cb={cb} bias_kind={bias_kind}]",
+                    T::name(),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn cplx_fused_unchecked_matches_checked() {
+    cplx_fused_unchecked_for::<Complex<f32>>();
+    cplx_fused_unchecked_for::<Complex<f64>>();
+}
+
+// ---------------------------------------------------------------------------
 // b. multi depth-panel: proves the last_k gating (intermediate partials untouched)
 // ---------------------------------------------------------------------------
 

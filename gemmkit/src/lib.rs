@@ -76,8 +76,9 @@ mod workspace;
 
 #[cfg(feature = "epilogue")]
 pub use api::{
-    Activation, Bias, gemm_batched_fused, gemm_batched_fused_with, gemm_fused,
-    gemm_fused_unchecked, gemm_fused_with,
+    Activation, Bias, gemm_batched_fused, gemm_batched_fused_unchecked,
+    gemm_batched_fused_unchecked_with, gemm_batched_fused_with, gemm_fused, gemm_fused_unchecked,
+    gemm_fused_unchecked_with, gemm_fused_with,
 };
 pub use api::{
     BatchProblem, MatMut, MatRef, PackedLhs, PackedRhs, gemm, gemm_batched,
@@ -90,12 +91,16 @@ pub use api::{
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 pub use api::{
     Requantize, gemm_i8_requant, gemm_i8_requant_u8, gemm_i8_requant_u8_unchecked,
-    gemm_i8_requant_u8_with, gemm_i8_requant_unchecked, gemm_i8_requant_with,
+    gemm_i8_requant_u8_unchecked_with, gemm_i8_requant_u8_with, gemm_i8_requant_unchecked,
+    gemm_i8_requant_unchecked_with, gemm_i8_requant_with,
 };
 #[cfg(feature = "complex")]
 pub use api::{gemm_cplx, gemm_cplx_unchecked, gemm_cplx_unchecked_with, gemm_cplx_with};
 #[cfg(all(feature = "complex", feature = "epilogue"))]
-pub use api::{gemm_cplx_fused, gemm_cplx_fused_with};
+pub use api::{
+    gemm_cplx_fused, gemm_cplx_fused_unchecked, gemm_cplx_fused_unchecked_with,
+    gemm_cplx_fused_with,
+};
 #[cfg(feature = "int8")]
 pub use api::{gemm_i8, gemm_i8_unchecked, gemm_i8_unchecked_with, gemm_i8_with};
 #[cfg(feature = "complex")]

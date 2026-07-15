@@ -5,6 +5,8 @@ use super::*;
 #[cfg(feature = "epilogue")]
 use crate::dispatch::FusedScalar;
 use crate::dispatch::GemmProblem;
+#[cfg(feature = "epilogue")]
+use crate::kernel::epilogue::BiasDim;
 use alloc::vec::Vec;
 
 /// Bounds check for a **strided-batched** view: the `batch` element views (element `bi` based at
@@ -413,6 +415,145 @@ pub fn gemm_batched_fused_with<T: FusedScalar>(
             c.data.as_mut_ptr(),
             c.rs,
             c.cs,
+            c_batch_stride,
+            epi,
+            par,
+            ws,
+        );
+    }
+}
+
+/// The raw strided-batched fused engine: `C_e <- act(alpha·A_e·B_e + beta·C_e + bias)` for
+/// `e in 0..batch` over pointers and `isize` strides, with **no** bounds/alias/shape checks — the
+/// raw-parts form of [`gemm_batched_fused`] (mirroring [`gemm_batched_unchecked`]'s shape plus the
+/// shared bias/activation of [`gemm_fused_unchecked`]). Element `e` is based at `a + e·a_batch_stride`
+/// / `b + e·b_batch_stride` / `c + e·c_batch_stride`, all sharing the single-element shape `(m, k, n)`
+/// and element strides; the **one** `bias` (`(ptr, dim)` pair enabled by `has_bias`) and **one** `act`
+/// are shared by every element. Uses the thread-local workspace pool.
+///
+/// # Safety
+/// For every element `e in 0..batch`: `a`/`b` are valid for reads and `c` for read+write over every
+/// `(i, j)` implied by `(m, k, n)` and the element strides at the batch-strided base; the `batch` `C`
+/// regions are pairwise disjoint and none aliases any `A`/`B`; and when `beta == 0`, `c` need not be
+/// initialized. A batch stride may be `0` (broadcast) only for the read-only `A`/`B`, never `C`. When
+/// `has_bias`, `bias` is a single shared vector valid for reads of `m` (`PerRow`) or `n` (`PerCol`)
+/// elements — sized for one element, not `batch·axis` — and disjoint from every `C` element; a
+/// non-finite `LeakyRelu` slope is the caller's responsibility (the checked API rejects it).
+#[cfg(feature = "epilogue")]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gemm_batched_fused_unchecked<T: FusedScalar>(
+    batch: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    alpha: T,
+    a: *const T,
+    rsa: isize,
+    csa: isize,
+    a_batch_stride: isize,
+    b: *const T,
+    rsb: isize,
+    csb: isize,
+    b_batch_stride: isize,
+    beta: T,
+    c: *mut T,
+    rsc: isize,
+    csc: isize,
+    c_batch_stride: isize,
+    bias: *const T,
+    bias_dim: BiasDim,
+    has_bias: bool,
+    act: Option<Activation<T>>,
+    par: Parallelism,
+) {
+    // SAFETY: preconditions forwarded to the caller (see this fn's # Safety).
+    unsafe {
+        workspace::with_thread_pool(|ws| {
+            gemm_batched_fused_unchecked_with(
+                ws,
+                batch,
+                m,
+                k,
+                n,
+                alpha,
+                a,
+                rsa,
+                csa,
+                a_batch_stride,
+                b,
+                rsb,
+                csb,
+                b_batch_stride,
+                beta,
+                c,
+                rsc,
+                csc,
+                c_batch_stride,
+                bias,
+                bias_dim,
+                has_bias,
+                act,
+                par,
+            );
+        });
+    }
+}
+
+/// As [`gemm_batched_fused_unchecked`] but with a caller-owned [`Workspace`].
+///
+/// # Safety
+/// See [`gemm_batched_fused_unchecked`].
+#[cfg(feature = "epilogue")]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gemm_batched_fused_unchecked_with<T: FusedScalar>(
+    ws: &mut Workspace,
+    batch: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    alpha: T,
+    a: *const T,
+    rsa: isize,
+    csa: isize,
+    a_batch_stride: isize,
+    b: *const T,
+    rsb: isize,
+    csb: isize,
+    b_batch_stride: isize,
+    beta: T,
+    c: *mut T,
+    rsc: isize,
+    csc: isize,
+    c_batch_stride: isize,
+    bias: *const T,
+    bias_dim: BiasDim,
+    has_bias: bool,
+    act: Option<Activation<T>>,
+    par: Parallelism,
+) {
+    let epi = to_fused_epi_raw(bias, bias_dim, has_bias, act);
+    // SAFETY: the caller guarantees per-element pointer validity, pairwise-disjoint `C` regions that
+    // don't alias `A`/`B`, a valid disjoint shared bias when `has_bias`, and that `beta == 0` may
+    // leave `C` uninitialized (see # Safety).
+    unsafe {
+        crate::special::batched::run_fused(
+            batch,
+            m,
+            k,
+            n,
+            alpha,
+            a,
+            rsa,
+            csa,
+            a_batch_stride,
+            b,
+            rsb,
+            csb,
+            b_batch_stride,
+            beta,
+            c,
+            rsc,
+            csc,
             c_batch_stride,
             epi,
             par,

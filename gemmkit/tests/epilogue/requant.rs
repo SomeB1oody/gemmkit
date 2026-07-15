@@ -171,6 +171,70 @@ fn requant_unchecked_matches_checked() {
     );
 }
 
+/// The `_with` twin `gemm_i8_requant_unchecked_with` (caller-owned `Workspace`) must match the
+/// checked `gemm_i8_requant_with` twin bit-for-bit on a driver-shaped case (with bias).
+#[test]
+fn requant_unchecked_with_matches_checked() {
+    use gemmkit::{Workspace, gemm_i8_requant_unchecked_with, gemm_i8_requant_with};
+
+    let mut rng = Rng::new(0x5EED_5678);
+    let (m, k, n) = (24usize, 33usize, 40usize);
+    let a = make_i8(&mut rng, m * k);
+    let b = make_i8(&mut rng, k * n);
+    let bias: Vec<i32> = (0..m)
+        .map(|_| (rng.next_u64() % 2001) as i64 as i32 - 1000)
+        .collect();
+    let (scale, zp) = (0.5f32, 13i32);
+    let (rsc, csc) = (1isize, m as isize);
+    let par = Parallelism::Serial;
+
+    let mut c_checked = vec![0i8; m * n];
+    {
+        let mut ws = Workspace::new();
+        let ar = MatRef::new(&a, m, k, 1, m as isize);
+        let br = MatRef::new(&b, k, n, 1, k as isize);
+        let cm = MatMut::new(&mut c_checked, m, n, rsc, csc);
+        let req = Requantize {
+            scale,
+            zero_point: zp,
+            bias: Some(&bias),
+        };
+        gemm_i8_requant_with(&mut ws, ar, br, req, cm, par);
+    }
+
+    let mut c_unchecked = vec![0i8; m * n];
+    let mut ws = Workspace::new();
+    // SAFETY: valid in-bounds col-major layouts; C aliases neither A/B nor the (per-row, length-m)
+    // bias.
+    unsafe {
+        gemm_i8_requant_unchecked_with(
+            &mut ws,
+            m,
+            k,
+            n,
+            a.as_ptr(),
+            1,
+            m as isize,
+            b.as_ptr(),
+            1,
+            k as isize,
+            scale,
+            zp,
+            bias.as_ptr(),
+            true,
+            c_unchecked.as_mut_ptr(),
+            rsc,
+            csc,
+            par,
+        );
+    }
+
+    assert_eq!(
+        c_checked, c_unchecked,
+        "requant unchecked_with != checked [m={m} k={k} n={n}]"
+    );
+}
+
 /// Hardcoded round-half-to-even ties, independent of any reference function: each row is a
 /// `1×1` product giving an exact `acc`, and `scale = 0.5` lands `scale·acc` on a half-integer.
 /// A round-half-up/away regression would flip 0.5→1, 2.5→3, etc.
@@ -726,6 +790,70 @@ fn requant_u8_unchecked_matches_checked() {
     assert_eq!(
         c_checked, c_unchecked,
         "u8 requant unchecked != checked [m={m} k={k} n={n}]"
+    );
+}
+
+/// The `_with` twin `gemm_i8_requant_u8_unchecked_with` (caller-owned `Workspace`) must match the
+/// checked `gemm_i8_requant_u8_with` twin bit-for-bit on a driver-shaped case (with bias).
+#[test]
+fn requant_u8_unchecked_with_matches_checked() {
+    use gemmkit::{Workspace, gemm_i8_requant_u8_unchecked_with, gemm_i8_requant_u8_with};
+
+    let mut rng = Rng::new(0x0075_5E5E);
+    let (m, k, n) = (24usize, 33usize, 40usize);
+    let a = make_i8(&mut rng, m * k);
+    let b = make_i8(&mut rng, k * n);
+    let bias: Vec<i32> = (0..m)
+        .map(|_| (rng.next_u64() % 2001) as i64 as i32 - 1000)
+        .collect();
+    let (scale, zp) = (0.5f32, 200i32);
+    let (rsc, csc) = (1isize, m as isize);
+    let par = Parallelism::Serial;
+
+    let mut c_checked = vec![0u8; m * n];
+    {
+        let mut ws = Workspace::new();
+        let ar = MatRef::new(&a, m, k, 1, m as isize);
+        let br = MatRef::new(&b, k, n, 1, k as isize);
+        let cm = MatMut::new(&mut c_checked, m, n, rsc, csc);
+        let req = Requantize {
+            scale,
+            zero_point: zp,
+            bias: Some(&bias),
+        };
+        gemm_i8_requant_u8_with(&mut ws, ar, br, req, cm, par);
+    }
+
+    let mut c_unchecked = vec![0u8; m * n];
+    let mut ws = Workspace::new();
+    // SAFETY: valid in-bounds col-major layouts; C aliases neither A/B nor the (per-row, length-m)
+    // bias.
+    unsafe {
+        gemm_i8_requant_u8_unchecked_with(
+            &mut ws,
+            m,
+            k,
+            n,
+            a.as_ptr(),
+            1,
+            m as isize,
+            b.as_ptr(),
+            1,
+            k as isize,
+            scale,
+            zp,
+            bias.as_ptr(),
+            true,
+            c_unchecked.as_mut_ptr(),
+            rsc,
+            csc,
+            par,
+        );
+    }
+
+    assert_eq!(
+        c_checked, c_unchecked,
+        "u8 requant unchecked_with != checked [m={m} k={k} n={n}]"
     );
 }
 

@@ -333,8 +333,9 @@ shape and every conj combination (the tile-local post-pass above), and determini
 counts. There is deliberately **no activation** on the complex entry: an ordering-based activation
 (ReLU / LeakyReLU) is mathematically undefined on `ℂ`. The dispatch mirror (`run_complex_fused`)
 swaps both the conj flags and the bias axis on the orientation swap; the degenerate `A·B`-vanishes
-map is bias-only (`C <- β·C + bias`, conj irrelevant). There is no `_unchecked` complex fused entry
-(minimal surface).
+map is bias-only (`C <- β·C + bias`, conj irrelevant). Like the real-float fused entry, it exposes a
+raw `gemm_cplx_fused_unchecked`/`_with` tier (bias as a `(ptr, BiasDim, has_bias)` triple, no
+activation) the adapters forward to.
 
 [`Epilogue<Fam>`]: gemmkit::kernel::epilogue::Epilogue
 
@@ -547,7 +548,7 @@ call.
   `gemm_batched_fused_with`, `FusedScalar` bound) applies **one** shared bias + activation to
   every element — `C_b <- act(α·A_b·B_b + β·C_b + bias)`, the batched-linear-layer case —
   bit-identical to a loop of `gemm_fused`; it reuses that validation plus the fused bias/slope
-  checks and has no unchecked variant.
+  checks, and has a raw `gemm_batched_fused_unchecked`/`_with` tier the adapters use.
 - **Pointer-array batched** ([`gemm_batched_slice`] / [`gemm_batched_ptr_unchecked`]): a slice of
   independent, **heterogeneously-shaped** problems (each its own pointers). The checked form takes
   safe views — a distinct `MatMut` per element, so the borrow checker already guarantees the
@@ -579,11 +580,15 @@ call.
   `KRequantize` epilogue and one requant-store seam, parametrized by the `QuantOut` output domain.
 - **Unchecked** ([`gemm_unchecked`], plus a raw-pointer sibling for every safe entry:
   `gemm_batched_unchecked`, `prepack_rhs_unchecked`/`gemm_packed_b_unchecked`,
-  `prepack_lhs_unchecked`/`gemm_packed_a_unchecked`, `gemm_i8_unchecked`, `gemm_cplx_unchecked` —
-  each with a `_with` caller-owned-`Workspace` form): the raw pointer + `isize` stride engine for
-  advanced callers (e.g. the ndarray adapter) that validate their own inputs and may use negative
-  strides. Each safe entry is exactly its bounds/alias/orientation checks followed by a forward to
-  the matching unchecked engine, so the checked and raw paths never diverge.
+  `prepack_lhs_unchecked`/`gemm_packed_a_unchecked`, `gemm_i8_unchecked`, `gemm_cplx_unchecked`, and
+  — under `epilogue` — the fused tier `gemm_fused_unchecked`, `gemm_batched_fused_unchecked`,
+  `gemm_i8_requant_unchecked`/`gemm_i8_requant_u8_unchecked`, `gemm_cplx_fused_unchecked` (bias as a
+  raw `(ptr, BiasDim, has_bias)` triple) — each with a `_with` caller-owned-`Workspace` form): the
+  raw pointer + `isize` stride engine for advanced callers (e.g. the ndarray adapter) that validate
+  their own inputs and may use negative strides. Each safe entry is exactly its
+  bounds/alias/orientation checks (and, for the fused entries, bias-length/overlap, finite-slope, and
+  requant scale/zero-point checks) followed by a forward to the matching unchecked engine, so the
+  checked and raw paths never diverge.
 
 `gemmkit-ndarray` is a thin adapter: it accepts `&ArrayBase<S, Ix2>` for any
 `S: Data` (both `ArrayView2` and `&Array2`), reads the pointer and strides, and
@@ -591,15 +596,25 @@ forwards to the unchecked engine — so C-order, F-order, general-stride, and
 reversed views all work without copying. `dot` is the `.dot()`-style convenience.
 The same thin-wrapper treatment covers the batched (`gemm_batched`/`dot_batched` over an `Ix3`
 array, batch on axis 0) and packed (`prepack_rhs`/`prepack_lhs` + their consumers) raw entries.
+Under `epilogue` the fused entries — `gemm_fused`/`gemm_batched_fused` (and, with `int8`/`complex`,
+`gemm_i8_requant`/`gemm_i8_requant_u8` and `gemm_cplx_fused`, each with a `_with` form) — follow the
+same pattern: they read the raw `(ptr, dims, strides)`, replicate the core's epilogue-parameter
+checks (bias length, bias-vs-`C` overlap via raw pointer arithmetic, finite slope, requant
+scale/zero-point) with the core's exact wording, then forward to gemmkit's matching `_unchecked`
+fused entry. So reversed (negative-stride) views work exactly as in the plain entries, and no slice
+is ever fabricated over `C`'s (possibly gappy / partly-uninitialized) footprint.
 
 `gemmkit-nalgebra` is the same thin adapter for nalgebra: it accepts `&Matrix<T, R, C, S>` for any
 `S: RawStorage` (`DMatrix`, static `SMatrix`, and every view type), pulls `shape()`/`strides()` (the
 non-negative `usize` strides widened to `isize`) and the storage pointer, and forwards to the same
 unchecked engine — so column-major, row-major, and general-stride views all work without copying. It
-mirrors the ndarray surface fn-for-fn (`gemm`/`dot`/packed/`gemm_i8`/`gemm_cplx`, each with a `_with`
-form) minus the batched pair, which has no nalgebra analogue (no 3-D array type). `dot` returns a
-column-major `DMatrix` built through `VecStorage`, so the fresh-output allocation needs no nalgebra
-`Scalar`/`Zero` bound.
+mirrors the ndarray surface fn-for-fn (`gemm`/`dot`/packed/`gemm_i8`/`gemm_cplx`, plus the
+`epilogue` fused entries `gemm_fused`/`gemm_i8_requant`/`gemm_cplx_fused`, each with a `_with` form)
+minus the batched pair (and its `gemm_batched_fused`), which has no nalgebra analogue (no 3-D array
+type). The fused entries replicate the core's epilogue checks and forward to the same `_unchecked`
+engine as ndarray; nalgebra's strides are always non-negative, so the reversed-view case never
+arises. `dot` returns a column-major `DMatrix` built through `VecStorage`, so
+the fresh-output allocation needs no nalgebra `Scalar`/`Zero` bound.
 
 `gemmkit-faer` is the same thin adapter for faer 0.24. Because faer's `MatRef<'_, T>`/`MatMut<'_, T>`
 are *already* type-erased strided views (generic over an arbitrary element `T` — the vocabulary-view
@@ -608,9 +623,12 @@ than being generic over a storage trait: `gemm(alpha, a: MatRef, b: MatRef, beta
 reading `nrows()`/`ncols()` and the element-unit `isize` `row_stride()`/`col_stride()` (already the
 sign-and-unit convention gemmkit wants — negative for a `reverse_rows`/`reverse_cols` view — so no
 cast) plus `as_ptr()`/`as_ptr_mut()`, then forwarding to the same unchecked engine. It mirrors the
-nalgebra surface fn-for-fn (`gemm`/`dot`/packed/`gemm_i8`/`gemm_cplx`, each `_with`); `dot` returns a
+nalgebra surface fn-for-fn (`gemm`/`dot`/packed/`gemm_i8`/`gemm_cplx`, plus the `epilogue` fused
+entries `gemm_fused`/`gemm_i8_requant`/`gemm_cplx_fused`, each `_with`); `dot` returns a
 fresh column-major `Mat<T>` built with `Mat::from_fn` (no numeric bound, so `f16`/`bf16`/`i32` need
-not satisfy faer's `ComplexField`). Complex unifies for free: faer's `c32`/`c64` are
+not satisfy faer's `ComplexField`). The fused entries replicate the core's epilogue checks and
+forward raw parts to the same `_unchecked` engine, so a `reverse_rows`/`reverse_cols` view works
+exactly as in the plain entries. Complex unifies for free: faer's `c32`/`c64` are
 `num_complex::Complex<f32>`/`<f64>` over the same num-complex 0.4 gemmkit uses, so no cast is needed.
 faer 0.24's MSRV (1.84) fits the workspace 1.89 and the dependency is `default-features = false`
 (view geometry + one `Mat` alloc only, never faer's own matmul).

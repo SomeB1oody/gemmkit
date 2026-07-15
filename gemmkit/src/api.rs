@@ -14,7 +14,7 @@
 
 use crate::dispatch::{self, GemmScalar, Task};
 #[cfg(feature = "epilogue")]
-use crate::kernel::epilogue::{Act, BiasSpec, FusedEpi};
+use crate::kernel::epilogue::{Act, BiasDim, BiasSpec, FusedEpi};
 use crate::parallel::Parallelism;
 #[cfg(feature = "epilogue")]
 use crate::parallel::Ptr;
@@ -34,17 +34,26 @@ pub use batched::{
     gemm_batched_unchecked, gemm_batched_unchecked_with, gemm_batched_with,
 };
 #[cfg(feature = "epilogue")]
-pub use batched::{gemm_batched_fused, gemm_batched_fused_with};
+pub use batched::{
+    gemm_batched_fused, gemm_batched_fused_unchecked, gemm_batched_fused_unchecked_with,
+    gemm_batched_fused_with,
+};
 #[cfg(feature = "complex")]
 pub use cplx::{gemm_cplx, gemm_cplx_unchecked, gemm_cplx_unchecked_with, gemm_cplx_with};
 #[cfg(all(feature = "complex", feature = "epilogue"))]
-pub use cplx::{gemm_cplx_fused, gemm_cplx_fused_with};
+pub use cplx::{
+    gemm_cplx_fused, gemm_cplx_fused_unchecked, gemm_cplx_fused_unchecked_with,
+    gemm_cplx_fused_with,
+};
 #[cfg(feature = "epilogue")]
-pub use fused::{Activation, Bias, gemm_fused, gemm_fused_unchecked, gemm_fused_with};
+pub use fused::{
+    Activation, Bias, gemm_fused, gemm_fused_unchecked, gemm_fused_unchecked_with, gemm_fused_with,
+};
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 pub use int8::{
     Requantize, gemm_i8_requant, gemm_i8_requant_u8, gemm_i8_requant_u8_unchecked,
-    gemm_i8_requant_u8_with, gemm_i8_requant_unchecked, gemm_i8_requant_with,
+    gemm_i8_requant_u8_unchecked_with, gemm_i8_requant_u8_with, gemm_i8_requant_unchecked,
+    gemm_i8_requant_unchecked_with, gemm_i8_requant_with,
 };
 #[cfg(feature = "int8")]
 pub use int8::{gemm_i8, gemm_i8_unchecked, gemm_i8_unchecked_with, gemm_i8_with};
@@ -309,6 +318,36 @@ fn to_fused_epi<T>(bias: Option<Bias<'_, T>>, act: Option<Activation<T>>) -> Fus
         None => BiasSpec::None,
         Some(Bias::PerRow(s)) => BiasSpec::Row(Ptr(s.as_ptr() as *mut T)),
         Some(Bias::PerCol(s)) => BiasSpec::Col(Ptr(s.as_ptr() as *mut T)),
+    };
+    let act = match act {
+        None => Act::None,
+        Some(Activation::Relu) => Act::Relu,
+        Some(Activation::LeakyRelu(s)) => Act::LeakyRelu(s),
+    };
+    FusedEpi { bias, act }
+}
+
+/// The raw-pointer analogue of [`to_fused_epi`]: lower a `(bias ptr, [`BiasDim`], `has_bias`)`
+/// selector plus an optional [`Activation`] into the internal [`FusedEpi`] the dispatch layer
+/// consumes. `has_bias == false` maps to [`BiasSpec::None`] (the `bias` pointer is then ignored);
+/// otherwise the pointer is erased to the `Send + Sync` [`Ptr`] shim under the chosen axis. Shared by
+/// the unchecked fused entries — `gemm_fused_unchecked_with`, `gemm_batched_fused_unchecked_with`,
+/// and the complex `gemm_cplx_fused_unchecked_with` (which always passes `act == None`, since an
+/// ordering activation is undefined on `ℂ`) — so the raw lowering lives in one place.
+#[cfg(feature = "epilogue")]
+fn to_fused_epi_raw<T>(
+    bias: *const T,
+    bias_dim: BiasDim,
+    has_bias: bool,
+    act: Option<Activation<T>>,
+) -> FusedEpi<T> {
+    let bias = if has_bias {
+        match bias_dim {
+            BiasDim::PerRow => BiasSpec::Row(Ptr(bias as *mut T)),
+            BiasDim::PerCol => BiasSpec::Col(Ptr(bias as *mut T)),
+        }
+    } else {
+        BiasSpec::None
     };
     let act = match act {
         None => Act::None,

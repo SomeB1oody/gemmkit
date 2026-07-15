@@ -2,7 +2,7 @@
 use super::*;
 use crate::dispatch::ComplexScalar;
 #[cfg(feature = "epilogue")]
-use crate::kernel::epilogue::{Act, BiasSpec, FusedEpi};
+use crate::kernel::epilogue::{Act, BiasDim, BiasSpec, FusedEpi};
 #[cfg(feature = "epilogue")]
 use crate::parallel::Ptr;
 
@@ -190,6 +190,110 @@ pub fn gemm_cplx_fused_with<T: ComplexScalar>(
                 c: c.data.as_mut_ptr(),
                 rsc: c.rs,
                 csc: c.cs,
+            },
+            epi,
+            par,
+            ws,
+        );
+    }
+}
+
+/// The raw complex fused engine: `C <- alpha·op(A)·op(B) + beta·C + bias` over pointers and `isize`
+/// strides, with **no** bounds/alias/shape checks — the raw-parts form of [`gemm_cplx_fused`] (and
+/// the complex sibling of [`gemm_fused_unchecked`]). `op` conjugates the operand when its `conj_*`
+/// flag is set; `bias` is a `(ptr, dim)` pair enabled by `has_bias` (`bias` is ignored when
+/// `has_bias == false`), added verbatim (never conjugated). There is **no** activation parameter —
+/// an ordering activation is undefined on `ℂ`. Uses the thread-local workspace pool.
+///
+/// # Safety
+/// As [`gemm_cplx_unchecked`], plus: when `has_bias`, `bias` is valid for reads of `m` (`PerRow`)
+/// or `n` (`PerCol`) elements and does not alias `c`.
+#[cfg(all(feature = "complex", feature = "epilogue"))]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gemm_cplx_fused_unchecked<T: ComplexScalar>(
+    m: usize,
+    k: usize,
+    n: usize,
+    alpha: T,
+    a: *const T,
+    rsa: isize,
+    csa: isize,
+    conj_a: bool,
+    b: *const T,
+    rsb: isize,
+    csb: isize,
+    conj_b: bool,
+    beta: T,
+    c: *mut T,
+    rsc: isize,
+    csc: isize,
+    bias: *const T,
+    bias_dim: BiasDim,
+    has_bias: bool,
+    par: Parallelism,
+) {
+    // SAFETY: preconditions forwarded to the caller (see # Safety).
+    unsafe {
+        workspace::with_thread_pool(|ws| {
+            gemm_cplx_fused_unchecked_with(
+                ws, m, k, n, alpha, a, rsa, csa, conj_a, b, rsb, csb, conj_b, beta, c, rsc, csc,
+                bias, bias_dim, has_bias, par,
+            );
+        });
+    }
+}
+
+/// As [`gemm_cplx_fused_unchecked`] but with a caller-owned [`Workspace`].
+///
+/// # Safety
+/// See [`gemm_cplx_fused_unchecked`].
+#[cfg(all(feature = "complex", feature = "epilogue"))]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gemm_cplx_fused_unchecked_with<T: ComplexScalar>(
+    ws: &mut Workspace,
+    m: usize,
+    k: usize,
+    n: usize,
+    alpha: T,
+    a: *const T,
+    rsa: isize,
+    csa: isize,
+    conj_a: bool,
+    b: *const T,
+    rsb: isize,
+    csb: isize,
+    conj_b: bool,
+    beta: T,
+    c: *mut T,
+    rsc: isize,
+    csc: isize,
+    bias: *const T,
+    bias_dim: BiasDim,
+    has_bias: bool,
+    par: Parallelism,
+) {
+    // Complex has no activation (undefined on `ℂ`): lower with `act = None`, giving `Act::None`.
+    let epi = to_fused_epi_raw(bias, bias_dim, has_bias, None);
+    // SAFETY: preconditions forwarded to the caller (see # Safety).
+    unsafe {
+        dispatch::execute_complex_fused(
+            conj_a,
+            conj_b,
+            Task {
+                m,
+                k,
+                n,
+                alpha,
+                a,
+                rsa,
+                csa,
+                b,
+                rsb,
+                csb,
+                beta,
+                c,
+                rsc,
+                csc,
             },
             epi,
             par,

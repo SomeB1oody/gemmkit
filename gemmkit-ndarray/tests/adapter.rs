@@ -339,3 +339,294 @@ fn cplx_dot_and_conj_matches_reference() {
         assert!(cabs(g - exp2[(i, j)]) < 1e-9, "gemm_cplx conjA ({i},{j})");
     }
 }
+
+/// `gemm_fused` (a `PerRow` bias + `ReLU`, and the identity `None`/`None` case) is **bit-identical**
+/// to plain `gemm` followed by the same scalar map — gemmkit's `f32`/`f64` fused contract, mirrored
+/// through the adapter over a general-stride C.
+#[cfg(feature = "epilogue")]
+#[test]
+fn fused_matches_plain_then_map() {
+    use gemmkit_ndarray::{Activation, Bias, gemm_fused};
+    let (m, k, n) = (12usize, 9, 7);
+    let a = rand2(m, k, 101);
+    let b = rand2(k, n, 102);
+    let c0 = rand2(m, n, 103);
+    let bias: Vec<f64> = (0..m).map(|i| 0.5 * i as f64 - 2.0).collect();
+    let (alpha, beta) = (1.3f64, -0.7);
+    for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
+        // PerRow bias + ReLU.
+        let mut c_fused = c0.clone();
+        gemm_fused(
+            alpha,
+            &a,
+            &b,
+            beta,
+            &mut c_fused,
+            Some(Bias::PerRow(&bias)),
+            Some(Activation::Relu),
+            par,
+        );
+        let mut c_ref = c0.clone();
+        gemm(alpha, &a, &b, beta, &mut c_ref, par);
+        for i in 0..m {
+            for j in 0..n {
+                let v = c_ref[(i, j)] + bias[i];
+                let want = if v > 0.0 { v } else { 0.0 };
+                assert_eq!(
+                    c_fused[(i, j)].to_bits(),
+                    want.to_bits(),
+                    "fused PerRow+ReLU ({i},{j})"
+                );
+            }
+        }
+        // None/None ≡ plain gemm, bit-for-bit.
+        let mut c_id = c0.clone();
+        gemm_fused(alpha, &a, &b, beta, &mut c_id, None, None, par);
+        let mut c_plain = c0.clone();
+        gemm(alpha, &a, &b, beta, &mut c_plain, par);
+        for i in 0..m {
+            for j in 0..n {
+                assert_eq!(
+                    c_id[(i, j)].to_bits(),
+                    c_plain[(i, j)].to_bits(),
+                    "fused None/None ({i},{j})"
+                );
+            }
+        }
+    }
+}
+
+/// A reversed (negative-stride) A view through `gemm_fused` must equal plain `gemm` on the **same**
+/// reversed view then the same scalar map, **bit-for-bit**: the fused entry now forwards to gemmkit's
+/// raw engine (no reversed-view rejection), exactly like the plain entry.
+#[cfg(feature = "epilogue")]
+#[test]
+fn fused_reversed_view_matches_plain_then_map() {
+    use gemmkit_ndarray::{Activation, Bias, gemm_fused};
+    let (m, k, n) = (10usize, 8, 6);
+    let a = rand2(m, k, 401);
+    let b = rand2(k, n, 402);
+    let c0 = rand2(m, n, 403);
+    let a_rev = a.slice(ndarray::s![..;-1, ..]); // negative row stride
+    assert!(
+        a_rev.strides()[0] < 0,
+        "reversed view should have a negative row stride"
+    );
+    let bias: Vec<f64> = (0..m).map(|i| 0.5 * i as f64 - 2.0).collect();
+    let (alpha, beta) = (1.3f64, -0.7);
+    for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
+        let mut c_fused = c0.clone();
+        gemm_fused(
+            alpha,
+            &a_rev,
+            &b,
+            beta,
+            &mut c_fused,
+            Some(Bias::PerRow(&bias)),
+            Some(Activation::Relu),
+            par,
+        );
+        let mut c_ref = c0.clone();
+        gemm(alpha, &a_rev, &b, beta, &mut c_ref, par);
+        for i in 0..m {
+            for j in 0..n {
+                let v = c_ref[(i, j)] + bias[i];
+                let want = if v > 0.0 { v } else { 0.0 };
+                assert_eq!(
+                    c_fused[(i, j)].to_bits(),
+                    want.to_bits(),
+                    "fused reversed ({i},{j})"
+                );
+            }
+        }
+    }
+}
+
+/// `gemm_batched_fused` (one shared `PerRow` bias + `ReLU`) is **bit-identical** to a loop of
+/// [`gemm_fused`] calls, one per batch element — gemmkit's batched-fused headline property.
+#[cfg(feature = "epilogue")]
+#[test]
+fn batched_fused_matches_loop_of_gemm_fused() {
+    use gemmkit_ndarray::{Activation, Bias, gemm_batched_fused, gemm_fused};
+    let (batch, m, k, n) = (4usize, 8, 5, 6);
+    let a = rand3(batch, m, k, 201);
+    let b = rand3(batch, k, n, 202);
+    let c0 = rand3(batch, m, n, 203);
+    let bias: Vec<f64> = (0..m).map(|i| 0.3 * i as f64 - 1.0).collect();
+    let (alpha, beta) = (0.9f64, 1.1);
+    for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
+        let mut c_b = c0.clone();
+        gemm_batched_fused(
+            alpha,
+            &a,
+            &b,
+            beta,
+            &mut c_b,
+            Some(Bias::PerRow(&bias)),
+            Some(Activation::Relu),
+            par,
+        );
+        for e in 0..batch {
+            let ae = a.index_axis(Axis(0), e);
+            let be = b.index_axis(Axis(0), e);
+            let mut ce = c0.index_axis(Axis(0), e).to_owned();
+            gemm_fused(
+                alpha,
+                &ae,
+                &be,
+                beta,
+                &mut ce,
+                Some(Bias::PerRow(&bias)),
+                Some(Activation::Relu),
+                par,
+            );
+            for i in 0..m {
+                for j in 0..n {
+                    assert_eq!(
+                        c_b[(e, i, j)].to_bits(),
+                        ce[(i, j)].to_bits(),
+                        "batched_fused ({e},{i},{j})"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `gemm_i8_requant` / `gemm_i8_requant_u8` are **bit-exact** against an independent scalar model
+/// (round-half-to-even, clamp) applied to the exact `i32` accumulator from `dot_i8`.
+#[cfg(all(feature = "int8", feature = "epilogue"))]
+#[test]
+fn requant_matches_scalar_model() {
+    use gemmkit_ndarray::{Requantize, dot_i8, gemm_i8_requant, gemm_i8_requant_u8};
+
+    let randi8 = |r: usize, c: usize, seed: u64| -> Array2<i8> {
+        let mut s = seed | 1;
+        Array2::from_shape_fn((r, c), |_| {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            ((s >> 40) as i32 % 51 - 25) as i8
+        })
+    };
+    // Independent contract: round-ties-even scale, integer zero-point join, saturating clamp.
+    let ref_i8 = |acc: i32, bias: i32, scale: f32, zp: i32| -> i8 {
+        let scaled = (f64::from(acc.wrapping_add(bias)) * f64::from(scale)).round_ties_even();
+        (scaled as i64).saturating_add(zp as i64).clamp(-128, 127) as i8
+    };
+    let ref_u8 = |acc: i32, bias: i32, scale: f32, zp: i32| -> u8 {
+        let scaled = (f64::from(acc.wrapping_add(bias)) * f64::from(scale)).round_ties_even();
+        (scaled as i64).saturating_add(zp as i64).clamp(0, 255) as u8
+    };
+
+    let (m, k, n) = (17usize, 20, 13);
+    let a = randi8(m, k, 0x1);
+    let b = randi8(k, n, 0x2);
+    let acc = dot_i8(&a, &b);
+    let bias: Vec<i32> = (0..m).map(|i| 40 * i as i32 - 200).collect();
+    let (scale, zp_i8, zp_u8) = (0.05f32, -7i32, 30i32);
+
+    for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
+        // i8 output, with bias.
+        let mut c = Array2::<i8>::zeros((m, n));
+        let req = Requantize {
+            scale,
+            zero_point: zp_i8,
+            bias: Some(&bias),
+        };
+        gemm_i8_requant(&a, &b, req, &mut c, par);
+        for i in 0..m {
+            for j in 0..n {
+                assert_eq!(
+                    c[(i, j)],
+                    ref_i8(acc[(i, j)], bias[i], scale, zp_i8),
+                    "requant i8 ({i},{j})"
+                );
+            }
+        }
+        // u8 output, no bias.
+        let mut cu = Array2::<u8>::zeros((m, n));
+        let requ = Requantize {
+            scale,
+            zero_point: zp_u8,
+            bias: None,
+        };
+        gemm_i8_requant_u8(&a, &b, requ, &mut cu, par);
+        for i in 0..m {
+            for j in 0..n {
+                assert_eq!(
+                    cu[(i, j)],
+                    ref_u8(acc[(i, j)], 0, scale, zp_u8),
+                    "requant u8 ({i},{j})"
+                );
+            }
+        }
+    }
+}
+
+/// `gemm_cplx_fused` (a `PerRow` complex bias, with conjugation) is **bit-identical** to
+/// [`gemm_cplx`] followed by the same element-wise bias add.
+#[cfg(all(feature = "complex", feature = "epilogue"))]
+#[test]
+fn cplx_fused_matches_gemm_cplx_then_add() {
+    use gemmkit::Complex;
+    use gemmkit_ndarray::{Bias, gemm_cplx, gemm_cplx_fused};
+
+    type C = Complex<f64>;
+    let crand = |r: usize, c: usize, s: u64| -> Array2<C> {
+        let re = rand2(r, c, s);
+        let im = rand2(r, c, s ^ 0xABCD);
+        Array2::from_shape_fn((r, c), |(i, j)| Complex::new(re[(i, j)], im[(i, j)]))
+    };
+
+    let (m, k, n) = (12usize, 9, 7);
+    let a = crand(m, k, 301);
+    let b = crand(k, n, 302);
+    let c0 = crand(m, n, 303);
+    let bias: Vec<C> = (0..m)
+        .map(|i| Complex::new(0.4 * i as f64 - 1.0, 0.7))
+        .collect();
+    let alpha = Complex::new(1.3, -0.4);
+    let beta = Complex::new(0.5, 0.7);
+
+    for &(conj_a, conj_b) in &[(false, false), (true, false), (false, true)] {
+        let mut c_fused = c0.clone();
+        gemm_cplx_fused(
+            alpha,
+            &a,
+            conj_a,
+            &b,
+            conj_b,
+            beta,
+            &mut c_fused,
+            Some(Bias::PerRow(&bias)),
+            Parallelism::Serial,
+        );
+        let mut c_ref = c0.clone();
+        gemm_cplx(
+            alpha,
+            &a,
+            conj_a,
+            &b,
+            conj_b,
+            beta,
+            &mut c_ref,
+            Parallelism::Serial,
+        );
+        for i in 0..m {
+            for j in 0..n {
+                let want = c_ref[(i, j)] + bias[i];
+                assert_eq!(
+                    c_fused[(i, j)].re.to_bits(),
+                    want.re.to_bits(),
+                    "cplx_fused re conj=({conj_a},{conj_b}) ({i},{j})"
+                );
+                assert_eq!(
+                    c_fused[(i, j)].im.to_bits(),
+                    want.im.to_bits(),
+                    "cplx_fused im conj=({conj_a},{conj_b}) ({i},{j})"
+                );
+            }
+        }
+    }
+}

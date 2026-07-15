@@ -571,7 +571,14 @@ pub trait SimdOps<T: Scalar>: Simd {
 /// bounds and asserts each stored byte equals an **independent** scalar model of the map (std
 /// `round_ties_even`, not the kernel's `2^52` trick). The `(0, 255)` bounds pre-verify the future
 /// `u8`-output phase. Platform-independent: the scalar model is the oracle, never a machine number.
-#[cfg(all(test, feature = "int8"))]
+/// x86-only for now — no other arch overrides `requant_store` (all take the scalar epilogue), so
+/// elsewhere the sweep would be vacuous and its helpers dead code; extend the gate with the arch
+/// when a non-x86 override (e.g. NEON) lands.
+#[cfg(all(
+    test,
+    feature = "int8",
+    any(target_arch = "x86", target_arch = "x86_64")
+))]
 mod requant_store_tests {
     #![allow(clippy::needless_range_loop)]
     use super::{KernelSimd, SimdOps};

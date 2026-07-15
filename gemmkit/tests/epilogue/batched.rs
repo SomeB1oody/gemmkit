@@ -195,6 +195,126 @@ fn batched_fused_matches_loop_narrow() {
 }
 
 // ---------------------------------------------------------------------------
+// a'. checked/unchecked twin equivalence: gemm_batched_fused_unchecked(_with)
+// ---------------------------------------------------------------------------
+
+/// `gemm_batched_fused` and its raw twins `gemm_batched_fused_unchecked` (pool) / `_with`
+/// (caller-owned `Workspace`) are **parallel** entry points — the checked one does not delegate to
+/// the raw one, so a divergence in the raw `(ptr, strides, batch strides, bias)` lowering would go
+/// undetected. Exercise both raw forms against the checked twin bit-for-bit (PerRow bias +
+/// LeakyReLU, contiguously-packed elements).
+fn unchecked_matches_checked<T: BEl>() {
+    use gemmkit::{BiasDim, gemm_batched_fused_unchecked, gemm_batched_fused_unchecked_with};
+
+    let (batch, m, k, n) = (5usize, 31usize, 17usize, 23usize);
+    let mut rng = Rng::new(0xBA7C_0FEE);
+    let a = make_vec::<T>(&mut rng, batch * m * k, 1.0);
+    let b = make_vec::<T>(&mut rng, batch * k * n, 1.0);
+    let c0 = make_vec::<T>(&mut rng, batch * m * n, 1.0);
+    let bias_row = make_vec::<T>(&mut rng, m, 2.0); // ONE shared per-row bias (length m)
+    let alpha = T::of(0.9);
+    let beta = T::of(0.7);
+    let (a_bs, b_bs, c_bs) = ((m * k) as isize, (k * n) as isize, (m * n) as isize);
+    let par = Parallelism::Serial;
+
+    let mut c_checked = c0.clone();
+    gemm_batched_fused(
+        batch,
+        alpha,
+        MatRef::new(&a, m, k, 1, m as isize),
+        a_bs,
+        MatRef::new(&b, k, n, 1, k as isize),
+        b_bs,
+        beta,
+        MatMut::new(&mut c_checked, m, n, 1, m as isize),
+        c_bs,
+        Some(Bias::PerRow(&bias_row)),
+        Some(T::leaky(0.25)),
+        par,
+    );
+
+    let mut c_pool = c0.clone();
+    let mut c_ws = c0.clone();
+    let mut ws = Workspace::new();
+    // SAFETY: valid in-bounds contiguously-packed col-major elements; the batch C regions are
+    // pairwise disjoint and alias neither A/B nor the (per-row, length-m) shared bias.
+    unsafe {
+        gemm_batched_fused_unchecked(
+            batch,
+            m,
+            k,
+            n,
+            alpha,
+            a.as_ptr(),
+            1,
+            m as isize,
+            a_bs,
+            b.as_ptr(),
+            1,
+            k as isize,
+            b_bs,
+            beta,
+            c_pool.as_mut_ptr(),
+            1,
+            m as isize,
+            c_bs,
+            bias_row.as_ptr(),
+            BiasDim::PerRow,
+            true,
+            Some(T::leaky(0.25)),
+            par,
+        );
+        gemm_batched_fused_unchecked_with(
+            &mut ws,
+            batch,
+            m,
+            k,
+            n,
+            alpha,
+            a.as_ptr(),
+            1,
+            m as isize,
+            a_bs,
+            b.as_ptr(),
+            1,
+            k as isize,
+            b_bs,
+            beta,
+            c_ws.as_mut_ptr(),
+            1,
+            m as isize,
+            c_bs,
+            bias_row.as_ptr(),
+            BiasDim::PerRow,
+            true,
+            Some(T::leaky(0.25)),
+            par,
+        );
+    }
+
+    for idx in 0..batch * m * n {
+        assert_eq!(
+            c_checked[idx].bits(),
+            c_pool[idx].bits(),
+            "{}: batched fused unchecked != checked at {idx}",
+            T::name(),
+        );
+        assert_eq!(
+            c_checked[idx].bits(),
+            c_ws[idx].bits(),
+            "{}: batched fused unchecked_with != checked at {idx}",
+            T::name(),
+        );
+    }
+}
+
+#[test]
+fn batched_fused_unchecked_matches_checked() {
+    unchecked_matches_checked::<f32>();
+    unchecked_matches_checked::<f64>();
+}
+
+// ---------------------------------------------------------------------------
 // b. broadcast A (a_batch_stride = 0): PerCol bias + Relu, bitwise vs the gemm_fused loop
 // ---------------------------------------------------------------------------
 

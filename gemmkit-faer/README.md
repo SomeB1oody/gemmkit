@@ -37,6 +37,11 @@ gemmkit_faer::gemm(1.5, a.as_dyn_stride(), b.as_dyn_stride(), 2.0, c.as_dyn_stri
 - `prepack_rhs`/`prepack_lhs` + `gemm_packed_b`/`gemm_packed_a` — pre-pack one reused
   operand for the fixed-weight loop.
 - `gemm_i8`/`dot_i8` (`int8` feature) and `gemm_cplx`/`dot_cplx` (`complex` feature).
+- `gemm_fused`/`gemm_fused_with` (`epilogue` feature) — `C ← act(α·A·B + β·C + bias)` in one
+  pass, an optional `Bias` + `Activation`. With `int8` + `epilogue`, `gemm_i8_requant` /
+  `gemm_i8_requant_u8` (requantized `i8`/`u8` output). With `complex` + `epilogue`, the bias-only
+  `gemm_cplx_fused`. (Like the plain entries, these read raw parts from the view and forward to
+  gemmkit's raw engine, so reversed/negative-stride views work without copying.)
 
 `T` is `f32` or `f64` (`gemmkit::GemmScalar`), plus `f16`/`bf16` under `half`. Complex
 uses faer's `c32`/`c64` (`= num_complex::Complex<f32>`/`<f64>`), which are exactly
@@ -47,6 +52,9 @@ gemmkit's complex element types. `Parallelism` is re-exported from `gemmkit`. fa
 
 - `parallel` (default) — forwards to `gemmkit/parallel` (rayon).
 - `wasm_threads`, `half`, `complex`, `int8` — forward to the matching `gemmkit` feature.
+- `epilogue` — fused epilogues: `gemm_fused` (bias/activation); requant `gemm_i8_requant` needs
+  `int8` + `epilogue`, complex-fused `gemm_cplx_fused` needs `complex` + `epilogue`, and `f16`/`bf16`
+  fused ride `half`.
 
 ## License
 

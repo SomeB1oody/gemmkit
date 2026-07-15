@@ -18,14 +18,9 @@ wasm_threads = ["parallel", "gemmkit/wasm_threads"]
 half = ["gemmkit/half"]
 complex = ["gemmkit/complex"]
 int8 = ["gemmkit/int8"]
+epilogue = ["gemmkit/epilogue"]
 
 [dependencies]
 gemmkit = { path = "../gemmkit", version = "0.1.0", default-features = false, features = ["std"] }
-# faer 0.24 (resolves 0.24.4) has rust-version = 1.84.0 (< the workspace MSRV 1.89), so it
-# builds under `cargo +1.89`. `default-features = false` drops rayon/sparse/rand/npy: this
-# adapter only reads faer's `MatRef`/`MatMut` view geometry and allocates a `Mat` for `dot`,
-# never faer's own matmul, so no feature flag is needed. faer's `c32`/`c64` are
-# `num_complex::Complex<f32>`/`<f64>` over num-complex "0.4" — the same semver-compatible
-# version gemmkit uses — so faer's complex element type *is* gemmkit's, and the `complex`
-# entries type-unify with no cast.
+# faer 0.24 (resolves 0.24.4) has rust-version = 1.84.0 (< the workspace MSRV 1.89)
 faer = { version = "0.24", default-features = false }

@@ -36,6 +36,10 @@ gemmkit_nalgebra::gemm(1.5, &a, &b, 2.0, &mut c, Parallelism::Rayon(0));
 - `prepack_rhs`/`prepack_lhs` + `gemm_packed_b`/`gemm_packed_a` — pre-pack one reused
   operand for the fixed-weight loop.
 - `gemm_i8`/`dot_i8` (`int8` feature) and `gemm_cplx`/`dot_cplx` (`complex` feature).
+- `gemm_fused`/`gemm_fused_with` (`epilogue` feature) — `C ← act(α·A·B + β·C + bias)` in one
+  pass, an optional `Bias` + `Activation`. With `int8` + `epilogue`, `gemm_i8_requant` /
+  `gemm_i8_requant_u8` (requantized `i8`/`u8` output). With `complex` + `epilogue`, the bias-only
+  `gemm_cplx_fused`.
 
 `T` is `f32` or `f64` (`gemmkit::GemmScalar`), plus `f16`/`bf16` under `half`.
 `Parallelism` is re-exported from `gemmkit`. nalgebra has no 3-D array type, so the
@@ -45,6 +49,9 @@ ndarray adapter's batched entries have no analogue here.
 
 - `parallel` (default) — forwards to `gemmkit/parallel` (rayon).
 - `wasm_threads`, `half`, `complex`, `int8` — forward to the matching `gemmkit` feature.
+- `epilogue` — fused epilogues: `gemm_fused` (bias/activation); requant `gemm_i8_requant` needs
+  `int8` + `epilogue`, complex-fused `gemm_cplx_fused` needs `complex` + `epilogue`, and `f16`/`bf16`
+  fused ride `half`.
 
 ## License
 

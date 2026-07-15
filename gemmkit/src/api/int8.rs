@@ -338,30 +338,67 @@ pub unsafe fn gemm_i8_requant_unchecked(
     // SAFETY: preconditions forwarded to the caller (see # Safety).
     unsafe {
         workspace::with_thread_pool(|ws| {
-            dispatch::execute_int_requant(
-                dispatch::RequantTask {
-                    m,
-                    k,
-                    n,
-                    a,
-                    rsa,
-                    csa,
-                    b,
-                    rsb,
-                    csb,
-                    c,
-                    rsc,
-                    csc,
-                    scale,
-                    zp: zero_point,
-                    bias,
-                    has_bias,
-                    bias_dim: BiasDim::PerRow,
-                },
-                par,
-                ws,
+            gemm_i8_requant_unchecked_with(
+                ws, m, k, n, a, rsa, csa, b, rsb, csb, scale, zero_point, bias, has_bias, c, rsc,
+                csc, par,
             );
         });
+    }
+}
+
+/// As [`gemm_i8_requant_unchecked`] but with a caller-owned [`Workspace`].
+///
+/// # Safety
+/// See [`gemm_i8_requant_unchecked`].
+#[cfg(all(feature = "int8", feature = "epilogue"))]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gemm_i8_requant_unchecked_with(
+    ws: &mut Workspace,
+    m: usize,
+    k: usize,
+    n: usize,
+    a: *const i8,
+    rsa: isize,
+    csa: isize,
+    b: *const i8,
+    rsb: isize,
+    csb: isize,
+    scale: f32,
+    zero_point: i32,
+    bias: *const i32,
+    has_bias: bool,
+    c: *mut i8,
+    rsc: isize,
+    csc: isize,
+    par: Parallelism,
+) {
+    // SAFETY: the caller guarantees `a`/`b` valid for reads and `c` for writes over the
+    // shape/strides, `c` not aliasing `a`/`b`, when `has_bias` a valid disjoint `m`-length bias,
+    // and `scale`/`zero_point` in range (see [`gemm_i8_requant_unchecked`]).
+    unsafe {
+        dispatch::execute_int_requant(
+            dispatch::RequantTask {
+                m,
+                k,
+                n,
+                a,
+                rsa,
+                csa,
+                b,
+                rsb,
+                csb,
+                c,
+                rsc,
+                csc,
+                scale,
+                zp: zero_point,
+                bias,
+                has_bias,
+                bias_dim: BiasDim::PerRow,
+            },
+            par,
+            ws,
+        );
     }
 }
 
@@ -484,29 +521,66 @@ pub unsafe fn gemm_i8_requant_u8_unchecked(
     // SAFETY: preconditions forwarded to the caller (see # Safety).
     unsafe {
         workspace::with_thread_pool(|ws| {
-            dispatch::execute_int_requant(
-                dispatch::RequantTask {
-                    m,
-                    k,
-                    n,
-                    a,
-                    rsa,
-                    csa,
-                    b,
-                    rsb,
-                    csb,
-                    c,
-                    rsc,
-                    csc,
-                    scale,
-                    zp: zero_point,
-                    bias,
-                    has_bias,
-                    bias_dim: BiasDim::PerRow,
-                },
-                par,
-                ws,
+            gemm_i8_requant_u8_unchecked_with(
+                ws, m, k, n, a, rsa, csa, b, rsb, csb, scale, zero_point, bias, has_bias, c, rsc,
+                csc, par,
             );
         });
+    }
+}
+
+/// As [`gemm_i8_requant_u8_unchecked`] but with a caller-owned [`Workspace`].
+///
+/// # Safety
+/// See [`gemm_i8_requant_u8_unchecked`].
+#[cfg(all(feature = "int8", feature = "epilogue"))]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gemm_i8_requant_u8_unchecked_with(
+    ws: &mut Workspace,
+    m: usize,
+    k: usize,
+    n: usize,
+    a: *const i8,
+    rsa: isize,
+    csa: isize,
+    b: *const i8,
+    rsb: isize,
+    csb: isize,
+    scale: f32,
+    zero_point: i32,
+    bias: *const i32,
+    has_bias: bool,
+    c: *mut u8,
+    rsc: isize,
+    csc: isize,
+    par: Parallelism,
+) {
+    // SAFETY: the caller guarantees `a`/`b` valid for reads and `c` for writes over the
+    // shape/strides, `c` not aliasing `a`/`b`, when `has_bias` a valid disjoint `m`-length bias,
+    // and `scale`/`zero_point` in range (see [`gemm_i8_requant_u8_unchecked`]).
+    unsafe {
+        dispatch::execute_int_requant(
+            dispatch::RequantTask {
+                m,
+                k,
+                n,
+                a,
+                rsa,
+                csa,
+                b,
+                rsb,
+                csb,
+                c,
+                rsc,
+                csc,
+                scale,
+                zp: zero_point,
+                bias,
+                has_bias,
+                bias_dim: BiasDim::PerRow,
+            },
+            par,
+            ws,
+        );
     }
 }

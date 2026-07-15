@@ -544,3 +544,76 @@ fn fused_unchecked_matches_checked() {
         }
     }
 }
+
+/// The `_with` twin `gemm_fused_unchecked_with` shares the raw lowering with `gemm_fused_unchecked`
+/// but drives a caller-owned `Workspace`; exercise it against the checked `gemm_fused_with` twin
+/// bit-for-bit (per-row bias + LeakyReLU on a driver shape).
+#[test]
+fn fused_unchecked_with_matches_checked() {
+    use gemmkit::{BiasDim, gemm_fused_unchecked_with, gemm_fused_with};
+
+    let mut rng = Rng::new(0x0F05_ED13);
+    let (m, k, n) = (40usize, 33usize, 24usize);
+    let a = make::<f64>(&mut rng, m, k); // col-major m×k
+    let b = make::<f64>(&mut rng, k, n); // col-major k×n
+    let c0 = make::<f64>(&mut rng, m * n, 1); // col-major m×n C
+    let bias_row: Vec<f64> = (0..m).map(|_| rng.unit() * 3.0).collect();
+    let (alpha, beta) = (0.9f64, 0.7f64);
+    let par = Parallelism::Serial;
+
+    let mut c_checked = c0.clone();
+    {
+        let mut ws = Workspace::new();
+        let ar = MatRef::new(&a, m, k, 1, m as isize);
+        let br = MatRef::new(&b, k, n, 1, k as isize);
+        let cm = MatMut::new(&mut c_checked, m, n, 1, m as isize);
+        gemm_fused_with(
+            &mut ws,
+            alpha,
+            ar,
+            br,
+            beta,
+            cm,
+            Some(Bias::PerRow(&bias_row)),
+            Some(Activation::LeakyRelu(0.1)),
+            par,
+        );
+    }
+
+    let mut c_unchecked = c0.clone();
+    let mut ws = Workspace::new();
+    // SAFETY: valid in-bounds col-major layouts; C aliases neither A/B nor the (per-row, length-m)
+    // bias.
+    unsafe {
+        gemm_fused_unchecked_with(
+            &mut ws,
+            m,
+            k,
+            n,
+            alpha,
+            a.as_ptr(),
+            1,
+            m as isize,
+            b.as_ptr(),
+            1,
+            k as isize,
+            beta,
+            c_unchecked.as_mut_ptr(),
+            1,
+            m as isize,
+            bias_row.as_ptr(),
+            BiasDim::PerRow,
+            true,
+            Some(Activation::LeakyRelu(0.1)),
+            par,
+        );
+    }
+
+    for idx in 0..m * n {
+        assert_eq!(
+            c_checked[idx].to_bits(),
+            c_unchecked[idx].to_bits(),
+            "fused unchecked_with != checked at {idx}",
+        );
+    }
+}

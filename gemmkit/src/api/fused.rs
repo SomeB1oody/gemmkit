@@ -1,8 +1,7 @@
 //! Fused-epilogue (bias / activation) GEMM entries.
 use super::*;
 use crate::dispatch::FusedScalar;
-use crate::kernel::epilogue::{Act, BiasDim, BiasSpec, FusedEpi};
-use crate::parallel::Ptr;
+use crate::kernel::epilogue::{BiasDim, FusedEpi};
 
 /// A bias vector fused into a [`gemm_fused`] call: one value per output **row** (length `m`)
 /// or per output **column** (length `n`), added to every element of that row / column after
@@ -161,47 +160,116 @@ pub unsafe fn gemm_fused_unchecked<T: FusedScalar>(
     act: Option<Activation<T>>,
     par: Parallelism,
 ) {
-    let bias_spec = if has_bias {
-        match bias_dim {
-            BiasDim::PerRow => BiasSpec::Row(Ptr(bias as *mut T)),
-            BiasDim::PerCol => BiasSpec::Col(Ptr(bias as *mut T)),
-        }
-    } else {
-        BiasSpec::None
-    };
-    let act_e = match act {
-        None => Act::None,
-        Some(Activation::Relu) => Act::Relu,
-        Some(Activation::LeakyRelu(s)) => Act::LeakyRelu(s),
-    };
-    let epi = FusedEpi {
-        bias: bias_spec,
-        act: act_e,
+    let epi = to_fused_epi_raw(bias, bias_dim, has_bias, act);
+    // SAFETY: preconditions forwarded to the caller (see # Safety).
+    unsafe {
+        fused_unchecked_impl(
+            None, m, k, n, alpha, a, rsa, csa, b, rsb, csb, beta, c, rsc, csc, epi, par,
+        );
+    }
+}
+
+/// As [`gemm_fused_unchecked`] but with a caller-owned [`Workspace`].
+///
+/// # Safety
+/// See [`gemm_fused_unchecked`].
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gemm_fused_unchecked_with<T: FusedScalar>(
+    ws: &mut Workspace,
+    m: usize,
+    k: usize,
+    n: usize,
+    alpha: T,
+    a: *const T,
+    rsa: isize,
+    csa: isize,
+    b: *const T,
+    rsb: isize,
+    csb: isize,
+    beta: T,
+    c: *mut T,
+    rsc: isize,
+    csc: isize,
+    bias: *const T,
+    bias_dim: BiasDim,
+    has_bias: bool,
+    act: Option<Activation<T>>,
+    par: Parallelism,
+) {
+    let epi = to_fused_epi_raw(bias, bias_dim, has_bias, act);
+    // SAFETY: preconditions forwarded to the caller (see # Safety).
+    unsafe {
+        fused_unchecked_impl(
+            Some(ws),
+            m,
+            k,
+            n,
+            alpha,
+            a,
+            rsa,
+            csa,
+            b,
+            rsb,
+            csb,
+            beta,
+            c,
+            rsc,
+            csc,
+            epi,
+            par,
+        );
+    }
+}
+
+/// Shared lowering for the two raw fused entries: build the [`Task`], then dispatch the fused
+/// engine over either a caller-owned [`Workspace`] (`ws = Some`) or the thread-local pool
+/// (`ws = None`). The bias/activation are already lowered into `epi` by [`to_fused_epi_raw`].
+///
+/// # Safety
+/// As [`gemm_fused_unchecked`]: `a`/`b` valid for reads and `c` for read+write over the shape /
+/// strides, `c` not aliasing `a`/`b`, and `epi`'s bias (if any) valid for `m`/`n` reads and
+/// disjoint from `c`.
+#[allow(clippy::too_many_arguments)]
+unsafe fn fused_unchecked_impl<T: FusedScalar>(
+    ws: Option<&mut Workspace>,
+    m: usize,
+    k: usize,
+    n: usize,
+    alpha: T,
+    a: *const T,
+    rsa: isize,
+    csa: isize,
+    b: *const T,
+    rsb: isize,
+    csb: isize,
+    beta: T,
+    c: *mut T,
+    rsc: isize,
+    csc: isize,
+    epi: FusedEpi<T>,
+    par: Parallelism,
+) {
+    let task = Task {
+        m,
+        k,
+        n,
+        alpha,
+        a,
+        rsa,
+        csa,
+        b,
+        rsb,
+        csb,
+        beta,
+        c,
+        rsc,
+        csc,
     };
     // SAFETY: preconditions forwarded to the caller (see # Safety).
     unsafe {
-        workspace::with_thread_pool(|ws| {
-            dispatch::execute_fused(
-                Task {
-                    m,
-                    k,
-                    n,
-                    alpha,
-                    a,
-                    rsa,
-                    csa,
-                    b,
-                    rsb,
-                    csb,
-                    beta,
-                    c,
-                    rsc,
-                    csc,
-                },
-                epi,
-                par,
-                ws,
-            );
-        });
+        match ws {
+            Some(ws) => dispatch::execute_fused(task, epi, par, ws),
+            None => workspace::with_thread_pool(|ws| dispatch::execute_fused(task, epi, par, ws)),
+        }
     }
 }
