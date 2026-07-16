@@ -25,6 +25,10 @@ int8 = [] # i8 -> i32 integer GEMM (`gemm_i8`)
 # Optional capability
 epilogue = [] # fused epilogues: bias/activation
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [dependencies]
 rayon = { version = "1.10", optional = true }
 half = { version = "2", default-features = false, optional = true }

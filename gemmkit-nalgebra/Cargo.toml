@@ -20,6 +20,10 @@ complex = ["gemmkit/complex"]
 int8 = ["gemmkit/int8"]
 epilogue = ["gemmkit/epilogue"]
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [dependencies]
 gemmkit = { path = "../gemmkit", version = "0.1.0", default-features = false, features = ["std"] }
 # nalgebra 0.35 has rust-version = 1.89.0 (== the workspace MSRV)

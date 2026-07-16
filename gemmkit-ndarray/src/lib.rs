@@ -38,6 +38,8 @@
 //! into a quantized `i8` (resp. `u8`) output. Complex-fused needs `complex` + `epilogue`: the
 //! bias-only [`gemm_cplx_fused`]/[`gemm_cplx_fused_with`] (no activation: undefined on complex numbers)
 
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
 /// The fused-epilogue selectors, re-exported so callers of [`gemm_fused`] need not depend on
 /// `gemmkit` directly
 #[cfg(feature = "epilogue")]

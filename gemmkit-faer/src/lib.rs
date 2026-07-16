@@ -40,6 +40,8 @@
 //! faer has no 3-D array / batch type, so the batched (`gemm_batched`, `gemm_batched_fused`) entries
 //! of the ndarray adapter have no analogue here
 
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
 use faer::{Mat, MatMut, MatRef};
 /// The fused-epilogue selectors, re-exported so callers of [`gemm_fused`] need not depend on
 /// `gemmkit` directly
