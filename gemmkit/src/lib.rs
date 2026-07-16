@@ -55,7 +55,6 @@
 //! is likewise off by default, so a plain-GEMM build pays for none of its codegen
 
 #![cfg_attr(not(feature = "std"), no_std)]
-
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_docs)]
 #![allow(clippy::missing_safety_doc)] // safety documented at the module / contract level
