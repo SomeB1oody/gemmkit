@@ -1,6 +1,7 @@
 [package]
 name = "gemmkit-tune"
 description = "Install-time autotuner for gemmkit: sweeps its runtime knobs on the target machine and emits a GEMMKIT_* env profile"
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

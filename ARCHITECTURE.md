@@ -1,758 +1,400 @@
 # Architecture
 
-This document is a tour of how gemmkit is built and *why*. The short version: the
-combinatorial explosion of **{element type} × {ISA} × {tile} × {operation family}**
-is dissolved in the type system — a thick SIMD trait, const generics, and an
-operation-family seam — so the algorithm is written **once**, with **no macros**
-and **no `transmute`**.
+This document describes the design of the gemmkit workspace as it exists in
+the code: the layer structure of the core engine, the path a call takes from
+public API to microkernel, and the seams that make new instruction sets and
+element types cheap to add. File references are repo-relative paths; the API
+reference lives at [docs.rs/gemmkit](https://docs.rs/gemmkit).
 
-## Design principles
+## Goals and constraints
 
-1. **The algorithm is written once.** Blocking, packing, parallelism, and cache
-   modelling are all generic. There is exactly one five-loop driver, and each family's
-   microkernel is a single generic function across all ISAs and tiles (the real
-   `FloatGemm` one; the shared split-layout complex one).
-2. **Variation points collapse onto traits.** ISA → [`SimdOps`]; element type →
-   [`Scalar`]; operation family → [`KernelFamily`]. Tile geometry is a pair of
-   const generics chosen at the dispatch site.
-3. **Runtime detection + compile-time monomorphization.** CPU features are probed
-   once at runtime; the chosen path is a fully monomorphized function. The only
-   `unsafe` *codegen* boundary is a per-ISA `#[target_feature]` trampoline.
-4. **Best-effort with a guaranteed floor.** Cache detection, feature detection,
-   and packing are all adaptive but always have a correct fallback.
+gemmkit computes `C <- alpha*A*B + beta*C` over `&[T]` + stride views (or raw
+pointers with `isize` strides), selecting the best available instruction set
+at runtime. Edition 2024, `rust-version` 1.89, licensed MIT OR Apache-2.0
+(`LICENSE-MIT`, `LICENSE-APACHE` at the repo root). The design targets:
+
+- **Safety at the boundary.** The checked entries (`gemm`, `gemm_fused`, ...)
+  panic on shape mismatch, out-of-bounds strides, a self-aliasing output, or
+  `C` overlapping `A`/`B` before any unsafe work runs (`validate_gemm_views`
+  in `gemmkit/src/api.rs`). The `*_unchecked` tier exposes the raw engine
+  (negative strides allowed) for callers that validate their own inputs, such
+  as the adapters.
+- **Reproducible, not bitwise, parallel results.** For a fixed input,
+  environment, and configuration the output is identical regardless of the
+  worker count: blocking is thread-count independent and every output element
+  is reduced start-to-finish by one worker. Bitwise serial-vs-parallel
+  identity happens to hold on the driver paths today, but the promised
+  contract is reproducibility under a fixed config.
+- **No macros, no `transmute` in the variation points.** ISA, element type,
+  and operation family are traits; dispatch slots are typed function pointers
+  in `OnceLock`s; tile geometry is a pair of const generics.
+- **`no_std` and zero mandatory dependencies.** With default features off the
+  crate is `#![no_std]`, needs only `core` + `alloc`, and depends on nothing:
+  compile-time target features replace runtime CPU detection, env knobs are
+  off, and a per-call workspace replaces the thread-local pool. Optional
+  features pull one crate each: `std` -> `raw-cpuid` (x86 only), `parallel`
+  -> `rayon`, `half` -> `half`, `complex` -> `num-complex`; `int8` and
+  `epilogue` add none.
+
+## Workspace layout
+
+Five crates release in lockstep at version 0.1.0 (not yet published to
+crates.io); the fuzz crate is a separate nightly-only root.
+
+| Path | Crate | Role |
+|---|---|---|
+| `gemmkit/` | [gemmkit](https://crates.io/crates/gemmkit) | The core GEMM engine (everything below) |
+| `gemmkit-ndarray/` | [gemmkit-ndarray](https://crates.io/crates/gemmkit-ndarray) | Zero-copy adapter over `ndarray` (>= 0.17.1) views |
+| `gemmkit-nalgebra/` | [gemmkit-nalgebra](https://crates.io/crates/gemmkit-nalgebra) | Zero-copy adapter over `nalgebra` 0.35 matrices |
+| `gemmkit-faer/` | [gemmkit-faer](https://crates.io/crates/gemmkit-faer) | Zero-copy adapter over `faer` 0.24 matrices |
+| `gemmkit-tune/` | [gemmkit-tune](https://crates.io/crates/gemmkit-tune) | Install-time autotuner binary (emits a `GEMMKIT_*` env profile) |
+| `gemmkit/fuzz/` | gemmkit-fuzz | cargo-fuzz targets; its own workspace root, excluded from the stable workspace |
+
+The adapters pull matrix pointers and strides straight out of each library's
+native views (C-order, F-order, general and reversed strides, no copies) and
+forward to the `*_unchecked` engine. Each adapter feature (default `parallel`,
+plus `wasm_threads`, `half`, `complex`, `int8`, `epilogue`) forwards to the
+same-named gemmkit feature.
 
 ## Layer map
 
+Module docs in the core crate carry explicit layer labels; this is the stack
+they declare, public API at the top. Dependencies point strictly downward
+(`simd` depends only on `scalar` and `core`; the driver never names a
+concrete element type or ISA):
+
 ```
-L0  scalar.rs        Scalar (+ Float) — the data-type seam
-L0  simd/            Simd + SimdOps<T> — the ISA seam (tokens: ScalarTok/Fma/Avx512/Neon/Simd128)
-L1  kernel/          KernelFamily — the operation-family seam; float microkernel
-L2  pack.rs          micropanel packing primitive
-L3  cache/           CacheTopology + analytical BLIS blocking (cpuid/sysctl/sysfs backends + fallback)
-L4  driver.rs        the generic five-loop nest
-L5  parallel.rs      Parallelism + 1-D job split + work-gate
-L6  special/         special paths (gemv.rs matrix·vector, small_k.rs skinny/low-depth, small_mn.rs small-m,n horizontal, batched.rs many-GEMM orchestration)
-L7  dispatch.rs      OnceLock<fn> ISA selection + orientation + per-(type,ISA) entry
-L8a api.rs           MatRef/MatMut safe API + unchecked raw engine
-L8b gemmkit-ndarray  ArrayBase adapter + dot
-L8b gemmkit-nalgebra nalgebra Matrix adapter + dot
-L8b gemmkit-faer     faer MatRef/MatMut adapter + dot
-        tuning.rs / workspace.rs    cross-cutting
+L8a  api        safe slice entries, *_with, *_unchecked; MatRef/MatMut
+L7   dispatch   runtime ISA selection, one memoized fn pointer per type
+L6   special    gemv, small-k, small-m,n, batched reroutes
+L5   parallel   worker-count resolution, JobCursor work distribution
+L4   driver     the generic 5-loop blocked GEMM, one for all families
+L3   cache      topology detection + BLIS analytical blocking
+L2   pack       micropanel packing primitives
+L1   kernel     KernelFamily seam (float/mixed/int/complex) + Epilogue
+L0   simd       ISA tokens + SimdOps vocabulary;  scalar: Scalar/Acc types
+     ---        cross-cutting: tuning (GEMMKIT_* knobs), workspace (buffers)
 ```
 
-Dependencies flow strictly upward. The `simd` module depends only on `scalar` and
-`core` — no reverse dependency on anything above it — so it could be split into its
-own crate unchanged.
-
-## L0 — `Scalar` and `SimdOps`
-
-[`Scalar`] is deliberately tiny: identity constants plus a mixed-precision
-accumulator type `Acc` (`Self` for f32/f64; a future f16 would set `Acc = f32`).
-No arithmetic lives on it, so adding an element type does not grow the trait.
-[`Float`] adds the scalar arithmetic the float epilogues need.
-
-[`SimdOps<T>`] is the **load-bearing wall**. It is *thick*: it exposes every
-primitive the whole microkernel needs — `zero`, `splat`, `loadu`, `storeu`
-(unaligned-tolerant; the packed buffers are 64-byte-aligned so nothing is paid for
-the tolerance, and no separate aligned entry points exist), `mul`, `add`, `mul_add`,
-`fnma` (fused `c - a·b`, for the complex
-kernel's `acc_re -= ai·bi`), `reduce_sum` — plus `LANES`. Because the ISA
-*token* and the element *type* are decoupled, `LANES` varies with the `(ISA, T)` pair
-(f32@FMA = 8, f32@AVX-512 = 16, f32@NEON = 4, f32@wasm-simd128 = 4, f64 halved).
-
-This is the direct answer to matrixmultiply's thin-trait trap. matrixmultiply's
-kernel trait abstracts only the multiply-add, so the entire microkernel had to be
-hand-written per ISA (and only one tile per ISA was maintainable). Here, *all* the
-primitives are in `SimdOps`, so the microkernel is one generic function and each
-ISA contributes only a set of primitives plus a one-line trampoline.
-
-The hot inner loop — the `kc`-deep accumulation of one full `MR_REG × NR` tile —
-is factored behind a single overridable seam, [`SimdOps::accumulate_tile`], so an
-ISA can re-shape *the schedule* without forking the microkernel. The shared
-microkernel calls it directly and carries **no per-ISA branch**; all the variation
-lives in that method's *default implementation*, which holds two schedules: the
-portable per-column `splat` + FMA, and an optional lane-indexed fast path
-(`const LANE_FMA` + `fma_bvec`, NEON `vfmaq_laneq`, broadcasting B multipliers
-straight from a loaded vector lane). The lane path is gated on a `const` that is
-`false` for every ISA by default, so it and its provided `fma_bvec` fallback
-compile away everywhere except the one token (NEON) that overrides them.
-
-On a wide out-of-order core LLVM already lowers the default to the canonical
-register-blocked kernel, so the *whole-seam* override exists only for cores it
-will **not** fix on its own — an in-order / narrow-OoO core that needs explicit
-software pipelining, or a scalable-vector ISA (SVE/RVV) whose length is not a
-compile-time `LANES`. Every path here — the lane fast path and any override — is
-bound by one contract: **same-run consistency**. Within a run the accumulation
-stays a per-element fused `a·b + c` in ascending `p`, so a full tile and an edge
-tile of the same matrix round identically (the L4 driver's determinism guarantee);
-software pipelining reorders *loads*, never the arithmetic, so it is legal. The
-lane path performs the same per-element fused `a·b + c` as the `splat` path and on
-the benchmarked M-series is perf-neutral (that kernel is FMA-throughput-bound, not
-B-load-bound) — it earns its place as a vocabulary option, not a measured win. An
-override need only stay **deterministic and accurate to the same tolerance** under
-a fixed config; it need not be bitwise-identical to the default. Instructions that
-*reshape the accumulation rounding itself* — matrix/dot widening (`bfmmla`, `sdot`,
-VNNI, bf16) — are out of scope for *this* seam: they arrive as a new
-[`KernelFamily`] (L1) with a dedicated dot seam, never an `accumulate_tile`
-override.
-
-### `#[target_feature]` correctness
-
-AVX/AVX-512 intrinsics must be code-generated where the feature is enabled, but
-the CPU is chosen at runtime, so we can't put a fixed `#[target_feature]` on the
-generic kernel. Each token's [`Simd::vectorize`] runs a closure inside a tiny
-`#[target_feature]`-annotated inner function; the closure and the `#[inline]`
-primitives fold into it, so every intrinsic lands in a feature-enabled context.
-The driver wraps each output column strip in `vectorize`, which works for both the
-serial path and rayon worker closures (the proven pulp/faer pattern). The scalar
-token's `vectorize` is the identity.
-
-## L1 — `KernelFamily` and the float microkernel
-
-The driver is generic over [`KernelFamily`], not over "do an FMA on `T`". A family
-bundles the input/accumulator/output types, the pack layout, the microkernel, and
-the epilogue. It ships four families: `FloatGemm<T>` (homogeneous `f32`/`f64`),
-`MixedGemm<N>` (mixed precision — `f16`/`bf16` in, **`f32` accumulator**, narrow
-out; its bf16 `vdpbf16ps` dot sibling `Bf16DotGemm` is below), `IntGemm` (`i8` in, **`i32` accumulator/output** — the first family with
-`Lhs != Out`, reached via the public `gemm_i8` since the homogeneous `gemm<T>`
-surface can't express `Out != Lhs`; it reuses the `KernelSimd` widen seam with an
-`i8 -> i32` sign-extend and exact wrapping `i32` arithmetic; its sibling `IntGemmVnni`
-is the denser AVX-512 **VNNI dot kernel**, below), and `ComplexGemm<T, CONJ_A, CONJ_B>`
-(`Complex<f32>`/`Complex<f64>`, via the public `gemm_cplx`).
-
-**Dot-kernel families** add a second L0 seam, [`KernelSimd::dot_accumulate`], for ISAs
-whose hardware folds several depth steps into one *dot* instruction — `vpdpbusd` (4 i8
-steps), `vdpbf16ps` (2 bf16 steps). These reshape the accumulation rounding, so they
-cannot ride `accumulate_tile` (whose contract forbids that); instead the family packs
-its operands **k-group-interleaved** and reports `KernelFamily::DEPTH_MULTIPLE = Q` (the
-group size), the one driver-visible knob: the driver rounds each packed panel's depth up
-to `Q` (`1` for every other family, so they are byte-for-byte unchanged), and the family
-depth-pads the tail. Two dot families ship, both AVX-512, each a sibling of the widen
-family it accelerates (the pack layout differs, and `pack_lhs`/`pack_rhs` have no ISA
-parameter, so the interleave must key off the family):
-
-* `IntGemmVnni` (`Q = 4`, sibling of `IntGemm`) offsets A by `+128` for the `u8 × i8`
-  `vpdpbusd` and subtracts the per-column bias `128·Σ_k B[k][j]` in the dot seam, so it is
-  **bit-for-bit equal to `IntGemm`** (exact wrapping `i32`). The auto dispatch falls back
-  to the widen kernel for small *parallel* problems, where the dot kernel's mandatory pack
-  barrier outweighs its compute win.
-* `Bf16DotGemm` (`Q = 2`, sibling of `MixedGemm<bf16>`) packs bf16 in pairs and accumulates
-  in `f32` with `vdpbf16ps`, sharing `MixedGemm`'s `kc = k` rule and narrow epilogue. Its
-  fused 2-term MAC is only *tolerance*-equal to the widen path (not bitwise), but serial,
-  parallel, and prepacked runs share the one kernel and pack layout, so they reproduce each
-  other bit-for-bit. Because the widen bf16 load is load-bound, the dot kernel wins at every
-  size, so it has no widen fallback.
-
-`FloatGemm` is always built; the other three families are **optional, off-by-default
-Cargo features** — `half` (`MixedGemm`, pulls `half`), `int8` (`IntGemm`, no extra
-dep), and `complex` (`ComplexGemm`, pulls `num-complex`). Gating is purely additive
-and orthogonal to the seam: each feature toggles a family's kernel, its per-ISA
-`SimdOps`/`KernelSimd` impls, its dispatch ladder, and its public entry — the driver,
-packing framework, cache model, and parallelism are untouched, so a plain `f32`/`f64`
-build pays for none of their codegen or dependencies.
-
-A fourth, **off-by-default capability feature** `epilogue` (no dependency) gates the
-entire fused-epilogue / requantized-output surface: the `FusedEpi` bias/activation
-epilogue and its `gemm_fused*` / `gemm_batched_fused*` / `gemm_cplx_fused*` entries, plus
-the `KRequantize` epilogue and the `IntGemmQ`/`IntGemmVnniQ` requant families with their
-`gemm_i8_requant*` entries. It composes with the element-type features — a `half`/`complex`
-fused epilogue needs `half`+`epilogue` / `complex`+`epilogue`, and requant needs
-`int8`+`epilogue`. The plain-GEMM path (the zero-cost `Identity` epilogue: the `Epilogue`
-trait, the driver's `run_epilogue` threading, and every family's `microkernel_epi`) is
-**unconditional**, so with `epilogue` off `gemm`/`gemm_i8`/`gemm_cplx` are unchanged and
-pay for none of the fused codegen.
-
-**Complex (op-family seam) — a dedicated split (SoA) kernel.** `ComplexGemm` does
-**not** ride `FloatGemm`. The product runs in the **structure-of-arrays** layout: real
-and imaginary planes in **separate accumulator registers**, so one complex
-multiply-accumulate is four fused *real* FMAs into two banks — `acc_re += ar·br`,
-`acc_re -= ai·bi`, `acc_im += ar·bi`, `acc_im += ai·br` — with no in-loop shuffle or
-`fmaddsub` (that `-=` step is the only new L0 primitive, `SimdOps::fnma`, x86 `fnmadd` /
-NEON `vfms`). The de-interleave moves *out* of the `kc` loop into the pack: each
-micropanel is laid down **planar** (per depth step, the `mr`/`nr` reals then the imags),
-amortized `O(MK+KN)` instead of `O(MNK)`, so the kernel loads a register of reals and a
-register of imags with plain contiguous loads. Because the kernel only consumes that
-layout, both operands are **always** packed (`FORCE_PACK_LHS = FORCE_PACK_RHS = true`).
-The epilogue de-interleaves `C`, folds the complex `alpha`/`beta`, and re-interleaves on
-store. This is the only path to NEON's full FMA throughput on **stable** Rust (the fused
-`FCMLA` is nightly-gated — `stdarch_neon_fcma`, rust-lang/rust#117222 — and would also
-change the rounding relative to the SoA real-FMA path) and it raises x86 throughput over
-the old interleaved-`fmaddsub` kernel.
-
-The family stays homogeneous (`Acc = T`, so the complex `alpha`/`beta` thread through the
-unchanged driver), but the hot loop runs on the *real* component, which the
-`KernelSimd<T, T, T, T>` bound — yielding only `SimdOps<Complex>` — cannot name. The
-bridge is `SimdOps::cplx_microkernel`, the **complex analogue of `accumulate_tile`**: an
-L0 seam whose default is unreachable and whose per-ISA `SimdOps<Complex<_>>` override has
-the real `SimdOps<f32>`/`<f64>` concretely and forwards to one shared, ISA-generic SoA
-kernel. The thin `SimdOps<Complex<_>>` glue exists only so the driver can read `LANES`
-(set to the **real** lane count: real lanes = complex rows the tile spans) and the
-homogeneous `KernelSimd` blanket applies; complex GEMM never calls its element ops.
-
-**Conjugation is a sign flip on the packed imaginary plane:** `CONJ_A`/`CONJ_B` are
-`const` params, and a set flag negates the imag plane *during packing*, so `A̅·B` falls
-out of the same real-FMA loop — no per-element conj branch. Dispatch maps the runtime
-conj flags to the const-generic variant (and the orientation swap swaps the flags too,
-since `(A̅·B)ᵀ = Bᵀ·A̅ᵀ`); `conjC` is deferred. The deferred integer VNNI (a dot kernel
-with interleaved-K packing and a requantize epilogue) would arrive the same way, with the
-driver, packing framework, cache model, and parallelism untouched.
-
-**Mixed precision (`Acc != Lhs`).** `MixedGemm<N>` is the seam's first asymmetric
-family: it packs narrow `N` panels (plain micropanels, like the float pack),
-**widens them to `f32` registers on load**, accumulates in `f32`, and **rounds back
-to `N` on store** (reading a narrow `C` widened for the `β != 0` term). The widening
-lives entirely behind a small L0 capability, `KernelSimd<L, R, A, O>`, whose
-`load_lhs`/`splat_rhs`/`load_out`/`store_out` are the widen-load / narrow-store
-primitives an ISA token must provide. A single blanket impl makes the homogeneous
-case (`L = R = A = O`) plain `SimdOps` load/splat/store, so `FloatGemm` and every
-external homogeneous family get it for free; the all-equal blanket can never overlap
-a mixed impl (which has `L != A`), so coherence is clean. The microkernel and driver
-bound on `KernelSimd` instead of `SimdOps`, and the driver derives `MR` from the
-**accumulator** lane count — so the five-loop nest carries no per-type branch. The
-dispatch bound is `GemmScalar: Scalar` (not `Float<Acc = Self>`); per-type details
-that can't be expressed generically (the `f32`-mediated `β`-scale; which family to
-pack/dispatch through) are `GemmScalar` methods.
-
-**Tile geometry is not on the trait.** `MR_REG` (register rows) and `NR` (columns)
-are const generics on the driver/microkernel, chosen per `(family, ISA)` at the
-dispatch site. So a new tile is a new instantiation — never a new type, never a
-macro. `MR = MR_REG * LANES`.
-
-The float microkernel is a rank-1 outer-product update: load `MR_REG` LHS vectors,
-broadcast each of `NR` RHS scalars, FMA into `NR * MR_REG` accumulators that stay
-in registers. The const-bounded `for` loops monomorphize and fully unroll, so the
-optimizer keeps every accumulator in a register without any `seq!`-style macro.
-The full-tile `kc`-loop runs through the overridable [`SimdOps::accumulate_tile`]
-seam (L0); only the partial-column edge tile and the epilogue stay inline in the
-kernel. v1 tiles (register usage in parentheses):
-
-| | f32 | f64 |
+| Layer | Path | Responsibility |
 |---|---|---|
-| FMA (AVX2) | 16×6 = `MR_REG=2, NR=6` (15 YMM) | 8×6 (15 YMM) |
-| AVX-512 | 32×12 = `MR_REG=2, NR=12` (27 ZMM) | 16×12 (27 ZMM) |
-| scalar | 4×4 | 4×4 |
+| L8a | `gemmkit/src/api.rs` + `api/` | Public entries per family (`batched`, `cplx`, `fused`, `int8`, `map`, `packed`); validation; lowering to dispatch tasks |
+| L7 | `gemmkit/src/dispatch.rs` + `dispatch/` | Per-type `OnceLock<fn>` selection ladders (`float`, `mixed`, `int`, `complex`, `isa`); orientation normalization; special-path gates |
+| L6 | `gemmkit/src/special.rs` + `special/` | `gemv`, `small_k`, `small_mn`, `batched` orchestration |
+| L5 | `gemmkit/src/parallel.rs` | `Parallelism`, worker ramps, `JobCursor`, rayon integration |
+| L4 | `gemmkit/src/driver.rs` | The blocked loop nest, packing decisions, prepacked-RHS consumption |
+| L3 | `gemmkit/src/cache.rs` + `cache/` | Cache detection (`cpuid`, `sysfs`, `sysctl`), `blocking()` model |
+| L2 | `gemmkit/src/pack.rs` | `pack_panels` and the k-group-interleaved `pack_kgroup_panels` |
+| L1 | `gemmkit/src/kernel.rs` + `kernel/` | `KernelFamily` trait, the families, `Epilogue` trait and built-ins |
+| L0 | `gemmkit/src/simd.rs` + `simd/`, `gemmkit/src/scalar.rs` | `Simd` tokens, `SimdOps`/`KernelSimd`, `Scalar`/`Float`/`NarrowFloat`/`ComplexFloat` |
+| - | `gemmkit/src/tuning.rs`, `gemmkit/src/workspace.rs` | Threshold knobs; packing-buffer pool |
 
-**Epilogue.** A full tile with column-major output (`rsc == 1`) takes the fast
-vector path (load C, `β·C + α·AB`, store). Partial tiles or general/negative
-strides drain the accumulators to a stack scratch buffer and copy back with the
-real strides — one scratch tile per call, no lookup grid. `β == 0` never reads C.
+## Life of a gemm call
 
-### Fused epilogues (`kernel::epilogue`)
+```rust
+use gemmkit::{gemm, MatRef, MatMut, Parallelism};
 
-A second L1 seam, [`Epilogue<Fam>`], fuses a per-element transform into the store —
-`C[r,c] <- apply(α·AB + β·C, r, c)` — instead of materializing the raw product and
-mapping it in a second pass. The seam itself — the `Epilogue` trait, the zero-cost
-`Identity`, the driver's `run_epilogue`, and every family's `microkernel_epi` — is
-**unconditional** (it is the plain-GEMM store path); the concrete fused epilogues below
-(`FusedEpi`, `KRequantize`) and their public entries are gated behind the `epilogue`
-feature (requant additionally behind `int8`). It is threaded through a **provided** family method,
-`KernelFamily::microkernel_epi(.., row0, col0, last_k, epi, ..)`, whose default just
-forwards to `microkernel` (so the `i32`-out integer families are byte-for-byte unchanged and only
-debug-assert the epilogue is `Identity`). A family implements exactly **one** of the pair:
-a non-fusing family provides `microkernel` and rides the fail-closed default forward, while a
-fusing family overrides `microkernel_epi` and leaves `microkernel` on its default `unreachable!`
-body (the driver only ever calls `microkernel_epi`). `ComplexGemm` is the one deliberate
-exception that implements both — its override reuses its own plain `microkernel`, below. `FloatGemm`, the mixed families
-(`MixedGemm<f16/bf16>` and `Bf16DotGemm`), the two requantizing families, and `ComplexGemm`
-override it. `ComplexGemm`
-cannot thread `E` into its store (its α/β epilogue lives inside the L0 `cplx_microkernel` seam,
-which must not depend on this L1 trait), so its override instead runs the *unchanged* SoA kernel
-and then, on the final depth panel only (`!IS_IDENTITY && last_k`), sweeps the just-stored tile
-applying `epi` **in place** — a cache-hot `O(mr·nr)` post-pass that fires once per element and,
-because the kernel first stores exactly the bits plain `gemm_cplx` would, is bitwise-identical to
-`gemm_cplx`-then-map by construction (the same strategy as the gemv sweep). It const-folds back to
-the bare `microkernel` for `E = Identity`, so plain `gemm_cplx` stays byte-for-byte unchanged.
-
-The load-bearing invariant is **zero-cost identity**: every kernel hook is gated on the
-associated `const Epilogue::IS_IDENTITY`, so with `E = Identity` (a ZST) the guards const-fold
-away, `row0/col0/last_k` become dead arguments, and the monomorphized kernel is the
-pre-epilogue one. The driver's plain `run`/`run_packed_rhs` forward `&Identity`; a new
-`run_epilogue` forwards a real `E` — one extra instantiation per (family, ISA, tile) *only when
-the fused entry is linked*. The determinism contract is stronger: blocking is
-epilogue-independent and the epilogue is applied to the very register the plain store would
-have written, so `gemm_fused == gemm()` then a scalar map, **bit-for-bit**. The driver passes
-`last_k` (final depth panel) so a float epilogue fires exactly once; the requant families are
-`OUT_IS_ACC = false` (⇒ `kc = k`), so they fire once *structurally*.
-
-Two built-ins ship. `FusedEpi<T>` is **one runtime-composed type** — bias
-(per-row/per-col/none) then activation (none/ReLU/LeakyReLU) as ~2 predictable branches per
-tile — so the kernel is not multiplied by the epilogue kind; it uses the fast vector path via
-new `SimdOps::{max, min}` (the NaN-non-propagating `maxnm`/`pmax` variants, so `ReLU(NaN)=0`
-and the vector and scratch/scalar paths agree bit-for-bit). It covers `f32`/`f64` **and**, under
-`half`, the narrow floats `f16`/`bf16` (one blanket `Epilogue` impl over the three mixed
-families). For a narrow type the bias vector and `LeakyReLU` slope are the narrow type, widened
-**exactly** to `f32`; the epilogue applies in `f32` to the accumulator **before** the single
-round-to-nearest-even narrowing on store (`apply_reg` transforms the `f32` register and the
-family's `store_out` narrows; `apply` narrows itself). That is *more* precise than `gemm()` then
-a separate narrow map (which rounds to the narrow type, widens back, then rounds again), so for
-narrow types `gemm_fused` is **not** bitwise-equal to `gemm`-then-map — the every-shape bitwise
-contract holds for `f32`/`f64` only. Within a fused run the vector and scratch paths still agree
-bit-for-bit (both round once), and serial ≡ parallel is unchanged. `KRequantize` (`i8 -> i8` or
-`i8 -> u8`, a per-tensor/per-row/per-col `ScaleSpec` scale + zero-point + optional integer bias)
-keeps `VECTOR = false` (no float-style in-register path) but sets `VECTOR_STORE = true`: every tile
-drains to `i32` scratch, then the `i32 -> {i8,u8}` map is **vectorized in f64** on x86 and AArch64
-(`apply_store` → the `KernelSimd::requant_store` seam, with `REQUANT_VECTOR = true` on
-`Fma`/`Avx512`/`Avx512Vnni` and `Neon` — the NEON override is device-validated on Apple silicon,
-`vrndnq_f64` ties-to-even + a `vqtbl1q_u8` low-byte gather, bit-exact to the x86 tokens). The output
-domain — its clamp band `[LO, HI]`
-and the final low-byte narrowing — is chosen per output type by the `QuantOut` trait (`i8` →
-`[-128, 127]`, `u8` → `[0, 255]`, the ONNX-QLinearMatMul activation); the vector store writes the
-same low byte either way (a value clamped into `[-128, 255]` has identical bytes read as `i8` or
-`u8`), so one `requant_store` serves both. A full lane-run of a unit-stride tile whose scale is
-constant across the run (per-tensor, or per-col in the driver frame after a swap) takes that vector
-store; a per-row scale (which varies per lane) plus the sub-lane row tail, a strided `C`, the
-`k == 0` fill, and non-vector ISAs take the scalar `apply` — and all paths are **bit-identical**, so
-one output mixes them freely. Either way it deletes
-the full `m·n` `i32` materialization a `gemm_i8` + separate pass would pay. Its rounding is a single
-correctly-rounded f64 multiply with round-half-to-even (scalar: the `no_std`-safe `2^52` trick;
-vector: the hardware round-to-nearest-even, which equals it), joining the zero-point in integer —
-so it is **bit-exact across every ISA (vector ≡ scalar) and serial ≡ parallel** (widen ≡ VNNI). It
-rides two requant families, `IntGemmQ<O>` (widen) and `IntGemmVnniQ<O>` (`vpdpbusd`), generic in
-the output byte (`Out = O` in `{i8, u8}`, `Acc = i32`, `O` defaulting to `i8`), reached through a
-pair of delegating `KernelSimd<i8,i8,i32,i8>` / `<i8,i8,i32,u8>` blankets that forward the hot
-accumulate ops to the existing `<i8,i8,i32,i32>` impl. The public entry points are `gemm_fused`,
-`gemm_i8_requant` (`i8` output), and `gemm_i8_requant_u8` (`u8` output) (L8).
-`gemm_fused` routes every shape through the **same** kernel `gemm` would — the general driver
-*and* the L6 float special paths (gemv, small-`m,n`, small-`k`), each threading `E` through the
-same `run`/`run_typed` decision tree via zero-cost `Identity` forwarders (`run_epi` /
-`run_typed_epi` / `core_epi`) — so the `gemm_fused == gemm()`-then-map contract is bit-for-bit
-for **every** `f32`/`f64` shape. gemv fuses as a final in-place epilogue sweep over each worker's
-own output range (the vector output is negligible next to the memory-bound matrix read, and the
-strategy kernels stay byte-identical); the small-`m,n` / small-`k` paths apply `E` at each tile's
-single store. gemv routes in the user frame (before orientation), so its `epi` is unflipped; the
-others consume the orientation-flipped `epi`. The narrow (`f16`/`bf16`) fused path is the mirror
-`run_typed_mixed_fused`: **no gemv route** (the general driver handles those shapes) but the same
-small-`m,n` / small-`k` reroutes (through `MixedGemm<N>`, as the plain mixed path) and the same
-bias-axis flip — with the pre-narrow `f32` epilogue semantics above (more precise than, not
-bitwise-equal to, `gemm`-then-map). The `FusedScalar` bound admits exactly these four types; each
-supplies `dispatch_fused`, a `dispatch_packed_fused`, and a `fused_degenerate` (the
-`C <- act(β·C + bias)` map when `A·B` vanishes — real floats in `T`, narrow types in `f32`, narrowing
-once). `gemm_i8_requant` still covers the general driver
-path only (the integer special paths keep the identity seam and adopt `E` later behind the same
-API). The **prepacked** operands also fuse: `gemm_packed_b_fused` / `gemm_packed_a_fused` reuse the
-same `PackedRhs` / `PackedLhs` handle (the epilogue is store-side only, so packing is untouched) and
-ride the driver's `run_packed_rhs_epilogue` — `run_packed_rhs` with a non-identity `E` on the same
-`run_inner`, so the pre-epilogue store is byte-identical to a plain prepacked GEMM and the fused
-result is `gemm_packed_* == gemm_packed_*()`-then-map bit-for-bit for `f32`/`f64`. Unlike `gemm_fused`
-these never reroute to a special path (always the general prepacked kernel, the packed divergence the
-plain packed entries document) and never orientation-swap in the driver; the RHS-packed consume is the
-user frame (bias unflipped), while the LHS-packed path always drives the transposed product, so its
-entry flips the user bias axis once when it builds the transposed consume (the same field-write flip
-`gemm_fused` applies dynamically, here baked into the always-transposed packed-A path). The `A·B`-vanishes
-degenerate rides `execute_packed_fused` (mirroring `execute_packed`) with the already-oriented `epi`.
-
-The **complex** family fuses a **bias only**: `gemm_cplx_fused` computes
-`C <- α·op(A)·op(B) + β·C + bias` in one pass (per-row / per-col complex bias), reusing the same
-`FusedEpi<T>` type with `Act::None`. It is **bit-identical** to `gemm_cplx`-then-bias-add for every
-shape and every conj combination (the tile-local post-pass above), and deterministic across thread
-counts. There is deliberately **no activation** on the complex entry: an ordering-based activation
-(ReLU / LeakyReLU) is mathematically undefined on `ℂ`. The dispatch mirror (`run_complex_fused`)
-swaps both the conj flags and the bias axis on the orientation swap; the degenerate `A·B`-vanishes
-map is bias-only (`C <- β·C + bias`, conj irrelevant). Like the real-float fused entry, it exposes a
-raw `gemm_cplx_fused_unchecked`/`_with` tier (bias as a `(ptr, BiasDim, has_bias)` triple, no
-activation) the adapters forward to.
-
-**User-defined map** (`gemm_map`, `f32`/`f64`). For epilogues the library ships no fast path (GELU,
-sigmoid, clamps, position-dependent transforms) `gemm_map` applies a caller closure
-`f(value, row, col) -> value` to each element at its final value, `(row, col)` in the user frame,
-fired once. We deliberately do **not** unseal the internal `Epilogue` trait — that would freeze the
-L0/L1 seam types (`S::Reg`, `KernelSimd`) into the public API — so instead a `dyn`-closure entry lowers
-to an internal `MapEpi<'u, T>` epilogue (a borrowed `&'u (dyn Fn + Sync)`, so a closure captures its
-environment by reference; `Copy + Send + Sync` with **no** `'static` bound, captured by value into the
-scoped rayon workers that join before the borrow ends — no `Box`, no leak). One indirect call per
-element, amortized by the `O(k)` FLOPs, one monomorphization per `(T, ISA)` not per closure (the reason
-for `dyn` over a generic `F` — the fn-pointer dispatch table cannot hold a generic `F`). It threads the
-same `run_typed_map` routing as `run_typed_fused` (gemv pre-orientation, then the orientation flip, then
-small-`m,n` / small-`k` / driver) but rides a **separate** memoized table (`MAP_F32`/`MAP_F64`) rather
-than the shared `Dispatched<T>`, since the narrow types are out of scope (a `T`-domain closure after the
-`f32` accumulate would double-round). `MapEpi` sets `VECTOR = true` so the kernel routes every element
-through the *same* fast/scratch path plain `gemm` does (the guard is identical for `Identity` and a
-`VECTOR` epilogue), draining the fast-path register to scalars in `apply_reg` to apply the closure per
-lane — the fast path's *fused* β·C store is what a scratch-only path would fail to reproduce for
-`β ∉ {0,1}`, so this keeps `gemm_map == gemm()`-then-`f` **bit-for-bit** for every `f32`/`f64` shape and
-route. The `MapScalar` bound (sealed, `f32`/`f64`) admits exactly those two; the raw
-`gemm_map_unchecked`/`_with` tier the adapters forward to takes the closure and the standard view checks
-(no bias, nothing epilogue-specific to validate). Batched, complex, integer, and prepacked map entries
-are out of scope for v1.
-
-[`Epilogue<Fam>`]: gemmkit::kernel::epilogue::Epilogue
-
-## L2 — packing
-
-Packed layout is **micropanel-major**: A as panels of `MR` rows (column-by-column,
-`MR` contiguous rows per depth step), B as panels of `NR` columns, tails
-zero-filled. The same `pack_panels` primitive serves both LHS and RHS — they
-differ only in which stride is "leading" vs "depth". The *choice* of layout
-belongs to the family, but the mechanical copy is shared and never changes when a family
-is added: `pack_panels` for the plain micropanel layout, and `pack_kgroup_panels` for the
-**k-group-interleaved** dot layout (`Q` consecutive depth steps contiguous per lane/column,
-depth padded to `Q`, with a per-element transform — identity for bf16, the `+128` `u8` bias
-for VNNI). Both dot families (`IntGemmVnni` `Q = 4`, `Bf16DotGemm` `Q = 2`) route through
-that one routine, so the interleave index math has a single source of truth.
-
-**Adaptive.** Packing is skipped when it doesn't pay. RHS is packed once per
-panel (always, in v1) and reused across all row blocks. LHS packing has **two
-independent triggers**:
-
-1. *Reuse* — a non-unit row stride or a partial row panel forces packing (the
-   microkernel reads full `MR`-row vectors); otherwise a column-major full block is
-   packed only when each worker reuses it across enough columns to amortize the
-   copy. Historically every worker packed into its own buffer, so redundant packing
-   made mid-size parallel runs cheaper *unpacked* — column-major inputs flowed
-   straight into the kernel and packed only when reuse was genuinely high. (The L5
-   dynamic scheduler now hands each row-block to one worker on the packed path, so
-   that redundancy is largely gone.)
-2. *Stride* — even with low reuse, an in-place column-major A is read by walking K
-   with stride `csa`, so once `csa · sizeof` reaches ~a memory page every depth
-   step lands on a fresh page and the strided read collapses (TLB thrash). Above
-   that gate A is packed regardless of reuse, which recovers large-`m` parallel
-   throughput dramatically — measured ~2.4× at m = 4096 on Apple Silicon's 16 KiB
-   pages (50% → 111% of the `gemm` crate). The gate scales with the page, so —
-   keeping with the "detect geometry, don't hardcode" rule — it is **derived from
-   the runtime page size** (`cache::page_size()` via `getpagesize`, half a page),
-   not a fixed constant: 8 KiB on 16 KiB-page Apple Silicon, 2 KiB on 4 KiB-page
-   x86/Linux, automatically. `GEMMKIT_LHS_PACK_STRIDE` overrides it (`0` = auto).
-
-## L3 — cache topology and analytical blocking
-
-`#[cfg]` chooses the *sniffing method*, never the *values*. CPUID is an
-instruction (OS-independent; works in containers/VMs), so the x86 backend reads
-L1/L2/L3 via CPUID (`raw-cpuid`: Intel deterministic leaf, AMD legacy leaves). On
-macOS the `sysctl` backend reads `hw.perflevel0.{l1d,l2}cachesize` etc. through a
-tiny `sysctlbyname` FFI (no `libc` dependency) — the primary source on Apple
-Silicon, where there is no CPUID; it divides the cluster-shared L2 by
-`hw.perflevel0.cpusperl2` for a realistic per-core budget. On Linux a `sysfs`
-backend reads `/sys/devices/system/cpu`. Any backend that fails or returns
-implausible values, or a VM that masks CPUID, falls through a chain: backend →
-micro-arch hint → a static default calibrated on the Ryzen 9950X. Detection runs
-once (memoized) and a plausibility gate rejects half-populated reads.
-
-Blocking is the **BLIS analytical model**: `KC` so the A and B micro-panels coexist
-in L1 without self-eviction; `MC` so the A macro-panel resides in L2 (reserving one
-way for B, capped at `8·MR`); `NC` so the B macro-panel resides in L3 (reserving
-one way for A). The result is **independent of thread count**, which is the
-mechanism behind reproducible serial/parallel output: a fixed config yields the
-same result regardless of how many workers run.
-
-## L4 — the driver
-
-One BLIS five-loop nest, generic over the family and the ISA token, with no
-concrete type, ISA, or macro:
-
-```
-for jc in 0..n step nc:               # L3 column macro-panel
-  for pc in 0..k step kc:             # depth — NOT parallel (C accumulates)
-    beta_eff = (pc==0) ? beta : 1     # user β only on the first depth slice
-    pack B panel in parallel
-    for each (ic row-block × jt column-tile) job, parallel over a flat 1-D list:
-      pack/reuse this row-block's A
-      vectorize: for each MR×NR microtile -> microkernel(...)
+fn main() {
+    // 2x3 * 3x2 = 2x2, all row-major
+    let a = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let b = [7.0_f32, 8.0, 9.0, 10.0, 11.0, 12.0];
+    let mut c = [0.0_f32; 4];
+    gemm(
+        1.0,
+        MatRef::from_row_major(&a, 2, 3),
+        MatRef::from_row_major(&b, 3, 2),
+        0.0,
+        MatMut::from_row_major(&mut c, 2, 2),
+        Parallelism::Serial,
+    );
+    assert_eq!(c, [58.0, 64.0, 139.0, 154.0]);
+}
 ```
 
-Invariants: the depth loop is serial (the C tile is read-modify-written across
-depth); `β` is applied only on the first depth slice so `C ← βC + αAB` holds and
-`β==0` never reads C; each output tile is computed start-to-finish by one worker
-over the full K; the blocking is thread-count-independent. Together these make the
-output **reproducible** for any [`Parallelism`] — a fixed config gives the same
-result regardless of thread count. (Serial and parallel happen to be bitwise-equal
-today because both run the same kernel, but the contract is reproducibility under a
-fixed config, not bitwise serial-vs-parallel identity.)
+1. **Validate** (`gemm_with` in `gemmkit/src/api.rs`): shapes agree, every
+   view stays inside its slice, `C` addresses each `(i, j)` uniquely and does
+   not overlap `A`/`B`; the views lower to a `Task<T>` of raw pointers and
+   strides.
+2. **Dispatch** (`dispatch::execute` in `gemmkit/src/dispatch.rs`): degenerate
+   cases exit early (`m == 0 || n == 0` returns; `k == 0 || alpha == 0`
+   becomes a `C <- beta*C` scale that never reads `A`/`B`), then the memoized
+   per-type function pointer runs (next section).
+3. **Route** (`run_typed` in `gemmkit/src/dispatch/float.rs`): a gemv shape
+   (`m == 1 || n == 1`) goes to `special/gemv.rs` first, in the user frame.
+   Everything else is orientation-normalized (`orient_transpose`: if `C` is
+   row-major-ish, compute `C^T = B^T*A^T` so output columns are contiguous),
+   then gated to `special/small_mn.rs` or `special/small_k.rs`, else the
+   general driver.
+4. **Block, loop, pack** (`driver::run_inner` in `gemmkit/src/driver.rs`):
+   `(MC, KC, NC)` come from `cache::topology().blocking(...)`, sized in
+   packed-input elements. The BLIS-order nest is `jc` (columns, L3) -> `pc`
+   (depth; never parallel) -> a flat 1-D job list over `(ic row-block x jt
+   column-tile)` that workers drain from a shared `JobCursor`. `beta` applies
+   only on the first depth slice; later slices accumulate. Packing is
+   adaptive: `B` is packed once per depth slice (in parallel, behind a
+   fork-join barrier) when `m` clears `rhs_pack_threshold`; `A` is packed per
+   worker, or once per row block by a shared pre-pass on large parallel
+   problems, or read in place when reuse is too low to amortize the copy.
+5. **Microkernel** (`Fam::microkernel_epi`, e.g. `gemmkit/src/kernel/float.rs`):
+   one `MR x NR` tile is accumulated in registers by
+   `SimdOps::accumulate_tile` (an ascending-`k` fused-multiply-add schedule),
+   then the alpha/beta epilogue stores it: full unit-stride tiles store
+   vectors directly, edge or strided tiles drain through a stack scratch tile.
+   Plain `gemm` runs the zero-cost `Identity` epilogue, which const-folds
+   away; the fused entries thread a real `Epilogue` through the same path.
 
-**Orientation.** If C is row-major-ish (`|csc| < |rsc|`), the dispatch layer
-computes `Cᵀ = Bᵀ·Aᵀ` by swapping A/B and the strides, so the kernel always writes
-columns contiguously. (This swap needs `Lhs == Rhs`, so it lives in the
-concretely-typed dispatch layer, not the fully generic driver.)
+## ISA dispatch
 
-## L5 — parallelism
+Each element type has one `OnceLock<Dispatched<T>>` slot
+(`gemmkit/src/dispatch/`): feature detection runs once, the winning
+monomorphized entry points (plain, prepacked, fused) plus the microtile
+geometry are cached, and every later call is a plain indirect call. The
+auto-selection ladders prefer AVX-512 then FMA/AVX2 then scalar on x86; NEON
+is baseline on aarch64; `simd128` is chosen at compile time on wasm32 (no
+runtime feature detection there, so the build must pass
+`-C target-feature=+simd128`); scalar is the portable floor everywhere.
 
-`Parallelism::{Serial, Rayon(n)}` (`Rayon(0)` = auto). A single work-gate: below an
-`m·n·k` threshold the run is forced serial; above it the worker count *scales with
-the workload* (half-gate granularity) and is capped by the available parallelism
-and the job count. Work is a flat 1-D list of column strips; workers pull
-contiguous chunks from a shared lock-free cursor (`JobCursor`) **on demand**, so
-faster cores absorb proportionally more — the makespan approaches `work / Σ core
-rates` instead of `n · slowest`, which matters on heterogeneous big.LITTLE layouts
-(Apple P/E, ARM DynamIQ, Intel hybrid) where an equal indivisible split is bounded
-by the slowest core. This forfeits *nothing*: blocking stays thread-count
-independent, the depth loop stays serial, and each output tile is still computed
-wholly by one worker over the full K, so *which* worker computes a tile does not
-change the result — the output is reproducible (and, with today's single-kernel
-design, bitwise-equal) across thread counts. On the common in-place-LHS path, chunk size targets
-`GEMMKIT_PARALLEL_OVERSAMPLE` chunks per worker (default 8: ~8 chunks/worker bounds
-the heterogeneous tail imbalance to ~⅛ of a worker's share). When the LHS is packed
-*and* there are at least as many row-blocks as workers, the chunk is a whole
-row-block instead — each block's A is then packed by exactly one worker, trading
-some balance granularity for pack-once reuse; with fewer row-blocks it falls back to
-the fine grain. RHS packing is parallelized the same way (its own cursor) with a
-barrier before compute.
+Runtime detection cannot pair with a fixed `#[target_feature]` on the generic
+kernel, so each ISA token's `Simd::vectorize` runs a closure inside a small
+`#[target_feature]`-annotated trampoline (`gemmkit/src/simd.rs`); the kernel
+and its `#[inline(always)]` primitives inline into that context, landing every
+intrinsic in feature-enabled codegen.
 
-The `cbrt(mnk)` ramp above models *compute* work. The bandwidth-bound L6 special paths
-instead call `Parallelism::resolve_bandwidth(bytes_touched, rows)`: below an LLC-derived byte
-floor the touched data is cache-resident and one core already gets the full LLC bandwidth, so
-it stays serial (splitting there only loses — the thread-scaling curve *dips* at 2–4 workers
-on fork/join and shared-cache contention, with no DRAM to gain); above the floor the auto
-count steps straight to a topology bandwidth cap (`bandwidth_cap` — a documented fraction of
-the logical core count, since DRAM saturates far below it). It is a *step*, not a ramp,
-because for a bandwidth-bound shape a few workers is the worst point on the curve.
-`GEMMKIT_GEMV_PARALLEL_BYTES` / `GEMMKIT_GEMV_THREAD_CAP` tune the floor and cap.
+Tile geometry `(MR_REG, NR)` is the only per-(type, ISA) knob, chosen at the
+dispatch site as const generics: for `f32`, AVX-512 runs 32x12, FMA 16x6, NEON
+16x4, simd128 8x4, scalar 4x4 (`MR = MR_REG * LANES`; `f64` halves the lane
+count).
 
-## L6 — special paths (bandwidth-bound shapes)
+`GEMMKIT_REQUIRE_ISA` pins the kernel end to end: `scalar`, `fma`, `avx512`,
+`avx512vnni` (the i8 dot kernel), `avx512bf16` (the bf16 dot kernel), `neon`,
+`simd128`, or `auto`. If the CPU or target does not support the request,
+dispatch panics rather than falling back, so a CI job that means to exercise
+a given kernel fails loudly. The value is read once and memoized.
 
-These shapes have O(1) arithmetic intensity, so the ceiling is memory bandwidth, not
-compute. Both compute each output element in a **single pass over `k`** and parallelize by
-partitioning disjoint **output** tiles — no cross-thread reduction — so the result is
-bit-identical to the serial run for any worker count. Worker counts come from
-`Parallelism::resolve_bandwidth` (serial below an LLC-derived byte floor, then a step
-straight to a topology bandwidth cap), not the driver's `cbrt(mnk)` compute ramp: past the
-few cores that saturate DRAM, more workers stop helping.
+## Element-type families
 
-- **gemv** (`gemv.rs`, `m == 1` or `n == 1`): both cases reduce to one core routine by
-  viewing the matrix (transposed for `m == 1`) as `rows × k`. Column-major (axpy) shape has
-  two bit-identical strategies chosen by cache fit and `k` — column-outer axpy when the
-  output stays L2-resident (its re-reads are cheap and its single contiguous matrix stream is
-  ideal; it folds `KB` columns per output load/store, so the axpy form is limited by DRAM
-  bandwidth rather than load/store-port throughput), and **output register-blocking** (hold
-  the output panel in registers across the
-  whole `k`-sweep, output/matrix read once) when the output spills L2 *and* `k` is small
-  enough that the register-blocked form's `k` in-place matrix column-streams stay within the
-  prefetcher's window. Row-major uses the dot form.
-- **small_k** (`small_k.rs`, `k <= small_k_threshold`): skinny / low-depth GEMM (gevv,
-  rank-`k`, tall-skinny). Computes the whole product in one depth panel over the family's
-  microkernel, reading A/B **in place** (unpacked), skipping the driver's blocking/packing/
-  workspace setup that is pure overhead at tiny `k`. Requires column-major A (`rsa == 1`) and
-  a non-`FORCE_PACK` family; otherwise defers to `driver::run`. Wired into every family's
-  dispatch except complex (its planar SoA kernel cannot read in place).
-- **small_mn** (`small_mn.rs`, `m, n <= small_mn_dim` and `k > small_k_threshold`): the
-  small-matrix **horizontal (inner-product)** kernel. When both output dimensions are far
-  below the microtile, the driver pads the tiny row/col tiles to a full `MR × NR` microtile
-  and packs mostly padding; this route computes each output as a direct SIMD dot over `k`
-  (`gemv`'s `dot_rows` generalized to an `m×n` grid — they share `dot_contiguous`), reading
-  A/B in place with the output register-blocked into `MT × NT` tiles. Gated to the
-  contiguous-along-`k` layout (A rows unit-stride `csa == 1`, B cols unit-stride `rsb == 1`);
-  a strided layout would need a scalar dot that loses to the driver, so it stays on the
-  driver. Covers `f32`/`f64` (`run`) and `f16`/`bf16` (`run_mixed`, which widen-loads `N → f32`,
-  accumulates in `f32`, and rounds once in the epilogue); `i8`/complex would need their own
-  widen/planar variants and stay on the driver.
+Two small traits carry the type variation. `Scalar`
+(`gemmkit/src/scalar.rs`, L0) holds only the identity constants and the
+accumulator type `Acc` (`f32`/`f64` accumulate in themselves, `f16`/`bf16` in
+`f32`, `i8` in `i32`, complex in itself); no arithmetic lives on it.
+`KernelFamily` (`gemmkit/src/kernel.rs`, L1) bundles what distinguishes one
+kind of GEMM: the `Lhs`/`Rhs`/`Acc`/`Out` types, the pack layout, and the
+microkernel; the driver is generic over the family and never branches on
+element type. The families:
 
-The special paths above are **bandwidth-bound**; each output element is one fixed-order
-reduction computed wholly by one worker, so they are bit-identical to the serial run for any
-worker count.
+| Family | Types | Notes |
+|---|---|---|
+| `FloatGemm<T>` | `f32`, `f64` | The baseline; one generic microkernel for every ISA |
+| `MixedGemm<N>` | `f16`, `bf16` in/out, `f32` acc | Widen on load, narrow on store via the `KernelSimd` seam |
+| `Bf16DotGemm` | `bf16`, AVX-512 BF16 | `vdpbf16ps` dot kernel, `DEPTH_MULTIPLE = 2` |
+| `IntGemm` / `IntGemmVnni` | `i8 -> i32` | Exact, wrapping; VNNI `vpdpbusd` dot kernel (`DEPTH_MULTIPLE = 4`) with `+128` signedness correction, bit-identical to the widen path |
+| `IntGemmQ` / `IntGemmVnniQ` | `i8 -> i8`/`u8` | The requantizing variants (feature `epilogue`) |
+| `ComplexGemm<T, CONJ_A, CONJ_B>` | `c32`, `c64` | Split (SoA) kernel; see below |
 
-- **batched** (`batched.rs`): `gemm_batched` computes many independent products `C_b =
-  α·A_b·B_b + β·C_b` in one call. It is an **orchestration layer**, not a new microkernel:
-  each element re-dispatches through `dispatch::execute`, so batched composes with every route
-  above automatically. `Parallelism::resolve_batch` picks the schedule: **serial** below a
-  total-work gate; **batch-parallel** (each element run serially and cache-hot on one worker, so
-  the batch pays one fork/join instead of one per element) when there are enough elements to
-  fill the workers or the elements are cache-resident; and, for the few-but-large **DRAM-bound**
-  case (fewer elements than cores, each spilling L2 and scaling across cores on its own), a
-  sequential loop giving **each** element the full engine parallelism. That last schedule splits
-  an element across workers, so it is used only for `m, n > 1` shapes (whose driver / small_k /
-  small_mn route reduces each output within one worker, so serial and parallel agree under the
-  current thread-independent blocking), never gemv; the serial and batch-parallel schedules run
-  each element serially, so they are **bit-identical across worker counts**. Workers pack through
-  the re-entrancy-safe thread-local pool (see below), so a batch-parallel worker running an element
-  inline while `gemm_batched`'s outer `with_thread_pool` still holds the pool can't double-borrow.
-  A **fused-epilogue** twin `run_fused` is an exact mirror that swaps `dispatch::execute` for
-  `dispatch::execute_fused` in every schedule arm, threading one shared `FusedEpi` (bias +
-  activation, `Copy`, captured into workers like the base pointers) through every element — so each
-  element is bit-identical to a standalone `gemm_fused` of that element, and the schedule /
-  reproducibility contract is unchanged (`resolve_batch` policy carries over: the fused routes are
-  the same kernels).
+`KernelSimd<L, R, A, O>` (`gemmkit/src/simd.rs`) is the widen/narrow seam: a
+blanket impl covers the homogeneous case, and mixed impls add widening loads
+and narrowing stores, so mixed precision needs no branch in the driver. A
+family whose output is narrower than its accumulator sets `OUT_IS_ACC = false`
+and the driver uses `kc = k` (one depth panel): the whole contraction
+accumulates in `f32` and rounds to the narrow output once.
 
-## L7 — dispatch
+Dot-product families declare `DEPTH_MULTIPLE = Q` and pack via
+`pack_kgroup_panels` (`gemmkit/src/pack.rs`), which interleaves `Q` consecutive
+depth steps contiguously per lane; the ISA token's `dot_accumulate` override
+consumes whole instruction groups. VNNI is bit-exact against the widen path
+(integer arithmetic); the bf16 dot kernel reshapes the accumulation rounding
+and is held to a tolerance, within the reproducibility contract.
 
-Each element type has one `OnceLock<fn>`. Feature detection (`avx512f → fma →
-scalar`) runs once; the winning monomorphized entry point is cached; later calls
-are a plain indirect call. **No `transmute`, no `AtomicPtr<()>`** — the slot is a
-typed function pointer. A per-`(type, ISA)` wrapper picks the `(MR_REG, NR)` tile
-and calls the generic driver; that is the *only* per-(type,ISA) code, and it is one
-line each. Without `std` this collapses to compile-time selection: there is no
-`OnceLock` and no runtime detection (`raw-cpuid` is `std`-gated), so each `select_*`
-picks the kernel straight from `target_feature` cfgs and rebuilds the descriptor per
-call.
+Complex GEMM does not ride `FloatGemm`: its pack de-interleaves each
+micropanel into planar real/imaginary planes (conjugation is a sign flip
+applied during packing, selected by const generics), and the hot loop is pure
+real FMAs through the `SimdOps::cplx_microkernel` seam, four fused real steps
+per complex multiply-accumulate with no in-loop shuffles. Both operands are
+always packed: only the planar layout is consumable.
 
-## L8 — API
+## Blocking and the cache model
 
-- **Safe** ([`gemm`] / [`gemm_with`]): `MatRef`/`MatMut` slice + stride views.
-  Shape mismatch, out-of-bounds strides, and C aliasing A/B all **panic** before
-  any unsafe work. (In safe Rust, `&mut` C cannot overlap `&` A/B anyway; the alias
-  check is a defensive guarantee.)
-- **Batched** ([`gemm_batched`] / `gemm_batched_with`): strided-batched `C_b <-
-  α·A_b·B_b + β·C_b`. One element shape + strides plus a per-operand batch stride;
-  validation additionally checks every element (including the last) is in bounds and
-  the `batch` C regions are pairwise disjoint (factored into a `validate_batched_views`
-  helper shared with the fused twin). A **fused** twin (`gemm_batched_fused` /
-  `gemm_batched_fused_with`, `FusedScalar` bound) applies **one** shared bias + activation to
-  every element — `C_b <- act(α·A_b·B_b + β·C_b + bias)`, the batched-linear-layer case —
-  bit-identical to a loop of `gemm_fused`; it reuses that validation plus the fused bias/slope
-  checks, and has a raw `gemm_batched_fused_unchecked`/`_with` tier the adapters use.
-- **Pointer-array batched** ([`gemm_batched_slice`] / [`gemm_batched_ptr_unchecked`]): a slice of
-  independent, **heterogeneously-shaped** problems (each its own pointers). The checked form takes
-  safe views — a distinct `MatMut` per element, so the borrow checker already guarantees the
-  outputs are disjoint and don't alias the inputs, leaving only shape/bounds validation; the
-  unchecked form takes raw `GemmProblem` descriptors. Both drive the same batch-level parallelism
-  (`special::batched::run_ptr`, `resolve_batch_flat` — each element serial on one worker).
-- **Packed** ([`prepack_rhs`]/[`gemm_packed_b`], [`prepack_lhs`]/[`gemm_packed_a`]): pre-pack one
-  reused operand once into the micropanel layout, then skip the per-call repack across many products
-  (the fixed-weight inference pattern). RHS-packed needs column-major-ish C, LHS-packed
-  row-major-ish — the no-swap orientation the prepacked operand was laid out for. Under `epilogue`
-  a **fused** twin combines the two — `gemm_packed_b_fused` / `gemm_packed_a_fused` (and their
-  `_with` / `_unchecked` tiers) fuse a `Bias`/`Activation` epilogue into the reused-handle store
-  (`C <- act(α·A·B + β·C + bias)`), bit-identical to the plain packed entry then the scalar map for
-  `f32`/`f64`; they share the *same* `PackedRhs`/`PackedLhs` handle (the epilogue is store-side only),
-  keep the same no-swap orientation constraint, and, like the plain packed path, do not reroute to a
-  special path.
-- **Fused** ([`gemm_fused`] / `gemm_fused_with`; `epilogue` feature): `C <- act(α·A·B + β·C + bias)`
-  in one pass, with
-  an optional per-row/per-col `Bias` and an optional `Activation` (ReLU/LeakyReLU) — the fused L1
-  epilogue seam. The sealed `FusedScalar` bound admits exactly `f32`/`f64` **and**, under the `half`
-  feature, the narrow floats `f16`/`bf16` (whose epilogue applies in `f32` *before* the single
-  round-to-nearest narrowing — the pre-narrow semantics of the fused-epilogue section above, more
-  precise than, so **not** bitwise-equal to, `gemm`-then-map). `bias == None && act == None`
-  delegates to plain `gemm`. Validation adds bias-length, bias-vs-C overlap, and finite-slope checks;
-  the result is bit-identical to `gemm` then the scalar map for **every** `f32`/`f64` shape (the L6
-  special paths — gemv, small-`m,n`, small-`k` — are fused too, so a fused shape routes exactly as
-  `gemm`). A strided-batched twin (`gemm_batched_fused` / `gemm_batched_fused_with`, above) applies
-  one shared bias + activation per element, a **prepacked** twin
-  (`gemm_packed_b_fused` / `gemm_packed_a_fused`, above) fuses over a reused pack handle under the same
-  no-swap orientation constraint, and a complex sibling (`gemm_cplx_fused`) fuses a bias
-  only (an ordering-based activation is undefined on `ℂ`); all reuse the same `FusedEpi` epilogue.
-- **Requantize** ([`gemm_i8_requant`] / `gemm_i8_requant_with` → `i8` output; `gemm_i8_requant_u8` /
-  `gemm_i8_requant_u8_with` → `u8` output, ONNX-QLinearMatMul-style; `int8` + `epilogue` features): `i8·i8 -> i8`/`u8`
-  with a `Requantize { scale, zero_point, bias }` (`zero_point` in `[-128, 127]` for `i8`,
-  `[0, 255]` for `u8`), fusing the `i32 -> {i8,u8}` requantize into the store (deleting the `m·n` `i32`
-  materialization). The `scale` is a `RequantScale`: per-tensor (`PerTensor(f32)`) or **per-channel**
-  (`PerRow(&[f32])`, one scale per output row / channel, the quantized-inference convention), lowered
-  to a `ScaleSpec` that flips per-row↔per-col on the orientation swap in lockstep with the bias axis.
-  Bit-exact across ISAs and serial ≡ parallel (a `PerTensor(s)` is bitwise-identical to a
-  `PerRow([s; m])`); the two outputs share one `KRequantize` epilogue and one requant-store seam,
-  parametrized by the `QuantOut` output domain.
-- **Unchecked** ([`gemm_unchecked`], plus a raw-pointer sibling for every safe entry:
-  `gemm_batched_unchecked`, `prepack_rhs_unchecked`/`gemm_packed_b_unchecked`,
-  `prepack_lhs_unchecked`/`gemm_packed_a_unchecked`, `gemm_i8_unchecked`, `gemm_cplx_unchecked`, and
-  — under `epilogue` — the fused tier `gemm_fused_unchecked`, `gemm_batched_fused_unchecked`,
-  `gemm_i8_requant_unchecked`/`gemm_i8_requant_u8_unchecked`, `gemm_cplx_fused_unchecked` (bias as a
-  raw `(ptr, BiasDim, has_bias)` triple) — each with a `_with` caller-owned-`Workspace` form): the
-  raw pointer + `isize` stride engine for advanced callers (e.g. the ndarray adapter) that validate
-  their own inputs and may use negative strides. Each safe entry is exactly its
-  bounds/alias/orientation checks (and, for the fused entries, bias-length/overlap, finite-slope, and
-  requant scale/zero-point checks) followed by a forward to the matching unchecked engine, so the
-  checked and raw paths never diverge.
+`gemmkit/src/cache.rs` computes `(MC, KC, NC)` analytically from the detected
+cache geometry using the BLIS model: `KC` so the A and B micropanels coexist
+in L1 without self-eviction, `MC` so the A macro-panel fits L2 (one way
+reserved for B), `NC` so the B macro-panel fits L3 (with a panel-count cap on
+L3-less machines). A tiny-matrix shortcut skips the model for small shapes,
+and sizing uses the packed-input element size, so narrow types get deeper
+blocks. Blocking is deliberately independent of the thread count: that is the
+mechanism behind reproducible output. Parallelism instead feeds the packing
+decisions: the LHS pack gate is per-worker column reuse, and the shared-A
+pre-pass engages only on the parallel packed path above a workload threshold.
 
-`gemmkit-ndarray` is a thin adapter: it accepts `&ArrayBase<S, Ix2>` for any
-`S: Data` (both `ArrayView2` and `&Array2`), reads the pointer and strides, and
-forwards to the unchecked engine — so C-order, F-order, general-stride, and
-reversed views all work without copying. `dot` is the `.dot()`-style convenience.
-The same thin-wrapper treatment covers the batched (`gemm_batched`/`dot_batched` over an `Ix3`
-array, batch on axis 0) and packed (`prepack_rhs`/`prepack_lhs` + their consumers) raw entries.
-Under `epilogue` the fused entries — `gemm_fused`/`gemm_batched_fused` (and, with `int8`/`complex`,
-`gemm_i8_requant`/`gemm_i8_requant_u8` and `gemm_cplx_fused`, each with a `_with` form) — follow the
-same pattern: they read the raw `(ptr, dims, strides)`, replicate the core's epilogue-parameter
-checks (bias length, bias-vs-`C` overlap via raw pointer arithmetic, finite slope, requant
-scale/zero-point) with the core's exact wording, then forward to gemmkit's matching `_unchecked`
-fused entry. So reversed (negative-stride) views work exactly as in the plain entries, and no slice
-is ever fabricated over `C`'s (possibly gappy / partly-uninitialized) footprint.
+Detection is best-effort with a fallback chain that cannot fail: CPUID on x86
+(`cache/cpuid.rs`) -> Linux sysfs (`cache/sysfs.rs`) -> macOS sysctl
+(`cache/sysctl.rs`) -> a static default calibrated on a Zen5 part. `#[cfg]`
+only ever picks the sniffing method, never the values; implausible reads are
+filtered out, and results are memoized once (with the OS page size) in
+`Machine`. `Level::shared_by` models per-worker contention for the data the
+driver actually places at each level, not raw hardware sharing: L1 and L3 are
+always 1, and only L2 uses the physical-core sharing degree.
 
-`gemmkit-nalgebra` is the same thin adapter for nalgebra: it accepts `&Matrix<T, R, C, S>` for any
-`S: RawStorage` (`DMatrix`, static `SMatrix`, and every view type), pulls `shape()`/`strides()` (the
-non-negative `usize` strides widened to `isize`) and the storage pointer, and forwards to the same
-unchecked engine — so column-major, row-major, and general-stride views all work without copying. It
-mirrors the ndarray surface fn-for-fn (`gemm`/`dot`/packed/`gemm_i8`/`gemm_cplx`, plus the
-`epilogue` fused entries `gemm_fused`/`gemm_i8_requant`/`gemm_cplx_fused`, each with a `_with` form)
-minus the batched pair (and its `gemm_batched_fused`), which has no nalgebra analogue (no 3-D array
-type). The fused entries replicate the core's epilogue checks and forward to the same `_unchecked`
-engine as ndarray; nalgebra's strides are always non-negative, so the reversed-view case never
-arises. `dot` returns a column-major `DMatrix` built through `VecStorage`, so
-the fresh-output allocation needs no nalgebra `Scalar`/`Zero` bound.
+## Packing and workspaces
 
-`gemmkit-faer` is the same thin adapter for faer 0.24. Because faer's `MatRef<'_, T>`/`MatMut<'_, T>`
-are *already* type-erased strided views (generic over an arbitrary element `T` — the vocabulary-view
-accessors carry no `Entity`/`ComplexField` bound), the entries take those view types directly rather
-than being generic over a storage trait: `gemm(alpha, a: MatRef, b: MatRef, beta, c: MatMut, par)`,
-reading `nrows()`/`ncols()` and the element-unit `isize` `row_stride()`/`col_stride()` (already the
-sign-and-unit convention gemmkit wants — negative for a `reverse_rows`/`reverse_cols` view — so no
-cast) plus `as_ptr()`/`as_ptr_mut()`, then forwarding to the same unchecked engine. It mirrors the
-nalgebra surface fn-for-fn (`gemm`/`dot`/packed/`gemm_i8`/`gemm_cplx`, plus the `epilogue` fused
-entries `gemm_fused`/`gemm_i8_requant`/`gemm_cplx_fused`, each `_with`); `dot` returns a
-fresh column-major `Mat<T>` built with `Mat::from_fn` (no numeric bound, so `f16`/`bf16`/`i32` need
-not satisfy faer's `ComplexField`). The fused entries replicate the core's epilogue checks and
-forward raw parts to the same `_unchecked` engine, so a `reverse_rows`/`reverse_cols` view works
-exactly as in the plain entries. Complex unifies for free: faer's `c32`/`c64` are
-`num_complex::Complex<f32>`/`<f64>` over the same num-complex 0.4 gemmkit uses, so no cast is needed.
-faer 0.24's MSRV (1.84) fits the workspace 1.89 and the dependency is `default-features = false`
-(view geometry + one `Mat` alloc only, never faer's own matmul).
+`pack_panels` (`gemmkit/src/pack.rs`) is the one micropanel copy both operands
+share: LHS panels `mr` rows tall stored column-by-column, RHS panels `nr`
+columns wide stored row-by-row (the same routine with strides swapped), tails
+zero-filled. A contiguous leading dimension takes a straight copy; a strided
+source takes a cache-blocked transpose that writes identical bytes.
 
-## Cross-cutting
+Prepacked operands (`gemmkit/src/api/packed.rs`) serve the fixed-weight loop:
+`prepack_rhs`/`prepack_lhs` pack a whole operand once into a `PackedRhs<T>` /
+`PackedLhs<T>` recording the blocking geometry (`nr`, `kc`, `nc`) it was built
+for; `gemm_packed_b`/`gemm_packed_a` (and their fused twins) read that
+geometry back verbatim so panels always match their tiling (`gemm_packed_a`
+consumes through the transposed problem). The layout comes from
+`driver::pack_rhs_full`, the same code the per-call pack uses, so a prepacked
+GEMM reproduces a plain one under the same config; the buffer is read-only and
+shared across workers with no synchronization.
 
-- **Tuning** (`tuning.rs`): every heuristic threshold in one place, each resolving
-  *per-call argument > setter > `GEMMKIT_*` env var > compile-time default*.
-- **Test fast mode** (`GEMMKIT_FAST_TEST`): a test-suite-only knob (the library never
-  reads it - a grep of `gemmkit/src` returns nothing). Set to `1` or `true` it shrinks the
-  deterministic dimension/coefficient sweeps in the test bodies - keeping the full
-  coefficient/layout/bias/activation lattice on one representative shape and reducing the
-  other shapes to a single representative combo each - so every branch/path class (each
-  alpha/beta class, layout, bias kind, activation, entry point, and dimension class,
-  including the kc-crossing `k > 512` wherever the full sweep has one) is still hit at least
-  once while the redundant per-shape cross-product is dropped; unset (or `0`) it reproduces
-  the full byte-for-byte sweep. It also lowers the proptest case counts to `max(default/8, 8)`
-  unless `PROPTEST_CASES` is set explicitly. It is single-sourced in
-  `tests/fast_test_common/mod.rs` (cached in a `OnceLock`, read once per process) and reached
-  by the suites via the existing `#[path]` include pattern. CI turns it on for the 3
-  Intel-SDE jobs (`avx512_test`, `avx512vnni_test`, `avx512bf16_test`), whose ~50x emulation
-  makes the full sweeps dominate the wall time; the native, macOS, and wasm jobs keep full
-  coverage.
-- **Workspace** (`workspace.rs`): a 64-byte-aligned growable packing buffer. The
-  default path uses a transparent thread-local pool; `gemm_with` accepts a
-  caller-owned `Workspace` whose second-and-later uses allocate nothing. The pool
-  accessor is **re-entrancy-safe**: if a GEMM is nested on a thread already inside
-  one (nested rayon work-stealing), it hands out a fresh scratch that once rather
-  than double-borrowing the `RefCell`. Without `std` there is no pool (and no
-  threads to re-enter, since `parallel` requires `std`): each default call runs on
-  a fresh `Workspace`, so `gemm_with` is the zero-alloc-after-first path there.
+`Workspace` (`gemmkit/src/workspace.rs`) is a growable 64-byte-aligned scratch
+buffer. `Workspace::regions` carves per-worker (or per-row-block) LHS regions
+plus one shared RHS region, with fail-closed overflow checks at the
+element-to-byte chokepoint (a broadcast stride can present logical dimensions
+near `isize::MAX`; a wrapped size would under-allocate the buffer the pack
+then writes past). A re-entrancy-safe thread-local pool supplies the default
+workspace; the `*_with` entries thread a caller-owned one through instead,
+giving zero heap allocation after the first sufficiently large call. Without
+`std` there is no pool and each call uses a fresh workspace.
 
-## How this maps to the rigor criteria
+## Parallel execution
 
-- **No macro-generated kernels** — each microkernel is a single generic function (the
-  real one; the one shared SoA complex one); the `macro_rules!` in the crate generate
-  `SimdOps` *impl boilerplate* (the scalar token's element ops and the thin complex
-  glue) plus a one-line compile-time-vs-runtime ISA-detection shim — never kernel
-  bodies.
-- **One kernel, all ISAs** — adding an ISA is a `SimdOps` impl + one `vectorize`
-  trampoline + a few dispatch lines, with the driver, packing, blocking,
-  parallelism, API, and microkernel all untouched. The AArch64 NEON token is the
-  worked proof: it was added purely additively (new `simd/neon.rs`, two `mod`
-  lines, the dispatch wiring, one `isa_neon` test) on a different architecture
-  with 32 vector registers and a wider tile than AVX2. The WebAssembly `simd128`
-  token (`simd/wasm.rs`, `Simd128`) is a second, differently-shaped proof: a
-  *compile-time* feature (`cfg`-selected, no runtime detection — like NEON's
-  baseline-by-cfg arm) on a register-poor backend with **no hardware FMA**, so
-  its `mul_add` is the two-rounding `add(mul(a,b),c)` that matches the scalar
-  reference and keeps the path reproducible. It spans the **whole element-type
-  matrix** purely additively — f32/f64 via the homogeneous blanket; i8 (`IntGemm`
-  widen-and-multiply, no `vpdpbusd`), f16/bf16 (`MixedGemm` scalar widen/narrow,
-  no native fp16), and complex (the shared SoA `cplx_microkernel` macro) reuse the
-  exact same seams as the x86/NEON tokens — all with zero kernel/driver edits.
-  Multithreading on wasm is opt-in: `parallel` alone stays safe-serial (the `RAYON_USABLE`
-  guard degrades to the serial loop, since baseline `wasm32-wasip1` has no thread runtime),
-  and the `wasm_threads` feature turns on a gemmkit-owned rayon pool for
-  `wasm32-wasip1-threads`. wasm has no `available_parallelism` and on stable Rust the
-  `atomics` cfg is unsettable, so both the opt-in and the worker count
-  (`GEMMKIT_WASM_THREADS`, default 8) are explicit rather than auto-detected.
-- **No `transmute`** — `OnceLock<fn>`.
-- **Open/closed** — `tests/open_closed.rs` declares a second `KernelFamily`
-  entirely outside the crate and drives it through the unchanged `driver::run`.
-- **Single crate, many types; no reverse deps; localized unsafe** — by construction
-  of the layer map above.
+`Parallelism` is `Serial` or `Rayon(n)` (`Rayon(0)` = auto). Resolution
+(`gemmkit/src/parallel.rs`) is workload-aware: below a total-work gate
+everything stays serial; an explicit count is honored (capped by cores and
+available jobs); the auto count ramps with the linear problem size,
+`cbrt(m*n*k)` divided by a core-count-derived stride, instead of jumping to
+all cores. Bandwidth-bound shapes (gemv/gevv) use a different rule: serial
+below an LLC-derived byte floor, then straight to a bandwidth cap, because a
+few workers is the worst point on a bandwidth scaling curve.
 
-[`Scalar`]: crate::scalar::Scalar
-[`Float`]: crate::scalar::Float
-[`Simd::vectorize`]: crate::simd::Simd::vectorize
-[`SimdOps`]: crate::simd::SimdOps
-[`SimdOps<T>`]: crate::simd::SimdOps
-[`SimdOps::accumulate_tile`]: crate::simd::SimdOps::accumulate_tile
-[`KernelFamily`]: crate::kernel::KernelFamily
-[`Parallelism`]: crate::Parallelism
-[`gemm`]: crate::gemm
-[`gemm_with`]: crate::gemm_with
-[`gemm_unchecked`]: crate::gemm_unchecked
+Work distribution is demand-driven: the driver flattens its inner work into a
+1-D job list and workers pull contiguous chunks from a shared lock-free
+`JobCursor`, so faster cores on heterogeneous parts absorb proportionally
+more. The chunk grain oversamples the worker count; the packed-LHS path uses a
+row-block-aligned grain so chunks never straddle a pack boundary. On wasm32,
+rayon is usable only under `wasm_threads` (targeting `wasm32-wasip1-threads`),
+which sizes a dedicated pool from the `GEMMKIT_WASM_THREADS` knob; without it,
+`parallel` degrades to the serial loop instead of trapping.
+
+The reproducibility contract, concretely: blocking and the job list are
+identical for every worker count, each output tile is computed whole by one
+worker over the full depth, and packed bytes do not depend on who packs them.
+Which worker computes a tile varies run to run; the result never does.
+
+## Special paths
+
+Dispatch reroutes shapes the register-tiling driver fits poorly
+(`gemmkit/src/special/`), all behind the same public entries and all tunable:
+
+- **gemv** (`gemv.rs`): `m == 1 || n == 1`. Memory-bound; output rows are
+  partitioned across workers with no split reductions, so it is bit-identical
+  across worker counts. Two bit-identical axpy strategies (register-blocked
+  output vs plain column-outer) are chosen by output cache residency.
+- **small-k** (`small_k.rs`): `k` at or below `small_k_threshold`. The whole
+  product is one depth panel over the family's microkernel, reading A/B in
+  place with no packing or blocking setup; generic over families.
+- **small-m,n** (`small_mn.rs`): both `m, n` at or below `small_mn_dim`, long
+  contraction, both operands unit-stride along `k`. Each output is a single
+  horizontal SIMD dot; the driver would compute mostly microtile padding here.
+- **batched** (`batched.rs`): `gemm_batched*` is orchestration over the
+  single-GEMM engine. `Parallelism::resolve_batch` picks between assigning
+  whole cache-hot GEMMs to workers, a sequential loop giving each large
+  element the full engine parallelism (gated to `m, n > 1` shapes whose routes
+  are worker-count independent), and serial. The pointer-array form
+  (`gemm_batched_ptr_unchecked` over `GemmProblem`s) allows per-element shapes.
+
+## Epilogue fusion
+
+The `epilogue` feature fuses a per-element transform into the microkernel's
+store instead of a second pass over `C`. The seam is the `Epilogue` trait
+(`gemmkit/src/kernel/epilogue.rs`), threaded through
+`KernelFamily::microkernel_epi`:
+
+- **Zero-cost identity**: plain `gemm` passes `Identity`, whose hooks
+  const-fold away (`IS_IDENTITY`), so the non-fused kernel is unchanged.
+- **Fire-once semantics**: the driver passes `last_k` and the epilogue applies
+  only on the final depth panel; earlier panels store raw accumulator partials
+  (`OUT_IS_ACC = false` families have a single panel by construction).
+- **Built-ins**: `FusedEpi` (per-row/per-col bias, ReLU / LeakyReLU) behind
+  `gemm_fused*`, its batched/prepacked variants, and the bias-only
+  `gemm_cplx_fused*`; `MapEpi` (a user per-element closure, `f32`/`f64`)
+  behind `gemm_map*`; `KRequantize` (`i32` accumulator to quantized `i8`/`u8`:
+  per-tensor or per-row scale, zero point, optional `i32` bias,
+  round-half-to-even) behind `gemm_i8_requant*`.
+
+The correctness contract: a fused call routes every shape through the same
+kernel plain `gemm` would (driver, gemv, small-k, small-m,n, each fused), the
+engine is epilogue-independent, and the vector and scalar apply paths must
+agree bit-for-bit, so for `f32`/`f64` `gemm_fused` equals `gemm()` followed by
+the same scalar map, bitwise, for every shape. The documented exception is
+`f16`/`bf16`: the epilogue applies in `f32` before the single narrowing (more
+precise than narrow-then-map), so those entries are deliberately not
+bitwise-equal to gemm-then-map; reproducibility is unaffected. The requantize
+vector store is proven bit-equal to its scalar map per lane.
+
+## Extension points
+
+- **A new ISA backend** is a zero-sized token with a `Simd::vectorize`
+  trampoline, `SimdOps<T>` impls for the element types it accelerates, a
+  `Dispatched` descriptor with its tile geometry, and one arm per `select_*`
+  ladder (plus a `GEMMKIT_REQUIRE_ISA` name). Driver, families, packing, and
+  blocking are untouched.
+- **A new element type** is a `Scalar` impl (choosing its `Acc`), a
+  `KernelFamily` (or reuse of one through the `KernelSimd` widen/narrow seam),
+  and a dispatch module with its own `OnceLock` slot. The open/closed property
+  is enforced by `gemmkit/tests/open_closed.rs`, which drives the driver with
+  a second trivial family.
+- **A dot-product instruction** (VNNI-style) arrives as a family with
+  `DEPTH_MULTIPLE > 1` plus a `KernelSimd::dot_accumulate` override on the
+  capable token; `accumulate_tile` overrides are reserved for scheduling
+  changes that keep the rounding shape.
+- **A new fused transform** is an `Epilogue` impl; the vector and scalar paths
+  must agree bitwise.
+
+## Tuning knobs
+
+Every heuristic threshold lives in `gemmkit/src/tuning.rs` and resolves as:
+per-call argument > programmatic setter (`tuning::set_*`) > environment
+variable (`GEMMKIT_*`) > compiled default (calibrated on a Zen5 x86 part, with
+arch-split defaults where aarch64 measured differently). Env vars are read
+once and cached; malformed values warn on stderr and fall back rather than
+panic. Knobs cover the serial/parallel gate, pack gates and strides,
+special-path thresholds, scheduler grains, and blocking caps.
+
+`gemmkit-tune` (`gemmkit-tune/src/main.rs`) automates host calibration: run on
+the deploy machine, it sweeps each knob independently over a probe-shape set,
+scores candidates by geometric-mean throughput with a default-biased,
+noise-aware tie-break, and writes a `gemmkit-tune.env` profile of
+`export GEMMKIT_*=...` lines to source before running; no recompile involved.
+
+## Testing strategy
+
+The suites live in `gemmkit/tests/`; the performance harnesses there
+(`tests/perf/`, `benches/`) are measurement tools, not CI gates.
+
+- **Correctness** (`tests/correctness/`): shapes x layouts x alpha/beta swept
+  against an independent `f64` reference GEMM (`tests/oracle_common/`) with
+  per-type accuracy gates, cross-checks against the external `gemm` crate,
+  parallel bit-identity where promised, per-ISA kernel runs, and the safe
+  API's exact panic wording.
+- **Property tests** (`tests/props_api.rs`, `props_packed.rs`,
+  `props_knobs.rs`): proptest over shapes, strides, and knob values.
+- **Conformance** (`tests/simd_conformance.rs`, plus in-module sweeps like
+  `requant_store` in `gemmkit/src/simd.rs`): every available token checked
+  against scalar models.
+- **Fuzzing** (`gemmkit/fuzz/`): five libFuzzer targets (gemm, batched,
+  prepack, API validation, knobs) in a nightly-only sub-workspace.
+- **Miri**: CI runs the scalar-path correctness suite and the complex
+  negative-stride entry under Miri; `cfg(miri)` detours exist only where Miri
+  cannot interpret hardware conversions.
+- **ISA pinning in CI** (`.github/workflows/ci.yml`): jobs pin each kernel via
+  `GEMMKIT_REQUIRE_ISA` (AVX-512, VNNI, and BF16 under Intel SDE, NEON on
+  aarch64, simd128 on wasm), plus no_std builds, an MSRV job, and
+  feature-matrix builds. `GEMMKIT_FAST_TEST` is a test-suite-only switch that
+  shrinks the sweeps; the library never reads it.

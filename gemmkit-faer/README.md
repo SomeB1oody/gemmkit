@@ -1,71 +1,66 @@
 # gemmkit-faer
 
-A thin [`faer`] 0.24 adapter over the [`gemmkit`](/gemmkit/README.md) GEMM engine.
+[![crates.io](https://img.shields.io/crates/v/gemmkit-faer.svg)](https://crates.io/crates/gemmkit-faer) [![docs.rs](https://img.shields.io/docsrs/gemmkit-faer)](https://docs.rs/gemmkit-faer)
 
-It accepts faer's view types — `MatRef<'_, T>` for inputs, `MatMut<'_, T>` for the
-output — reads the data pointer and the element-unit `isize` row/column strides straight
-out of the view, and forwards to gemmkit's raw engine. faer's natural column-major
-layout, transposed views, sub-matrices, and reversed (negative-stride) views therefore
-all work **without copying**.
+Zero-copy [faer](https://crates.io/crates/faer) adapter for the [gemmkit](https://crates.io/crates/gemmkit) GEMM engine. It accepts faer's view types (`MatRef<'_, T>` for the inputs, `MatMut<'_, T>` for the output), reads the data pointer and the element-unit `isize` row and column strides straight out of each view, and forwards them to gemmkit's raw engine. faer's column-major layout, transposed views, sub-matrices, and reversed (negative-stride) views therefore all work without copying.
 
-```rust
-use faer::Mat;
+The entry points mirror the core gemmkit surface, including the feature-gated element families (`half`, `complex`, `int8`) and the fused epilogue entries (`epilogue`). faer has no rank-3 array type, so gemmkit's batched entries have no analogue here.
 
-// .dot()-style convenience
-let a = Mat::from_fn(2, 2, |i, j| [[1.0_f64, 2.0], [3.0, 4.0]][i][j]);
-let b = Mat::from_fn(2, 2, |i, j| [[5.0_f64, 6.0], [7.0, 8.0]][i][j]);
-let c = gemmkit_faer::dot(a.as_dyn_stride(), b.as_dyn_stride());
-assert_eq!(c[(0, 0)], 19.0);
-assert_eq!(c[(1, 1)], 50.0);
+## Usage
+
+```toml
+[dependencies]
+gemmkit-faer = "0.1"
+gemmkit = "0.1" # for the Parallelism argument, which is not re-exported
+faer = "0.24"
 ```
 
 ```rust
 use faer::Mat;
-use gemmkit::Parallelism;
-# let a = Mat::<f64>::zeros(8, 6);
-# let b = Mat::<f64>::zeros(6, 5);
-let mut c = Mat::<f64>::zeros(8, 5);
-// C ← 1.5·A·B + 2.0·C, accepting views or owned matrices.
-gemmkit_faer::gemm(1.5, a.as_dyn_stride(), b.as_dyn_stride(), 2.0, c.as_dyn_stride_mut(), Parallelism::Rayon(0));
+
+fn main() {
+    let a = Mat::from_fn(2, 2, |i, j| [[1.0_f32, 2.0], [3.0, 4.0]][i][j]);
+    let b = Mat::from_fn(2, 2, |i, j| [[5.0_f32, 6.0], [7.0, 8.0]][i][j]);
+    let c = gemmkit_faer::dot(a.as_dyn_stride(), b.as_dyn_stride());
+    assert_eq!(c[(0, 0)], 19.0);
+    assert_eq!(c[(1, 1)], 50.0);
+}
 ```
 
-## API
+`dot` returns `A*B` in a fresh column-major `Mat`. For the general update `C <- alpha*A*B + beta*C` in place, use `gemm(alpha, a, b, beta, c, par)`, where `par` is a `gemmkit::Parallelism`; `gemm_with` runs the same call against a caller-owned `gemmkit::Workspace`. The element type `T` is `f32` or `f64`, plus `f16` and `bf16` under `half`.
 
-- `gemm(alpha, a, b, beta, c, par)` — `C ← α·A·B + β·C`.
-- `gemm_with(ws, alpha, a, b, beta, c, par)` — same, reusing a `gemmkit::Workspace`.
-- `dot(a, b) -> Mat<T>` — `A·B` into a fresh column-major matrix.
-- `prepack_rhs`/`prepack_lhs` + `gemm_packed_b`/`gemm_packed_a` — pre-pack one reused
-  operand for the fixed-weight loop.
-- `gemm_i8`/`dot_i8` (`int8` feature) and `gemm_cplx`/`dot_cplx` (`complex` feature).
-- `gemm_fused`/`gemm_fused_with` (`epilogue` feature) — `C ← act(α·A·B + β·C + bias)` in one
-  pass, an optional `Bias` + `Activation`; the prepacked twins
-  `gemm_packed_b_fused`/`gemm_packed_a_fused` (and their `_with`) fuse the same epilogue over a
-  reused pack handle. With `int8` + `epilogue`, `gemm_i8_requant` /
-  `gemm_i8_requant_u8` (requantized `i8`/`u8` output). With `complex` + `epilogue`, the bias-only
-  `gemm_cplx_fused`. (Like the plain entries, these read raw parts from the view and forward to
-  gemmkit's raw engine, so reversed/negative-stride views work without copying.)
-- `gemm_map`/`gemm_map_with` (`epilogue` feature, `f32`/`f64`) — a user-defined per-element closure
-  `f(value, row, col)` applied to each output element in one pass; bit-identical to plain `gemm` then
-  the same map. For bias/activation prefer `gemm_fused` (it vectorizes); `gemm_map` is the general
-  per-element extension point (GELU, sigmoid, clamps, position-dependent transforms).
+Beyond `gemm` and `dot`, the crate exposes:
 
-`T` is `f32` or `f64` (`gemmkit::GemmScalar`), plus `f16`/`bf16` under `half`. Complex
-uses faer's `c32`/`c64` (`= num_complex::Complex<f32>`/`<f64>`), which are exactly
-gemmkit's complex element types. `Parallelism` is re-exported from `gemmkit`. faer has no
-3-D array type, so the ndarray adapter's batched entries have no analogue here.
+- Prepacked-operand reuse: `prepack_rhs` / `prepack_lhs` produce a reusable handle consumed by `gemm_packed_b` / `gemm_packed_a` for fixed-weight loops.
+- Complex (`complex` feature): `gemm_cplx` / `dot_cplx` over faer's `c32` / `c64`, with optional per-operand conjugation.
+- Integer (`int8` feature): `gemm_i8` / `dot_i8` take `i8` inputs and accumulate into an `i32` output.
+- Fused epilogue (`epilogue` feature): `gemm_fused` computes `C <- act(alpha*A*B + beta*C + bias)` in one pass, `gemm_map` applies a user closure per output element (`f32` / `f64`), `gemm_i8_requant` / `gemm_i8_requant_u8` requantize the `i8` result (with `int8`), and `gemm_cplx_fused` adds a bias to a complex result (with `complex`). The prepacked entries have fused twins as well.
 
-## Features
+Each entry has a `_with` variant that reuses a caller-owned `Workspace`. See the [API docs](https://docs.rs/gemmkit-faer) for the complete list of signatures.
 
-- `parallel` (default) — forwards to `gemmkit/parallel` (rayon).
-- `wasm_threads`, `half`, `complex`, `int8` — forward to the matching `gemmkit` feature.
-- `epilogue` — fused epilogues: `gemm_fused` and the prepacked `gemm_packed_b_fused` /
-  `gemm_packed_a_fused` (bias/activation), plus the user-defined per-element `gemm_map` (`f32`/`f64`);
-  requant `gemm_i8_requant` needs
-  `int8` + `epilogue`, complex-fused `gemm_cplx_fused` needs `complex` + `epilogue`, and `f16`/`bf16`
-  fused ride `half`.
+## Feature flags
+
+Every feature forwards to the same-named `gemmkit` feature.
+
+- `parallel` (default): rayon-based parallelism.
+- `wasm_threads`: threading on `wasm32-wasip1-threads` (also enables `parallel`).
+- `half`: `f16` and `bf16` element types, accumulated in `f32`.
+- `complex`: `c32` and `c64` element types.
+- `int8`: `i8` inputs into an `i32` output.
+- `epilogue`: the fused bias/activation, requantization, and per-element map entries.
+
+## Related crates
+
+- [gemmkit](https://crates.io/crates/gemmkit): the core engine. All algorithmic documentation (ISA dispatch, cache blocking, packing, and numeric semantics) lives there and on its [docs.rs](https://docs.rs/gemmkit) page.
+- [gemmkit-ndarray](https://crates.io/crates/gemmkit-ndarray) and [gemmkit-nalgebra](https://crates.io/crates/gemmkit-nalgebra): sibling zero-copy adapters for other matrix libraries.
+- [gemmkit-tune](https://crates.io/crates/gemmkit-tune): install-time autotuner binary that emits a `GEMMKIT_*` environment profile for the target machine.
+
+This adapter targets faer 0.24.
+
+## Minimum supported Rust version
+
+Rust 1.89.
 
 ## License
 
-MIT OR Apache-2.0.
-
-[`faer`]: https://docs.rs/faer
+Licensed under either of [MIT](https://github.com/SomeB1oody/gemmkit/blob/master/LICENSE-MIT) or [Apache-2.0](https://github.com/SomeB1oody/gemmkit/blob/master/LICENSE-APACHE), at your option.
