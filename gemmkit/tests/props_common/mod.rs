@@ -26,11 +26,21 @@ pub use oracle_common::*;
 /// Per-property case count with a `PROPTEST_CASES` override. `ProptestConfig::default()`
 /// already reads the env var, but an explicit `cases:` field clobbers it, so read it here
 /// and fall back to the tuned default. Every property block passes `cases(N)`
+///
+/// Precedence: an explicit `PROPTEST_CASES` always wins (the SDE CI jobs pin it to 16);
+/// else under `GEMMKIT_FAST_TEST` the count drops to `max(default/8, 8)` so the property
+/// binaries stay a meaningful sample without the full case budget; else the tuned default
 pub fn cases(default: u32) -> u32 {
-    std::env::var("PROPTEST_CASES")
+    if let Some(n) = std::env::var("PROPTEST_CASES")
         .ok()
         .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(default)
+    {
+        return n;
+    }
+    if fast_test() {
+        return (default / 8).max(8);
+    }
+    default
 }
 
 // layout / stride strategies (generalizes `build_view` in tests/correctness/common.rs;

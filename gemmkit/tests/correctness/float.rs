@@ -5,13 +5,19 @@ use crate::common::*;
 use gemmkit::{MatMut, MatRef, Parallelism, Workspace, gemm, gemm_unchecked};
 
 fn dims() -> Vec<(usize, usize, usize)> {
-    // Edge values around the AVX-512 f32 tile (MR=32, NR=12) and blocking
-    let vals = [
-        0usize, 1, 2, 5, 11, 12, 13, 16, 31, 32, 33, 48, 64, 100, 257,
-    ];
+    // Edge values around the AVX-512 f32 tile (MR=32, NR=12) and blocking. Under
+    // GEMMKIT_FAST_TEST keep the edge / tile-boundary / multi-block classes and drop the
+    // redundant middle (11, 16, 31, 48, 100 and the near-duplicate 2): zero, one, a sub-tile,
+    // both NR and MR boundary+1, a multi-tile, and the large multi-block remain. The k / n
+    // lists and the big squares below are unchanged
+    let vals: &[usize] = if fast_test() {
+        &[0, 1, 5, 12, 13, 32, 33, 64, 257]
+    } else {
+        &[0, 1, 2, 5, 11, 12, 13, 16, 31, 32, 33, 48, 64, 100, 257]
+    };
     let mut out = Vec::new();
     // A representative cross-section (full cross product is huge)
-    for &m in &vals {
+    for &m in vals {
         for &k in &[1usize, 2, 7, 32, 65] {
             for &n in &[1usize, 11, 12, 13, 64] {
                 out.push((m, k, n));

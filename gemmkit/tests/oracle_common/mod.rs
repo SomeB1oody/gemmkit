@@ -13,6 +13,12 @@
 
 use gemmkit::GemmScalar;
 
+// Single-sourced `GEMMKIT_FAST_TEST` knob, re-exported so the correctness and property
+// suites reach `fast_test()` through their existing `pub use oracle_common::*`
+#[path = "../fast_test_common/mod.rs"]
+mod fast_test_common;
+pub use fast_test_common::fast_test;
+
 /// Trait letting the harness be generic over the homogeneous float element types
 /// (f32/f64, and, under the `half` feature, f16/bf16)
 pub trait Elem: GemmScalar {

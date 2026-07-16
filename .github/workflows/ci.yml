@@ -96,6 +96,9 @@ jobs:
           GEMMKIT_REQUIRE_ISA: avx512
           # Bound the props_* proptest binaries under SDE emulation; native runs use full case counts
           PROPTEST_CASES: "16"
+          # Shrink the deterministic dimension/coefficient sweeps under ~50x SDE emulation;
+          # every branch/path class is still covered (native jobs keep the full sweeps)
+          GEMMKIT_FAST_TEST: "1"
 
   # i8 VNNI (`vpdpbusd`) dot kernel
   avx512vnni_test:
@@ -124,6 +127,7 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: "sde64 -spr --"
           GEMMKIT_REQUIRE_ISA: avx512vnni
           PROPTEST_CASES: "16"
+          GEMMKIT_FAST_TEST: "1"
 
   # bf16 (`vdpbf16ps`) dot kernel
   avx512bf16_test:
@@ -152,6 +156,7 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: "sde64 -spr --"
           GEMMKIT_REQUIRE_ISA: avx512bf16
           PROPTEST_CASES: "16"
+          GEMMKIT_FAST_TEST: "1"
 
   # 32-bit x86 `cargo check` only (no runner)
   i686_check:

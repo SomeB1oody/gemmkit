@@ -105,10 +105,24 @@ fn driver_matrix<T: Flt + gemmkit::MapScalar>(par: Parallelism) {
         (48, 96, 129),
         (40, 4096, 40), // multi-panel K: fire-once (a per-panel map would diverge)
     ];
-    for &(m, k, n) in &shapes {
+    // Under GEMMKIT_FAST_TEST run the full coefficient/layout lattice on one representative
+    // shape (index 0, the smallest) and reduce the other 3 shapes to a single non-trivial
+    // combo each. The kc-crossing k = 4096 fire-once shape still runs at least once (with the
+    // divergence-catching beta = 0.7). Off, `fast` is false and the sweep is byte-for-byte full
+    let fast = fast_test();
+    let full_lattice = 0usize;
+    for (si, &(m, k, n)) in shapes.iter().enumerate() {
         for &beta in &[T::ZERO, T::ONE, T::of(0.7)] {
             for &alpha in &[T::ONE, T::of(0.9)] {
                 for layout in [Layout::Col, Layout::Row, Layout::ColPadded] {
+                    if fast
+                        && si != full_lattice
+                        && !(beta == T::of(0.7)
+                            && alpha == T::of(0.9)
+                            && matches!(layout, Layout::ColPadded))
+                    {
+                        continue;
+                    }
                     check_map::<T>(&mut rng, m, k, n, alpha, beta, layout, par, "driver");
                 }
             }

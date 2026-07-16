@@ -5,6 +5,12 @@
 
 use gemmkit::{Activation, Bias, MatMut, MatRef, Parallelism, Workspace, gemm};
 
+// Single-sourced `GEMMKIT_FAST_TEST` knob, reached via the same `#[path]` include the
+// oracle suite uses; re-exported so the epilogue modules see it through `crate::common::*`
+#[path = "../fast_test_common/mod.rs"]
+mod fast_test_common;
+pub(crate) use fast_test_common::fast_test;
+
 /// Deterministic xorshift* RNG (no external dep, reproducible across runs)
 pub(crate) struct Rng(u64);
 impl Rng {

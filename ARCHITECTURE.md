@@ -687,6 +687,21 @@ faer 0.24's MSRV (1.84) fits the workspace 1.89 and the dependency is `default-f
 
 - **Tuning** (`tuning.rs`): every heuristic threshold in one place, each resolving
   *per-call argument > setter > `GEMMKIT_*` env var > compile-time default*.
+- **Test fast mode** (`GEMMKIT_FAST_TEST`): a test-suite-only knob (the library never
+  reads it - a grep of `gemmkit/src` returns nothing). Set to `1` or `true` it shrinks the
+  deterministic dimension/coefficient sweeps in the test bodies - keeping the full
+  coefficient/layout/bias/activation lattice on one representative shape and reducing the
+  other shapes to a single representative combo each - so every branch/path class (each
+  alpha/beta class, layout, bias kind, activation, entry point, and dimension class,
+  including the kc-crossing `k > 512` wherever the full sweep has one) is still hit at least
+  once while the redundant per-shape cross-product is dropped; unset (or `0`) it reproduces
+  the full byte-for-byte sweep. It also lowers the proptest case counts to `max(default/8, 8)`
+  unless `PROPTEST_CASES` is set explicitly. It is single-sourced in
+  `tests/fast_test_common/mod.rs` (cached in a `OnceLock`, read once per process) and reached
+  by the suites via the existing `#[path]` include pattern. CI turns it on for the 3
+  Intel-SDE jobs (`avx512_test`, `avx512vnni_test`, `avx512bf16_test`), whose ~50x emulation
+  makes the full sweeps dominate the wall time; the native, macOS, and wasm jobs keep full
+  coverage.
 - **Workspace** (`workspace.rs`): a 64-byte-aligned growable packing buffer. The
   default path uses a transparent thread-local pool; `gemm_with` accepts a
   caller-owned `Workspace` whose second-and-later uses allocate nothing. The pool

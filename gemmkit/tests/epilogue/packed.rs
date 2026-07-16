@@ -222,13 +222,29 @@ fn packed_b_matrix<T: Flt>(par: Parallelism) {
         Some(Activation::Relu),
         Some(Activation::LeakyRelu(T::of(0.1))),
     ];
-    for &(m, k, n) in &shapes {
+    // Under GEMMKIT_FAST_TEST run the full coefficient/layout/bias/activation lattice on one
+    // representative shape (index 1, the smallest) and reduce the other 2 shapes to a single
+    // non-trivial combo each: every class stays covered, only the redundant per-shape
+    // cross-product is dropped. Off, `fast` is false and the sweep is byte-for-byte the full one
+    let fast = fast_test();
+    let full_lattice = 1usize;
+    for (si, &(m, k, n)) in shapes.iter().enumerate() {
         for &beta in &[T::ZERO, T::ONE, T::of(0.7)] {
             for &alpha in &[T::ONE, T::of(0.9)] {
                 for layout in [ColC::Col, ColC::ColPadded] {
                     let (rsc, csc, clen) = col_c_strides(layout, m, n);
                     for bias_kind in 0u8..=2 {
                         for act in &acts {
+                            if fast
+                                && si != full_lattice
+                                && !(beta == T::of(0.7)
+                                    && alpha == T::of(0.9)
+                                    && matches!(layout, ColC::ColPadded)
+                                    && bias_kind == 2
+                                    && matches!(act, Some(Activation::LeakyRelu(_))))
+                            {
+                                continue;
+                            }
                             check_packed_b_fused::<T>(
                                 &mut rng,
                                 m,
@@ -260,13 +276,27 @@ fn packed_a_matrix<T: Flt>(par: Parallelism) {
         Some(Activation::Relu),
         Some(Activation::LeakyRelu(T::of(0.1))),
     ];
-    for &(m, k, n) in &shapes {
+    // Same shrink policy as `packed_b_matrix`: full lattice on the smallest shape, one
+    // non-trivial combo on the others under GEMMKIT_FAST_TEST; byte-for-byte full when off
+    let fast = fast_test();
+    let full_lattice = 1usize;
+    for (si, &(m, k, n)) in shapes.iter().enumerate() {
         for &beta in &[T::ZERO, T::ONE, T::of(0.7)] {
             for &alpha in &[T::ONE, T::of(0.9)] {
                 for layout in [RowC::Row, RowC::RowPadded] {
                     let (rsc, csc, clen) = row_c_strides(layout, m, n);
                     for bias_kind in 0u8..=2 {
                         for act in &acts {
+                            if fast
+                                && si != full_lattice
+                                && !(beta == T::of(0.7)
+                                    && alpha == T::of(0.9)
+                                    && matches!(layout, RowC::RowPadded)
+                                    && bias_kind == 2
+                                    && matches!(act, Some(Activation::LeakyRelu(_))))
+                            {
+                                continue;
+                            }
                             check_packed_a_fused::<T>(
                                 &mut rng,
                                 m,
