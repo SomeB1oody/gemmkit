@@ -294,6 +294,84 @@ fn perf_gemv() {
     }
 }
 
+/// gemv `C(mx1) = A(mxk)*x` with **row-major** A, routed to the dot-layout path
+/// ([`gemmkit`]'s `special::gemv::dot_rows`): row-major A gives `mat_rs == k` (not the
+/// axpy shape) while the unit-stride vector and output give `mat_cs == 1 && vec_s == 1`,
+/// which is the dot gate. Reported as GB/s of the minimum traffic `(m*k + k + m)*4` (A
+/// read once, x once, C written once) against the STREAM `ceiling`, plus a GFLOP/s figure
+/// (`2*m*k` flops) derived from the same timing so the latency-bound FMA-chain effect is
+/// readable on the cache-resident rows. The `gemm`-crate / `matrixmultiply` baselines run
+/// the same `m,k,1` shape (their A is column-major, but the traffic and flop count match)
+fn bench_gemv_dot(m: usize, k: usize, par: Parallelism, ceiling: f64) {
+    let a = fill(m * k, 1);
+    let x = fill(k, 2);
+    let mut c = vec![0.0f32; m];
+    let bytes = (m * k + k + m) * 4;
+    let st = measure_gbps(bytes, || {
+        gemm(
+            1.0,
+            MatRef::from_row_major(&a, m, k),
+            MatRef::from_col_major(&x, k, 1),
+            0.0,
+            MatMut::from_col_major(&mut c, m, 1),
+            par,
+        );
+    });
+    let mode = if matches!(par, Parallelism::Serial) {
+        "ser"
+    } else {
+        "par"
+    };
+    // GFLOP/s from the GB/s median: identical elapsed time, so the flop/byte ratio
+    // converts the moved-bytes rate into a flop rate without re-timing
+    let gflops = st.median * (2.0 * m as f64 * k as f64) / bytes as f64;
+    let tail = baseline_tail(m, k, 1, bytes, par, st.median);
+    println!(
+        "  m={m:<6} k={k:<6} {mode}  kit={:7.1} GB/s (±{:>2.0}%)  {:7.1} GFLOP/s  {:3.0}% ceil{tail}",
+        st.median,
+        st.spread_pct(),
+        gflops,
+        100.0 * st.median / ceiling.max(1e-9),
+    );
+}
+
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture"]
+fn perf_gemv_dot() {
+    let _guard = BENCH_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    println!(
+        "\ngemv dot-layout (C[m×1] = A[m×k]·x, row-major A -> dot_rows) — GB/s + GFLOP/s vs STREAM ceiling:"
+    );
+    let avail = std::thread::available_parallelism()
+        .map(|x| x.get())
+        .unwrap_or(1);
+    let ser_ceiling = stream_triad_serial().median;
+    let (peak_thr, par_ceiling) = stream_triad_parallel_peak(avail);
+    let par_ceiling = par_ceiling.median;
+    println!(
+        "  serial ceiling {ser_ceiling:.1} GB/s;  parallel ceiling {par_ceiling:.1} GB/s @ {peak_thr} thr"
+    );
+    for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
+        let ceiling = if matches!(par, Parallelism::Serial) {
+            ser_ceiling
+        } else {
+            par_ceiling
+        };
+        // A latency-bound cache-resident pair, a few-long-rows shape, and a DRAM-bound
+        // regression guard. The dot path carries 1 FMA chain per row, so the cache-resident
+        // rows expose the single-accumulator latency wall register-blocking targets; the
+        // DRAM row should be unchanged (bandwidth-bound, the arithmetic is already hidden)
+        for &(m, k) in &[
+            (512usize, 512usize), // L2-resident (~1 MiB): the latency wall is clearest
+            (2048, 2048),         // L3-resident (16 MiB)
+            (64, 65536),          // few long rows: probes the shared-vector-read benefit
+            (8192, 8192),         // 256 MiB, DRAM-bound: expect ~no change (regression guard)
+        ] {
+            bench_gemv_dot(m, k, par, ceiling);
+        }
+    }
+}
+
 /// Investigation: for a gemv shape, measure the dedicated gemv special path vs the general
 /// driver (reached by disabling the gemv path) vs the `gemm` crate. Confirms the special
 /// path is the right choice (the driver, which packs A into micropanels for a compute-bound

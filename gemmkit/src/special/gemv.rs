@@ -458,9 +458,27 @@ unsafe fn axpy_plain<T, S>(
     }
 }
 
+/// Output rows register-blocked in the dot path: `DOT_RB` rows are reduced side by side,
+/// each keeping its own accumulator, so `DOT_RB` independent FMA chains overlap across the
+/// shared k-sweep. A single row's reduction is one dependent `mul_add` chain, latency-bound
+/// (~4-cycle FMA latency on Zen5, so ~1 FMA per 4 cycles) rather than throughput-bound (2
+/// FMAs/cycle); running several rows' chains at once fills that latency shadow, and the
+/// vector `vec` is loaded once per depth step and shared by the whole group. Chosen at 4 by
+/// measurement, not by the latency*throughput product (which wants ~8): 4 chains already
+/// recover most of the stall, and each row adds a concurrent matrix read-stream, so 8
+/// over-subscribes the hardware prefetcher and grows the per-group load footprint. 4 wins on
+/// both cache-resident shapes and the DRAM-bound guard (where the extra memory-level
+/// parallelism from a few independent streams even pushes a single core past its naive
+/// single-stream rate); 8 pulls ahead only on the few-long-rows shape, where the stream count
+/// is small. Not a partition grain (the dot path partitions on single SIMD rows), so its
+/// value is free of the serial-vs-parallel reproducibility constraint that pins [`MB_REG`]
+const DOT_RB: usize = 4;
+
 /// Dot-form over output rows `[s, e)` (row-major matrix): `out[i] = alpha*<mat[i,:], vec> +
 /// beta*out[i]`, one pass (matrix row read once, output once, vector kept in L1). `beta` folded
-/// into the per-row epilogue
+/// into the per-row epilogue. Rows are register-blocked in groups of [`DOT_RB`] to keep several
+/// independent FMA chains in flight (the per-row reduction is latency-bound otherwise); the
+/// `< DOT_RB` tail falls through to the plain per-row form
 ///
 /// # Safety
 /// As [`axpy_regblocked`], with `mat` rows contiguous over `k` and `vec` unit-stride
@@ -483,7 +501,53 @@ unsafe fn dot_rows<T, S>(
     S: SimdOps<T>,
 {
     unsafe {
-        for i in s..e {
+        let lanes = <S as SimdOps<T>>::LANES;
+        let mut i = s;
+
+        // Register-blocked groups of DOT_RB rows: DOT_RB independent SIMD accumulators plus
+        // DOT_RB independent scalar-tail accumulators, so DOT_RB FMA chains overlap across the
+        // shared k-sweep. Every row runs exactly `dot_contiguous`'s order (single accumulator,
+        // ascending k in `lanes` steps with `mul_add(row, vec, acc)`, `reduce_sum`, then the
+        // ascending scalar tail), so interleaving the chains leaves each row bit-identical to
+        // the per-row `dot_contiguous` used by the tail below and by the small_mn edge cell
+        while i + DOT_RB <= e {
+            let rows: [*const T; DOT_RB] =
+                core::array::from_fn(|r| mat.offset((i + r) as isize * mat_rs));
+            let mut acc = [simd.zero(); DOT_RB];
+            let mut kk = 0;
+            while kk + lanes <= k {
+                // Load the shared vector once, feed every row's chain
+                let v = simd.loadu(vec.add(kk));
+                for r in 0..DOT_RB {
+                    acc[r] = simd.mul_add(simd.loadu(rows[r].add(kk)), v, acc[r]);
+                }
+                kk += lanes;
+            }
+            let mut dots: [T; DOT_RB] = core::array::from_fn(|r| simd.reduce_sum(acc[r]));
+            while kk < k {
+                let y = *vec.add(kk);
+                for r in 0..DOT_RB {
+                    dots[r] = (*rows[r].add(kk)).mul_add(y, dots[r]);
+                }
+                kk += 1;
+            }
+            for (r, dot) in dots.into_iter().enumerate() {
+                let op = out.offset((i + r) as isize * out_s);
+                let ov = if beta == T::ZERO {
+                    T::ZERO
+                } else if beta == T::ONE {
+                    *op
+                } else {
+                    beta * *op
+                };
+                *op = alpha.mul_add(dot, ov);
+            }
+            i += DOT_RB;
+        }
+
+        // Remaining `< DOT_RB` rows: the plain single-accumulator per-row form (unchanged),
+        // which is exactly the per-row arithmetic the blocked groups above reproduce
+        while i < e {
             let row = mat.offset(i as isize * mat_rs);
             let dot = super::dot_contiguous::<T, S>(simd, k, row, vec);
             let op = out.offset(i as isize * out_s);
@@ -495,6 +559,7 @@ unsafe fn dot_rows<T, S>(
                 beta * *op
             };
             *op = alpha.mul_add(dot, ov);
+            i += 1;
         }
     }
 }
@@ -546,7 +611,7 @@ unsafe fn strided_rows<T, S>(
 
 #[cfg(test)]
 mod tests {
-    use super::MB_REG;
+    use super::{DOT_RB, MB_REG};
     use crate::simd::{ScalarTok, SimdOps};
 
     /// Generate a per-float-type checker for [`super::axpy_regblocked`]. It picks a row count
@@ -650,6 +715,125 @@ mod tests {
         {
             check_f32(crate::simd::Neon, "neon/f32");
             check_f64(crate::simd::Neon, "neon/f64");
+        }
+    }
+
+    /// Generate a per-float-type bit-identity checker for [`super::dot_rows`]. The
+    /// register-blocked dot path must produce output *bitwise identical* to a reference loop
+    /// that reduces each row with [`crate::special::dot_contiguous`] (the shared fixed-order
+    /// reduction gemv and small_mn depend on): interleaving independent rows' chains keeps
+    /// each row's single-accumulator ascending-`k` order intact, so the bits must match. The
+    /// row count spans 2 full `DOT_RB` groups plus a `< DOT_RB` remainder, `k` spans the SIMD
+    /// vector loop plus a sub-lane scalar tail, and `beta` sweeps `{0, 1, other}` so every
+    /// epilogue branch runs. Compared on raw bits (`to_bits`), not a tolerance
+    macro_rules! dot_rows_bit_identity_check {
+        ($fn:ident, $t:ty) => {
+            fn $fn<S: SimdOps<$t>>(simd: S, label: &str) {
+                let lanes = <S as SimdOps<$t>>::LANES;
+                // 2 full DOT_RB groups + a sub-group remainder
+                let rows = DOT_RB * 2 + 3;
+                // full SIMD vector loop + a sub-lane scalar tail
+                let k = lanes * 5 + 3;
+
+                // Row-major matrix (`mat_rs == k`, rows contiguous over `k`), unit-stride
+                // vector and unit-stride output (the dot-path layout)
+                let mat: Vec<$t> = (0..rows * k)
+                    .map(|i| (((i as u64 * 1103515245 + 12345) % 251) as $t) * 0.008 - 1.0)
+                    .collect();
+                let vec: Vec<$t> = (0..k)
+                    .map(|i| (((i as u64 * 2654435761) % 193) as $t) * 0.01 - 0.9)
+                    .collect();
+                let out0: Vec<$t> = (0..rows)
+                    .map(|i| (((i as u64 * 40503) % 131) as $t) * 0.05 - 3.0)
+                    .collect();
+
+                for &(alpha, beta) in &[
+                    (1.3 as $t, 0.0 as $t),
+                    (0.7 as $t, 1.0 as $t),
+                    (1.1 as $t, 2.5 as $t),
+                ] {
+                    let mut out = out0.clone();
+                    let mut refr = out0.clone();
+                    unsafe {
+                        simd.vectorize(|| {
+                            super::dot_rows::<$t, S>(
+                                simd,
+                                0,
+                                rows,
+                                k,
+                                alpha,
+                                mat.as_ptr(),
+                                k as isize,
+                                vec.as_ptr(),
+                                beta,
+                                out.as_mut_ptr(),
+                                1,
+                            );
+                            // Reference: the plain per-row `dot_contiguous` form the blocked
+                            // groups must reproduce bit-for-bit. The epilogue uses `alpha*dot +
+                            // ov`, matching `Float::mul_add` (plain mul-add, not a hardware
+                            // FMA), so any reordering in the blocked path would flip a bit here
+                            for i in 0..rows {
+                                let row = mat.as_ptr().add(i * k);
+                                let dot = crate::special::dot_contiguous::<$t, S>(
+                                    simd,
+                                    k,
+                                    row,
+                                    vec.as_ptr(),
+                                );
+                                let ov = if beta == 0.0 as $t {
+                                    0.0 as $t
+                                } else if beta == 1.0 as $t {
+                                    refr[i]
+                                } else {
+                                    beta * refr[i]
+                                };
+                                refr[i] = alpha * dot + ov;
+                            }
+                        });
+                    }
+                    for i in 0..rows {
+                        assert_eq!(
+                            out[i].to_bits(),
+                            refr[i].to_bits(),
+                            "{label} lanes={lanes} beta={beta} row {i}: blocked {} vs ref {}",
+                            out[i],
+                            refr[i]
+                        );
+                    }
+                }
+            }
+        };
+    }
+
+    dot_rows_bit_identity_check!(dot_check_f32, f32);
+    dot_rows_bit_identity_check!(dot_check_f64, f64);
+
+    /// The scalar token (`LANES == 1`) always runs, covering the register-blocked groups and
+    /// remainder platform-independently; the SIMD tokens (guarded by runtime detection)
+    /// additionally exercise the shared SIMD `mul_add` sweep and the sub-lane scalar tail
+    #[test]
+    fn dot_rows_bit_identical() {
+        dot_check_f32(ScalarTok, "scalar/f32");
+        dot_check_f64(ScalarTok, "scalar/f64");
+
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            use crate::simd::{Avx512, Fma};
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                dot_check_f32(Fma, "fma/f32");
+                dot_check_f64(Fma, "fma/f64");
+            }
+            if is_x86_feature_detected!("avx512f") {
+                dot_check_f32(Avx512, "avx512/f32");
+                dot_check_f64(Avx512, "avx512/f64");
+            }
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            dot_check_f32(crate::simd::Neon, "neon/f32");
+            dot_check_f64(crate::simd::Neon, "neon/f64");
         }
     }
 }
