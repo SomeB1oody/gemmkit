@@ -387,7 +387,19 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize, E>(
                 // not split K, or the running sum would round to `Out` between panels
                 // Use the whole contraction as one panel so it accumulates in `Acc`
                 // and rounds once. Homogeneous families keep the cache-model `kc`
-                let kc = if Fam::OUT_IS_ACC { blk.kc } else { k };
+                // A multi-slice DOT family (`DEPTH_MULTIPLE > 1` with `OUT_IS_ACC =
+                // true`, i.e. the f32-output narrow twin) rounds the slice depth up to
+                // the group multiple so an interior boundary never splits a depth-group:
+                // a split group would depth-pad its tail (a zero pad-pair) mid-
+                // contraction, regrouping the fused dot and rounding differently from
+                // one panel. Only the final short tail is then padded, exactly as the
+                // single-panel case. `next_multiple_of(1)` is the identity for every
+                // other family, so nothing else moves
+                let kc = if Fam::OUT_IS_ACC {
+                    blk.kc.next_multiple_of(Fam::DEPTH_MULTIPLE)
+                } else {
+                    k
+                };
                 (kc.max(1), blk.nc.next_multiple_of(nr).max(nr))
             }
         };

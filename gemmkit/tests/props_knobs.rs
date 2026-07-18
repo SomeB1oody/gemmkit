@@ -72,7 +72,7 @@ fn thread_dim_stride_restore() -> usize {
 /// round-trips to
 type Knob = (fn(usize), fn() -> usize);
 
-/// The 21 general-path knobs P16 sweeps (i8 VNNI is int8/f32-inert, exercised by P20), each
+/// The 22 general-path knobs P16 sweeps (i8 VNNI is int8/f32-inert, exercised by P20), each
 /// paired with the capture fn that reads the value its setter round-trips to. Order-independent:
 /// each is set to an independently-drawn value. Both `KnobGuard::capture` (restore side) and
 /// `apply_knobs` (sweep side) drive this single table, so their lengths (and hence
@@ -102,6 +102,7 @@ const KNOBS: &[Knob] = &[
     (tuning::set_kc, tuning::kc),
     (tuning::set_kc_min, tuning::kc_min),
     (tuning::set_pack_transpose_tile, tuning::pack_transpose_tile),
+    (tuning::set_deep_kc_bytes, tuning::deep_kc_bytes),
 ];
 const KNOB_COUNT: usize = KNOBS.len();
 

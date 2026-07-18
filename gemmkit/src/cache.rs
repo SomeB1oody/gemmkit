@@ -240,6 +240,25 @@ pub(crate) fn gemv_regblock_engage_bytes() -> usize {
     }
 }
 
+/// The deep-contraction engage gate in *bytes*: a narrow-output family (`OUT_IS_ACC = false`)
+/// runs `kc = k` (one depth panel), so its single RHS micropanel is `nr * k * sizeof(N)` bytes;
+/// once that outgrows L2 every microtile call streams it (alongside the even larger `mr * k` LHS
+/// micropanel) from L3/DRAM. The `GEMMKIT_DEEP_KC_BYTES` knob overrides it verbatim; `0` (the
+/// default) derives it from **half** the L2 effective per-worker capacity. Measured on the Zen5
+/// 9950X (AVX-512, `nr = 12`, `f16`/`bf16`): the throughput cliff hits at `k = 32768` (a `768 KiB`
+/// RHS micropanel, ~0.75x the 1 MiB L2) - `k = 16384` (`384 KiB`) is still near peak - so a
+/// full-L2 gate would engage only past `k ~ 43000` and miss the cliff entirely; the `L2/2` gate
+/// engages the twin at `32768`/`65536` (2.8x / 3.6x faster for `f16`) while leaving `16384` and
+/// below on the single panel (where the twin is within noise, so no regression). Centralized here
+/// (like [`lhs_pack_stride_bytes`] / [`gemv_parallel_floor_bytes`]) as the one home for the
+/// `0 => auto` derivation and its direct test
+pub(crate) fn deep_k_engage_bytes() -> usize {
+    match crate::tuning::deep_kc_bytes() {
+        0 => (topology().l2.effective_bytes() / 2).max(1),
+        v => v,
+    }
+}
+
 /// Run the fallback chain once. Never panics: any backend that fails or returns
 /// implausible values is skipped
 #[cfg(feature = "std")]
@@ -437,6 +456,28 @@ mod tests {
         assert_eq!(lhs_pack_stride_bytes(), 4096, "override must pass through");
         // Restore the default so concurrent/later tests see auto
         crate::tuning::set_lhs_pack_stride(0);
+    }
+
+    /// The deep-contraction engage gate: the default `0` knob must resolve to *half* the L2
+    /// effective per-worker bytes (the measured cliff), and any non-zero knob must pass through
+    /// verbatim. Guards the `0 => l2/2` derivation and the override branch (platform-independent:
+    /// asserts against the host's own detected L2)
+    #[test]
+    fn deep_k_engage_gate_auto_and_override() {
+        let restore = crate::tuning::deep_kc_bytes();
+        // Auto: 0 => half the L2 effective bytes (and never zero, so the gate can fire)
+        crate::tuning::set_deep_kc_bytes(0);
+        let auto = deep_k_engage_bytes();
+        assert_eq!(
+            auto,
+            (topology().l2.effective_bytes() / 2).max(1),
+            "auto gate must be half the L2 effective bytes"
+        );
+        assert!(auto > 0, "auto gate must be non-zero");
+        // Override: any non-zero value is the byte threshold verbatim
+        crate::tuning::set_deep_kc_bytes(4096);
+        assert_eq!(deep_k_engage_bytes(), 4096, "override must pass through");
+        crate::tuning::set_deep_kc_bytes(restore);
     }
 
     /// A degenerate dimension (`m`, `n`, or `k` == 0) short-circuits the BLIS model: the

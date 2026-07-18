@@ -244,7 +244,8 @@ impl KernelSimd<f16, f16, f32, f16> for Neon {
     }
     #[inline(always)]
     unsafe fn load_out(self, p: *const f16) -> float32x4_t {
-        unsafe { self.load_lhs(p) }
+        // Qualified: the f32-output twin adds a 2nd `KernelSimd<f16, .., f32, ..>` impl
+        unsafe { <Self as KernelSimd<f16, f16, f32, f16>>::load_lhs(self, p) }
     }
     #[inline(always)]
     unsafe fn store_out(self, p: *mut f16, v: float32x4_t) {
@@ -280,7 +281,8 @@ impl KernelSimd<bf16, bf16, f32, bf16> for Neon {
     }
     #[inline(always)]
     unsafe fn load_out(self, p: *const bf16) -> float32x4_t {
-        unsafe { self.load_lhs(p) }
+        // Qualified: the f32-output twin adds a 2nd `KernelSimd<bf16, .., f32, ..>` impl
+        unsafe { <Self as KernelSimd<bf16, bf16, f32, bf16>>::load_lhs(self, p) }
     }
     #[inline(always)]
     unsafe fn store_out(self, p: *mut bf16, v: float32x4_t) {

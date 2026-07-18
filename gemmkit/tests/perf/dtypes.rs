@@ -88,6 +88,77 @@ fn perf_f16() {
     }
 }
 
+/// Deep-contraction probe for the narrow-output single-slice rule: an `OUT_IS_ACC = false`
+/// family runs the whole contraction as one depth panel (`kc = k`, the single-rounding
+/// contract), so at large `k` its micropanels outgrow L1/L2 where the homogeneous f32 driver
+/// re-blocks at the cache-model `kc`. The f32 column is the control: if f16/bf16 efficiency
+/// (relative to its own shallow-`k` row) falls off materially faster than f32's, the
+/// single-slice rule is leaving cache locality on the table; if the falloff tracks f32's,
+/// the deep panels are prefetch-covered and a multi-slice restructure has nothing to win
+#[cfg(all(feature = "half", not(target_family = "wasm")))]
+fn bench_narrow_k_sweep(m: usize, k: usize, n: usize) {
+    use gemmkit::{bf16, f16};
+    let af = fill(m * k, 1);
+    let bf = fill(k * n, 2);
+    let mut cf = vec![0.0f32; m * n];
+    let s_f32 = measure(m, k, n, || {
+        gemm(
+            1.0f32,
+            MatRef::from_col_major(&af, m, k),
+            MatRef::from_col_major(&bf, k, n),
+            0.0,
+            MatMut::from_col_major(&mut cf, m, n),
+            Parallelism::Serial,
+        );
+    });
+    let a16: Vec<f16> = af.iter().map(|&x| f16::from_f32(x)).collect();
+    let b16: Vec<f16> = bf.iter().map(|&x| f16::from_f32(x)).collect();
+    let mut c16 = vec![f16::from_f32(0.0); m * n];
+    let s_f16 = measure(m, k, n, || {
+        gemm(
+            f16::from_f32(1.0),
+            MatRef::from_col_major(&a16, m, k),
+            MatRef::from_col_major(&b16, k, n),
+            f16::from_f32(0.0),
+            MatMut::from_col_major(&mut c16, m, n),
+            Parallelism::Serial,
+        );
+    });
+    let ab: Vec<bf16> = af.iter().map(|&x| bf16::from_f32(x)).collect();
+    let bb: Vec<bf16> = bf.iter().map(|&x| bf16::from_f32(x)).collect();
+    let mut cb = vec![bf16::from_f32(0.0); m * n];
+    let s_bf16 = measure(m, k, n, || {
+        gemm(
+            bf16::from_f32(1.0),
+            MatRef::from_col_major(&ab, m, k),
+            MatRef::from_col_major(&bb, k, n),
+            bf16::from_f32(0.0),
+            MatMut::from_col_major(&mut cb, m, n),
+            Parallelism::Serial,
+        );
+    });
+    println!(
+        "  m=n={m:<4} k={k:<6} ser  f32={:7.1} (±{:>2.0}%)  f16={:7.1} (±{:>2.0}%)  bf16={:7.1} (±{:>2.0}%)",
+        s_f32.median,
+        s_f32.spread_pct(),
+        s_f16.median,
+        s_f16.spread_pct(),
+        s_bf16.median,
+        s_bf16.spread_pct()
+    );
+}
+
+#[cfg(all(feature = "half", not(target_family = "wasm")))]
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture"]
+fn perf_narrow_k_sweep() {
+    let _guard = BENCH_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    println!("\nnarrow-output deep-k probe (single-slice kc = k vs the f32 control):");
+    for &k in &[512usize, 4096, 16384, 32768, 65536] {
+        bench_narrow_k_sweep(512, k, 512);
+    }
+}
+
 /// bf16 -> f32 GEMM throughput (no `gemm`-crate baseline: it lacks bf16 in 0.18). On an
 /// AVX-512-BF16 box the driver takes the `vdpbf16ps` dot kernel, whose LHS/RHS packs run
 /// through `pack_kgroup_panels`; row-major A + col-major B is the contiguous (`depth == 1`)

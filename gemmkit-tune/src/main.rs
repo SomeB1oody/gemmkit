@@ -1055,6 +1055,15 @@ fn main() {
              and the default is a deliberate cross-shape compromise"
             .to_string(),
     )];
+    // DEEP_KC_BYTES gates the f16/bf16 deep-contraction twin; this tool sweeps no narrow-type
+    // shapes, and the auto default is L2-derived (a machine property). Override
+    // GEMMKIT_DEEP_KC_BYTES directly to retune the narrow deep-k engage point
+    skipped.push((
+        "GEMMKIT_DEEP_KC_BYTES",
+        "narrow-only (f16/bf16 deep-contraction twin engage gate); no narrow probe here, and the \
+         auto default is derived from L2"
+            .to_string(),
+    ));
     // SEQ_INTERNAL_BYTES_PER_WORKER is swept above on aarch64 (the only arch whose resolve_batch
     // reads it); on x86 it is inert, so skip it there
     #[cfg(not(target_arch = "aarch64"))]

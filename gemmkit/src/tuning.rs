@@ -316,6 +316,20 @@ static KC: Threshold = Threshold::new("GEMMKIT_KC", KC_DEFAULT);
 pub const KC_MIN_DEFAULT: usize = 512;
 static KC_MIN: Threshold = Threshold::new("GEMMKIT_KC_MIN", KC_MIN_DEFAULT);
 
+// Deep-contraction engage gate, in bytes. A narrow-output family (`f16`/`bf16`, `OUT_IS_ACC =
+// false`) runs the whole contraction as one depth panel (`kc = k`) so the narrow output rounds
+// once; at large `k` its single RHS micropanel (`nr * k * sizeof(N)` bytes) outgrows L2 and every
+// microtile call streams it from L3/DRAM. When that micropanel size exceeds this gate the dispatch
+// switches to the f32-output twin (`OUT_IS_ACC = true`), which re-blocks the contraction at the
+// cache-model `kc` (multi-slice, panels L2-resident) into an f32 scratch and then narrows once
+// `0` (the default) means *auto*: derive the gate from half the detected L2 (see
+// `crate::cache::deep_k_engage_bytes`, where the measured cliff sits); any non-zero value is the
+// byte threshold verbatim. Bit-identical to the single panel for the common `beta in {0, 1}` (the
+// twin continues the same ascending-k accumulation across slices); accurate to tolerance otherwise
+/// Compiled default for [`deep_kc_bytes`] (before any env/setter override); `0` = auto (L2-derived)
+pub const DEEP_KC_BYTES_DEFAULT: usize = 0;
+static DEEP_KC_BYTES: Threshold = Threshold::new("GEMMKIT_DEEP_KC_BYTES", DEEP_KC_BYTES_DEFAULT);
+
 // Strip length for the cache-blocked transpose in the strided packing paths (real and complex):
 // the source is walked along its contiguous dimension in strips of this many depth steps and each
 // strip scattered into the panel, turning a per-element strided gather into blocked copies. One
@@ -520,6 +534,18 @@ pub fn kc_min() -> usize {
 /// Override the main-model `kc` floor
 pub fn set_kc_min(v: usize) {
     KC_MIN.set(v);
+}
+
+/// Get the deep-contraction engage gate, in bytes: a narrow-output family switches to its
+/// f32-output multi-slice twin once its single RHS micropanel (`nr * k * sizeof(N)`) exceeds this.
+/// `0` (the default) means *auto*: derive the gate from the detected L2 (see
+/// `crate::cache::deep_k_engage_bytes`); any non-zero value is the byte threshold verbatim
+pub fn deep_kc_bytes() -> usize {
+    DEEP_KC_BYTES.get()
+}
+/// Override the deep-contraction engage gate (bytes); `0` restores the L2-derived auto value
+pub fn set_deep_kc_bytes(v: usize) {
+    DEEP_KC_BYTES.set(v);
 }
 
 /// Get the cache-blocked-transpose strip length used by the strided packing paths. Always `>= 1`

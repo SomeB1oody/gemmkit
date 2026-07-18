@@ -9,18 +9,20 @@ use super::float::Dispatched;
 use super::float::FusedScalar;
 use super::isa::{ForcedIsa, forced_isa};
 use super::{GemmScalar, PackedConsume, Task, orient_transpose, small_mn_eligible};
-use crate::driver;
+use crate::driver::{self, alpha_status, beta_status};
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use crate::kernel::Bf16DotGemm;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use crate::kernel::Bf16DotGemmF32;
 use crate::kernel::KernelFamily;
-use crate::kernel::MixedGemm;
+use crate::kernel::MixedGemmF32;
 #[cfg(feature = "epilogue")]
 use crate::kernel::epilogue::{BiasSpec, Epilogue, FusedEpi};
+use crate::kernel::{AlphaStatus, BetaStatus, MixedGemm};
 use crate::parallel::Parallelism;
 use crate::scalar::NarrowFloat;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use crate::simd::Avx512Bf16;
-use crate::simd::KernelSimd;
 #[cfg(target_arch = "aarch64")]
 use crate::simd::Neon;
 use crate::simd::ScalarTok;
@@ -28,6 +30,7 @@ use crate::simd::ScalarTok;
 use crate::simd::Simd128;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use crate::simd::{Avx512, Fma};
+use crate::simd::{KernelSimd, SimdOps};
 use crate::special::{gemv, small_k, small_mn};
 use crate::tuning;
 use crate::workspace::Workspace;
@@ -59,6 +62,146 @@ unsafe fn scale_c_narrow<N: NarrowFloat>(
     }
 }
 
+/// Bridges a narrow-output family to its f32-output **deep-k twin** (`Out = f32 = Acc`,
+/// `OUT_IS_ACC = true`), the family the driver multi-slices for a large-`k` narrow GEMM. Keyed off
+/// the family (not the ISA), so `run_typed_mixed` picks the right twin from the same `Fam` its
+/// wrappers already pass: `MixedGemm<N> -> MixedGemmF32<N>`, `Bf16DotGemm -> Bf16DotGemmF32`
+#[cfg(feature = "half")]
+trait DeepKTwin: KernelFamily {
+    /// The f32-output twin family (same inputs/accumulator, `Out = f32`)
+    type Twin: KernelFamily<Lhs = Self::Lhs, Rhs = Self::Rhs, Acc = Self::Acc, Out = f32>;
+}
+#[cfg(feature = "half")]
+impl<N: NarrowFloat> DeepKTwin for MixedGemm<N> {
+    type Twin = MixedGemmF32<N>;
+}
+#[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
+impl DeepKTwin for Bf16DotGemm {
+    type Twin = Bf16DotGemmF32;
+}
+
+/// Deep-contraction route: re-block a large-`k` narrow GEMM through its f32-output twin `Tw`, then
+/// narrow once. The single-panel narrow family (`OUT_IS_ACC = false`, `kc = k`) rounds the output
+/// once but streams an L2-overflowing RHS micropanel from L3/DRAM at large `k`; the twin instead
+/// blocks `K` at the cache-model `kc` (panels L2-resident), accumulating into an `m x n` **f32
+/// scratch** with `alpha = 1`, `beta = 0`, then a single vectorized sweep applies the real
+/// `alpha`/`beta` and narrows to `N`
+///
+/// **Bit-identity to the single panel** (for the common `beta in {0, 1}`): the twin seeds each
+/// slice's accumulators from the f32 scratch (see `kernel::mixed::twin_seed`), so every output's
+/// ascending-`k` FMA/dot chain is the single-panel one merely split at slice boundaries (store/
+/// reload of an f32 is exact); the dot twin's `kc` is rounded to `DEPTH_MULTIPLE` so a pair never
+/// straddles a boundary. The narrowing sweep replicates `mixed_epilogue`'s arithmetic (fold
+/// `alpha` with `mul`, combine `beta` with `add`, narrow with the same `store_out`), so the result
+/// is byte-for-byte the single-panel path for `beta in {0, 1}`; for a general `beta` it is accurate
+/// to tolerance (the single panel itself uses a fused `beta*C + AB` on full tiles but an unfused
+/// one on edge tiles, so no single sweep matches both). Serial and parallel are always bit-
+/// identical (the twin driver's blocking is thread-count independent; the sweep is elementwise)
+///
+/// The f32 scratch comes from a **dedicated `Workspace`**: deep-k is a large-`k` regime, so the
+/// one `m*n` f32 allocation is negligible next to the contraction, and the hot packing buffer
+/// (`ws`, threaded into the twin driver) stays pooled and reused. `Workspace::regions` carries the
+/// same fail-closed overflow guard as the driver's own sizing
+///
+/// # Safety
+/// As [`run_typed_mixed`]; `t` is already orientation-normalized (`c` column-major-ish)
+#[cfg(feature = "half")]
+#[inline]
+unsafe fn run_deep_k_twin<N, Tw, S, const MR_REG: usize, const NR: usize>(
+    simd: S,
+    t: &Task<N>,
+    par: Parallelism,
+    ws: &mut Workspace,
+) where
+    N: NarrowFloat,
+    Tw: KernelFamily<Lhs = N, Rhs = N, Acc = f32, Out = f32>,
+    S: KernelSimd<N, N, f32, N> + KernelSimd<N, N, f32, f32>,
+{
+    unsafe {
+        let (m, n, k) = (t.m, t.n, t.k);
+        // f32 scratch, contiguous column-major m x n (rsc = 1, csc = m). A dedicated Workspace so
+        // the pooled `ws` stays free for the twin driver's packing; `regions` fail-closes on the
+        // element->byte overflow the same way the driver's own sizing does
+        let mut scratch_ws = Workspace::new();
+        let scratch = scratch_ws.regions::<f32>(m.saturating_mul(n), 1, 0).a_base;
+        // Pure sum(A*B) into the scratch (alpha = 1, beta = 0). `Out = f32 = Acc`, so the driver
+        // multi-slices at the cache-model kc; the twin seeds each slice from the scratch, so the
+        // accumulation is the single panel's, split at slice boundaries. The first (beta = 0) slice
+        // writes every scratch element before any later slice reads it (the pc-loop fork-joins per
+        // slice), so the uninitialized scratch is never read
+        driver::run::<Tw, S, MR_REG, NR>(
+            simd, m, k, n, 1.0f32, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb, 0.0f32, scratch, 1,
+            m as isize, par, ws,
+        );
+
+        // Narrowing sweep: c = narrow(alpha*scratch + beta*widen(c_old)), replicating
+        // `mixed_epilogue` op-for-op so `beta in {0, 1}` reproduces the single panel bitwise
+        let alpha = t.alpha.widen();
+        let beta = t.beta.widen();
+        let ash = alpha_status(alpha);
+        let bst = beta_status(beta);
+        let (c, rsc, csc) = (t.c, t.rsc, t.csc);
+        simd.vectorize(|| {
+            let lanes = <S as SimdOps<f32>>::LANES;
+            let av = simd.splat(alpha);
+            let bv = simd.splat(beta);
+            for j in 0..n {
+                let sc = scratch.add(j * m); // contiguous f32 scratch column
+                let cc = c.offset(j as isize * csc); // narrow C column
+                if rsc == 1 {
+                    let mut i = 0;
+                    while i + lanes <= m {
+                        let mut r = simd.loadu(sc.add(i));
+                        if ash == AlphaStatus::Other {
+                            r = simd.mul(r, av);
+                        }
+                        r = match bst {
+                            BetaStatus::Zero => r,
+                            BetaStatus::One => {
+                                let cv = <S as KernelSimd<N, N, f32, N>>::load_out(simd, cc.add(i));
+                                simd.add(cv, r)
+                            }
+                            BetaStatus::Other => {
+                                let cv = <S as KernelSimd<N, N, f32, N>>::load_out(simd, cc.add(i));
+                                simd.mul_add(cv, bv, r)
+                            }
+                        };
+                        <S as KernelSimd<N, N, f32, N>>::store_out(simd, cc.add(i), r);
+                        i += lanes;
+                    }
+                    while i < m {
+                        let mut r = *sc.add(i);
+                        if ash == AlphaStatus::Other {
+                            r *= alpha;
+                        }
+                        r = match bst {
+                            BetaStatus::Zero => r,
+                            BetaStatus::One => (*cc.add(i)).widen() + r,
+                            BetaStatus::Other => beta * (*cc.add(i)).widen() + r,
+                        };
+                        *cc.add(i) = N::narrow(r);
+                        i += 1;
+                    }
+                } else {
+                    for i in 0..m {
+                        let cp = cc.offset(i as isize * rsc);
+                        let mut r = *sc.add(i);
+                        if ash == AlphaStatus::Other {
+                            r *= alpha;
+                        }
+                        r = match bst {
+                            BetaStatus::Zero => r,
+                            BetaStatus::One => (*cp).widen() + r,
+                            BetaStatus::Other => beta * (*cp).widen() + r,
+                        };
+                        *cp = N::narrow(r);
+                    }
+                }
+            }
+        });
+    }
+}
+
 /// Mixed-precision driver entry for a concrete `(narrow type, family, ISA, tile)`. Mirror
 /// of [`run_typed`] driving a narrow-in / `f32`-accumulate family: the gemv reroute, the same
 /// orientation swap, and `alpha`/`beta` **widened to the `f32` accumulator** before the driver
@@ -85,8 +228,8 @@ unsafe fn run_typed_mixed<N, Fam, S, const MR_REG: usize, const NR: usize>(
     ws: &mut Workspace,
 ) where
     N: NarrowFloat,
-    Fam: KernelFamily<Lhs = N, Rhs = N, Acc = f32, Out = N>,
-    S: KernelSimd<N, N, f32, N>,
+    Fam: KernelFamily<Lhs = N, Rhs = N, Acc = f32, Out = N> + DeepKTwin,
+    S: KernelSimd<N, N, f32, N> + KernelSimd<N, N, f32, f32>,
 {
     unsafe {
         // gemv shape (unless the dedicated path is disabled via tuning): the widen matrix*vector,
@@ -158,6 +301,23 @@ unsafe fn run_typed_mixed<N, Fam, S, const MR_REG: usize, const NR: usize>(
                 par,
                 ws,
             );
+            return;
+        }
+        // Deep-contraction reblocking (see [`run_deep_k_twin`]): a narrow family runs `kc = k` (one
+        // depth panel) so the output rounds once, but at large `k` its RHS micropanel
+        // (`nr * k * sizeof(N)`) outgrows L2 and every microtile call streams it from L3/DRAM. Once
+        // that micropanel exceeds the engage gate, run the f32-output twin (`OUT_IS_ACC = true`,
+        // multi-slice, panels L2-resident) into an f32 scratch and narrow once. `checked_mul` so an
+        // overflowing micropanel size (a broadcast operand can pass validation with a logically huge
+        // `k`) does NOT engage: it falls through to the single panel, whose pack sizing then fails
+        // closed with the "too large" guard - the twin would instead multi-slice that absurd `k`
+        // forever
+        let engage_deep_k = NR
+            .checked_mul(t.k)
+            .and_then(|x| x.checked_mul(core::mem::size_of::<N>()))
+            .is_some_and(|bytes| bytes > crate::cache::deep_k_engage_bytes());
+        if engage_deep_k {
+            run_deep_k_twin::<N, Fam::Twin, S, MR_REG, NR>(simd, &t, par, ws);
             return;
         }
         driver::run::<Fam, S, MR_REG, NR>(

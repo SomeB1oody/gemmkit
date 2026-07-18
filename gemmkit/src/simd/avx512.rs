@@ -154,8 +154,9 @@ impl KernelSimd<f16, f16, f32, f16> for Avx512 {
     }
     #[inline(always)]
     unsafe fn load_out(self, p: *const f16) -> __m512 {
-        // C (== Out == Lhs == f16) widens exactly like an A panel
-        unsafe { self.load_lhs(p) }
+        // C (== Out == Lhs == f16) widens exactly like an A panel. Qualified: the f32-output twin
+        // adds a 2nd `KernelSimd<f16, .., f32, ..>` impl, so the seam op is disambiguated here
+        unsafe { <Self as KernelSimd<f16, f16, f32, f16>>::load_lhs(self, p) }
     }
     #[inline(always)]
     unsafe fn store_out(self, p: *mut f16, v: __m512) {
@@ -187,7 +188,8 @@ impl KernelSimd<bf16, bf16, f32, bf16> for Avx512 {
     }
     #[inline(always)]
     unsafe fn load_out(self, p: *const bf16) -> __m512 {
-        unsafe { self.load_lhs(p) }
+        // Qualified for the same reason as the `f16` twin (2nd `KernelSimd<bf16, ..>` impl)
+        unsafe { <Self as KernelSimd<bf16, bf16, f32, bf16>>::load_lhs(self, p) }
     }
     #[inline(always)]
     unsafe fn store_out(self, p: *mut bf16, v: __m512) {

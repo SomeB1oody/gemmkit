@@ -42,7 +42,7 @@ pub use int::{IntGemm, IntGemmVnni};
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 pub use int::{IntGemmQ, IntGemmVnniQ};
 #[cfg(feature = "half")]
-pub use mixed::{Bf16DotGemm, MixedGemm};
+pub use mixed::{Bf16DotGemm, Bf16DotGemmF32, MixedGemm, MixedGemmF32};
 
 /// State of the `alpha` scale, precomputed once by the driver so the microkernel
 /// never compares floats. `alpha == 0` never reaches the microkernel (the driver

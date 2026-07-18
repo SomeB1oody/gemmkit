@@ -286,6 +286,95 @@ impl_requant_blanket!(i8);
 #[cfg(feature = "int8")]
 impl_requant_blanket!(u8);
 
+/// f32-output twin of the narrow mixed seam: `f16`/`bf16` inputs, `f32` accumulator, and an
+/// **`f32`** output (`Out == Acc`). It is the seam the deep-contraction narrow twins
+/// ([`crate::kernel::MixedGemmF32`] / [`crate::kernel::Bf16DotGemmF32`]) drive on when a large-`k`
+/// narrow GEMM is re-blocked into an f32 scratch: the accumulate-side ops (`load_lhs`/`splat_rhs`
+/// widen `N -> f32`, `dot_accumulate` folds bf16 pairs) forward verbatim to the narrow
+/// `KernelSimd<N, N, f32, N>` impl (so a token's `vdpbf16ps` override flows through unchanged and
+/// the twin's accumulation is bit-identical to the narrow family's), while `load_out`/`store_out`
+/// are a plain `f32` load/store (the C scratch is `f32`, so there is no widen/narrow). Two explicit
+/// impls (one per narrow type), not a generic blanket over `N`: a `KernelSimd<N, N, f32, f32>`
+/// blanket generic in `N` would collide with the homogeneous `<A, A, A, A>` blanket under the
+/// coherence check (it cannot rule out `N = f32`); the concrete `f16`/`bf16` heads cannot unify with
+/// `<A, A, A, A>` (`f16 != f32`), so they are coherent, mirroring the concrete-type
+/// `impl_requant_blanket!` heads above
+#[cfg(feature = "half")]
+impl<S: KernelSimd<half::f16, half::f16, f32, half::f16>> KernelSimd<half::f16, half::f16, f32, f32>
+    for S
+{
+    #[inline(always)]
+    unsafe fn load_lhs(self, p: *const half::f16) -> <Self as SimdOps<f32>>::Reg {
+        unsafe { <Self as KernelSimd<half::f16, half::f16, f32, half::f16>>::load_lhs(self, p) }
+    }
+    #[inline(always)]
+    unsafe fn splat_rhs(self, v: half::f16) -> <Self as SimdOps<f32>>::Reg {
+        unsafe { <Self as KernelSimd<half::f16, half::f16, f32, half::f16>>::splat_rhs(self, v) }
+    }
+    // C == Out == Acc == f32: a plain f32 load/store, no widen/narrow
+    #[inline(always)]
+    unsafe fn load_out(self, p: *const f32) -> <Self as SimdOps<f32>>::Reg {
+        unsafe { self.loadu(p) }
+    }
+    #[inline(always)]
+    unsafe fn store_out(self, p: *mut f32, v: <Self as SimdOps<f32>>::Reg) {
+        unsafe { self.storeu(p, v) }
+    }
+    #[inline(always)]
+    unsafe fn dot_accumulate<const MR_REG: usize, const NR: usize>(
+        self,
+        kc: usize,
+        a: *const half::f16,
+        b: *const half::f16,
+        acc: &mut [[<Self as SimdOps<f32>>::Reg; MR_REG]; NR],
+    ) {
+        unsafe {
+            <Self as KernelSimd<half::f16, half::f16, f32, half::f16>>::dot_accumulate::<MR_REG, NR>(
+                self, kc, a, b, acc,
+            )
+        }
+    }
+}
+
+/// See the `f16` twin above: the `bf16` head, whose `dot_accumulate` forward carries a token's
+/// `vdpbf16ps` override to the f32-output twin ([`crate::kernel::Bf16DotGemmF32`])
+#[cfg(feature = "half")]
+impl<S: KernelSimd<half::bf16, half::bf16, f32, half::bf16>>
+    KernelSimd<half::bf16, half::bf16, f32, f32> for S
+{
+    #[inline(always)]
+    unsafe fn load_lhs(self, p: *const half::bf16) -> <Self as SimdOps<f32>>::Reg {
+        unsafe { <Self as KernelSimd<half::bf16, half::bf16, f32, half::bf16>>::load_lhs(self, p) }
+    }
+    #[inline(always)]
+    unsafe fn splat_rhs(self, v: half::bf16) -> <Self as SimdOps<f32>>::Reg {
+        unsafe { <Self as KernelSimd<half::bf16, half::bf16, f32, half::bf16>>::splat_rhs(self, v) }
+    }
+    #[inline(always)]
+    unsafe fn load_out(self, p: *const f32) -> <Self as SimdOps<f32>>::Reg {
+        unsafe { self.loadu(p) }
+    }
+    #[inline(always)]
+    unsafe fn store_out(self, p: *mut f32, v: <Self as SimdOps<f32>>::Reg) {
+        unsafe { self.storeu(p, v) }
+    }
+    #[inline(always)]
+    unsafe fn dot_accumulate<const MR_REG: usize, const NR: usize>(
+        self,
+        kc: usize,
+        a: *const half::bf16,
+        b: *const half::bf16,
+        acc: &mut [[<Self as SimdOps<f32>>::Reg; MR_REG]; NR],
+    ) {
+        unsafe {
+            <Self as KernelSimd<half::bf16, half::bf16, f32, half::bf16>>::dot_accumulate::<
+                MR_REG,
+                NR,
+            >(self, kc, a, b, acc)
+        }
+    }
+}
+
 /// An ISA token: a zero-sized marker carrying a set of target features
 ///
 /// The only behaviour is [`Simd::vectorize`], which establishes the

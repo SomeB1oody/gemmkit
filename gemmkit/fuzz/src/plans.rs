@@ -186,6 +186,7 @@ pub(crate) const KNOB_SETTERS: &[(&str, fn(usize))] = &[
     ("kc", tuning::set_kc),
     ("kc_min", tuning::set_kc_min),
     ("pack_transpose_tile", tuning::set_pack_transpose_tile),
+    ("deep_kc_bytes", tuning::set_deep_kc_bytes),
     ("i8_vnni_min_par_mnk", tuning::set_i8_vnni_min_par_mnk),
 ];
 

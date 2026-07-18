@@ -38,6 +38,14 @@ Initial release.
   the `int8` twin `prepack_rhs_i8`/`gemm_i8_packed_b` (bit-identical to plain
   `gemm_i8`; the layout is pinned to the selected integer kernel, so the VNNI
   `vpdpbusd` path skips its otherwise-mandatory per-call RHS repack)
+- Deep-contraction reblocking for `f16`/`bf16`: at large `k` the narrow single
+  depth panel (`kc = k`) streams an L2-overflowing RHS micropanel from L3/DRAM,
+  so above an auto-derived engage gate (`GEMMKIT_DEEP_KC_BYTES`, default half the
+  detected L2) the dispatch runs an f32-output twin (`MixedGemmF32`/
+  `Bf16DotGemmF32`) that re-blocks `K` at the cache-model `kc` into an f32 scratch
+  and narrows once. Byte-for-byte the single panel for `beta in {0, 1}`, held to
+  tolerance otherwise; measured 2.8x-3.6x (`f16`) and up to +32% (`bf16`) at
+  `k = 32768`/`65536` on the Zen5 9950X, with shallow `k` unchanged
 - Batched GEMM (`gemm_batched*`) with an internal per-batch parallel policy
 - Bandwidth-bound special paths (gemv/gevv, small-k, and the small-m,n
   inner-product route) selected automatically behind the same entry points

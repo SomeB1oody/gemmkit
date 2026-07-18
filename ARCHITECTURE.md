@@ -192,6 +192,7 @@ element type. The families:
 | `FloatGemm<T>` | `f32`, `f64` | The baseline; one generic microkernel for every ISA |
 | `MixedGemm<N>` | `f16`, `bf16` in/out, `f32` acc | Widen on load, narrow on store via the `KernelSimd` seam |
 | `Bf16DotGemm` | `bf16`, AVX-512 BF16 | `vdpbf16ps` dot kernel, `DEPTH_MULTIPLE = 2` |
+| `MixedGemmF32<N>` / `Bf16DotGemmF32` | `f16`/`bf16` in, `f32` out | Deep-contraction twins (`OUT_IS_ACC = true`, multi-slice); see below |
 | `IntGemm` / `IntGemmVnni` | `i8 -> i32` | Exact, wrapping; VNNI `vpdpbusd` dot kernel (`DEPTH_MULTIPLE = 4`) with `+128` signedness correction, bit-identical to the widen path |
 | `IntGemmQ` / `IntGemmVnniQ` | `i8 -> i8`/`u8` | The requantizing variants (feature `epilogue`) |
 | `ComplexGemm<T, CONJ_A, CONJ_B>` | `c32`, `c64` | Split (SoA) kernel; see below |
@@ -202,6 +203,24 @@ and narrowing stores, so mixed precision needs no branch in the driver. A
 family whose output is narrower than its accumulator sets `OUT_IS_ACC = false`
 and the driver uses `kc = k` (one depth panel): the whole contraction
 accumulates in `f32` and rounds to the narrow output once.
+
+At large `k` that single panel streams an L2-overflowing RHS micropanel
+(`nr * k * sizeof(N)`) from L3/DRAM on every microtile call, so above an engage
+gate (`GEMMKIT_DEEP_KC_BYTES`, auto-derived from half the L2 in
+`cache::deep_k_engage_bytes`) the mixed dispatch instead runs an **f32-output
+twin** family - `MixedGemmF32<N>` / `Bf16DotGemmF32`, `Out = f32 = Acc`, so
+`OUT_IS_ACC = true`. The twin reuses the narrow pack and widen-FMA / `vdpbf16ps`
+accumulate but stores `f32`, so the driver's existing multi-slice blocking
+applies unchanged (each slice's panels L2-resident); it accumulates into an
+`m x n` f32 scratch (a dedicated `Workspace`) with `alpha = 1`, `beta = 0`, then
+one vectorized sweep narrows `alpha*scratch + beta*C` back to `N`. The twin
+seeds each slice's accumulators from the scratch (a third `KernelSimd<N, N, f32,
+f32>` seam supplies the plain-f32 C load/store), continuing the single panel's
+ascending-`k` chain split at slice boundaries - an exact f32 store/reload - so
+for the common `beta in {0, 1}` the deep-k route is byte-for-byte the single
+panel; for a general `beta` it holds to tolerance. The dot twin's interior
+slices round `kc` up to `DEPTH_MULTIPLE`, so a k-pair never straddles a boundary.
+Shallow `k`, the fused-epilogue path, and prepacked RHS keep the single panel.
 
 Dot-product families declare `DEPTH_MULTIPLE = Q` and pack via
 `pack_kgroup_panels` (`gemmkit/src/pack.rs`), which interleaves `Q` consecutive
