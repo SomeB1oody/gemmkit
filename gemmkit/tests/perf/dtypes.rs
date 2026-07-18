@@ -88,6 +88,56 @@ fn perf_f16() {
     }
 }
 
+/// bf16 -> f32 GEMM throughput (no `gemm`-crate baseline: it lacks bf16 in 0.18). On an
+/// AVX-512-BF16 box the driver takes the `vdpbf16ps` dot kernel, whose LHS/RHS packs run
+/// through `pack_kgroup_panels`; row-major A + col-major B is the contiguous (`depth == 1`)
+/// pack layout for both operands, so this exercises the fast pack path. bf16 FLOPs counted
+/// like f32. Mirrors `bench_f16` but reports gemmkit throughput only (no crate baseline)
+#[cfg(all(feature = "half", not(target_family = "wasm")))]
+fn bench_bf16(s: usize, parallel: bool) {
+    use gemmkit::bf16;
+    let (m, k, n) = (s, s, s);
+    let to16 = |v: &[f32]| v.iter().map(|&x| bf16::from_f32(x)).collect::<Vec<_>>();
+    let a = to16(&fill(m * k, 1));
+    let b = to16(&fill(k * n, 2));
+    let mut c = vec![bf16::from_f32(0.0); m * n];
+
+    let par = if parallel {
+        Parallelism::Rayon(0)
+    } else {
+        Parallelism::Serial
+    };
+    let st = measure(m, k, n, || {
+        gemm(
+            bf16::from_f32(1.0),
+            MatRef::from_row_major(&a, m, k),
+            MatRef::from_col_major(&b, k, n),
+            bf16::from_f32(0.0),
+            MatMut::from_col_major(&mut c, m, n),
+            par,
+        );
+    });
+    let mode = if parallel { "par" } else { "ser" };
+    println!(
+        "  n={s:<5} {mode}  gemmkit={:7.1} (±{:>2.0}%)",
+        st.median,
+        st.spread_pct()
+    );
+}
+
+#[cfg(all(feature = "half", not(target_family = "wasm")))]
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture"]
+fn perf_bf16() {
+    let _guard = BENCH_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    println!("\nbf16->f32 GFLOP/s (row-major A, col-major B) — gemmkit vdpbf16ps dot kernel:");
+    for &par in &[false, true] {
+        for &s in &[384usize, 1024] {
+            bench_bf16(s, par);
+        }
+    }
+}
+
 /// i8 -> i32 GEMM throughput (no `gemm`-crate baseline: it lacks i8 in 0.18). Just
 /// confirms the widen-and-multiply kernel is SIMD-accelerated, not scalar-bound
 #[cfg(all(feature = "int8", not(target_family = "wasm")))]
