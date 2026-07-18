@@ -206,19 +206,6 @@ fn bench_small_mn_layouts(m: usize, n: usize, k: usize, par: Parallelism) {
     );
 }
 
-#[cfg(not(target_family = "wasm"))]
-#[test]
-#[ignore = "benchmark; run with --release --ignored --nocapture"]
-fn perf_small_mn_layouts() {
-    let _guard = BENCH_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-    println!("\nsmall-m,n layout coverage (eligible horizontal vs ineligible layouts):");
-    for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
-        for &(m, n, k) in &[(4usize, 4usize, 65536usize), (8, 8, 65536), (16, 16, 16384)] {
-            bench_small_mn_layouts(m, n, k, par);
-        }
-    }
-}
-
 /// Pack-tier crossover probe: for an **ineligible** (all-col-major, so A fails `csa == 1`) small
 /// shape, compare the new packed-horizontal route (pack A into `k`-contiguous scratch, then the
 /// horizontal dot) against the current fallback (the register-tiling driver) and the small_k route
@@ -266,15 +253,29 @@ fn bench_small_mn_pack_crossover(m: usize, n: usize, k: usize, par: Parallelism)
     );
 }
 
-/// Pack-tier crossover sweep: the packed horizontal route vs the driver / small_k across `k` for
-/// ineligible (all-col-major) small shapes. Sets `small_mn_pack_min_k` from where `packed` overtakes
+/// Small-`m,n` pack-tier probe, two views of the same tier. View 1 (`bench_small_mn_layouts`, at
+/// shipped defaults): how close the pack tier's ineligible-layout rate (`all_rm` = pack-B,
+/// `all_cm` = pack-A) lands to the eligible horizontal rate (the ceiling), the residual gap being
+/// the copy tax. View 2 (`bench_small_mn_pack_crossover`, forced routes): the packed-horizontal
+/// route vs the driver / small_k swept across `k` for ineligible (all-col-major) shapes, which is
+/// what sets `small_mn_pack_min_k` (the gate sits where `packed` overtakes the driver). Both live
+/// in one probe because they measure the same tier from opposite ends: recovery-at-default and the
+/// crossover that fixes the gate
 #[cfg(not(target_family = "wasm"))]
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
-fn perf_small_mn_pack_crossover() {
+fn perf_small_mn_pack() {
     let _guard = BENCH_GUARD.lock().unwrap_or_else(|e| e.into_inner());
     println!(
-        "\nsmall-m,n pack-tier crossover (packed-horizontal vs driver, ineligible all-col-major):"
+        "\nsmall-m,n pack tier — view 1: recovery vs the eligible horizontal ceiling (defaults):"
+    );
+    for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
+        for &(m, n, k) in &[(4usize, 4usize, 65536usize), (8, 8, 65536), (16, 16, 16384)] {
+            bench_small_mn_layouts(m, n, k, par);
+        }
+    }
+    println!(
+        "\nsmall-m,n pack tier — view 2: crossover (packed-horizontal vs driver, ineligible all-col-major):"
     );
     for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
         for &(m, n) in &[(4usize, 4usize), (8, 8), (16, 16)] {

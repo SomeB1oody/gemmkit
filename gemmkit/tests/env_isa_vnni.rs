@@ -1,10 +1,10 @@
-//! `GEMMKIT_REQUIRE_ISA=avx512vnni` small-`m,n` horizontal-route pin: a forced ISA still allows the
-//! special paths (the `small_mn` gate lives in `run_typed_int`, orthogonal to `select_i8`), so a
-//! tiny-`m,n` / long-`k` i8 shape widens through the horizontal dot instead of the `vpdpbusd`
-//! driver. This binary pins VNNI in its own process (so the memoized `select_i8` is the dot kernel)
-//! and checks the horizontal route (eligible layout) stays bit-exact vs both the driver (ineligible
-//! layout) and the exact `i32` reference. Its own single-test binary so the one `set_var` runs
-//! before any i8 dispatch. Skips gracefully when the host lacks `avx512f+bw+vnni`
+//! `GEMMKIT_REQUIRE_ISA=avx512vnni` pin: forces the `vpdpbusd` i8 dot kernel (k-quad-interleaved
+//! RHS prepack, `DEPTH_MULTIPLE = 4`, `+128` LHS bias), disabling the small-parallel widen fallback
+//! so the VNNI prepack-and-consume path is pinned exactly. Both tests want the same `avx512vnni`
+//! pin and funnel through [`env_isa_common::pin`] (single `set_var` under a `Once` before any
+//! dispatch; the shared write overrides an inherited pin, so the SDE VNNI CI job still exercises
+//! these routes). Both skip gracefully when the host lacks `avx512f+bw+vnni` (the pin would
+//! otherwise assert in `select_i8`)
 #![cfg(all(
     feature = "std",
     feature = "int8",
@@ -12,7 +12,32 @@
     not(miri)
 ))]
 
+// Shared single-set_var pin helper (Once before any dispatch; both tests here pin `avx512vnni`)
+mod env_isa_common;
+// Shared prepacked-i8 bit-parity check driven by the ISA pin binaries
+mod i8_packed_common;
+
 use gemmkit::{MatMut, MatRef, Parallelism};
+
+/// True iff the host reports the full `avx512f+bw+vnni` set the pin needs
+fn host_has_vnni() -> bool {
+    is_x86_feature_detected!("avx512vnni")
+        && is_x86_feature_detected!("avx512bw")
+        && is_x86_feature_detected!("avx512f")
+}
+
+// Prepacked-i8 bit-parity: the `vpdpbusd` dot kernel's prepacked micropanel (`DEPTH_MULTIPLE = 4`,
+// `+128` bias) must be bit-identical to a plain `gemm_i8` across the shared sweep
+
+#[test]
+fn avx512vnni_pin_i8_packed_matches_plain() {
+    env_isa_common::pin("avx512vnni");
+    if !host_has_vnni() {
+        eprintln!("skipping: host does not report avx512f+bw+vnni");
+        return;
+    }
+    i8_packed_common::check();
+}
 
 /// Exact wrapping-`i32` GEMM reference (row-major A/B), matching the documented i8 contract
 #[allow(clippy::too_many_arguments)]
@@ -41,17 +66,16 @@ fn ref_i8(
     out
 }
 
+// Small-`m,n` horizontal-route pin: a forced ISA still allows the special paths (the `small_mn`
+// gate lives in `run_typed_int`, orthogonal to `select_i8`), so a tiny-`m,n` / long-`k` i8 shape
+// widens through the horizontal dot instead of the `vpdpbusd` driver. The horizontal route
+// (eligible layout) must stay bit-exact vs both the driver (ineligible layout) and the exact
+// `i32` reference
+
 #[test]
 fn avx512vnni_pin_i8_small_mn_matches_driver() {
-    // Pin once, before any i8 dispatch. SAFETY: the only test in this binary, so nothing reads the
-    // environment concurrently with this write
-    unsafe {
-        std::env::set_var("GEMMKIT_REQUIRE_ISA", "avx512vnni");
-    }
-    if !(is_x86_feature_detected!("avx512vnni")
-        && is_x86_feature_detected!("avx512bw")
-        && is_x86_feature_detected!("avx512f"))
-    {
+    env_isa_common::pin("avx512vnni");
+    if !host_has_vnni() {
         eprintln!("skipping: host does not report avx512f+bw+vnni");
         return;
     }

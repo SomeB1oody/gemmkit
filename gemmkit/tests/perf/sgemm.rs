@@ -1,6 +1,6 @@
-//! f32 sgemm vs gemm crate / matrixmultiply, thread-scaling, knob-neutrality probe
+//! f32 sgemm vs gemm crate / matrixmultiply, thread-scaling, per-call latency
 
-use crate::harness::{BENCH_GUARD, fill, measure, measure_gbps};
+use crate::harness::{BENCH_GUARD, fill, measure};
 // Driver-level imports are used only by the equal-ISA bench; gate them to its
 // architectures so other targets stay warning-clean
 #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
@@ -11,7 +11,7 @@ use gemmkit::Workspace;
 use gemmkit::driver;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
 use gemmkit::kernel::FloatGemm;
-use gemmkit::{MatMut, MatRef, Parallelism, gemm, gemm_batched};
+use gemmkit::{MatMut, MatRef, Parallelism, gemm};
 
 // gemmkit best-ISA vs the `gemm` crate + `matrixmultiply`: external crates that do
 // not build for wasm, so this bench (and its `perf_sgemm` caller) is gated off wasm
@@ -234,167 +234,6 @@ fn perf_call_latency() {
         bench_call_latency(48, 256, 48, par);
         bench_call_latency(96, 256, 96, par);
         bench_call_latency(128, 256, 128, par);
-    }
-}
-
-/// Lean perf-neutrality probe (gemmkit only, no external baselines): measures the paths touched by
-/// the runtime-knob promotion at a few representative shapes, so a before/after run confirms the
-/// hoisted per-call knob read is free (it is one relaxed atomic load per call, never per element).
-/// Covers the general driver (mc/nc/kc/kc_min/tiny-block knobs), a tiny shape, gemv register-block
-/// (k_stream_max), the packed-LHS path (packed_oversample + the transpose packer's strip knob, both
-/// hit by a row-major A), batched GEMM (seq_internal_bytes), and i8 (i8_vnni_min_par_mnk)
-#[cfg(not(target_family = "wasm"))]
-#[test]
-#[ignore = "benchmark; run with --release --ignored --nocapture"]
-fn perf_knob_neutral() {
-    let _guard = BENCH_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-    println!("\nknob-indirection neutrality probe (gemmkit only):");
-
-    // General register-tiling driver, serial + parallel
-    for &s in &[256usize, 512, 1024] {
-        let a = fill(s * s, 1);
-        let b = fill(s * s, 2);
-        for &(tag, par) in &[("ser", Parallelism::Serial), ("par", Parallelism::Rayon(0))] {
-            let mut c = vec![0.0f32; s * s];
-            let st = measure(s, s, s, || {
-                gemm(
-                    1.0,
-                    MatRef::from_col_major(&a, s, s),
-                    MatRef::from_col_major(&b, s, s),
-                    0.0,
-                    MatMut::from_col_major(&mut c, s, s),
-                    par,
-                );
-            });
-            println!(
-                "  sgemm  {tag} s={s:<5} {:8.1} GFLOP/s (±{:>2.0}%)",
-                st.median,
-                st.spread_pct()
-            );
-        }
-    }
-
-    // Tiny shape (tiny-block branch + its kc ceiling)
-    {
-        let (m, k, n) = (48usize, 512usize, 48usize);
-        let a = fill(m * k, 1);
-        let b = fill(k * n, 2);
-        let mut c = vec![0.0f32; m * n];
-        let st = measure(m, k, n, || {
-            gemm(
-                1.0,
-                MatRef::from_col_major(&a, m, k),
-                MatRef::from_col_major(&b, k, n),
-                0.0,
-                MatMut::from_col_major(&mut c, m, n),
-                Parallelism::Serial,
-            );
-        });
-        println!(
-            "  tiny   ser {m}x{k}x{n} {:8.1} GFLOP/s (±{:>2.0}%)",
-            st.median,
-            st.spread_pct()
-        );
-    }
-
-    // gemv register-block (k_stream_max), serial, output spilling L2
-    {
-        let (m, k) = (65536usize, 64usize);
-        let a = fill(m * k, 1);
-        let x = fill(k, 2);
-        let mut y = vec![0.0f32; m];
-        let bytes = (m * k + k + m) * 4;
-        let st = measure_gbps(bytes, || {
-            gemm(
-                1.0,
-                MatRef::from_col_major(&a, m, k),
-                MatRef::from_col_major(&x, k, 1),
-                0.0,
-                MatMut::from_col_major(&mut y, m, 1),
-                Parallelism::Serial,
-            );
-        });
-        println!(
-            "  gemv   ser m={m} k={k} {:8.1} GB/s   (±{:>2.0}%)",
-            st.median,
-            st.spread_pct()
-        );
-    }
-
-    // Packed-LHS path (row-major A forces both the packed-block grain and the transpose packer)
-    {
-        let (m, k, n) = (2048usize, 256usize, 256usize);
-        let a = fill(m * k, 1);
-        let b = fill(k * n, 2);
-        let mut c = vec![0.0f32; m * n];
-        let st = measure(m, k, n, || {
-            gemm(
-                1.0,
-                MatRef::from_row_major(&a, m, k),
-                MatRef::from_col_major(&b, k, n),
-                0.0,
-                MatMut::from_col_major(&mut c, m, n),
-                Parallelism::Rayon(0),
-            );
-        });
-        println!(
-            "  packA  par {m}x{k}x{n} {:8.1} GFLOP/s (±{:>2.0}%)",
-            st.median,
-            st.spread_pct()
-        );
-    }
-
-    // Batched GEMM (seq_internal_bytes_per_worker; inert on x86 but exercises resolve_batch)
-    {
-        let (batch, m, k, n) = (64usize, 96usize, 96usize, 96usize);
-        let a = fill(batch * m * k, 1);
-        let b = fill(batch * k * n, 2);
-        let mut c = vec![0.0f32; batch * m * n];
-        let st = measure(batch * m, k, n, || {
-            gemm_batched(
-                batch,
-                1.0,
-                MatRef::new(&a, m, k, 1, m as isize),
-                (m * k) as isize,
-                MatRef::new(&b, k, n, 1, k as isize),
-                (k * n) as isize,
-                0.0,
-                MatMut::new(&mut c, m, n, 1, m as isize),
-                (m * n) as isize,
-                Parallelism::Rayon(0),
-            );
-        });
-        println!(
-            "  batch  par b={batch} {m}x{k}x{n} {:8.1} GFLOP/s (±{:>2.0}%)",
-            st.median,
-            st.spread_pct()
-        );
-    }
-
-    // i8 (i8_vnni_min_par_mnk fallback gate), serial + parallel
-    #[cfg(feature = "int8")]
-    {
-        let s = 512usize;
-        let a: Vec<i8> = (0..s * s).map(|x| (x % 17) as i8 - 8).collect();
-        let b: Vec<i8> = (0..s * s).map(|x| (x % 13) as i8 - 6).collect();
-        for &(tag, par) in &[("ser", Parallelism::Serial), ("par", Parallelism::Rayon(0))] {
-            let mut c = vec![0i32; s * s];
-            let st = measure(s, s, s, || {
-                gemmkit::gemm_i8(
-                    1,
-                    MatRef::from_col_major(&a, s, s),
-                    MatRef::from_col_major(&b, s, s),
-                    0,
-                    MatMut::from_col_major(&mut c, s, s),
-                    par,
-                );
-            });
-            println!(
-                "  i8     {tag} s={s} {:8.1} GFLOP/s (±{:>2.0}%)",
-                st.median,
-                st.spread_pct()
-            );
-        }
     }
 }
 

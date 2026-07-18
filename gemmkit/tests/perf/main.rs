@@ -35,9 +35,9 @@ mod batched;
     any(feature = "half", feature = "int8", feature = "complex")
 ))]
 mod dtypes;
-// Prepacked-RHS/LHS reuse, gather-pack probe, shared-LHS gate sweep
+// Prepacked-RHS/LHS reuse, prepack buffer setup cost, shared-LHS gate sweep
 mod prepack;
-// f32 sgemm vs gemm crate / matrixmultiply, thread-scaling, knob-neutrality probe
+// f32 sgemm vs gemm crate / matrixmultiply, thread-scaling, per-call latency
 #[cfg(not(target_family = "wasm"))]
 mod sgemm;
 // wasm simd128 vs scalar-token throughput

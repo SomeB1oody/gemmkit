@@ -1,6 +1,6 @@
-//! Shared prepacked-i8 bit-parity check, driven by the per-ISA pin binaries
-//! (`env_isa_i8_packed_*`). Each binary sets `GEMMKIT_REQUIRE_ISA` once (its own process, so the
-//! `set_var` runs before any dispatch) then calls [`check`], which asserts `gemm_i8_packed_b` is
+//! Shared prepacked-i8 bit-parity check, driven by the per-ISA pin binaries (`env_isa_avx512`,
+//! `env_isa_vnni`, `env_isa_scalar`). Each binary pins `GEMMKIT_REQUIRE_ISA` once (its own process,
+//! so the pin runs before any dispatch) then calls [`check`], which asserts `gemm_i8_packed_b` is
 //! **bit-identical** to a plain `gemm_i8` across a shape / layout / alpha-beta / thread-count
 //! sweep. `k` not a multiple of 4 (the VNNI depth pad) and `n` not a multiple of the panel width
 //! are both included, so the pinned widen kernel and the pinned VNNI dot kernel each exercise

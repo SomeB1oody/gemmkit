@@ -13,8 +13,8 @@
 //! Platform-independent: the route is toggled by the runtime `GEMMKIT_DEEP_KC_BYTES` knob (`1`
 //! forces the twin at any `k`, `MAX` forces the single panel), so this exercises whichever ISA the
 //! host selected. The x86 avx512 / avx512bf16 pins that isolate the widen (`MixedGemm`) vs dot
-//! (`Bf16DotGemm`) bf16 families live in the `env_isa_deep_k_*` binaries (memoized ISA needs its own
-//! process)
+//! (`Bf16DotGemm`) bf16 families live in the `env_isa_avx512` (widen) and `env_isa_bf16` (dot)
+//! binaries (memoized ISA needs its own process)
 #![cfg(all(
     feature = "half",
     feature = "std",

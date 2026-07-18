@@ -1,14 +1,19 @@
-//! Deep-k narrow-twin parity under a forced **AVX-512 BF16** kernel (its own process, so the
-//! memoized dispatch is the `vdpbf16ps` dot `Bf16DotGemm`). This pins the dot twin `Bf16DotGemmF32`,
-//! whose multi-slice `kc` is rounded to `DEPTH_MULTIPLE = 2` so a k-pair never straddles a slice
-//! boundary: the multi-slice dot must be byte-for-byte the single depth panel for `beta in {0, 1}`.
-//! Skips gracefully when the host lacks `avx512bf16`
+//! `GEMMKIT_REQUIRE_ISA=avx512bf16` pin: forces the `vdpbf16ps` dot `Bf16DotGemm` so its
+//! multi-slice deep-k twin (`Bf16DotGemmF32`, `kc` rounded to `DEPTH_MULTIPLE = 2` so a k-pair
+//! never straddles a slice boundary) runs in an isolated process. The single test pins through
+//! [`env_isa_common::pin`] (single `set_var` under a `Once` before any dispatch; the shared write
+//! overrides an inherited pin, so the SDE BF16 CI job still exercises this route). The multi-slice
+//! dot must be byte-for-byte the single depth panel for `beta in {0, 1}`. Skips gracefully when the
+//! host lacks `avx512bf16`
 #![cfg(all(
     feature = "half",
     feature = "std",
     any(target_arch = "x86", target_arch = "x86_64"),
     not(miri)
 ))]
+
+// Shared single-set_var pin helper (Once before any dispatch; this test pins `avx512bf16`)
+mod env_isa_common;
 
 use gemmkit::{MatMut, MatRef, Parallelism, bf16, gemm, tuning};
 
@@ -26,10 +31,7 @@ fn fill(n: usize, seed: u64) -> Vec<bf16> {
 
 #[test]
 fn deep_k_bf16_dot_under_avx512bf16_pin() {
-    // Pin once, before any dispatch. SAFETY: the only test in this binary
-    unsafe {
-        std::env::set_var("GEMMKIT_REQUIRE_ISA", "avx512bf16");
-    }
+    env_isa_common::pin("avx512bf16");
     if !(is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bf16")) {
         eprintln!("skipping: host does not report avx512f+avx512bf16");
         return;

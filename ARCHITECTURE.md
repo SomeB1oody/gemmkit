@@ -436,6 +436,18 @@ The suites live in `gemmkit/tests/`; the performance harnesses there
   against scalar models.
 - **Fuzzing** (`gemmkit/fuzz/`): five libFuzzer targets (gemm, batched,
   prepack, API validation, knobs) in a nightly-only sub-workspace.
+- **Knob and env surface** (`tests/tuning.rs`, `tests/env.rs`,
+  `tests/props_knobs.rs`, `tests/deep_k_narrow.rs`): the tests that mutate the
+  process-global tuning knobs or `GEMMKIT_*` environment live in their own
+  binaries (a separate process cannot race another's knob state) and serialize
+  their mutations under a per-binary `KNOB_LOCK`.
+- **ISA pins** (`tests/env_isa_*.rs`): one binary per `GEMMKIT_REQUIRE_ISA`
+  value (`avx512`, `vnni`, `bf16`, `scalar`, `neon`, `wasm`, plus a
+  garbage-value guard). Each pins its ISA once through a shared `Once`
+  (`tests/env_isa_common/`) before any dispatch, so the memoized per-ISA
+  dispatch resolves the pinned kernel in an isolated process; the write
+  overrides an inherited pin, so the SDE/pinned CI jobs still exercise these
+  routes.
 - **Miri**: CI runs the scalar-path correctness suite and the complex
   negative-stride entry under Miri; `cfg(miri)` detours exist only where Miri
   cannot interpret hardware conversions.
