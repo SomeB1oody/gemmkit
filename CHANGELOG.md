@@ -48,7 +48,12 @@ Initial release.
   `k = 32768`/`65536` on the Zen5 9950X, with shallow `k` unchanged
 - Batched GEMM (`gemm_batched*`) with an internal per-batch parallel policy
 - Bandwidth-bound special paths (gemv/gevv, small-k, and the small-m,n
-  inner-product route) selected automatically behind the same entry points
+  inner-product route) selected automatically behind the same entry points. The
+  small-m,n route also covers strided layouts (all-row-major, all-col-major):
+  above `GEMMKIT_SMALL_MN_PACK_MIN_K` it copies only the operand strided along
+  `k` into a padded `k`-contiguous scratch and runs the same horizontal dot,
+  bit-identical to the unit-stride layout and measured 1.4x-6.8x over the driver
+  fallback it replaces (Zen5 9950X, `4x4`-`16x16`)
 - `parallel` feature (rayon; default) with reproducible run-to-run results for a
   fixed input/config, plus `wasm_threads` for `wasm32-wasip1-threads`
 - `no_std` operation with default features off (needs only `core` + `alloc`)

@@ -5,13 +5,20 @@
 //! row/col tiles up to a full `MR x NR` microtile, so it computes (and reads) mostly padding.
 //! This route instead computes each output as a horizontal dot
 //! `C[i,j] = alpha*<A[i,:], B[:,j]> + beta*C[i,j]`, streaming SIMD along the contraction and
-//! reading A/B **in place**: no packing, blocking, workspace, or orientation machinery. It is
-//! [`crate::special::gemv`]'s `dot_rows` generalized from a vector to a small `m x n` grid
+//! reading A/B **in place** when both stream contiguously along `k`: no blocking or orientation
+//! machinery. It is [`crate::special::gemv`]'s `dot_rows` generalized from a vector to a small
+//! `m x n` grid
 //!
-//! Both operands must stream contiguously along `k`: A rows unit-stride (`csa == 1`, row-major
-//! A) and B columns unit-stride (`rsb == 1`, column-major B), which the dispatch gate enforces;
-//! a strided layout would force a scalar dot that loses to the driver's packed microkernel, so it
-//! stays on the driver. The output is register-blocked into `MT x NT` tiles: each cell holds one
+//! The kernel needs both operands unit-stride along `k`: A rows (`csa == 1`, row-major A) and B
+//! columns (`rsb == 1`, column-major B). The 2 most common layouts each miss exactly one side
+//! (all-row-major A/B fails `rsb`, all-col-major fails `csa`), so [`prepack_operands`] copies
+//! **only the failing operand** once into a flat `k`-contiguous scratch (A: `m` rows each
+//! `k`-contiguous; B: `n` cols each `k`-contiguous) and the same kernel then runs over the packed
+//! pointer with unit strides. The copy is `m*k` (or `n*k`) reads against the `m*n*k` dot, a
+//! `~1/n` (or `~1/m`) tax the horizontal win dwarfs, so a strided layout still beats falling to
+//! the driver's padded microtile. When both operands already stream unit-stride the pre-pack is a
+//! no-op and the route reads A/B in place exactly as before (the zero-copy fast path). The output
+//! is register-blocked into `MT x NT` tiles: each cell holds one
 //! accumulator live across the whole `k`-sweep, so a full tile keeps `MT*NT` independent FMA
 //! chains in flight (hiding the reduction latency) while loading each A-row and B-column once per
 //! tile
@@ -33,6 +40,7 @@ use crate::scalar::NarrowFloat;
 #[cfg(any(feature = "half", feature = "int8"))]
 use crate::simd::KernelSimd;
 use crate::simd::SimdOps;
+use crate::workspace::Workspace;
 
 /// Output register-block tile: `MT` rows x `NT` columns of accumulators. A full tile keeps
 /// `MT*NT` independent FMA chains live across the `k`-sweep (enough to saturate the FMA pipes)
@@ -86,6 +94,132 @@ fn tile_sweep(
     });
 }
 
+/// Line stride (in elements) for a packed `k`-contiguous buffer: `k` rounded up to an **odd** number
+/// of 64-byte cache lines. The packed buffer holds up to `small_mn_dim` (<= 16) lines that the
+/// horizontal kernel re-reads once per output tile; the natural stride `k` makes every line start
+/// alias to the same L1 set whenever `k*sizeof` is a multiple of the set span (any power-of-2 `k`),
+/// so 16 lines over an 8-way set thrash and the re-reads collapse (measured: a `16x16` all-col-major
+/// GEMM drops ~3x below the driver at `k >= 1024`). An odd cache-line count is coprime to the 64
+/// L1 sets, so the `l`-th line maps to set `l*odd (mod 64)`: 16 distinct sets, no aliasing. The
+/// pad past `k` is never read (the dot reads exactly `k` per line)
+#[inline]
+fn packed_line_stride<T>(k: usize) -> usize {
+    // Elements per 64-byte cache line (1 if the element is wider than a line, which never happens
+    // for the f32/f64/f16/bf16/i8 packed here, but keeps the divisor safe)
+    let lane = (64 / core::mem::size_of::<T>().max(1)).max(1);
+    let lines = k.div_ceil(lane).max(1);
+    let odd_lines = if lines.is_multiple_of(2) {
+        lines + 1
+    } else {
+        lines
+    };
+    odd_lines * lane
+}
+
+/// Copy one strided operand into a flat `k`-contiguous scratch: `dst[l*dst_stride + t] =
+/// src[l*lead + t*depth]` for `l in 0..lead`, `t in 0..k`, so each of the `lead` lines (A rows /
+/// B cols) lands as `k` contiguous elements the horizontal kernel then streams with unit stride
+/// (`dst_stride` is [`packed_line_stride`], `>= k`, breaking cache-set aliasing between lines). The
+/// operand that fails its unit-stride-along-`k` predicate has `k` as its *strided* axis, so `lead`
+/// (rows for A, cols for B) is the source's contiguous axis in the 2 common misses (all-col-major A:
+/// `lead = rsa = 1`; all-row-major B: `lead = csb = 1`): the inner loop walks it unit-stride while
+/// `t` is stripped in `pack_transpose_tile` blocks so the scattered `dst` writes stay cache-resident,
+/// turning what a naive per-`t` walk would make a strided gather into contiguous bursts. A pure
+/// reordered copy: the packed values are the source values in the same per-line order, so the dot
+/// reads identical numbers in identical order
+///
+/// # Safety
+/// `src` valid for the `lead x k` region at `lead`/`depth`; `dst` valid for `lead*dst_stride` writes
+#[inline]
+unsafe fn pack_k_contiguous<T: Copy>(
+    dst: *mut T,
+    src: *const T,
+    lead: usize,
+    k: usize,
+    dst_stride: usize,
+    lead_stride: isize,
+    depth_stride: isize,
+) {
+    unsafe {
+        let tile = crate::tuning::pack_transpose_tile();
+        let mut t0 = 0;
+        while t0 < k {
+            let te = core::cmp::min(t0 + tile, k);
+            for t in t0..te {
+                // Depth line `t` of the source; the inner sweep over `lead` reads it along the
+                // contiguous axis (unit-stride for the common col-major-A / row-major-B misses)
+                let col = src.offset(t as isize * depth_stride);
+                for l in 0..lead {
+                    *dst.add(l * dst_stride + t) = *col.offset(l as isize * lead_stride);
+                }
+            }
+            t0 = te;
+        }
+    }
+}
+
+/// Pre-pack the operand(s) that miss the unit-stride-along-`k` predicate into `ws`, returning the
+/// (possibly repointed) `(a, rsa, csa, b, rsb, csb)` the horizontal kernel then consumes with
+/// `csa == 1 && rsb == 1`. Shared by the float / mixed / int routes (one helper, no drift): the
+/// element type `T` is the only thing that varies, and the copy is type-generic. When both operands
+/// already stream unit-stride (the zero-copy fast path) this returns the inputs untouched and never
+/// carves the workspace, so an eligible-layout call is byte-for-byte the pre-pack-free route
+///
+/// `A` packs to `m` rows each `k`-contiguous (`rsa = stride`, `csa = 1`); `B` to `n` cols each
+/// `k`-contiguous (`rsb = 1`, `csb = stride`), where `stride` is [`packed_line_stride`] (`>= k`, the
+/// pad past `k` unread). `Workspace::regions` carries the same fail-closed element->byte overflow
+/// guard as the driver's own pack sizing
+///
+/// # Safety
+/// `a`/`b` valid for the `m x k` / `k x n` regions at their strides; the returned pointers are
+/// valid only while `ws`'s `&mut` borrow lives (the caller consumes them before releasing it)
+#[allow(clippy::too_many_arguments)]
+unsafe fn prepack_operands<T: Copy>(
+    ws: &mut Workspace,
+    m: usize,
+    k: usize,
+    n: usize,
+    a: *const T,
+    rsa: isize,
+    csa: isize,
+    b: *const T,
+    rsb: isize,
+    csb: isize,
+) -> (*const T, isize, isize, *const T, isize, isize) {
+    let pack_a = csa != 1;
+    let pack_b = rsb != 1;
+    // Zero-copy fast path: both operands already stream unit-stride along `k`, so read in place
+    if !pack_a && !pack_b {
+        return (a, rsa, csa, b, rsb, csb);
+    }
+    // Padded line stride (>= k) that breaks L1 set aliasing between the packed lines
+    let stride = packed_line_stride::<T>(k);
+    unsafe {
+        // Carve only the region(s) needed: A needs `m*stride`, B needs `n*stride`. `regions`
+        // fail-closes if either element->byte product overflows (a degenerate stride reaching here)
+        let a_elems = if pack_a { m.saturating_mul(stride) } else { 0 };
+        let b_elems = if pack_b { n.saturating_mul(stride) } else { 0 };
+        let r = ws.regions::<T>(a_elems, 1, b_elems);
+        let (mut a, mut rsa, mut csa) = (a, rsa, csa);
+        let (mut b, mut rsb, mut csb) = (b, rsb, csb);
+        if pack_a {
+            // A[i, :] -> dst[i*stride + t]: rows are the `lead` axis, `k` the depth (strided in src)
+            pack_k_contiguous::<T>(r.a_base, a, m, k, stride, rsa, csa);
+            a = r.a_base;
+            rsa = stride as isize;
+            csa = 1;
+        }
+        if pack_b {
+            // B[:, j] -> dst[j*stride + t]: cols are the `lead` axis, `k` the depth (strided in src)
+            pack_k_contiguous::<T>(r.b_base, b, n, k, stride, csb, rsb);
+            b = r.b_base;
+            rsb = 1;
+            csb = stride as isize;
+        }
+        (a, rsa, csa, b, rsb, csb)
+    }
+}
+
 /// Dispatch a small-`m,n` horizontal GEMM, partitioning the `MT x NT` output tiles across up to
 /// `par`-many workers. Like the other special paths this shape is memory-bound (the operands
 /// stream from cache), so the worker count comes from the bandwidth model, not the compute ramp.
@@ -107,6 +241,7 @@ pub unsafe fn run<T, S>(
     k: usize,
     n: usize,
     par: Parallelism,
+    ws: &mut Workspace,
     alpha: T,
     a: *const T,
     rsa: isize,
@@ -126,7 +261,7 @@ pub unsafe fn run<T, S>(
     // route always did (`E::IS_IDENTITY` folds the per-cell hook away)
     unsafe {
         run_epi::<T, S, Identity>(
-            simd, m, k, n, par, alpha, a, rsa, csa, b, rsb, csb, beta, c, rsc, csc, &Identity,
+            simd, m, k, n, par, ws, alpha, a, rsa, csa, b, rsb, csb, beta, c, rsc, csc, &Identity,
         )
     }
 }
@@ -148,6 +283,7 @@ pub unsafe fn run_epi<T, S, E>(
     k: usize,
     n: usize,
     par: Parallelism,
+    ws: &mut Workspace,
     alpha: T,
     a: *const T,
     rsa: isize,
@@ -165,14 +301,19 @@ pub unsafe fn run_epi<T, S, E>(
     S: SimdOps<T>,
     E: Epilogue<FloatGemm<T>>,
 {
-    debug_assert!(
-        csa == 1 && rsb == 1,
-        "small_mn requires A rows / B cols unit-stride along k"
-    );
     // `E: Copy` (an `Epilogue` supertrait): copy it out of the borrow so the `move` worker
     // closure captures it by value
     let epi = *epi;
     unsafe {
+        // Pre-pack whichever operand misses the unit-stride-along-`k` predicate into `ws` (a
+        // no-op that touches no scratch when both already stream unit-stride), so the kernel
+        // below always runs with `csa == 1 && rsb == 1`
+        let (a, rsa, csa, b, rsb, csb) =
+            prepack_operands::<T>(ws, m, k, n, a, rsa, csa, b, rsb, csb);
+        debug_assert!(
+            csa == 1 && rsb == 1,
+            "small_mn kernel requires A rows / B cols unit-stride along k"
+        );
         let n_row_tiles = m.div_ceil(MT);
 
         // Bandwidth-capped worker count: min traffic is A read once, B once, C written once
@@ -386,6 +527,7 @@ pub unsafe fn run_mixed<N, S>(
     k: usize,
     n: usize,
     par: Parallelism,
+    ws: &mut Workspace,
     alpha: f32,
     a: *const N,
     rsa: isize,
@@ -405,7 +547,7 @@ pub unsafe fn run_mixed<N, S>(
     // narrowing store this route always did (`E::IS_IDENTITY` folds the per-cell hook away)
     unsafe {
         run_mixed_epi::<N, S, Identity>(
-            simd, m, k, n, par, alpha, a, rsa, csa, b, rsb, csb, beta, c, rsc, csc, &Identity,
+            simd, m, k, n, par, ws, alpha, a, rsa, csa, b, rsb, csb, beta, c, rsc, csc, &Identity,
         )
     }
 }
@@ -429,6 +571,7 @@ pub unsafe fn run_mixed_epi<N, S, E>(
     k: usize,
     n: usize,
     par: Parallelism,
+    ws: &mut Workspace,
     alpha: f32,
     a: *const N,
     rsa: isize,
@@ -446,14 +589,19 @@ pub unsafe fn run_mixed_epi<N, S, E>(
     S: KernelSimd<N, N, f32, N>,
     E: Epilogue<MixedGemm<N>>,
 {
-    debug_assert!(
-        csa == 1 && rsb == 1,
-        "small_mn requires A rows / B cols unit-stride along k"
-    );
     // `E: Copy` (an `Epilogue` supertrait): copy it out of the borrow so the `move` worker
     // closure captures it by value
     let epi = *epi;
     unsafe {
+        // Pre-pack the operand missing the unit-stride-along-`k` predicate into `ws` (a no-op
+        // when both already stream unit-stride); the narrow operands pack as-is (`N` bytes), the
+        // kernel widens on load exactly as before
+        let (a, rsa, csa, b, rsb, csb) =
+            prepack_operands::<N>(ws, m, k, n, a, rsa, csa, b, rsb, csb);
+        debug_assert!(
+            csa == 1 && rsb == 1,
+            "small_mn kernel requires A rows / B cols unit-stride along k"
+        );
         let n_row_tiles = m.div_ceil(MT);
 
         // Bandwidth-capped worker count: A read once, B once, C written once (narrow bytes)
@@ -674,6 +822,7 @@ pub unsafe fn run_int<S>(
     k: usize,
     n: usize,
     par: Parallelism,
+    ws: &mut Workspace,
     alpha: i32,
     a: *const i8,
     rsa: isize,
@@ -688,11 +837,16 @@ pub unsafe fn run_int<S>(
 ) where
     S: KernelSimd<i8, i8, i32, i32>,
 {
-    debug_assert!(
-        csa == 1 && rsb == 1,
-        "small_mn requires A rows / B cols unit-stride along k"
-    );
     unsafe {
+        // Pre-pack the operand missing the unit-stride-along-`k` predicate into `ws` (a no-op
+        // when both already stream unit-stride); `i8` packs as-is, the kernel widens on load. The
+        // pack is a pure reorder, so bit-exactness vs the driver (wrapping i32) is unaffected
+        let (a, rsa, csa, b, rsb, csb) =
+            prepack_operands::<i8>(ws, m, k, n, a, rsa, csa, b, rsb, csb);
+        debug_assert!(
+            csa == 1 && rsb == 1,
+            "small_mn kernel requires A rows / B cols unit-stride along k"
+        );
         let n_row_tiles = m.div_ceil(MT);
 
         // Bandwidth-capped worker count: A / B read once as `i8`, C written once as `i32`

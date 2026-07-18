@@ -895,6 +895,24 @@ fn main() {
             false,
         )
     );
+    // Small-m,n horizontal PACK tier k-gate, probed on ineligible (col-major A, so A is strided
+    // along k) small-m,n long-k shapes: the packed horizontal route vs the register-tiling driver.
+    // `MAX` disables the tier (the driver), so raising the gate only helps if the pack ever loses;
+    // packing measures as a clear win at every k on the tuned box, so the default (fire from the
+    // small-k boundary) holds. `row_major_a = false` is what makes A strided and routes here
+    knob!(
+        "GEMMKIT_SMALL_MN_PACK_MIN_K",
+        sweep_sgemm(
+            "GEMMKIT_SMALL_MN_PACK_MIN_K",
+            tuning::set_small_mn_pack_min_k,
+            tuning::SMALL_MN_PACK_MIN_K_DEFAULT,
+            &[64, 256, MAX],
+            &timing,
+            &[(16, 4096, 16), (8, 8192, 8)],
+            par,
+            false,
+        )
+    );
 
     // Bandwidth-bound gemv
     // (GEMMKIT_K_STREAM_MAX is a heavy opt-in knob: swept only under --large-matrices; see the

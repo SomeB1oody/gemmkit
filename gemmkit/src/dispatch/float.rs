@@ -6,7 +6,10 @@
 use std::sync::OnceLock;
 
 use super::isa::{ForcedIsa, forced_isa};
-use super::{GemmScalar, PackedConsume, Task, orient_transpose, scale_c_float, small_mn_eligible};
+use super::{
+    GemmScalar, PackedConsume, Task, orient_transpose, scale_c_float, small_mn_eligible,
+    small_mn_pack_eligible,
+};
 use crate::driver;
 use crate::kernel::FloatGemm;
 #[cfg(feature = "epilogue")]
@@ -52,16 +55,18 @@ unsafe fn run_typed<T, S, const MR_REG: usize, const NR: usize>(
         }
 
         orient_transpose(&mut t);
-        // Small `m,n` with a long contraction, and both operands streaming contiguously along
-        // `k`: the driver would pad the tiny row/col tiles up to a full microtile and pack mostly
-        // padding, whereas the horizontal path computes each output as a direct SIMD dot over `k`,
-        // reading A/B in place. (At small `k` the small_k route below is already the right in-place
-        // tool, so this only claims the long-`k` regime; a strided layout would force a scalar dot
-        // that loses to the driver, so it stays on the driver)
-        if small_mn_eligible(&t) {
+        // Small `m,n` with a long contraction: the driver would pad the tiny row/col tiles up to a
+        // full microtile and pack mostly padding, whereas the horizontal path computes each output
+        // as a direct SIMD dot over `k`. When both operands stream unit-stride along `k` it reads
+        // A/B in place; when one is strided (an all-row-major or all-col-major shape) the pack tier
+        // copies only the failing operand into `k`-contiguous scratch (a `~1/m` or `~1/n` tax) and
+        // runs the same kernel, still beating the driver above `small_mn_pack_min_k`. (At small `k`
+        // the small_k route below is the right in-place tool, so both tiers claim only the long-`k`
+        // regime)
+        if small_mn_eligible(&t) || small_mn_pack_eligible(&t) {
             small_mn::run::<T, S>(
-                simd, t.m, t.k, t.n, par, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb, t.beta,
-                t.c, t.rsc, t.csc,
+                simd, t.m, t.k, t.n, par, ws, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb,
+                t.beta, t.c, t.rsc, t.csc,
             );
             return;
         }
@@ -135,13 +140,14 @@ unsafe fn run_typed_fused<T, S, const MR_REG: usize, const NR: usize>(
             };
         }
 
-        // Small `m,n` with a long contraction and both operands streaming contiguously along
-        // `k`: the horizontal path computes each output as a direct SIMD dot, applying the
-        // epilogue at each cell's single store
-        if small_mn_eligible(&t) {
+        // Small `m,n` with a long contraction: the horizontal path computes each output as a
+        // direct SIMD dot, applying the epilogue at each cell's single store. When one operand is
+        // strided along `k` the pack tier copies it into `k`-contiguous scratch first (the epilogue
+        // fires on the same per-cell store either way)
+        if small_mn_eligible(&t) || small_mn_pack_eligible(&t) {
             small_mn::run_epi::<T, S, FusedEpi<T>>(
-                simd, t.m, t.k, t.n, par, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb, t.beta,
-                t.c, t.rsc, t.csc, &epi,
+                simd, t.m, t.k, t.n, par, ws, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb,
+                t.beta, t.c, t.rsc, t.csc, &epi,
             );
             return;
         }
@@ -211,11 +217,12 @@ unsafe fn run_typed_map<'u, T, S, const MR_REG: usize, const NR: usize>(
         }
 
         // Small `m,n` with a long contraction: the horizontal path applies the closure at each
-        // cell's single store
-        if small_mn_eligible(&t) {
+        // cell's single store. A strided operand is packed into `k`-contiguous scratch first (the
+        // stored value handed to the closure is bit-for-bit the plain-`gemm` store either way)
+        if small_mn_eligible(&t) || small_mn_pack_eligible(&t) {
             small_mn::run_epi::<T, S, MapEpi<'u, T>>(
-                simd, t.m, t.k, t.n, par, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb, t.beta,
-                t.c, t.rsc, t.csc, &epi,
+                simd, t.m, t.k, t.n, par, ws, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb,
+                t.beta, t.c, t.rsc, t.csc, &epi,
             );
             return;
         }

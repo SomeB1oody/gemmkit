@@ -174,6 +174,23 @@ static SMALL_K_THRESHOLD: Threshold =
 pub const SMALL_MN_DIM_DEFAULT: usize = 16;
 static SMALL_MN_DIM: Threshold = Threshold::new("GEMMKIT_SMALL_MN_DIM", SMALL_MN_DIM_DEFAULT);
 
+// Minimum `k` (exclusive) at which the small-`m,n` horizontal route engages its PACK tier: a shape
+// that clears the `small_mn_dim` gates but whose operand is strided along `k` (an all-row-major or
+// all-col-major small-`m,n` GEMM) copies the failing operand into `k`-contiguous scratch (a `~1/m`
+// or `~1/n` tax) and runs the same horizontal dot, instead of falling to the register-tiling
+// driver. The zero-copy tier (both operands already unit-stride along `k`) is unaffected and keeps
+// firing at `k > small_k_threshold`. Below this `k` a strided shape stays on the driver: the pack
+// copy no longer amortizes against the driver gap. The crossover is a **machine** property (pack
+// copy cost vs the driver's padded-microtile deficit, and the cache geometry the packed re-reads
+// hit), the same class as `small_k_threshold`, so it is a knob. Calibrated on Zen5 (AVX-512): the
+// packed route beats the driver at every measured `k` for every small shape (1.1x at `16x16 k=32`,
+// up to ~6.8x at `4x4`, never a regression), so the gate sits right at the small-`k` boundary - a
+// strided small-`m,n` shape packs as soon as `k` grows past where an in-place shape leaves small_k
+/// Compiled default for [`small_mn_pack_min_k`] (before any env/setter override)
+pub const SMALL_MN_PACK_MIN_K_DEFAULT: usize = 16;
+static SMALL_MN_PACK_MIN_K: Threshold =
+    Threshold::new("GEMMKIT_SMALL_MN_PACK_MIN_K", SMALL_MN_PACK_MIN_K_DEFAULT);
+
 // Byte floor below which a bandwidth-bound gemv/gevv stays single-threaded: below it the
 // touched data (the matrix for gemv, the output for gevv) is LLC-resident and one core gets
 // the full LLC bandwidth, so splitting only loses (fork/join + shared-LLC contention, no DRAM
@@ -417,6 +434,18 @@ pub fn small_mn_dim() -> usize {
 /// Override the small-matrix horizontal route dimension cap (`0` disables the route)
 pub fn set_small_mn_dim(v: usize) {
     SMALL_MN_DIM.set(v);
+}
+
+/// Get the small-`m,n` horizontal PACK-tier `k` gate: a small-`m,n` shape whose operand is strided
+/// along `k` is copied into `k`-contiguous scratch and run through the horizontal dot only when
+/// `k` exceeds this (else it stays on the register-tiling driver). The zero-copy tier (both operands
+/// already unit-stride along `k`) ignores this knob and gates on `small_k_threshold`
+pub fn small_mn_pack_min_k() -> usize {
+    SMALL_MN_PACK_MIN_K.get()
+}
+/// Override the small-`m,n` horizontal PACK-tier `k` gate
+pub fn set_small_mn_pack_min_k(v: usize) {
+    SMALL_MN_PACK_MIN_K.set(v);
 }
 
 /// Get the gemv/gevv parallelism byte floor. `0` means *auto*: derive it from the LLC size

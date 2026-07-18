@@ -169,6 +169,7 @@ pub(crate) const KNOB_SETTERS: &[(&str, fn(usize))] = &[
     ("gemv_threshold", tuning::set_gemv_threshold),
     ("small_k_threshold", tuning::set_small_k_threshold),
     ("small_mn_dim", tuning::set_small_mn_dim),
+    ("small_mn_pack_min_k", tuning::set_small_mn_pack_min_k),
     ("gemv_parallel_bytes", tuning::set_gemv_parallel_bytes),
     ("gemv_thread_cap", tuning::set_gemv_thread_cap),
     ("parallel_oversample", tuning::set_parallel_oversample),

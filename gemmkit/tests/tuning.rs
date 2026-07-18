@@ -509,6 +509,262 @@ fn small_mn_serial_parallel_bit_identical() {
     tuning::set_gemv_parallel_bytes(pfloor);
 }
 
+/// The horizontal route's PACK tier (a small-`m,n` shape whose operand is strided along `k`) must be
+/// **bit-identical** to the zero-copy eligible layout for the same values: the pre-pack is a pure
+/// reorder, so each cell's dot reads the same numbers in the same order and lands on the same bits.
+/// This macro builds one such test for a real float (`f32`/`f64`), sweeping pack-A (col-major A) /
+/// pack-B (row-major B) / pack-both, tail shapes (`m,n,k` not multiples of the register tile), an
+/// alpha/beta sweep, and serial + parallel. All 4 layouts carry identical logical `A`/`B` values, so
+/// every result must equal the eligible one to the bit
+macro_rules! small_mn_pack_bit_identical {
+    ($name:ident, $t:ty) => {
+        #[test]
+        fn $name() {
+            let _g = knob_guard();
+            let pmn = tuning::small_mn_dim();
+            let psk = tuning::small_k_threshold();
+            let ppk = tuning::small_mn_pack_min_k();
+            let pfl = tuning::gemv_parallel_bytes();
+            tuning::set_small_mn_dim(usize::MAX); // route every small-m,n shape to the horizontal path
+            tuning::set_small_k_threshold(4); // k below 5 would take small_k; every k here is > 4
+            tuning::set_small_mn_pack_min_k(0); // pack tier fires for every k > 0
+            tuning::set_gemv_parallel_bytes(1); // drop the bandwidth floor so parallel actually forks
+
+            for &(m, k, n) in &[
+                (4, 64, 4),
+                (16, 4096, 16),
+                (5, 40, 7),
+                (3, 17, 8),
+                (13, 100, 11),
+            ] {
+                // Logical A (m x k) row-major and B (k x n) col-major (the eligible forms), plus the
+                // same values re-laid-out col-major A / row-major B (the ineligible forms)
+                let a_rm: Vec<$t> = (0..m * k).map(|x| (x % 23) as $t * 0.1 - 1.0).collect(); // A[i,t] = a_rm[i*k+t]
+                let b_cm: Vec<$t> = (0..k * n).map(|x| (x % 19) as $t * 0.2 - 1.5).collect(); // B[t,j] = b_cm[j*k+t]
+                let mut a_cm = vec![0.0 as $t; m * k]; // col-major A: a_cm[t*m+i] = A[i,t]
+                for i in 0..m {
+                    for t in 0..k {
+                        a_cm[t * m + i] = a_rm[i * k + t];
+                    }
+                }
+                let mut b_rm = vec![0.0 as $t; k * n]; // row-major B: b_rm[t*n+j] = B[t,j]
+                for t in 0..k {
+                    for j in 0..n {
+                        b_rm[t * n + j] = b_cm[j * k + t];
+                    }
+                }
+                let c0: Vec<$t> = (0..m * n).map(|x| (x % 7) as $t * 0.3 - 0.9).collect();
+
+                for &(alpha, beta) in &[(1.0 as $t, 0.0 as $t), (2.5, -0.5), (1.0, 1.0), (0.0, 2.0)]
+                {
+                    for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
+                        // `arm`/`brm` pick row-major vs col-major A/B, covering the 4 layouts; C
+                        // stays col-major so orient_transpose never swaps
+                        let run = |arm: bool, brm: bool| -> Vec<<$t as SmnBits>::Bits> {
+                            let mut c = c0.clone();
+                            let av = if arm {
+                                MatRef::from_row_major(&a_rm, m, k)
+                            } else {
+                                MatRef::from_col_major(&a_cm, m, k)
+                            };
+                            let bv = if brm {
+                                MatRef::from_row_major(&b_rm, k, n)
+                            } else {
+                                MatRef::from_col_major(&b_cm, k, n)
+                            };
+                            gemm(
+                                alpha,
+                                av,
+                                bv,
+                                beta,
+                                MatMut::from_col_major(&mut c, m, n),
+                                par,
+                            );
+                            c.iter().map(|v| v.smn_bits()).collect()
+                        };
+                        let elig = run(true, false); // row-major A + col-major B: zero-copy
+                        let ctx = format!("{m}x{k}x{n} a={alpha} b={beta} {par:?}");
+                        assert_eq!(run(false, false), elig, "pack-A != eligible {ctx}");
+                        assert_eq!(run(true, true), elig, "pack-B != eligible {ctx}");
+                        assert_eq!(run(false, true), elig, "pack-both != eligible {ctx}");
+                    }
+                }
+            }
+            tuning::set_small_mn_dim(pmn);
+            tuning::set_small_k_threshold(psk);
+            tuning::set_small_mn_pack_min_k(ppk);
+            tuning::set_gemv_parallel_bytes(pfl);
+        }
+    };
+}
+
+/// Raw-bit view used by the pack-parity tests to compare results exactly (a byte compare, so a `NaN`
+/// or a `-0.0` still has to match)
+trait SmnBits {
+    type Bits: PartialEq + core::fmt::Debug;
+    fn smn_bits(&self) -> Self::Bits;
+}
+impl SmnBits for f32 {
+    type Bits = u32;
+    fn smn_bits(&self) -> u32 {
+        self.to_bits()
+    }
+}
+impl SmnBits for f64 {
+    type Bits = u64;
+    fn smn_bits(&self) -> u64 {
+        self.to_bits()
+    }
+}
+
+small_mn_pack_bit_identical!(small_mn_pack_bit_identical_f32, f32);
+small_mn_pack_bit_identical!(small_mn_pack_bit_identical_f64, f64);
+
+/// Mixed-precision (`f16`, `f32`-accumulate) pack tier: like the real-float parity, the pre-pack is
+/// a pure reorder of the narrow inputs, so the widen-load dot reads the same `f16` bits in the same
+/// order and narrows to the same output bits. Bit-identical to the eligible layout (`f16` output
+/// bits compared exactly), across pack-A / pack-B / pack-both, tails, alpha/beta, serial + parallel
+#[cfg(feature = "half")]
+#[test]
+fn small_mn_pack_bit_identical_f16() {
+    use gemmkit::f16;
+    let _g = knob_guard();
+    let pmn = tuning::small_mn_dim();
+    let psk = tuning::small_k_threshold();
+    let ppk = tuning::small_mn_pack_min_k();
+    let pfl = tuning::gemv_parallel_bytes();
+    tuning::set_small_mn_dim(usize::MAX);
+    tuning::set_small_k_threshold(4);
+    tuning::set_small_mn_pack_min_k(0);
+    tuning::set_gemv_parallel_bytes(1);
+
+    let h = |x: usize, m: usize, s: f32| f16::from_f32((x % m) as f32 * s);
+    for &(m, k, n) in &[(4, 64, 4), (16, 512, 16), (5, 40, 7), (3, 17, 8)] {
+        let a_rm: Vec<f16> = (0..m * k).map(|x| h(x, 23, 0.03)).collect();
+        let b_cm: Vec<f16> = (0..k * n).map(|x| h(x, 19, 0.05)).collect();
+        let mut a_cm = vec![f16::from_f32(0.0); m * k];
+        for i in 0..m {
+            for t in 0..k {
+                a_cm[t * m + i] = a_rm[i * k + t];
+            }
+        }
+        let mut b_rm = vec![f16::from_f32(0.0); k * n];
+        for t in 0..k {
+            for j in 0..n {
+                b_rm[t * n + j] = b_cm[j * k + t];
+            }
+        }
+        let c0: Vec<f16> = (0..m * n).map(|x| h(x, 11, 0.1)).collect();
+        for &(alpha, beta) in &[(1.0f32, 0.0f32), (1.25, 1.0), (0.0, 2.0)] {
+            let (alpha, beta) = (f16::from_f32(alpha), f16::from_f32(beta));
+            for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
+                let run = |arm: bool, brm: bool| -> Vec<u16> {
+                    let mut c = c0.clone();
+                    let av = if arm {
+                        MatRef::from_row_major(&a_rm, m, k)
+                    } else {
+                        MatRef::from_col_major(&a_cm, m, k)
+                    };
+                    let bv = if brm {
+                        MatRef::from_row_major(&b_rm, k, n)
+                    } else {
+                        MatRef::from_col_major(&b_cm, k, n)
+                    };
+                    gemm(
+                        alpha,
+                        av,
+                        bv,
+                        beta,
+                        MatMut::from_col_major(&mut c, m, n),
+                        par,
+                    );
+                    c.iter().map(|v| v.to_bits()).collect()
+                };
+                let elig = run(true, false);
+                let ctx = format!("f16 {m}x{k}x{n} {par:?}");
+                assert_eq!(run(false, false), elig, "pack-A != eligible {ctx}");
+                assert_eq!(run(true, true), elig, "pack-B != eligible {ctx}");
+                assert_eq!(run(false, true), elig, "pack-both != eligible {ctx}");
+            }
+        }
+    }
+    tuning::set_small_mn_dim(pmn);
+    tuning::set_small_k_threshold(psk);
+    tuning::set_small_mn_pack_min_k(ppk);
+    tuning::set_gemv_parallel_bytes(pfl);
+}
+
+/// Integer (`i8 -> i32`) pack tier: the pre-pack is a pure reorder of the `i8` inputs, so the widen
+/// dot lands on the exact same wrapping-`i32` output. Exactly equal to the eligible layout, across
+/// pack-A / pack-B / pack-both, tails, alpha/beta, serial + parallel
+#[cfg(feature = "int8")]
+#[test]
+fn small_mn_pack_exact_i8() {
+    use gemmkit::gemm_i8;
+    let _g = knob_guard();
+    let pmn = tuning::small_mn_dim();
+    let psk = tuning::small_k_threshold();
+    let ppk = tuning::small_mn_pack_min_k();
+    let pfl = tuning::gemv_parallel_bytes();
+    tuning::set_small_mn_dim(usize::MAX);
+    tuning::set_small_k_threshold(4);
+    tuning::set_small_mn_pack_min_k(0);
+    tuning::set_gemv_parallel_bytes(1);
+
+    for &(m, k, n) in &[(4, 64, 4), (16, 4096, 16), (5, 40, 7), (3, 17, 8)] {
+        let a_rm: Vec<i8> = (0..m * k).map(|x| (x % 17) as i8 - 8).collect();
+        let b_cm: Vec<i8> = (0..k * n).map(|x| (x % 13) as i8 - 6).collect();
+        let mut a_cm = vec![0i8; m * k];
+        for i in 0..m {
+            for t in 0..k {
+                a_cm[t * m + i] = a_rm[i * k + t];
+            }
+        }
+        let mut b_rm = vec![0i8; k * n];
+        for t in 0..k {
+            for j in 0..n {
+                b_rm[t * n + j] = b_cm[j * k + t];
+            }
+        }
+        let c0: Vec<i32> = (0..m * n).map(|x| (x % 5) as i32 - 2).collect();
+        for &(alpha, beta) in &[(1i32, 0i32), (3, -1), (1, 1), (0, 2)] {
+            for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
+                let run = |arm: bool, brm: bool| -> Vec<i32> {
+                    let mut c = c0.clone();
+                    let av = if arm {
+                        MatRef::from_row_major(&a_rm, m, k)
+                    } else {
+                        MatRef::from_col_major(&a_cm, m, k)
+                    };
+                    let bv = if brm {
+                        MatRef::from_row_major(&b_rm, k, n)
+                    } else {
+                        MatRef::from_col_major(&b_cm, k, n)
+                    };
+                    gemm_i8(
+                        alpha,
+                        av,
+                        bv,
+                        beta,
+                        MatMut::from_col_major(&mut c, m, n),
+                        par,
+                    );
+                    c
+                };
+                let elig = run(true, false);
+                let ctx = format!("i8 {m}x{k}x{n} a={alpha} b={beta} {par:?}");
+                assert_eq!(run(false, false), elig, "pack-A != eligible {ctx}");
+                assert_eq!(run(true, true), elig, "pack-B != eligible {ctx}");
+                assert_eq!(run(false, true), elig, "pack-both != eligible {ctx}");
+            }
+        }
+    }
+    tuning::set_small_mn_dim(pmn);
+    tuning::set_small_k_threshold(psk);
+    tuning::set_small_mn_pack_min_k(ppk);
+    tuning::set_gemv_parallel_bytes(pfl);
+}
+
 // Promoted calibration knobs: each forces an extreme + the default and checks correctness
 
 /// Assert `got` matches a naive reference to a tight relative tolerance, with a labelled message

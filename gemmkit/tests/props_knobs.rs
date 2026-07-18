@@ -72,7 +72,7 @@ fn thread_dim_stride_restore() -> usize {
 /// round-trips to
 type Knob = (fn(usize), fn() -> usize);
 
-/// The 22 general-path knobs P16 sweeps (i8 VNNI is int8/f32-inert, exercised by P20), each
+/// The 23 general-path knobs P16 sweeps (i8 VNNI is int8/f32-inert, exercised by P20), each
 /// paired with the capture fn that reads the value its setter round-trips to. Order-independent:
 /// each is set to an independently-drawn value. Both `KnobGuard::capture` (restore side) and
 /// `apply_knobs` (sweep side) drive this single table, so their lengths (and hence
@@ -85,6 +85,7 @@ const KNOBS: &[Knob] = &[
     (tuning::set_gemv_threshold, tuning::gemv_threshold),
     (tuning::set_small_k_threshold, tuning::small_k_threshold),
     (tuning::set_small_mn_dim, tuning::small_mn_dim),
+    (tuning::set_small_mn_pack_min_k, tuning::small_mn_pack_min_k),
     (tuning::set_gemv_parallel_bytes, tuning::gemv_parallel_bytes),
     (tuning::set_gemv_thread_cap, tuning::gemv_thread_cap),
     (tuning::set_parallel_oversample, tuning::parallel_oversample),

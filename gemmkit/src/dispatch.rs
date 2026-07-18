@@ -418,6 +418,31 @@ fn small_mn_eligible<T>(t: &Task<T>) -> bool {
     small_mn_eligible_dims(t.m, t.n, t.k, t.csa, t.rsb)
 }
 
+/// `true` when a post-swap problem clears the horizontal `small_mn` dims / `k` gates but an operand
+/// **misses** its unit-stride-along-`k` predicate (`csa != 1` or `rsb != 1`): the pack tier copies
+/// only the failing operand into `k`-contiguous scratch and runs the same horizontal kernel (see
+/// [`crate::special::small_mn::prepack_operands`]). The 2 most common layouts (all-row-major,
+/// all-col-major) hit exactly this. Shares the dims gate with [`small_mn_eligible_dims`]
+/// (`small_mn_dim`, one calibration, no drift), but its `k` gate is its own knob
+/// ([`crate::tuning::small_mn_pack_min_k`], not `small_k_threshold`); it differs from the zero-copy
+/// gate in *requiring* a failing stride where that one forbids one, so the 2 tiers are mutually
+/// exclusive and a small_mn call takes whichever matches. This is the field-level core, shared by
+/// the [`Task`] and `IntTask` paths exactly as the zero-copy gate is
+#[inline]
+fn small_mn_pack_eligible_dims(m: usize, n: usize, k: usize, csa: isize, rsb: isize) -> bool {
+    m <= tuning::small_mn_dim()
+        && n <= tuning::small_mn_dim()
+        && k > tuning::small_mn_pack_min_k()
+        && !(csa == 1 && rsb == 1)
+}
+
+/// `true` when a post-swap [`Task`] should take the horizontal `small_mn` **pack** tier (see
+/// [`small_mn_pack_eligible_dims`]). Shared by the float / mixed / bf16-dot entries
+#[inline]
+fn small_mn_pack_eligible<T>(t: &Task<T>) -> bool {
+    small_mn_pack_eligible_dims(t.m, t.n, t.k, t.csa, t.rsb)
+}
+
 /// `C <- beta*C` for a **homogeneous float** type (`f32`/`f64`): in-place scale,
 /// `beta == 0` overwriting to zero without reading C. The float `GemmScalar::scale_c`
 /// forwards here; narrow types use [`scale_c_narrow`]

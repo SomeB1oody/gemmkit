@@ -340,8 +340,14 @@ Dispatch reroutes shapes the register-tiling driver fits poorly
   product is one depth panel over the family's microkernel, reading A/B in
   place with no packing or blocking setup; generic over families.
 - **small-m,n** (`small_mn.rs`): both `m, n` at or below `small_mn_dim`, long
-  contraction, both operands unit-stride along `k`. Each output is a single
-  horizontal SIMD dot; the driver would compute mostly microtile padding here.
+  contraction. Each output is a single horizontal SIMD dot; the driver would
+  compute mostly microtile padding here. When both operands stream unit-stride
+  along `k` (row-major A, col-major B) the dots read A/B in place; when one is
+  strided (an all-row-major or all-col-major shape, `k > small_mn_pack_min_k`)
+  a shared pre-pack copies only the failing operand into a padded `k`-contiguous
+  scratch (a `~1/m` or `~1/n` tax that still beats the driver) and the same
+  kernel runs over it. The pack is a pure reorder, so the packed route is
+  bit-identical to the eligible layout.
 - **batched** (`batched.rs`): `gemm_batched*` is orchestration over the
   single-GEMM engine. `Parallelism::resolve_batch` picks between assigning
   whole cache-hot GEMMs to workers, a sequential loop giving each large

@@ -8,7 +8,9 @@ use super::float::Dispatched;
 #[cfg(feature = "epilogue")]
 use super::float::FusedScalar;
 use super::isa::{ForcedIsa, forced_isa};
-use super::{GemmScalar, PackedConsume, Task, orient_transpose, small_mn_eligible};
+use super::{
+    GemmScalar, PackedConsume, Task, orient_transpose, small_mn_eligible, small_mn_pack_eligible,
+};
 use crate::driver::{self, alpha_status, beta_status};
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use crate::kernel::Bf16DotGemm;
@@ -257,15 +259,18 @@ unsafe fn run_typed_mixed<N, Fam, S, const MR_REG: usize, const NR: usize>(
             return;
         }
         orient_transpose(&mut t);
-        // Small `m,n` + long `k` + contiguous-along-`k` layout: the horizontal path, widening
-        // `N -> f32` on load and accumulating in `f32` (see [`run_typed`]'s float gate)
-        if small_mn_eligible(&t) {
+        // Small `m,n` + long `k`: the horizontal path, widening `N -> f32` on load and accumulating
+        // in `f32` (see [`run_typed`]'s float gate). A contiguous-along-`k` layout reads in place; a
+        // strided operand is packed into `k`-contiguous scratch first (packed as narrow `N`, widened
+        // on load exactly as before)
+        if small_mn_eligible(&t) || small_mn_pack_eligible(&t) {
             small_mn::run_mixed::<N, S>(
                 simd,
                 t.m,
                 t.k,
                 t.n,
                 par,
+                ws,
                 t.alpha.widen(),
                 t.a,
                 t.rsa,
@@ -394,15 +399,17 @@ unsafe fn run_typed_mixed_fused<N, Fam, S, const MR_REG: usize, const NR: usize>
             };
         }
 
-        // Small `m,n` + long `k` + contiguous-along-`k`: the horizontal path, widening `N -> f32` on
-        // load and applying the epilogue to each `f32` cell before the single narrowing
-        if small_mn_eligible(&t) {
+        // Small `m,n` + long `k`: the horizontal path, widening `N -> f32` on load and applying the
+        // epilogue to each `f32` cell before the single narrowing. A strided operand is packed into
+        // `k`-contiguous scratch first (packed as narrow `N`, widened on load as before)
+        if small_mn_eligible(&t) || small_mn_pack_eligible(&t) {
             small_mn::run_mixed_epi::<N, S, FusedEpi<N>>(
                 simd,
                 t.m,
                 t.k,
                 t.n,
                 par,
+                ws,
                 t.alpha.widen(),
                 t.a,
                 t.rsa,

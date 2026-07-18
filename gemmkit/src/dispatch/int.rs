@@ -180,20 +180,23 @@ unsafe fn run_typed_int<Fam, S, const MR_REG: usize, const NR: usize>(
             &mut t.m, &mut t.n, &mut t.a, &mut t.rsa, &mut t.csa, &mut t.b, &mut t.rsb, &mut t.csb,
             &mut t.rsc, &mut t.csc,
         );
-        // Small `m,n` with a long contraction, both operands streaming contiguously along `k`
-        // (`csa == 1`, `rsb == 1`): the driver would pack the tiny row/col tiles up to a full
-        // microtile (mostly padding for a 16x16 output on the 32x12 AVX-512 tile), whereas the
-        // horizontal route computes each output as a direct `i8 -> i32` widening SIMD dot, reading
-        // A/B in place. Shares `small_mn_eligible_dims` with the float / mixed entries so the gate
-        // never drifts, and is ordered before the small_k gate exactly as `run_typed` places it
+        // Small `m,n` with a long contraction: the driver would pack the tiny row/col tiles up to a
+        // full microtile (mostly padding for a 16x16 output on the 32x12 AVX-512 tile), whereas the
+        // horizontal route computes each output as a direct `i8 -> i32` widening SIMD dot. When both
+        // operands stream unit-stride along `k` it reads A/B in place; when one is strided the pack
+        // tier copies it into `k`-contiguous scratch first. Shares `small_mn_eligible_dims` /
+        // `small_mn_pack_eligible_dims` with the float / mixed entries so the gates never drift, and
+        // is ordered before the small_k gate exactly as `run_typed` places it
         // Bit-exact vs the driver (wrapping `i32` is fully associative), so it reproduces the widen
         // and VNNI results alike; and, like the float / mixed special paths, it fires even under a
         // forced ISA (the gate is orthogonal to ISA selection), so a forced-VNNI tiny shape widens
         // here rather than paying the VNNI pack barrier
-        if super::small_mn_eligible_dims(t.m, t.n, t.k, t.csa, t.rsb) {
+        if super::small_mn_eligible_dims(t.m, t.n, t.k, t.csa, t.rsb)
+            || super::small_mn_pack_eligible_dims(t.m, t.n, t.k, t.csa, t.rsb)
+        {
             small_mn::run_int::<S>(
-                simd, t.m, t.k, t.n, par, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb, t.beta,
-                t.c, t.rsc, t.csc,
+                simd, t.m, t.k, t.n, par, ws, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb,
+                t.beta, t.c, t.rsc, t.csc,
             );
             return;
         }

@@ -145,6 +145,146 @@ fn bench_small_mn(m: usize, n: usize, k: usize, row_major_a: bool, par: Parallel
     );
 }
 
+/// Layout-coverage probe: the horizontal path requires `csa == 1 && rsb == 1` (row-major A,
+/// col-major B) after orientation, so an all-row-major or all-col-major small-`m,n` shape misses
+/// that predicate. At default settings (`small_mn_pack_min_k`) a long-`k` miss now takes the pack
+/// tier instead of falling to the driver / small_k, so this measures how close the pack tier's
+/// `all_rm`/`all_cm` rate lands to the eligible layout's horizontal rate (the ceiling), the residual
+/// gap being the `~1/m`/`~1/n` copy tax the pack tier could not amortize away
+#[cfg(not(target_family = "wasm"))]
+fn bench_small_mn_layouts(m: usize, n: usize, k: usize, par: Parallelism) {
+    let a = fill(m * k, 1);
+    let b = fill(k * n, 2);
+    let mut c = vec![0.0f32; m * n];
+    // Eligible: row-major A, col-major B (the horizontal route)
+    let horiz = with_route(usize::MAX, 0, || {
+        measure(m, k, n, || {
+            gemm(
+                1.0,
+                MatRef::from_row_major(&a, m, k),
+                MatRef::from_col_major(&b, k, n),
+                0.0,
+                MatMut::from_col_major(&mut c, m, n),
+                par,
+            );
+        })
+    });
+    // All-row-major: B fails `rsb == 1`, so at defaults it takes the pack tier, not small_k / driver
+    let all_rm = measure(m, k, n, || {
+        gemm(
+            1.0,
+            MatRef::from_row_major(&a, m, k),
+            MatRef::from_row_major(&b, k, n),
+            0.0,
+            MatMut::from_row_major(&mut c, m, n),
+            par,
+        );
+    });
+    // All-col-major: A fails `csa == 1` post-swap
+    let all_cm = measure(m, k, n, || {
+        gemm(
+            1.0,
+            MatRef::from_col_major(&a, m, k),
+            MatRef::from_col_major(&b, k, n),
+            0.0,
+            MatMut::from_col_major(&mut c, m, n),
+            par,
+        );
+    });
+    let mode = if matches!(par, Parallelism::Serial) {
+        "ser"
+    } else {
+        "par"
+    };
+    println!(
+        "  {m:>2}x{n:<2} k={k:<6} {mode}  horiz={:7.1}  all_rm={:7.1} ({:.2}x h)  all_cm={:7.1} ({:.2}x h)",
+        horiz.median,
+        all_rm.median,
+        horiz.median / all_rm.median.max(1e-9),
+        all_cm.median,
+        horiz.median / all_cm.median.max(1e-9),
+    );
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture"]
+fn perf_small_mn_layouts() {
+    let _guard = BENCH_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    println!("\nsmall-m,n layout coverage (eligible horizontal vs ineligible layouts):");
+    for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
+        for &(m, n, k) in &[(4usize, 4usize, 65536usize), (8, 8, 65536), (16, 16, 16384)] {
+            bench_small_mn_layouts(m, n, k, par);
+        }
+    }
+}
+
+/// Pack-tier crossover probe: for an **ineligible** (all-col-major, so A fails `csa == 1`) small
+/// shape, compare the new packed-horizontal route (pack A into `k`-contiguous scratch, then the
+/// horizontal dot) against the current fallback (the register-tiling driver) and the small_k route
+/// across `k`. This is what sets `small_mn_pack_min_k`: the packed route must beat the driver at
+/// (and above) the gate. `packed` forces the pack tier (`small_mn_dim = MAX`, `pack_min_k = 0`,
+/// `small_k = 0`); `driver` forces the driver (`small_mn_dim = 0`, `small_k = 0`); `small_k` forces
+/// the in-place small_k route (`small_mn_dim = 0`, `small_k = MAX`). The `xd` ratio is packed/driver
+#[cfg(not(target_family = "wasm"))]
+fn bench_small_mn_pack_crossover(m: usize, n: usize, k: usize, par: Parallelism) {
+    let a = fill(m * k, 1);
+    let b = fill(k * n, 2);
+    let mut c = vec![0.0f32; m * n];
+    // All-col-major: A fails `csa == 1` post-orientation, so it takes the pack tier when enabled
+    let mut run = || {
+        measure(m, k, n, || {
+            gemm(
+                1.0,
+                MatRef::from_col_major(&a, m, k),
+                MatRef::from_col_major(&b, k, n),
+                0.0,
+                MatMut::from_col_major(&mut c, m, n),
+                par,
+            );
+        })
+    };
+    // pack tier: small_mn_dim = MAX + small_k = 0 route small-m,n here; pack_min_k = 0 clears the
+    // pack-tier k gate for every measured k
+    let pmnk = gemmkit::tuning::small_mn_pack_min_k();
+    gemmkit::tuning::set_small_mn_pack_min_k(0);
+    let packed = with_route(usize::MAX, 0, &mut run);
+    gemmkit::tuning::set_small_mn_pack_min_k(pmnk);
+    let driver = with_route(0, 0, &mut run);
+    let smallk = with_route(0, usize::MAX, &mut run);
+    let mode = if matches!(par, Parallelism::Serial) {
+        "ser"
+    } else {
+        "par"
+    };
+    println!(
+        "  {m:>2}x{n:<2} k={k:<6} {mode}  packed={:7.1}  driver={:7.1} ({:.2}x d)  small_k={:7.1}",
+        packed.median,
+        driver.median,
+        packed.median / driver.median.max(1e-9),
+        smallk.median,
+    );
+}
+
+/// Pack-tier crossover sweep: the packed horizontal route vs the driver / small_k across `k` for
+/// ineligible (all-col-major) small shapes. Sets `small_mn_pack_min_k` from where `packed` overtakes
+#[cfg(not(target_family = "wasm"))]
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture"]
+fn perf_small_mn_pack_crossover() {
+    let _guard = BENCH_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    println!(
+        "\nsmall-m,n pack-tier crossover (packed-horizontal vs driver, ineligible all-col-major):"
+    );
+    for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
+        for &(m, n) in &[(4usize, 4usize), (8, 8), (16, 16)] {
+            for &k in &[32usize, 64, 256, 1024, 4096, 16384] {
+                bench_small_mn_pack_crossover(m, n, k, par);
+            }
+        }
+    }
+}
+
 /// `perf_small_mn` row for **f16** (f32-accumulate mixed horizontal kernel): the horizontal path
 /// vs the register-tiling driver, plus the `gemm` crate (same f16-in-f32-acc convention), all
 /// GFLOP/s in the fast-path layout (row-major A, col-major B). Confirms the widen-load horizontal
