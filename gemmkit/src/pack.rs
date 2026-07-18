@@ -38,11 +38,21 @@ pub(crate) unsafe fn pack_panels<T: Scalar>(
         let mut base = 0usize;
         while base < n_lead {
             let live = core::cmp::min(width, n_lead - base);
-            if lead == 1 && live == width {
-                // Contiguous leading dimension and a full panel: straight copy
+            if lead == 1 {
+                // Contiguous leading dimension: the `live` leading elements at each
+                // depth step are contiguous in `src`, so copy them straight and
+                // zero-fill the `[live, width)` pad tail. A full panel (`live ==
+                // width`) has no pad, so the fill loop is empty and this is the
+                // original straight copy; a tail panel (`live < width`, the last
+                // panel when `n_lead` is not a multiple of `width`) copies its `live`
+                // contiguous elements instead of walking the strided transpose. The
+                // packed bytes are identical to the transpose path either way
                 for p in 0..depth_len {
                     let s = src.offset(base as isize + p as isize * depth);
-                    core::ptr::copy_nonoverlapping(s, d, width);
+                    core::ptr::copy_nonoverlapping(s, d, live);
+                    for i in live..width {
+                        *d.add(i) = T::ZERO;
+                    }
                     d = d.add(width);
                 }
             } else {
@@ -182,6 +192,204 @@ pub(crate) unsafe fn pack_kgroup_panels<T: Scalar, const Q: usize, F: Fn(T) -> T
             }
             d = d.add(width * kc_pad);
             base += width;
+        }
+    }
+}
+
+// Feature-independent byte-level oracle for [`pack_panels`]'s strided-transpose branch
+// (compiled on every build, unlike the kgroup oracle below which is gated to the dot
+// families): `check_case` forces `lead != 1`, so this reproduces only the pre-existing
+// transpose path bit-for-bit. The new `lead == 1` tail fast path is timed, not bit-checked,
+// by `bench_tail_panel_pack` below
+#[cfg(test)]
+mod panels_tests {
+    use super::*;
+
+    // Naive reference for the plain micropanel layout: `ceil(n_lead/width)` panels, each
+    // `depth_len` steps of `width` leading elements, depth-major within a panel; a leading
+    // position past `n_lead` is `T::ZERO`. No restructuring - the routine under test must
+    // reproduce this buffer bit-for-bit
+    fn reference<T: Scalar>(
+        base: *const T,
+        lead: isize,
+        depth: isize,
+        n_lead: usize,
+        depth_len: usize,
+        width: usize,
+    ) -> Vec<T> {
+        let panels = n_lead.div_ceil(width);
+        let mut out = vec![T::ZERO; panels * width * depth_len];
+        let mut d = 0usize;
+        let mut b = 0usize;
+        while b < n_lead {
+            for p in 0..depth_len {
+                for i in 0..width {
+                    let lead_pos = b + i;
+                    let v = if lead_pos < n_lead {
+                        // SAFETY: covered by `backing` in `check_case` for `lead_pos < n_lead`
+                        unsafe { *base.offset(lead_pos as isize * lead + p as isize * depth) }
+                    } else {
+                        T::ZERO
+                    };
+                    out[d + p * width + i] = v;
+                }
+            }
+            d += width * depth_len;
+            b += width;
+        }
+        out
+    }
+
+    // Raw-byte compare (the contract is bit-identity)
+    fn same_bytes<T>(a: &[T], b: &[T]) -> bool {
+        let (pa, la) = (a.as_ptr() as *const u8, core::mem::size_of_val(a));
+        let (pb, lb) = (b.as_ptr() as *const u8, core::mem::size_of_val(b));
+        // SAFETY: both slices are live for the read and `size_of_val` is their byte extent
+        unsafe { core::slice::from_raw_parts(pa, la) == core::slice::from_raw_parts(pb, lb) }
+    }
+
+    // `depth_stride` only varies the depth-read stride inside the strided-transpose branch
+    // (contiguous at 1, strided at 4); `lead` steps past the whole depth extent so leading
+    // rows never alias, which also forces `lead != 1`, away from the straight-copy fast path
+    fn check_case(n_lead: usize, depth_len: usize, width: usize, depth_stride: isize) {
+        let depth = depth_stride;
+        let lead = depth_len as isize * depth + 1;
+        let max_off = if n_lead == 0 || depth_len == 0 {
+            0
+        } else {
+            ((n_lead - 1) as isize * lead + (depth_len - 1) as isize * depth) as usize
+        };
+        // A spread-out bit pattern so a permuted or missed slot shows in the byte compare
+        let backing: Vec<f32> = (0..=max_off)
+            .map(|i| f32::from_bits((i as u32).wrapping_mul(2_654_435_761)))
+            .collect();
+        let base = backing.as_ptr();
+
+        let expected = reference::<f32>(base, lead, depth, n_lead, depth_len, width);
+        let panels = n_lead.div_ceil(width);
+        let mut actual = vec![0.0f32; panels * width * depth_len];
+        // SAFETY: `backing` covers every addressed offset for `lead_pos < n_lead`,
+        // `p < depth_len`; `actual` holds the exact layout size
+        unsafe {
+            pack_panels::<f32>(
+                actual.as_mut_ptr(),
+                base,
+                lead,
+                depth,
+                n_lead,
+                depth_len,
+                width,
+            );
+        }
+        assert!(
+            same_bytes(&actual, &expected),
+            "n_lead={n_lead} depth_len={depth_len} width={width} depth={depth}"
+        );
+    }
+
+    // Replica of the pre-change strided-transpose tail path (the `else` arm of `pack_panels`
+    // as it packed a `lead == 1`, `live < width` tail), kept here as the A/B baseline for the
+    // straight-copy microbench below. Same output bytes, walks `src` at the `depth` stride
+    fn transpose_tail<T: Scalar>(
+        dst: *mut T,
+        src: *const T,
+        lead: isize,
+        depth: isize,
+        live: usize,
+        depth_len: usize,
+        width: usize,
+    ) {
+        let tile = crate::tuning::pack_transpose_tile();
+        unsafe {
+            let panel = dst;
+            let mut p0 = 0;
+            while p0 < depth_len {
+                let pe = core::cmp::min(p0 + tile, depth_len);
+                for i in 0..width {
+                    if i < live {
+                        let row = src.offset(i as isize * lead);
+                        for p in p0..pe {
+                            *panel.add(p * width + i) = *row.offset(p as isize * depth);
+                        }
+                    } else {
+                        for p in p0..pe {
+                            *panel.add(p * width + i) = T::ZERO;
+                        }
+                    }
+                }
+                p0 = pe;
+            }
+        }
+    }
+
+    /// Isolated tail-panel pack cost: the new `lead == 1` straight-copy fast path vs the old
+    /// strided transpose, on the same `live`-row tail of a column-major LHS (`lead = 1`, depth
+    /// stride = the full row count). Reports median ns per pack; `run with --ignored --nocapture`
+    #[test]
+    #[ignore = "microbench; run with --release --ignored --nocapture"]
+    fn bench_tail_panel_pack() {
+        use std::time::Instant;
+        let (width, live, depth_len, m) = (32usize, 8usize, 4096usize, 520isize);
+        let (lead, depth) = (1isize, m); // column-major LHS tail: contiguous rows, depth stride m
+        let max_off = (live as isize - 1) * lead + (depth_len as isize - 1) * depth;
+        let backing: Vec<f32> = (0..=max_off as usize).map(|i| i as f32 * 0.5).collect();
+        let base = backing.as_ptr();
+        let mut dst = vec![0.0f32; width * depth_len];
+
+        let bench = |reps: usize, mut f: Box<dyn FnMut()>| -> f64 {
+            for _ in 0..20 {
+                f();
+            }
+            let mut s: Vec<f64> = Vec::with_capacity(reps);
+            for _ in 0..reps {
+                let t = Instant::now();
+                for _ in 0..200 {
+                    f();
+                }
+                s.push(t.elapsed().as_secs_f64() * 1e9 / 200.0);
+            }
+            s.sort_by(f64::total_cmp);
+            s[reps / 2]
+        };
+
+        let (p, b) = (dst.as_mut_ptr(), base);
+        let t_new = bench(
+            25,
+            Box::new(move || unsafe {
+                pack_panels::<f32>(p, b, lead, depth, live, depth_len, width);
+                core::hint::black_box(p);
+            }),
+        );
+        let (p, b) = (dst.as_mut_ptr(), base);
+        let t_old = bench(
+            25,
+            Box::new(move || {
+                transpose_tail::<f32>(p, b, lead, depth, live, depth_len, width);
+                core::hint::black_box(p);
+            }),
+        );
+        println!(
+            "\ntail-panel pack (live={live}/{width}, depth={depth_len}, stride={m}): straight-copy {t_new:7.1} ns  transpose {t_old:7.1} ns  ({:.2}x)",
+            t_old / t_new.max(1e-9)
+        );
+    }
+
+    // Sweep width tails (live < width via partial last panel), single- and multi-panel
+    // `n_lead`, varying depth, and both contiguous (depth == 1) and strided sources
+    #[test]
+    fn panels_bit_identical() {
+        const N_LEADS: [usize; 8] = [1, 3, 4, 5, 7, 8, 9, 17];
+        const DEPTHS: [usize; 5] = [1, 2, 3, 5, 8];
+        const WIDTHS: [usize; 5] = [1, 3, 4, 6, 8];
+        const STRIDES: [isize; 2] = [1, 4];
+        for &n_lead in &N_LEADS {
+            for &depth_len in &DEPTHS {
+                for &width in &WIDTHS {
+                    for &stride in &STRIDES {
+                        check_case(n_lead, depth_len, width, stride);
+                    }
+                }
+            }
         }
     }
 }

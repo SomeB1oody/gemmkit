@@ -24,7 +24,7 @@ use crate::parallel::{self, Parallelism, Ptr};
 use crate::scalar::Scalar;
 use crate::simd::{KernelSimd, SimdOps};
 use crate::tuning;
-use crate::workspace::Workspace;
+use crate::workspace::{Regions, Workspace};
 
 /// Precomputed `alpha` state so the microkernel never compares floats.
 /// `alpha == 0` is handled upstream (routed to the scale-only path), so only
@@ -481,13 +481,26 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize, E>(
         // with a logically huge `k`, so these products can overflow; a
         // wrapped size would under-allocate the workspace the pack then
         // writes past
-        let a_per_region = mc
-            .next_multiple_of(mr)
-            .checked_mul(kc_pad_block)
-            .unwrap_or_else(|| {
-                panic!("gemmkit: GEMM {m}x{k}x{n} is too large; the LHS pack region size overflows usize")
-            });
-        let a_regions = if shared_a { n_mc } else { n_threads };
+        // Whether the A macro-panel is ever packed. The per-worker path packs a
+        // tile only when `do_pack_lhs` holds; taken over every tile that reduces
+        // to this predicate, because only the last row block can carry an
+        // `mc_eff` that is not an `mr` multiple (`mc` is), and it does exactly
+        // when `m` is not. The shared pre-pass runs only under
+        // `rsa != 1 || want_pack_lhs`, already implied here, so this one
+        // predicate covers every A-pack site. When it is false the A region is
+        // reserved but never written, so skip reserving it entirely
+        let need_a_pack = rsa != 1 || !m.is_multiple_of(mr) || want_pack_lhs;
+        let (a_per_region, a_regions) = if need_a_pack {
+            let per = mc
+                .next_multiple_of(mr)
+                .checked_mul(kc_pad_block)
+                .unwrap_or_else(|| {
+                    panic!("gemmkit: GEMM {m}x{k}x{n} is too large; the LHS pack region size overflows usize")
+                });
+            (per, if shared_a { n_mc } else { n_threads })
+        } else {
+            (0, 0)
+        };
         let b_elems = if pack_b {
             nc.next_multiple_of(nr)
                 .checked_mul(kc_pad_block)
@@ -497,7 +510,19 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize, E>(
         } else {
             0
         };
-        let regions = ws.regions::<Fam::Lhs>(a_per_region, a_regions, b_elems);
+        // Reserve pack scratch only when a side actually packs. When neither
+        // does, hand out null bases (never dereferenced: every tile reads A in
+        // place and B is read in place or from the prepacked buffer), so an
+        // all-in-place workload never grows the pool
+        let regions: Regions<Fam::Lhs> = if need_a_pack || pack_b {
+            ws.regions::<Fam::Lhs>(a_per_region, a_regions, b_elems)
+        } else {
+            Regions {
+                a_base: core::ptr::null_mut(),
+                a_stride: 0,
+                b_base: core::ptr::null_mut(),
+            }
+        };
         let a_base = Ptr(regions.a_base);
         let a_stride = regions.a_stride;
         // Prepacked: read from the caller buffer; else from the per-call scratch

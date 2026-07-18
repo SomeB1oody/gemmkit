@@ -251,7 +251,9 @@ pub(crate) fn gemv_regblock_engage_bytes() -> usize {
 /// engages the twin at `32768`/`65536` (2.8x / 3.6x faster for `f16`) while leaving `16384` and
 /// below on the single panel (where the twin is within noise, so no regression). Centralized here
 /// (like [`lhs_pack_stride_bytes`] / [`gemv_parallel_floor_bytes`]) as the one home for the
-/// `0 => auto` derivation and its direct test
+/// `0 => auto` derivation and its direct test. Consumed only by the `half` dispatch (and the
+/// in-module test), so it is gated to match and stay dead-code-free in half-less builds
+#[cfg(any(test, feature = "half"))]
 pub(crate) fn deep_k_engage_bytes() -> usize {
     match crate::tuning::deep_kc_bytes() {
         0 => (topology().l2.effective_bytes() / 2).max(1),

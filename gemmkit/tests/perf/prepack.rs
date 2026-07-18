@@ -132,6 +132,64 @@ fn perf_prepack() {
     }
 }
 
+// Prepack buffer setup cost (half-type dead zero-fill probe)
+
+/// Median wall time of `reps` calls to `f`, in microseconds (after a short warmup).
+/// For timing an operation whose cost is not a GFLOP count (here, the prepack buffer
+/// setup), so the GFLOP/s-oriented `measure` does not apply
+#[cfg(feature = "half")]
+fn time_us<F: FnMut()>(reps: usize, mut f: F) -> f64 {
+    use std::time::Instant;
+    for _ in 0..3 {
+        f();
+    }
+    let mut samples: Vec<f64> = Vec::with_capacity(reps);
+    for _ in 0..reps {
+        let t = Instant::now();
+        f();
+        samples.push(t.elapsed().as_secs_f64() * 1e6);
+    }
+    samples.sort_by(f64::total_cmp);
+    samples[reps / 2]
+}
+
+/// Isolated cost of the prepack buffer setup. `prepack_rhs` allocates `ceil(n/nr)*nr*k_pad`
+/// elements, then packs every one of them. For `f32` the zero-init specializes to
+/// `alloc_zeroed` (no write pass), but the `half` types (`f16`/`bf16`) lack std's `IsZero`
+/// specialization, so a plain `vec![ZERO; ..]` runs a dead `O(k*n)` write the pack immediately
+/// overwrites. This times prepack alone (no compute) so that dead pass is visible; `f32` is the
+/// control (its zero-init is already free, so its number must not move)
+#[cfg(feature = "half")]
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture"]
+fn perf_prepack_alloc() {
+    use half::{bf16, f16};
+    let _guard = BENCH_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    let (k, n) = (4096usize, 4096usize);
+    println!("\nprepack buffer setup cost — prepack_rhs alone (k=n=4096), median us/call:");
+
+    let bf: Vec<bf16> = (0..k * n)
+        .map(|i| bf16::from_f32(i as f32 * 0.001))
+        .collect();
+    let t_bf = time_us(21, || {
+        let p = gemmkit::prepack_rhs(MatRef::from_col_major(&bf, k, n));
+        core::hint::black_box(&p);
+    });
+    let hf: Vec<f16> = (0..k * n)
+        .map(|i| f16::from_f32(i as f32 * 0.001))
+        .collect();
+    let t_hf = time_us(21, || {
+        let p = gemmkit::prepack_rhs(MatRef::from_col_major(&hf, k, n));
+        core::hint::black_box(&p);
+    });
+    let f: Vec<f32> = (0..k * n).map(|i| i as f32 * 0.001).collect();
+    let t_f = time_us(21, || {
+        let p = gemmkit::prepack_rhs(MatRef::from_col_major(&f, k, n));
+        core::hint::black_box(&p);
+    });
+    println!("  bf16 {t_bf:8.1} us   f16 {t_hf:8.1} us   f32 (control) {t_f:8.1} us");
+}
+
 // Prepacked-i8-RHS reuse
 
 /// Per-call throughput of a reused prepacked `i8` B (`gemm_i8_packed_b`) vs plain `gemm_i8`

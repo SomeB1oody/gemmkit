@@ -5,6 +5,9 @@ use crate::dispatch::FusedScalar;
 use crate::dispatch::PackedConsume;
 #[cfg(feature = "epilogue")]
 use crate::kernel::epilogue::{BiasDim, BiasSpec, FusedEpi};
+// The `vec!` macro is now used only by the i8 prepack path (`vec![0i8; ..]`, which already
+// specializes to `alloc_zeroed`); the float/half path allocates uninit via `Vec::with_capacity`
+#[cfg(feature = "int8")]
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -112,13 +115,26 @@ pub unsafe fn prepack_rhs_unchecked<T: GemmScalar>(
         .unwrap_or_else(|| {
             panic!("gemmkit: prepacked RHS of {k}x{n} is too large; the pack buffer size overflows usize")
         });
-    let mut buf = vec![T::ZERO; total];
+    // Allocate the pack buffer *without* zero-init: `pack_rhs_full` writes every one of the
+    // `total` slots below before any of them is read, so the zero pass is dead. For `f32`/`f64`
+    // `vec![ZERO; ..]` specializes to `alloc_zeroed` (already free), but the `half` types
+    // (`f16`/`bf16`) lack std's `IsZero` specialization and would run a genuine dead `O(k*n)`
+    // write; `with_capacity` + `set_len` avoids it uniformly. The write coverage is the same
+    // tiling proof the pack oracle tests cover: `pack_rhs_full` lays `ceil(n/nr)` panels of
+    // `nr x k_pad` end to end (its cursor advances `nr*k_pad_of_slice` per panel, summing to
+    // exactly `total`), and each panel's `pack_(kgroup_)panels` writes every leading lane and
+    // every padded-depth slot. So all `total` elements are initialized before `PackedRhs`
+    // returns (hence before any read). `T: Scalar` is `Copy` with no drop glue, so even the
+    // unreachable pack-panic path drops the (possibly uninit) `Vec` soundly
+    let mut buf: Vec<T> = Vec::with_capacity(total);
     if total > 0 {
-        // SAFETY: `buf` holds `ceil(n/nr)*nr*k_pad` elements (the exact layout size, with
-        // the depth padded to the dispatched family's `DEPTH_MULTIPLE`); `b` is caller-promised
-        // valid for the `(k, n)` strided reads; `pack_rhs_full` writes only that range
-        // `GemmScalar::pack_rhs_full` selects the right kernel family per type
+        // SAFETY: `buf`'s capacity is exactly `total`; `set_len(total)` exposes those slots,
+        // every one written by `pack_rhs_full` below before it is read. `buf` holds
+        // `ceil(n/nr)*nr*k_pad` elements (the exact layout size, with the depth padded to the
+        // dispatched family's `DEPTH_MULTIPLE`); `b` is caller-promised valid for the `(k, n)`
+        // strided reads; `pack_rhs_full` writes only that range and selects the right family
         unsafe {
+            buf.set_len(total);
             T::pack_rhs_full(buf.as_mut_ptr(), b, rsb, csb, k, n, kc, nc, nr);
         }
     }
