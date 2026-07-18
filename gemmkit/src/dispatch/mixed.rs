@@ -28,7 +28,7 @@ use crate::simd::ScalarTok;
 use crate::simd::Simd128;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use crate::simd::{Avx512, Fma};
-use crate::special::{small_k, small_mn};
+use crate::special::{gemv, small_k, small_mn};
 use crate::tuning;
 use crate::workspace::Workspace;
 use half::{bf16, f16};
@@ -60,13 +60,19 @@ unsafe fn scale_c_narrow<N: NarrowFloat>(
 }
 
 /// Mixed-precision driver entry for a concrete `(narrow type, family, ISA, tile)`. Mirror
-/// of [`run_typed`] driving a narrow-in / `f32`-accumulate family: no gemv special path (the
-/// general driver handles those shapes), the same orientation swap, and `alpha`/`beta`
-/// **widened to the `f32` accumulator** before the driver call. `Fam` selects the general-
-/// driver kernel (`MixedGemm<N>` for the widen path, `Bf16DotGemm` for the `vdpbf16ps` dot
-/// path) while the `small_mn` / small-`k` reroutes deliberately stay on `MixedGemm<N>`
-/// (both special paths bypass any dot kernel: a tiny output folds nothing and the dot pack's
+/// of [`run_typed`] driving a narrow-in / `f32`-accumulate family: the gemv reroute, the same
+/// orientation swap, and `alpha`/`beta` **widened to the `f32` accumulator** before the driver
+/// call. `Fam` selects the general-driver kernel (`MixedGemm<N>` for the widen path,
+/// `Bf16DotGemm` for the `vdpbf16ps` dot path) while the gemv / `small_mn` / small-`k` reroutes
+/// deliberately stay on the widen path (`MixedGemm<N>`'s `KernelSimd` seam): all 3 special
+/// paths bypass any dot kernel (a tiny/degenerate output folds nothing and the dot pack's
 /// `DEPTH_MULTIPLE` is pure loss there)
+///
+/// The gemv reroute is the mixed twin of the float gate in [`run_typed`]: an `m == 1` / `n == 1`
+/// shape is a bandwidth-bound matrix*vector, which the general driver would pad up to a full
+/// microtile (mostly zero FMAs). The widen [`gemv::run_mixed`] reads `N` in place, widens each
+/// load to `f32`, accumulates in `f32`, and rounds to `N` once at the store. It routes in the
+/// **user** frame before orientation normalization (as the float gate does)
 ///
 /// # Safety
 /// As [`run_typed`]
@@ -83,6 +89,30 @@ unsafe fn run_typed_mixed<N, Fam, S, const MR_REG: usize, const NR: usize>(
     S: KernelSimd<N, N, f32, N>,
 {
     unsafe {
+        // gemv shape (unless the dedicated path is disabled via tuning): the widen matrix*vector,
+        // in the user frame before orientation normalization (mirrors the float gate in
+        // [`run_typed`]). `alpha`/`beta` widened to the `f32` accumulator
+        if (t.n == 1 || t.m == 1) && core::cmp::min(t.m, t.n) <= tuning::gemv_threshold() {
+            gemv::run_mixed::<N, S>(
+                simd,
+                t.m,
+                t.k,
+                t.n,
+                par,
+                t.alpha.widen(),
+                t.a,
+                t.rsa,
+                t.csa,
+                t.b,
+                t.rsb,
+                t.csb,
+                t.beta.widen(),
+                t.c,
+                t.rsc,
+                t.csc,
+            );
+            return;
+        }
         orient_transpose(&mut t);
         // Small `m,n` + long `k` + contiguous-along-`k` layout: the horizontal path, widening
         // `N -> f32` on load and accumulating in `f32` (see [`run_typed`]'s float gate)
@@ -161,10 +191,18 @@ unsafe fn run_typed_mixed<N, Fam, S, const MR_REG: usize, const NR: usize>(
 /// the `f32`/`f64` every-shape contract). Reproducibility/determinism are unchanged (serial ==
 /// parallel bitwise on these routes)
 ///
-/// There is **no gemv route** (mixed never had one, the general driver handles those shapes). Like
-/// [`run_typed_mixed`], the `small_mn` / small-`k` reroutes deliberately stay on `MixedGemm<N>`
-/// (both bypass any dot kernel). `alpha`/`beta` are widened to the `f32` accumulator; the
-/// orientation swap flips the bias axis (same as the float `run_typed_fused`)
+/// There is **no gemv route** here, unlike the plain [`run_typed_mixed`]: mixed fused gemv stays on
+/// the general driver deliberately. The float fused gemv fuses by re-reading each stored output and
+/// mapping it ([`gemv::run_typed_epi`]'s final in-place sweep), which is bit-exact only because the
+/// float output *is* the accumulator (`OUT_IS_ACC = true`); for a narrow output the store has already
+/// rounded, so re-reading and mapping would round twice. Applying the epilogue to the `f32`
+/// accumulator *before* the single narrowing (the mixed discipline) would instead mean threading it
+/// through each widen gemv strategy kernel's `f32 -> N` store (the vectorized axpy narrow especially),
+/// a large diff for the rare fused-decode shape. The general driver already applies the epilogue in
+/// `f32` before narrowing, so fused mixed gemv rides it correctly (just without the bandwidth win).
+/// Like [`run_typed_mixed`], the `small_mn` / small-`k` reroutes stay on `MixedGemm<N>` (both bypass
+/// any dot kernel). `alpha`/`beta` are widened to the `f32` accumulator; the orientation swap flips
+/// the bias axis (same as the float `run_typed_fused`)
 ///
 /// # Safety
 /// As [`run_typed_mixed`], plus `epi`'s interior pointers valid for the (pre-swap) `m`/`n`

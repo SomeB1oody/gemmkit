@@ -118,6 +118,118 @@ fn parallel_equals_serial_mixed() {
     check::<gemmkit::bf16>(Layout::Col);
 }
 
+/// Mixed-precision (`f16`/`bf16`) gemv shapes through the widen gemv route: `m == 1` and `n == 1`,
+/// both operand orientations plus a strided (`GeneralPad`) A, an alpha/beta sweep, checked against
+/// the f64 oracle within the per-type tolerance. Row-major A + unit vector hits `dot_rows_mixed`,
+/// col-major A + col-major C hits `axpy_mixed`, and `GeneralPad` A hits `strided_rows_mixed`; `k`
+/// spans the SIMD widen sweep plus a sub-lane scalar tail
+#[cfg(feature = "half")]
+#[test]
+fn correctness_mixed_gemv() {
+    fn check<T: Elem>() {
+        // (m, k, n): the length-1 output dim makes it a gemv; k crosses the SIMD/scalar boundary
+        let shapes = [
+            (1usize, 40usize, 1usize), // 1x1: a bare dot
+            (64, 64, 1),
+            (129, 200, 1),
+            (1, 64, 17),
+            (1, 200, 64),
+            (1, 96, 129),
+        ];
+        for (m, k, n) in shapes {
+            for &la in &[Layout::Row, Layout::Col, Layout::GeneralPad] {
+                for &lc in &[Layout::Row, Layout::Col] {
+                    for &(al, be) in &[(1.0f64, 0.0), (1.0, 1.0), (0.75, -0.5), (0.0, 2.5)] {
+                        run_case::<T>(
+                            m,
+                            k,
+                            n,
+                            la,
+                            Layout::Col,
+                            lc,
+                            T::from_f64(al),
+                            T::from_f64(be),
+                            Parallelism::Serial,
+                        );
+                    }
+                }
+            }
+        }
+    }
+    check::<gemmkit::f16>();
+    check::<gemmkit::bf16>();
+}
+
+/// The widen gemv output-row partition computes each output element as one worker's single `f32`
+/// reduction (never split), so serial == parallel **bit-for-bit** for every thread count: the
+/// mixed twin of the promise the float gemv partition makes. Covers the dot layout (row-major A)
+/// and the axpy layout (col-major A + col-major C), for `n == 1` and `m == 1`. The gemv parallel
+/// floor is forced to 1 byte (RAII-restored) so the bandwidth partition engages at modest sizes on
+/// any machine, rather than relying on the shape exceeding an L3-derived floor
+#[cfg(feature = "half")]
+#[test]
+fn parallel_equals_serial_mixed_gemv() {
+    struct RestoreFloor(usize);
+    impl Drop for RestoreFloor {
+        fn drop(&mut self) {
+            gemmkit::tuning::set_gemv_parallel_bytes(self.0);
+        }
+    }
+    let _restore = RestoreFloor(gemmkit::tuning::gemv_parallel_bytes());
+    gemmkit::tuning::set_gemv_parallel_bytes(1); // tiny floor: force the row partition to engage
+
+    fn check<T: Elem>(la: Layout, label: &str) {
+        // n == 1 (mat*vec) and m == 1 (vec*mat), sized so the row partition splits across workers
+        for (m, k, n) in [
+            (4096usize, 512usize, 1usize),
+            (1, 512, 4096),
+            (2048, 320, 1),
+        ] {
+            for &(al, be) in &[(1.0f64, 0.0), (0.7, 1.3)] {
+                let a = Mat::<T>::rand(m, k, 0x6E7 + (m * 3 + k) as u64);
+                let b = Mat::<T>::rand(k, n, 0x11D + (n * 5 + k) as u64);
+                let c0 = Mat::<T>::rand(m, n, 0x03C + (m + n) as u64);
+                let (abuf, rsa, csa) = build_view(&a, la);
+                let (bbuf, rsb, csb) = build_view(&b, Layout::Col);
+                let (cbase, rsc, csc) = build_view(&c0, Layout::Col);
+                let (al, be) = (T::from_f64(al), T::from_f64(be));
+
+                let mut c_ser = cbase.clone();
+                gemm(
+                    al,
+                    MatRef::new(&abuf, m, k, rsa, csa),
+                    MatRef::new(&bbuf, k, n, rsb, csb),
+                    be,
+                    MatMut::new(&mut c_ser, m, n, rsc, csc),
+                    Parallelism::Serial,
+                );
+                for t in [2usize, 4, 8, 16] {
+                    let mut c_par = cbase.clone();
+                    gemm(
+                        al,
+                        MatRef::new(&abuf, m, k, rsa, csa),
+                        MatRef::new(&bbuf, k, n, rsb, csb),
+                        be,
+                        MatMut::new(&mut c_par, m, n, rsc, csc),
+                        Parallelism::Rayon(t),
+                    );
+                    assert!(
+                        c_ser
+                            .iter()
+                            .zip(&c_par)
+                            .all(|(a, b)| a.to_f64().to_bits() == b.to_f64().to_bits()),
+                        "mixed gemv {label} serial != parallel({t}) for {m}x{k}x{n}"
+                    );
+                }
+            }
+        }
+    }
+    check::<gemmkit::f16>(Layout::Row, "f16/dot"); // row-major A -> dot_rows_mixed
+    check::<gemmkit::f16>(Layout::Col, "f16/axpy"); // col-major A -> axpy_mixed
+    check::<gemmkit::bf16>(Layout::Row, "bf16/dot");
+    check::<gemmkit::bf16>(Layout::Col, "bf16/axpy");
+}
+
 /// Cross-check `f16` against the `gemm` crate (the ecosystem oracle, which also
 /// accumulates `f16` in `f32`): the 2 must agree to a tight `f16` tolerance.
 /// `gemm`'s `f16` *is* `half::f16` *is* `gemmkit::f16`, so the comparison is direct.

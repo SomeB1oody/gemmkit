@@ -310,7 +310,13 @@ Dispatch reroutes shapes the register-tiling driver fits poorly
 - **gemv** (`gemv.rs`): `m == 1 || n == 1`. Memory-bound; output rows are
   partitioned across workers with no split reductions, so it is bit-identical
   across worker counts. Two bit-identical axpy strategies (register-blocked
-  output vs plain column-outer) are chosen by output cache residency.
+  output vs plain column-outer) are chosen by output cache residency. The
+  mixed-precision (`f16`/`bf16`) twin `run_mixed` reuses the same partition but
+  widens each load to `f32` through the `KernelSimd` seam, accumulates in `f32`,
+  and rounds to the narrow type once at the store (only the register-blocked
+  axpy, since the narrow output must round exactly once); the mixed *fused*
+  gemv deliberately stays on the driver (which already rounds once after the
+  epilogue), so only the plain mixed path routes here.
 - **small-k** (`small_k.rs`): `k` at or below `small_k_threshold`. The whole
   product is one depth panel over the family's microkernel, reading A/B in
   place with no packing or blocking setup; generic over families.

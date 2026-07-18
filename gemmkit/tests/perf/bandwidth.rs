@@ -372,6 +372,86 @@ fn perf_gemv_dot() {
     }
 }
 
+/// f16/bf16 gemv `C(mx1) = A(mxk)*x` (or the `m == 1` transpose) through the widen gemv route,
+/// reported as GB/s of the minimum **narrow** traffic `(m*k + k + m)*sizeof(T)` (A read once, x
+/// once, C written once) plus a GFLOP/s figure (`2*m*k` flops). The dedicated widen gemv (gemv
+/// on) is measured against the general driver (gemv off, via the threshold toggle) on the same
+/// buffers, so machine drift cancels and the ratio is the honest speedup. `row_major_a` selects
+/// the dot layout (row-major A -> dot_rows_mixed) vs the axpy layout (col-major A -> axpy_mixed);
+/// both accumulate in f32 and round to the narrow type once at the store
+#[cfg(all(feature = "half", not(target_family = "wasm")))]
+fn bench_gemv_mixed<T: gemmkit::GemmScalar>(
+    label: &str,
+    m: usize,
+    k: usize,
+    row_major_a: bool,
+    par: Parallelism,
+    to_t: impl Fn(f32) -> T,
+) {
+    let a: Vec<T> = fill(m * k, 1).iter().map(|&v| to_t(v)).collect();
+    let x: Vec<T> = fill(k, 2).iter().map(|&v| to_t(v)).collect();
+    let mut c = vec![T::ZERO; m];
+    let bytes = (m * k + k + m) * core::mem::size_of::<T>();
+    let (alpha, beta) = (to_t(1.0), to_t(0.0));
+    let mut run = || {
+        measure_gbps(bytes, || {
+            let a_ref = if row_major_a {
+                MatRef::from_row_major(&a, m, k)
+            } else {
+                MatRef::from_col_major(&a, m, k)
+            };
+            gemm(
+                alpha,
+                a_ref,
+                MatRef::from_col_major(&x, k, 1),
+                beta,
+                MatMut::from_col_major(&mut c, m, 1),
+                par,
+            );
+        })
+    };
+    let prev = gemmkit::tuning::gemv_threshold();
+    gemmkit::tuning::set_gemv_threshold(usize::MAX - 1); // widen gemv route on
+    let gv = run();
+    gemmkit::tuning::set_gemv_threshold(0); // gemv off -> general driver (pads the length-1 dim)
+    let drv = run();
+    gemmkit::tuning::set_gemv_threshold(prev);
+    let gflops = gv.median * (2.0 * m as f64 * k as f64) / bytes as f64;
+    let mode = if matches!(par, Parallelism::Serial) {
+        "ser"
+    } else {
+        "par"
+    };
+    let layout = if row_major_a { "dot " } else { "axpy" };
+    println!(
+        "  {label} {layout} m={m:<7} k={k:<6} {mode}  gemv={:7.1} GB/s (±{:>2.0}%)  {:8.1} GFLOP/s   driver={:7.1}  ({:.2}× driver)",
+        gv.median,
+        gv.spread_pct(),
+        gflops,
+        drv.median,
+        gv.median / drv.median.max(1e-9),
+    );
+}
+
+#[cfg(all(feature = "half", not(target_family = "wasm")))]
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture"]
+fn perf_gemv_mixed() {
+    use gemmkit::{bf16, f16};
+    let _guard = BENCH_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    println!(
+        "\nf16/bf16 gemv (C[m×1] = A[m×k]·x) — widen gemv route (dot/axpy) vs general driver:"
+    );
+    for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
+        for &row_major_a in &[true, false] {
+            for &(m, k) in &[(4096usize, 4096usize), (65536, 1024), (1024, 65536)] {
+                bench_gemv_mixed::<f16>("f16 ", m, k, row_major_a, par, f16::from_f32);
+                bench_gemv_mixed::<bf16>("bf16", m, k, row_major_a, par, bf16::from_f32);
+            }
+        }
+    }
+}
+
 /// Investigation: for a gemv shape, measure the dedicated gemv special path vs the general
 /// driver (reached by disabling the gemv path) vs the `gemm` crate. Confirms the special
 /// path is the right choice (the driver, which packs A into micropanels for a compute-bound
