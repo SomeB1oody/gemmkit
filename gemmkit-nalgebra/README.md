@@ -18,7 +18,9 @@ feature). `prepack_lhs`/`prepack_rhs` build a reused pack handle for the
 `epilogue` feature adds fused entries: `gemm_fused` (bias plus activation), the
 per-element `gemm_map`, requantizing `gemm_i8_requant`/`gemm_i8_requant_u8`
 (`int8` + `epilogue`), and the bias-only `gemm_cplx_fused` (`complex` + `epilogue`).
-nalgebra has no rank-3 array type, so there are no batched entries.
+nalgebra has no rank-3 array type, so batched GEMM (`gemm_batched`) takes the batch as a
+slice of per-element `(&A, &B)` inputs paired with a slice of `&mut C` outputs (over
+gemmkit's pointer-array batched engine), with heterogeneous per-element shapes.
 
 ## Usage
 

@@ -4,7 +4,7 @@
 
 Zero-copy [faer](https://crates.io/crates/faer) adapter for the [gemmkit](https://crates.io/crates/gemmkit) GEMM engine. It accepts faer's view types (`MatRef<'_, T>` for the inputs, `MatMut<'_, T>` for the output), reads the data pointer and the element-unit `isize` row and column strides straight out of each view, and forwards them to gemmkit's raw engine. faer's column-major layout, transposed views, sub-matrices, and reversed (negative-stride) views therefore all work without copying.
 
-The entry points mirror the core gemmkit surface, including the feature-gated element families (`half`, `complex`, `int8`) and the fused epilogue entries (`epilogue`). faer has no rank-3 array type, so gemmkit's batched entries have no analogue here.
+The entry points mirror the core gemmkit surface, including the feature-gated element families (`half`, `complex`, `int8`) and the fused epilogue entries (`epilogue`). faer has no rank-3 array type, so batched GEMM (`gemm_batched`) takes the batch as a slice of per-element `(A, B)` `MatRef` inputs paired with a slice of `&mut C` `MatMut` outputs (over gemmkit's pointer-array batched engine), with heterogeneous per-element shapes.
 
 ## Usage
 

@@ -52,9 +52,14 @@ crates.io); the fuzz crate is a separate nightly-only root.
 
 The adapters pull matrix pointers and strides straight out of each library's
 native views (C-order, F-order, general and reversed strides, no copies) and
-forward to the `*_unchecked` engine. Each adapter feature (default `parallel`,
-plus `wasm_threads`, `half`, `complex`, `int8`, `epilogue`) forwards to the
-same-named gemmkit feature.
+forward to the `*_unchecked` engine. Batched GEMM is exposed in the shape each
+library's types allow: the ndarray adapter's 3-D strided `gemm_batched`
+(batch on axis 0, over the strided-batched engine), and the nalgebra/faer
+`gemm_batched` over a slice of per-element `(A, B)` inputs paired with a slice
+of `&mut C` outputs (over the pointer-array `gemm_batched_ptr_unchecked`
+engine, since neither library has a rank-3 type). Each adapter feature
+(default `parallel`, plus `wasm_threads`, `half`, `complex`, `int8`,
+`epilogue`) forwards to the same-named gemmkit feature.
 
 ## Layer map
 

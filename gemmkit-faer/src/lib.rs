@@ -37,8 +37,12 @@
 //! gemmkit's raw engine, so transposed, sub-matrix, and reversed (negative-stride) views all work
 //! without copying
 //!
-//! faer has no 3-D array / batch type, so the batched (`gemm_batched`, `gemm_batched_fused`) entries
-//! of the ndarray adapter have no analogue here
+//! faer has no rank-3 array / batch type, so the batched [`gemm_batched`] takes the batch as a slice
+//! of per-element `(A, B)` [`MatRef`] inputs paired with a slice of `&mut C`
+//! [`MatMut`] outputs (over gemmkit's pointer-array
+//! [`gemmkit::gemm_batched_ptr_unchecked`] engine), not the 3-D strided form the ndarray adapter
+//! uses; the one shared bias/activation `gemm_batched_fused` of the ndarray adapter has no
+//! pointer-array analogue in the core, so it is not mirrored here
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
@@ -50,9 +54,10 @@ pub use gemmkit::{Activation, Bias};
 #[cfg(feature = "complex")]
 use gemmkit::{ComplexScalar, gemm_cplx_unchecked, gemm_cplx_unchecked_with};
 use gemmkit::{
-    GemmScalar, Parallelism, Workspace, gemm_packed_a_unchecked, gemm_packed_a_unchecked_with,
-    gemm_packed_b_unchecked, gemm_packed_b_unchecked_with, gemm_unchecked, gemm_unchecked_with,
-    prepack_lhs_unchecked, prepack_rhs_unchecked,
+    GemmProblem, GemmScalar, Parallelism, Workspace, gemm_batched_ptr_unchecked,
+    gemm_packed_a_unchecked, gemm_packed_a_unchecked_with, gemm_packed_b_unchecked,
+    gemm_packed_b_unchecked_with, gemm_unchecked, gemm_unchecked_with, prepack_lhs_unchecked,
+    prepack_rhs_unchecked,
 };
 /// The prepacked-operand handles, re-exported so callers of [`prepack_rhs`] / [`prepack_lhs`] need
 /// not depend on `gemmkit` directly
@@ -81,6 +86,8 @@ use gemmkit::{
 #[cfg(feature = "int8")]
 use gemmkit::{gemm_i8_unchecked, gemm_i8_unchecked_with};
 
+// pointer-array-batched GEMM over a slice of per-element view triples
+mod batched;
 // shared view-adapter helpers (ref-part extraction, C-footprint / bias / requant validation)
 mod common;
 // complex GEMM entries with optional conjugation
@@ -100,6 +107,7 @@ mod map;
 // prepacked-operand (PackedLhs/PackedRhs) entries
 mod packed;
 
+pub use batched::gemm_batched;
 #[cfg(feature = "complex")]
 pub use cplx::{dot_cplx, gemm_cplx, gemm_cplx_with};
 #[cfg(all(feature = "complex", feature = "epilogue"))]

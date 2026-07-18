@@ -55,7 +55,11 @@ Initial release.
 - Zero-copy adapters over each library's native matrix views (C-order, F-order,
   general and reversed strides), mirroring the full core surface including the
   `half`/`int8`/`complex` families and the `epilogue` fused entries; batched
-  GEMM is exposed where the target library has a rank-3 type (ndarray only)
+  GEMM is exposed in the shape each library's types allow: the ndarray adapter's
+  3-D strided `gemm_batched`/`dot_batched` (and the fused twin), and the
+  nalgebra/faer `gemm_batched` over a slice of per-element `(A, B)` inputs paired
+  with a slice of `&mut C` outputs (gemmkit's pointer-array batched engine, with
+  heterogeneous per-element shapes; neither library has a rank-3 type)
 
 ### gemmkit-tune
 
