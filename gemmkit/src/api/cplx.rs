@@ -146,17 +146,19 @@ pub fn gemm_cplx_fused_with<T: ComplexScalar>(
     bias: Option<Bias<'_, T>>,
     par: Parallelism,
 ) {
-    validate_gemm_views(&a, &b, &c);
-
-    // Fused-bias validation: bias length matches its axis and does not overlap C
-    validate_bias(&bias, a.rows, b.cols, &c);
-
     // No bias: the fused path is pure identity, so delegate to plain `gemm_cplx`, the zero-cost
-    // path is then guaranteed (no fused monomorphization is instantiated)
+    // path is then guaranteed (no fused monomorphization is instantiated). Gated before
+    // validation (as the batched fused entry does) so the views are validated once, by the
+    // delegate, with byte-identical panics (with no bias `validate_bias` is a no-op)
     let Some(bias) = bias else {
         gemm_cplx_with(ws, alpha, a, conj_a, b, conj_b, beta, c, par);
         return;
     };
+
+    validate_gemm_views(&a, &b, &c);
+
+    // Fused-bias validation: bias length matches its axis and does not overlap C
+    validate_bias(&Some(bias), a.rows, b.cols, &c);
 
     let bias_spec = match bias {
         Bias::PerRow(s) => BiasSpec::Row(Ptr(s.as_ptr() as *mut T)),

@@ -6,6 +6,7 @@ use crate::kernel::epilogue::{BiasDim, FusedEpi};
 /// A bias vector fused into a [`gemm_fused`] call: 1 value per output **row** (length `m`)
 /// or per output **column** (length `n`), added to every element of that row / column after
 /// the product and before the activation
+#[derive(Copy, Clone)]
 pub enum Bias<'a, T> {
     /// 1 value per output row (length `m`)
     PerRow(&'a [T]),
@@ -78,19 +79,21 @@ pub fn gemm_fused_with<T: FusedScalar>(
     act: Option<Activation<T>>,
     par: Parallelism,
 ) {
+    // The identity-fused case cannot even reach a fused monomorphization: delegate to plain
+    // gemm so the zero-cost path is guaranteed. Gated before validation (as the batched fused
+    // entry does) so the views are validated once, by the delegate, with byte-identical panics
+    // (with no bias `validate_bias` is a no-op, and no activation skips the slope check)
+    if bias.is_none() && act.is_none() {
+        gemm_with(ws, alpha, a, b, beta, c, par);
+        return;
+    }
+
     validate_gemm_views(&a, &b, &c);
 
     // Fused-epilogue validation: bias length matches its axis and does not overlap C
     validate_bias(&bias, a.rows, b.cols, &c);
     if let Some(Activation::LeakyRelu(s)) = &act {
         assert!(T::finite(*s), "gemmkit: LeakyRelu slope must be finite");
-    }
-
-    // The identity-fused case cannot even reach a fused monomorphization: delegate to plain
-    // gemm so the zero-cost path is guaranteed
-    if bias.is_none() && act.is_none() {
-        gemm_with(ws, alpha, a, b, beta, c, par);
-        return;
     }
 
     let epi = to_fused_epi(bias, act);
