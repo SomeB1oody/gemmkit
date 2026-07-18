@@ -560,6 +560,18 @@ pub fn set_thread_dim_stride(v: usize) {
     THREAD_DIM_STRIDE.set(v);
 }
 
+/// As [`thread_dim_stride`] but deriving the auto value from an already-sampled core
+/// count: `resolve` needs the count anyway for its worker cap, so it samples
+/// `available_parallelism` once and shares it, instead of paying a 2nd
+/// affinity/cgroup query inside the stride derivation on every auto-parallel call
+#[cfg(feature = "parallel")]
+pub(crate) fn thread_dim_stride_for(cores: usize) -> usize {
+    match THREAD_DIM_STRIDE.get() {
+        0 => auto_stride_for(cores),
+        v => v.max(1),
+    }
+}
+
 /// Get the worker count for a threaded wasm build (default 8). See `WASM_THREADS`.
 /// Only exists on `wasm32` with the `wasm_threads` feature, where the runtime cannot
 /// report a core count; elsewhere `available_parallelism` is used instead
@@ -583,14 +595,22 @@ pub fn set_wasm_threads(v: usize) {
 /// count is only a proxy and the interpolation between the 2 anchors is unvalidated.
 /// The `16` floor keeps small machines from ramping *more* aggressively than measured (a
 /// bare `cores^2/16` gives `1` at 4 cores); the `64` ceiling keeps large ones no more
-/// aggressive than the legacy default. `available_parallelism` is cheap and `resolve`
-/// already calls it per region, so this is recomputed, not memoized. Override
+/// aggressive than the legacy default. Recomputed, not memoized (affinity can change at
+/// runtime); `resolve` samples the count once per call and routes it through
+/// [`thread_dim_stride_for`], so the hot path pays a single query. Override
 /// `GEMMKIT_THREAD_DIM_STRIDE` on any topology this 2-point fit misses
 #[cfg(feature = "std")]
 fn auto_thread_dim_stride() -> usize {
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(8);
+    auto_stride_for(cores)
+}
+
+/// The `cores -> stride` fit shared by the self-querying getter above and the
+/// caller-sampled [`thread_dim_stride_for`]
+#[cfg(any(feature = "std", feature = "parallel"))]
+fn auto_stride_for(cores: usize) -> usize {
     (cores * cores / 16).clamp(16, 64)
 }
 /// Without `std` there is no `available_parallelism`; keep the legacy constant

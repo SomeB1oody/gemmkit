@@ -190,6 +190,53 @@ fn perf_sgemm() {
     }
 }
 
+/// Per-call latency probe for shapes at and just above the parallel work gate
+/// (`parallel_threshold`, default 48*48*256): a few-MFLOP product runs tens of microseconds,
+/// so the fixed per-call resolve cost (knob reads, core-count queries, worker-ramp math) is a
+/// visible fraction here and nowhere else. Serial is the control: its resolve path exits
+/// before any core-count query, so a resolve-cost change moves only the parallel rows
+#[cfg(not(target_family = "wasm"))]
+fn bench_call_latency(m: usize, k: usize, n: usize, par: Parallelism) {
+    let a = fill(m * k, 1);
+    let b = fill(k * n, 2);
+    let mut c = vec![0.0f32; m * n];
+    let st = measure(m, k, n, || {
+        gemm(
+            1.0,
+            MatRef::from_col_major(&a, m, k),
+            MatRef::from_col_major(&b, k, n),
+            0.0,
+            MatMut::from_col_major(&mut c, m, n),
+            par,
+        );
+    });
+    let mode = if matches!(par, Parallelism::Serial) {
+        "ser"
+    } else {
+        "par"
+    };
+    // Median microseconds per call, derived from the median throughput
+    let us = 2.0 * m as f64 * k as f64 * n as f64 / st.median / 1e3;
+    println!(
+        "  {m:>4}x{k:<4}x{n:<4} {mode}  {:7.1} GFLOP/s (±{:>2.0}%)  {us:7.2} us/call",
+        st.median,
+        st.spread_pct()
+    );
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture"]
+fn perf_call_latency() {
+    let _guard = BENCH_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    println!("\nper-call latency at the parallel gate (fixed resolve cost visibility):");
+    for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
+        bench_call_latency(48, 256, 48, par);
+        bench_call_latency(96, 256, 96, par);
+        bench_call_latency(128, 256, 128, par);
+    }
+}
+
 /// Lean perf-neutrality probe (gemmkit only, no external baselines): measures the paths touched by
 /// the runtime-knob promotion at a few representative shapes, so a before/after run confirms the
 /// hoisted per-call knob read is free (it is one relaxed atomic load per call, never per element).

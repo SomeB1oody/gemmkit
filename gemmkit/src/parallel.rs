@@ -104,10 +104,15 @@ impl Parallelism {
                 }
                 // Auto: ramp workers with the linear dimension; contention
                 // grows with the worker count. The stride is core-count-derived
-                // by default and tunable via `GEMMKIT_THREAD_DIM_STRIDE`
+                // by default and tunable via `GEMMKIT_THREAD_DIM_STRIDE`. The core
+                // count is sampled once and shared between the stride derivation
+                // and the cap (`available_parallelism` walks affinity + cgroup
+                // state on Linux, so the duplicate query was the dearest part of
+                // this fixed per-call cost)
+                let cores = auto_threads();
                 let dim = (mnk as f64).cbrt() as usize; // roughly n for square problems
-                let want = dim.div_ceil(tuning::thread_dim_stride());
-                want.min(auto_threads()).min(n_jobs).max(1)
+                let want = dim.div_ceil(tuning::thread_dim_stride_for(cores));
+                want.min(cores).min(n_jobs).max(1)
             }
         }
     }
@@ -149,8 +154,10 @@ impl Parallelism {
                 // Auto: step straight to the cap. A *few* workers is the worst choice for a
                 // bandwidth-bound shape - the scaling curve dips there (fork/join + shared-cache
                 // contention) before the cap's aggregate DRAM bandwidth pays off - so a ramp
-                // through the dip beats neither serial (below the floor) nor the cap
-                bandwidth_cap().min(auto_threads()).min(rows).max(1)
+                // through the dip beats neither serial (below the floor) nor the cap. The core
+                // count is sampled once and shared with the cap's auto proxy
+                let cores = auto_threads();
+                bandwidth_cap(cores).min(cores).min(rows).max(1)
             }
         }
     }
@@ -310,13 +317,13 @@ impl Parallelism {
 ///   so half the logical count (7) sits on the broad t=4-8 plateau. A higher-bandwidth part
 ///   wants more - raise the knob
 #[cfg(feature = "parallel")]
-fn bandwidth_cap() -> usize {
+fn bandwidth_cap(cores: usize) -> usize {
     match tuning::gemv_thread_cap() {
         0 => {
             #[cfg(target_arch = "aarch64")]
-            let auto = auto_threads() / 2;
+            let auto = cores / 2;
             #[cfg(not(target_arch = "aarch64"))]
-            let auto = auto_threads() / 4;
+            let auto = cores / 4;
             auto.max(2)
         }
         v => v.max(1),
