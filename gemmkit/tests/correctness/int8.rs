@@ -48,6 +48,88 @@ fn correctness_i8() {
     }
 }
 
+/// The `small_mn` horizontal i8 route (both `m, n` small, long `k`, A rows / B cols unit-stride
+/// along `k`) must be **bit-exact** vs the register-tiling driver: `i32` is a ring, so the single
+/// fixed-order widen dot and the driver's panel-split accumulation land on the same wrapping `i32`.
+/// Straddle the default `small_mn_dim` gate (`m, n` in `1..=17`, so `17` in either axis spills to
+/// the driver), tail-sized `k` (`small_k_threshold + 1`, not a multiple of the tile), every
+/// alpha/beta sign, and serial + parallel. For each shape BOTH the eligible layout (row-major A +
+/// col-major B, which the orientation swap re-orients into `small_mn`'s unit-stride operands) and
+/// an ineligible layout (row-major B, whose post-swap A columns are strided along `k`, so the gate
+/// rejects it and the driver runs) are checked against the exact `i64` reference. No tuning-knob
+/// flip, so the route is selected by the real dispatch and it cannot perturb concurrent tests
+#[cfg(feature = "int8")]
+#[test]
+fn i8_small_mn_matches_reference() {
+    use gemmkit::{MatMut, MatRef};
+    let kt = gemmkit::tuning::small_k_threshold();
+    // Straddle `small_mn_dim` (16): tail sizes (not multiples of the 4x4 register tile) drive the
+    // edge-cell dot, `1` the degenerate single row/col, `17` the spill to the driver
+    let dims: &[usize] = if fast_test() {
+        &[1, 3, 4, 7, 16, 17]
+    } else {
+        &[1, 2, 3, 4, 5, 7, 8, 13, 16, 17]
+    };
+    let ks: &[usize] = if fast_test() {
+        &[kt + 1]
+    } else {
+        &[kt + 1, 4096]
+    };
+    for &m in dims {
+        for &n in dims {
+            for &k in ks {
+                let a = rand_i8(m * k, 0x510 + (m * 131 + n * 7) as u64);
+                let b = rand_i8(k * n, 0x620 + (n * 17 + k * 3) as u64);
+                // Column-major B (rsb=1, csb=k): the eligible-layout twin of the row-major B
+                let bcol: Vec<i8> = {
+                    let mut v = vec![0i8; k * n];
+                    for p in 0..k {
+                        for j in 0..n {
+                            v[p + j * k] = b[p * n + j];
+                        }
+                    }
+                    v
+                };
+                for &(alpha, beta) in &[(1i32, 0i32), (1, 1), (2, 2), (0, 1), (3, -1)] {
+                    let c0: Vec<i32> = (0..m * n).map(|x| (x as i32 % 7) - 3).collect();
+                    let cref = ref_i8(&a, &b, &c0, m, k, n, alpha, beta);
+                    for par in [Parallelism::Serial, Parallelism::Rayon(4)] {
+                        // Eligible: row-major A + col-major B + row-major C => `small_mn` for
+                        // m,n <= 16 (m or n == 17 spills to the driver); both must equal the ref
+                        let mut c_h = c0.clone();
+                        gemmkit::gemm_i8(
+                            alpha,
+                            MatRef::from_row_major(&a, m, k),
+                            MatRef::new(&bcol, k, n, 1, k as isize),
+                            beta,
+                            MatMut::from_row_major(&mut c_h, m, n),
+                            par,
+                        );
+                        assert_eq!(
+                            c_h, cref,
+                            "i8 small_mn (eligible) {m}x{k}x{n} alpha={alpha} beta={beta} {par:?}"
+                        );
+                        // Ineligible: row-major B => the driver route on the same math
+                        let mut c_d = c0.clone();
+                        gemmkit::gemm_i8(
+                            alpha,
+                            MatRef::from_row_major(&a, m, k),
+                            MatRef::from_row_major(&b, k, n),
+                            beta,
+                            MatMut::from_row_major(&mut c_d, m, n),
+                            par,
+                        );
+                        assert_eq!(
+                            c_d, cref,
+                            "i8 driver (ineligible) {m}x{k}x{n} alpha={alpha} beta={beta} {par:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// `gemm_i8_unchecked_with` (raw pointers + a caller-owned `Workspace`) must equal `gemm_i8`.
 /// It is the FFI/adapter-facing signature and the missing `_with` sibling for the reuse-workspace path
 #[cfg(feature = "int8")]

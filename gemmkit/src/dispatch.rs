@@ -396,17 +396,26 @@ fn orient_transpose<T>(t: &mut Task<T>) -> bool {
     )
 }
 
-/// `true` when a post-swap [`Task`] should take the horizontal `small_mn` path: small `m,n`
-/// with a long contraction and both operands streaming contiguously along `k` (A rows
-/// unit-stride `csa == 1`, B columns unit-stride `rsb == 1`). Shared by the float / mixed /
-/// bf16-dot entries: the gate has been re-tuned as one unit, so it lives in one place
+/// `true` when a post-swap problem should take the horizontal `small_mn` path, from the raw
+/// oriented dimensions / strides: small `m,n` with a long contraction and both operands
+/// streaming contiguously along `k` (A rows unit-stride `csa == 1`, B columns unit-stride
+/// `rsb == 1`). This is the field-level core so the homogeneous / mixed [`Task`] path and the
+/// heterogeneous integer `IntTask` path share ONE gate: the tuning has been calibrated as a
+/// unit, so it must not drift between them
+#[inline]
+fn small_mn_eligible_dims(m: usize, n: usize, k: usize, csa: isize, rsb: isize) -> bool {
+    m <= tuning::small_mn_dim()
+        && n <= tuning::small_mn_dim()
+        && k > tuning::small_k_threshold()
+        && csa == 1
+        && rsb == 1
+}
+
+/// `true` when a post-swap [`Task`] should take the horizontal `small_mn` path (see
+/// [`small_mn_eligible_dims`]). Shared by the float / mixed / bf16-dot entries
 #[inline]
 fn small_mn_eligible<T>(t: &Task<T>) -> bool {
-    t.m <= tuning::small_mn_dim()
-        && t.n <= tuning::small_mn_dim()
-        && t.k > tuning::small_k_threshold()
-        && t.csa == 1
-        && t.rsb == 1
+    small_mn_eligible_dims(t.m, t.n, t.k, t.csa, t.rsb)
 }
 
 /// `C <- beta*C` for a **homogeneous float** type (`f32`/`f64`): in-place scale,

@@ -251,6 +251,46 @@ fn bench_small_mn_bf16(m: usize, n: usize, k: usize, par: Parallelism) {
     );
 }
 
+/// `perf_small_mn` row for **i8 -> i32** (widen horizontal dot vs the register-tiling driver). On
+/// this box the driver is the `vpdpbusd` VNNI dot kernel serial (the widen kernel small-parallel),
+/// so the `xh` ratio measures the widen horizontal route against whichever driver kernel is picked.
+/// The horizontal path widens `i8 -> i32` on load and reduces in `i32`; no `gemm`-crate i8 baseline
+/// (0.18 lacks it), so it is horiz-vs-small_k-vs-driver only. Fast-path layout: row-major A,
+/// col-major B, col-major C32
+#[cfg(all(feature = "int8", not(target_family = "wasm")))]
+fn bench_small_mn_i8(m: usize, n: usize, k: usize, par: Parallelism) {
+    let a: Vec<i8> = (0..m * k).map(|i| (i % 17) as i8 - 8).collect();
+    let b: Vec<i8> = (0..k * n).map(|i| (i % 13) as i8 - 6).collect();
+    let mut c = vec![0i32; m * n];
+    let mut run = || {
+        measure(m, k, n, || {
+            gemmkit::gemm_i8(
+                1,
+                MatRef::from_row_major(&a, m, k),
+                MatRef::from_col_major(&b, k, n),
+                0,
+                MatMut::from_col_major(&mut c, m, n),
+                par,
+            );
+        })
+    };
+    let horiz = with_route(usize::MAX, 0, &mut run);
+    let smallk = with_route(0, usize::MAX, &mut run);
+    let driver = with_route(0, 0, &mut run);
+    let mode = if matches!(par, Parallelism::Serial) {
+        "ser"
+    } else {
+        "par"
+    };
+    println!(
+        "  {m:>2}×{n:<2} k={k:<5} {mode}  horiz={:7.1}  small_k={:7.1}  driver={:7.1} ({:.2}× h)",
+        horiz.median,
+        smallk.median,
+        driver.median,
+        horiz.median / driver.median.max(1e-9),
+    );
+}
+
 /// Small-matrix horizontal (inner-product) route: small `m,n`, long `k`. Sweeps the output
 /// dimensions against the contraction, forcing each of the 3 gemmkit routes (horizontal /
 /// small_k / driver) plus the `gemm`-crate and `matrixmultiply` baselines. The crossover (where
@@ -279,6 +319,21 @@ fn perf_small_mn() {
     // The route needs A rows / B cols unit-stride along `k`; a col-major A (strided along `k`)
     // would force a scalar dot that loses to the driver's packed microkernel, so the dispatch
     // gate excludes it and those shapes stay on the driver
+
+    #[cfg(feature = "int8")]
+    {
+        println!("\n  i8 -> i32 (widen horizontal dot vs vpdpbusd/widen driver):");
+        for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
+            for &(m, n, k) in &[
+                (4usize, 4usize, 65536usize),
+                (8, 8, 65536),
+                (16, 16, 65536),
+                (16, 16, 4096),
+            ] {
+                bench_small_mn_i8(m, n, k, par);
+            }
+        }
+    }
 
     #[cfg(feature = "half")]
     {

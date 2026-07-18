@@ -30,7 +30,7 @@ use crate::parallel::{self, JobCursor, Parallelism, Ptr};
 use crate::scalar::Float;
 #[cfg(feature = "half")]
 use crate::scalar::NarrowFloat;
-#[cfg(feature = "half")]
+#[cfg(any(feature = "half", feature = "int8"))]
 use crate::simd::KernelSimd;
 use crate::simd::SimdOps;
 
@@ -650,5 +650,236 @@ unsafe fn cell_dot_mixed<N, S, E>(
         } else {
             epi.apply(out, i, j)
         };
+    }
+}
+
+/// Integer (`i8` inputs, `i32` accumulate) sibling of [`run`]: same `MT x NT` tiling and output
+/// partition, but each A-row / B-col is **widen-loaded** `i8 -> i32` ([`KernelSimd::load_lhs`],
+/// the same seam the `IntGemm` microkernel uses) and accumulated in `i32`. `alpha`/`beta`/`C` are
+/// all `i32`, combined `C <- alpha*<A[i,:], B[:,j]> + beta*C[i,j]` in wrapping `i32`
+///
+/// Bit-identical to the register-tiling driver route (`IntGemm`, or the `IntGemmVnni` dot kernel
+/// this route bypasses): `i32` is a ring, so wrapping add is fully associative and wrapping mul
+/// distributes over it, so the driver's panel-split accumulation and this single fixed-order dot
+/// land on the same `i32`. No epilogue variant exists (the `i8 -> i32` `IntTask` path never fuses;
+/// the fused requantizing families keep their own dedicated route). Same reproducibility as [`run`]
+///
+/// # Safety
+/// As [`run`] (A rows / B cols unit-stride along `k`, `c` not aliasing `a`/`b`, CPU supports `S`)
+#[cfg(feature = "int8")]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn run_int<S>(
+    simd: S,
+    m: usize,
+    k: usize,
+    n: usize,
+    par: Parallelism,
+    alpha: i32,
+    a: *const i8,
+    rsa: isize,
+    csa: isize,
+    b: *const i8,
+    rsb: isize,
+    csb: isize,
+    beta: i32,
+    c: *mut i32,
+    rsc: isize,
+    csc: isize,
+) where
+    S: KernelSimd<i8, i8, i32, i32>,
+{
+    debug_assert!(
+        csa == 1 && rsb == 1,
+        "small_mn requires A rows / B cols unit-stride along k"
+    );
+    unsafe {
+        let n_row_tiles = m.div_ceil(MT);
+
+        // Bandwidth-capped worker count: A / B read once as `i8`, C written once as `i32`
+        let bytes = m
+            .saturating_mul(k)
+            .saturating_add(k.saturating_mul(n))
+            .saturating_mul(core::mem::size_of::<i8>())
+            .saturating_add(
+                m.saturating_mul(n)
+                    .saturating_mul(core::mem::size_of::<i32>()),
+            );
+
+        let a = Ptr(a as *mut i8);
+        let b = Ptr(b as *mut i8);
+        let c = Ptr(c);
+
+        let body = move |q_start: usize, q_end: usize| {
+            let (a, b, c) = (a, b, c);
+            let a = a.0 as *const i8;
+            let b = b.0 as *const i8;
+            let c = c.0;
+            simd.vectorize(|| {
+                for q in q_start..q_end {
+                    let it = q % n_row_tiles;
+                    let jt = q / n_row_tiles;
+                    let i0 = it * MT;
+                    let j0 = jt * NT;
+                    let mi = core::cmp::min(MT, m - i0);
+                    let nj = core::cmp::min(NT, n - j0);
+                    if mi == MT && nj == NT {
+                        full_tile_int::<S, MT, NT>(
+                            simd, k, i0, j0, alpha, a, rsa, b, csb, beta, c, rsc, csc,
+                        );
+                    } else {
+                        for cc in 0..nj {
+                            for ir in 0..mi {
+                                cell_dot_int::<S>(
+                                    simd,
+                                    k,
+                                    i0 + ir,
+                                    j0 + cc,
+                                    alpha,
+                                    a,
+                                    rsa,
+                                    b,
+                                    csb,
+                                    beta,
+                                    c,
+                                    rsc,
+                                    csc,
+                                );
+                            }
+                        }
+                    }
+                }
+            });
+        };
+
+        tile_sweep(m, n, bytes, par, body);
+    }
+}
+
+/// Integer sibling of [`full_tile`] (see [`run_int`]): hold `MT*NT` `i32` accumulators live across
+/// the `k`-sweep, widen-loading each A-row and B-column `i8 -> i32` once per depth step, then one
+/// `reduce_sum` + ascending scalar `k`-tail + wrapping `alpha`/`beta` combine per cell. The
+/// `load_lhs` / `mul_add` / `reduce_sum` are the `i32`-accumulator seams (wrapping arithmetic), so
+/// the per-cell result matches the `IntGemm` driver's exactly
+///
+/// # Safety
+/// As [`full_tile`], with `i8` inputs / `i32` accumulator and output
+#[cfg(feature = "int8")]
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+unsafe fn full_tile_int<S, const MT: usize, const NT: usize>(
+    simd: S,
+    k: usize,
+    i0: usize,
+    j0: usize,
+    alpha: i32,
+    a: *const i8,
+    rsa: isize,
+    b: *const i8,
+    csb: isize,
+    beta: i32,
+    c: *mut i32,
+    rsc: isize,
+    csc: isize,
+) where
+    S: KernelSimd<i8, i8, i32, i32>,
+{
+    unsafe {
+        let lanes = <S as SimdOps<i32>>::LANES;
+        let rows: [*const i8; MT] = core::array::from_fn(|r| a.offset((i0 + r) as isize * rsa));
+        let cols: [*const i8; NT] = core::array::from_fn(|cc| b.offset((j0 + cc) as isize * csb));
+
+        let mut acc: [[<S as SimdOps<i32>>::Reg; MT]; NT] = [[simd.zero(); MT]; NT];
+        let mut kk = 0;
+        while kk + lanes <= k {
+            // UFCS: a widen token also carries the requant `KernelSimd<i8,i8,i32,{i8,u8}>` impls,
+            // so the bare `load_lhs` would be ambiguous (see `kernel::int::i32_accumulate`)
+            let av: [<S as SimdOps<i32>>::Reg; MT] = core::array::from_fn(|r| {
+                <S as KernelSimd<i8, i8, i32, i32>>::load_lhs(simd, rows[r].add(kk))
+            });
+            for cc in 0..NT {
+                let bv = <S as KernelSimd<i8, i8, i32, i32>>::load_lhs(simd, cols[cc].add(kk));
+                for r in 0..MT {
+                    acc[cc][r] = simd.mul_add(av[r], bv, acc[cc][r]);
+                }
+            }
+            kk += lanes;
+        }
+        for cc in 0..NT {
+            for r in 0..MT {
+                let mut dot = simd.reduce_sum(acc[cc][r]);
+                let mut t = kk;
+                while t < k {
+                    dot = dot.wrapping_add(
+                        (*rows[r].add(t) as i32).wrapping_mul(*cols[cc].add(t) as i32),
+                    );
+                    t += 1;
+                }
+                let cp = c.offset((i0 + r) as isize * rsc + (j0 + cc) as isize * csc);
+                let ov = if beta == 0 {
+                    0
+                } else if beta == 1 {
+                    *cp
+                } else {
+                    beta.wrapping_mul(*cp)
+                };
+                *cp = alpha.wrapping_mul(dot).wrapping_add(ov);
+            }
+        }
+    }
+}
+
+/// Integer sibling of [`cell_dot`] (edge-tile path; see [`run_int`]): an `i8 -> i32` widen-load
+/// single-accumulator dot plus ascending scalar tail, `beta`/`alpha` folded in wrapping `i32`
+///
+/// # Safety
+/// As [`cell_dot`], with `i8` inputs / `i32` accumulator and output
+#[cfg(feature = "int8")]
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+unsafe fn cell_dot_int<S>(
+    simd: S,
+    k: usize,
+    i: usize,
+    j: usize,
+    alpha: i32,
+    a: *const i8,
+    rsa: isize,
+    b: *const i8,
+    csb: isize,
+    beta: i32,
+    c: *mut i32,
+    rsc: isize,
+    csc: isize,
+) where
+    S: KernelSimd<i8, i8, i32, i32>,
+{
+    unsafe {
+        let lanes = <S as SimdOps<i32>>::LANES;
+        let row = a.offset(i as isize * rsa);
+        let col = b.offset(j as isize * csb);
+        let mut acc = simd.zero();
+        let mut kk = 0;
+        while kk + lanes <= k {
+            acc = simd.mul_add(
+                <S as KernelSimd<i8, i8, i32, i32>>::load_lhs(simd, row.add(kk)),
+                <S as KernelSimd<i8, i8, i32, i32>>::load_lhs(simd, col.add(kk)),
+                acc,
+            );
+            kk += lanes;
+        }
+        let mut dot = simd.reduce_sum(acc);
+        while kk < k {
+            dot = dot.wrapping_add((*row.add(kk) as i32).wrapping_mul(*col.add(kk) as i32));
+            kk += 1;
+        }
+        let cp = c.offset(i as isize * rsc + j as isize * csc);
+        let ov = if beta == 0 {
+            0
+        } else if beta == 1 {
+            *cp
+        } else {
+            beta.wrapping_mul(*cp)
+        };
+        *cp = alpha.wrapping_mul(dot).wrapping_add(ov);
     }
 }
