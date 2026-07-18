@@ -58,6 +58,39 @@ pub(crate) struct IntTask {
     pub csc: isize,
 }
 
+/// An **integer** GEMM whose RHS is already prepacked into the selected kernel family's
+/// micropanel layout: `C(i32) <- alpha*A(i8)*(prepacked B) + beta*C`. The heterogeneous
+/// (`i8 -> i32`) twin of [`crate::dispatch::PackedConsume`]; it carries the blocking geometry
+/// (`nr`, `kc`, `nc`) the buffer was packed for, which the consuming call reads back verbatim so
+/// a reused panel always matches its tiling
+#[cfg(feature = "int8")]
+pub(crate) struct IntPackedConsume {
+    /// Rows of A and C
+    pub m: usize,
+    /// Shared dimension (cols of A == prepacked B's depth)
+    pub k: usize,
+    /// Cols of the prepacked B and of C
+    pub n: usize,
+    /// Product scale
+    pub alpha: i32,
+    /// LHS base pointer + strides
+    pub a: *const i8,
+    pub rsa: isize,
+    pub csa: isize,
+    /// Prepacked RHS micropanel buffer base (see [`crate::driver::pack_rhs_full`])
+    pub packed: *const i8,
+    /// Blocking geometry baked into `packed` at pack time
+    pub nr: usize,
+    pub kc: usize,
+    pub nc: usize,
+    /// Accumulator scale
+    pub beta: i32,
+    /// Output base pointer + strides
+    pub c: *mut i32,
+    pub rsc: isize,
+    pub csc: isize,
+}
+
 // Integer GEMM (i8 -> i32): a dedicated heterogeneous dispatch path, since the
 // homogeneous `GemmScalar` cannot express `Out != Lhs`
 
@@ -194,11 +227,120 @@ unsafe fn gemm_i8_simd128(t: IntTask, par: Parallelism, ws: &mut Workspace) {
     unsafe { run_typed_int::<IntGemm, Simd128, 2, 4>(Simd128, t, par, ws) }
 }
 
+/// Prepacked-RHS integer driver entry for a concrete `(family, ISA, tile)`. No gemv route, no
+/// small_k reroute, and **no orientation swap**: the API guarantees column-major-ish C, so the
+/// prepacked buffer is always the genuine RHS. The heterogeneous mirror of the float
+/// `run_packed_typed`
+///
+/// # Safety
+/// As [`run_typed_int`], plus `req.packed` valid for the geometry recorded in `req`
+#[cfg(feature = "int8")]
+#[inline]
+unsafe fn run_packed_typed_int<Fam, S, const MR_REG: usize, const NR: usize>(
+    simd: S,
+    req: IntPackedConsume,
+    par: Parallelism,
+    ws: &mut Workspace,
+) where
+    Fam: KernelFamily<Lhs = i8, Rhs = i8, Acc = i32, Out = i32>,
+    S: KernelSimd<i8, i8, i32, i32>,
+{
+    unsafe {
+        // One process's memoized ISA choice guarantees `NR` and the buffer's recorded `nr` agree
+        debug_assert_eq!(NR, req.nr, "prepacked RHS panel width != kernel NR");
+        driver::run_packed_rhs::<Fam, S, MR_REG, NR>(
+            simd, req.m, req.k, req.n, req.alpha, req.a, req.rsa, req.csa, req.packed, req.kc,
+            req.nc, req.beta, req.c, req.rsc, req.csc, par, ws,
+        );
+    }
+}
+
+// prepacked-RHS integer entry points: one per (ISA, family), same tiles as the plain wrappers
+// The widen ISAs consume a plain-panel buffer (`IntGemm`); the VNNI entry consumes the
+// k-quad-interleaved buffer (`IntGemmVnni`). Each is cfg-gated exactly like its plain sibling
+
+#[cfg(feature = "int8")]
+unsafe fn gemm_i8_scalar_packed(r: IntPackedConsume, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_packed_typed_int::<IntGemm, ScalarTok, 4, 4>(ScalarTok, r, par, ws) }
+}
+#[cfg(all(feature = "int8", any(target_arch = "x86", target_arch = "x86_64")))]
+unsafe fn gemm_i8_fma_packed(r: IntPackedConsume, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_packed_typed_int::<IntGemm, Fma, 2, 6>(Fma, r, par, ws) }
+}
+#[cfg(all(feature = "int8", any(target_arch = "x86", target_arch = "x86_64")))]
+unsafe fn gemm_i8_avx512_packed(r: IntPackedConsume, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_packed_typed_int::<IntGemm, Avx512, 2, 12>(Avx512, r, par, ws) }
+}
+#[cfg(all(feature = "int8", any(target_arch = "x86", target_arch = "x86_64")))]
+unsafe fn gemm_i8_avx512vnni_packed(r: IntPackedConsume, par: Parallelism, ws: &mut Workspace) {
+    // The buffer is k-quad-interleaved, so it MUST be consumed by the VNNI family; the widen
+    // small-parallel fallback would misread the quad layout, so the packed path never applies it
+    unsafe { run_packed_typed_int::<IntGemmVnni, Avx512Vnni, 2, 12>(Avx512Vnni, r, par, ws) }
+}
+#[cfg(all(feature = "int8", target_arch = "aarch64"))]
+unsafe fn gemm_i8_neon_packed(r: IntPackedConsume, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_packed_typed_int::<IntGemm, Neon, 4, 4>(Neon, r, par, ws) }
+}
+#[cfg(all(feature = "int8", target_arch = "wasm32", target_feature = "simd128"))]
+unsafe fn gemm_i8_simd128_packed(r: IntPackedConsume, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_packed_typed_int::<IntGemm, Simd128, 2, 4>(Simd128, r, par, ws) }
+}
+
+/// Pack a full `(k, n)` RHS into the widen (`IntGemm`) micropanel layout (plain panels,
+/// `DEPTH_MULTIPLE = 1`), the same `pack_rhs_full` the per-call widen driver runs
+///
+/// # Safety
+/// As [`driver::pack_rhs_full`]
+#[cfg(feature = "int8")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn pack_rhs_i8_widen(
+    dst: *mut i8,
+    b: *const i8,
+    rsb: isize,
+    csb: isize,
+    k: usize,
+    n: usize,
+    kc: usize,
+    nc: usize,
+    nr: usize,
+) {
+    unsafe { driver::pack_rhs_full::<IntGemm>(dst, b, rsb, csb, k, n, kc, nc, nr) }
+}
+
+/// Pack a full `(k, n)` RHS into the VNNI (`IntGemmVnni`) k-quad-interleaved layout
+/// (`DEPTH_MULTIPLE = 4`, identity transform on RHS: the `+128` bias lives on the LHS side), the
+/// same `pack_rhs_full` the per-call VNNI driver runs
+///
+/// # Safety
+/// As [`driver::pack_rhs_full`]
+#[cfg(all(feature = "int8", any(target_arch = "x86", target_arch = "x86_64")))]
+#[allow(clippy::too_many_arguments)]
+unsafe fn pack_rhs_i8_vnni(
+    dst: *mut i8,
+    b: *const i8,
+    rsb: isize,
+    csb: isize,
+    k: usize,
+    n: usize,
+    kc: usize,
+    nc: usize,
+    nr: usize,
+) {
+    unsafe { driver::pack_rhs_full::<IntGemmVnni>(dst, b, rsb, csb, k, n, kc, nc, nr) }
+}
+
 #[cfg(feature = "int8")]
 type IntFn = unsafe fn(IntTask, Parallelism, &mut Workspace);
+/// A per-ISA prepacked-RHS integer consume entry (`Copy`, a fn pointer)
+#[cfg(feature = "int8")]
+type IntPackedFn = unsafe fn(IntPackedConsume, Parallelism, &mut Workspace);
+/// Packs a full RHS into the selected family's micropanel layout (`pack_rhs_full` bound to
+/// `IntGemm` / `IntGemmVnni`); a `Copy` fn pointer carried by the descriptor
+#[cfg(feature = "int8")]
+type IntPackFn = unsafe fn(*mut i8, *const i8, isize, isize, usize, usize, usize, usize, usize);
 
-/// Memoized integer dispatch slot (mirror of [`Dispatched`] but a single kernel, integer
-/// prepack is not yet a public API)
+/// Memoized integer dispatch slot (mirror of [`Dispatched`]): the plain kernel, the
+/// prepacked-RHS kernel, the RHS packer, and the microtile geometry they share
 ///
 /// `small_par_fallback` replaces `run` for *auto-selected, multi-threaded, small*
 /// problems. Only the VNNI auto path sets it: VNNI's mandatory RHS-pack barrier (the
@@ -206,42 +348,88 @@ type IntFn = unsafe fn(IntTask, Parallelism, &mut Workspace);
 /// problem, so the in-place widen kernel wins; serial and large-parallel runs keep VNNI.
 /// `None` for every other selection and when VNNI is *forced* (force must run exactly
 /// that kernel). Bit-identical to VNNI (exact i32), so the swap never perturbs results
+///
+/// `run_packed` / `pack_rhs` serve the fixed-weight prepacked-RHS path. They are ALWAYS the
+/// memoized family's (VNNI's when auto-VNNI is selected), never the widen `small_par_fallback`:
+/// the prepacked buffer's micropanel layout is family-specific (VNNI k-quad-interleave vs plain
+/// panels), so a buffer packed by `pack_rhs` is only consumable by the matching `run_packed`.
+/// [`execute_int_packed`] therefore bypasses the dynamic small-parallel gate that
+/// [`execute_int`] applies (the pack barrier the gate hedges against is already amortized once at
+/// prepack time). `mr`/`nr`/`depth_multiple` mirror the tile constants and feed
+/// [`prepack_rhs_i8`](crate::prepack_rhs_i8) so the buffer and the consume path agree on the
+/// blocking geometry
 #[cfg(feature = "int8")]
 #[derive(Copy, Clone)]
 struct IntDispatched {
     run: IntFn,
     small_par_fallback: Option<IntFn>,
+    run_packed: IntPackedFn,
+    pack_rhs: IntPackFn,
+    mr: usize,
+    nr: usize,
+    depth_multiple: usize,
 }
 
 #[cfg(feature = "int8")]
 const DISP_I8_SCALAR: IntDispatched = IntDispatched {
     run: gemm_i8_scalar,
     small_par_fallback: None,
+    run_packed: gemm_i8_scalar_packed,
+    pack_rhs: pack_rhs_i8_widen,
+    mr: 4,
+    nr: 4,
+    depth_multiple: 1,
 };
 #[cfg(all(feature = "int8", any(target_arch = "x86", target_arch = "x86_64")))]
 const DISP_I8_FMA: IntDispatched = IntDispatched {
     run: gemm_i8_fma,
     small_par_fallback: None,
+    run_packed: gemm_i8_fma_packed,
+    pack_rhs: pack_rhs_i8_widen,
+    mr: 16,
+    nr: 6,
+    depth_multiple: 1,
 };
 #[cfg(all(feature = "int8", any(target_arch = "x86", target_arch = "x86_64")))]
 const DISP_I8_AVX512: IntDispatched = IntDispatched {
     run: gemm_i8_avx512,
     small_par_fallback: None,
+    run_packed: gemm_i8_avx512_packed,
+    pack_rhs: pack_rhs_i8_widen,
+    mr: 32,
+    nr: 12,
+    depth_multiple: 1,
 };
 #[cfg(all(feature = "int8", any(target_arch = "x86", target_arch = "x86_64")))]
 const DISP_I8_AVX512VNNI: IntDispatched = IntDispatched {
     run: gemm_i8_avx512vnni,
     small_par_fallback: None,
+    run_packed: gemm_i8_avx512vnni_packed,
+    pack_rhs: pack_rhs_i8_vnni,
+    mr: 32,
+    nr: 12,
+    // k-quad-interleaved pack -> the prepack buffer rounds its depth up to 4
+    depth_multiple: 4,
 };
 #[cfg(all(feature = "int8", target_arch = "aarch64"))]
 const DISP_I8_NEON: IntDispatched = IntDispatched {
     run: gemm_i8_neon,
     small_par_fallback: None,
+    run_packed: gemm_i8_neon_packed,
+    pack_rhs: pack_rhs_i8_widen,
+    mr: 16,
+    nr: 4,
+    depth_multiple: 1,
 };
 #[cfg(all(feature = "int8", target_arch = "wasm32", target_feature = "simd128"))]
 const DISP_I8_SIMD128: IntDispatched = IntDispatched {
     run: gemm_i8_simd128,
     small_par_fallback: None,
+    run_packed: gemm_i8_simd128_packed,
+    pack_rhs: pack_rhs_i8_widen,
+    mr: 8,
+    nr: 4,
+    depth_multiple: 1,
 };
 
 /// `i8` ISA selection. The widen-and-multiply integer kernel uses only AVX2/AVX-512
@@ -343,6 +531,71 @@ memoized_select!(
     "The memoized integer dispatch descriptor (selection runs once).",
     "int8"
 );
+
+/// The memoized integer kernel's microtile `(mr, nr) = (MR_REG*LANES, NR)`. Read by
+/// [`prepack_rhs_i8`](crate::prepack_rhs_i8) to size the buffer's blocking geometry through the
+/// *same* ISA choice the consuming call will make (the heterogeneous mirror of
+/// [`GemmScalar::rhs_tile`](crate::dispatch::GemmScalar))
+#[cfg(feature = "int8")]
+pub(crate) fn i8_rhs_tile() -> (usize, usize) {
+    let d = dispatched_i8();
+    (d.mr, d.nr)
+}
+
+/// The memoized integer kernel family's pack depth multiple (`4` for the VNNI `vpdpbusd` dot
+/// kernel, `1` for every widen kernel). The prepack constructor rounds the packed depth up to it
+#[cfg(feature = "int8")]
+pub(crate) fn i8_rhs_depth_multiple() -> usize {
+    dispatched_i8().depth_multiple
+}
+
+/// Pack a full `(k, n)` RHS into the memoized integer kernel's micropanel buffer (the same layout
+/// [`execute_int_packed`] consumes). Delegates to the family-specific `pack_rhs_full`
+/// (widen plain panels vs VNNI k-quad-interleave), so the bytes are identical to the per-call pack
+///
+/// # Safety
+/// As [`driver::pack_rhs_full`]
+#[cfg(feature = "int8")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn pack_rhs_full_i8(
+    dst: *mut i8,
+    b: *const i8,
+    rsb: isize,
+    csb: isize,
+    k: usize,
+    n: usize,
+    kc: usize,
+    nc: usize,
+    nr: usize,
+) {
+    unsafe { (dispatched_i8().pack_rhs)(dst, b, rsb, csb, k, n, kc, nc, nr) }
+}
+
+/// Top-level prepacked-RHS integer entry: the degenerate cases (the `A*B` term vanishes =>
+/// `C <- beta*C`, never touching the packed buffer) then the memoized prepacked kernel. Runs the
+/// buffer's own family unconditionally: the `small_par_fallback` gate that [`execute_int`] applies
+/// is deliberately bypassed, since the quad-interleaved VNNI buffer is not consumable by the widen
+/// fallback and the pack barrier the gate hedges against was already amortized at prepack time
+///
+/// # Safety
+/// As [`execute_int`], plus `req.packed` valid for the recorded geometry and not aliasing `c`
+#[cfg(feature = "int8")]
+pub(crate) unsafe fn execute_int_packed(
+    req: IntPackedConsume,
+    par: Parallelism,
+    ws: &mut Workspace,
+) {
+    unsafe {
+        if req.m == 0 || req.n == 0 {
+            return;
+        }
+        if req.k == 0 || req.alpha == 0 {
+            scale_c_int(req.beta, req.c, req.m, req.n, req.rsc, req.csc);
+            return;
+        }
+        (dispatched_i8().run_packed)(req, par, ws);
+    }
+}
 
 // Integer requantizing GEMM (i8 * i8 -> O, O in {i8, u8}): the `IntGemmQ<O>` /
 // `IntGemmVnniQ<O>` families fused with the `KRequantize` epilogue (per-tensor scale +

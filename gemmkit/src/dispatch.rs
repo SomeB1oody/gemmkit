@@ -62,7 +62,10 @@ pub use float::{FusedScalar, MapScalar};
 #[cfg(feature = "epilogue")]
 pub(crate) use float::{execute_fused, execute_map, execute_packed_fused};
 #[cfg(feature = "int8")]
-pub(crate) use int::{IntTask, execute_int};
+pub(crate) use int::{
+    IntPackedConsume, IntTask, execute_int, execute_int_packed, i8_rhs_depth_multiple, i8_rhs_tile,
+    pack_rhs_full_i8,
+};
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 pub(crate) use int::{RequantTask, execute_int_requant};
 

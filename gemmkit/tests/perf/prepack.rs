@@ -132,6 +132,74 @@ fn perf_prepack() {
     }
 }
 
+// Prepacked-i8-RHS reuse
+
+/// Per-call throughput of a reused prepacked `i8` B (`gemm_i8_packed_b`) vs plain `gemm_i8`
+/// (which re-packs B every call - for the VNNI `vpdpbusd` kernel the k-quad-interleaved RHS pack
+/// is *mandatory* on every call, the quad layout can't be read in place) for a fixed `(k, n)` B
+/// and a small activation batch `m`. At small `m` the `O(k*n)` pack dominates the `O(m*k*n)`
+/// compute, so a reused prepacked panel should win per call (the one-time pack amortizes away over
+/// a stream of activation batches)
+#[cfg(all(feature = "int8", not(target_family = "wasm")))]
+fn bench_prepack_i8(k: usize, n: usize, m: usize, par: Parallelism) {
+    let a: Vec<i8> = (0..m * k).map(|i| (i % 17) as i8 - 8).collect();
+    let b: Vec<i8> = (0..k * n).map(|i| (i % 13) as i8 - 6).collect();
+    let mut c = vec![0i32; m * n];
+
+    let s_plain = measure(m, k, n, || {
+        gemmkit::gemm_i8(
+            1,
+            MatRef::from_col_major(&a, m, k),
+            MatRef::from_col_major(&b, k, n),
+            0,
+            MatMut::from_col_major(&mut c, m, n),
+            par,
+        );
+    });
+    let packed = gemmkit::prepack_rhs_i8(MatRef::from_col_major(&b, k, n));
+    let s_packed = measure(m, k, n, || {
+        gemmkit::gemm_i8_packed_b(
+            1,
+            MatRef::from_col_major(&a, m, k),
+            &packed,
+            0,
+            MatMut::from_col_major(&mut c, m, n),
+            par,
+        );
+    });
+
+    let mode = if matches!(par, Parallelism::Serial) {
+        "ser"
+    } else {
+        "par"
+    };
+    println!(
+        "  m={m:<4} k={k} n={n} {mode}  plain={:7.1} (±{:>2.0}%)  packed={:7.1} (±{:>2.0}%)  ({:.0}% of plain)",
+        s_plain.median,
+        s_plain.spread_pct(),
+        s_packed.median,
+        s_packed.spread_pct(),
+        100.0 * s_packed.median / s_plain.median.max(1e-9)
+    );
+}
+
+#[cfg(all(feature = "int8", not(target_family = "wasm")))]
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture"]
+fn perf_prepack_i8() {
+    let _guard = BENCH_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    println!(
+        "\nprepacked-i8-RHS reuse — per-call GFLOP/s, plain gemm_i8 vs gemm_i8_packed_b (fixed B):"
+    );
+    for &(k, n) in &[(1024usize, 1024usize), (2048, 2048)] {
+        for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
+            for &m in &[8usize, 64] {
+                bench_prepack_i8(k, n, m, par);
+            }
+        }
+    }
+}
+
 /// Per-call throughput of a reused prepacked A (`gemm_packed_a`) vs plain `gemm`
 /// (which re-packs A every call) for a fixed `(m, k)` A and varying `n`. The
 /// packed-LHS path drives the product transposed, so C is row-major (its supported

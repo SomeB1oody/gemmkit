@@ -72,6 +72,11 @@ pub use packed::{
     gemm_packed_a_with, gemm_packed_b, gemm_packed_b_unchecked, gemm_packed_b_unchecked_with,
     gemm_packed_b_with, prepack_lhs, prepack_lhs_unchecked, prepack_rhs, prepack_rhs_unchecked,
 };
+#[cfg(feature = "int8")]
+pub use packed::{
+    gemm_i8_packed_b, gemm_i8_packed_b_unchecked, gemm_i8_packed_b_unchecked_with,
+    gemm_i8_packed_b_with, prepack_rhs_i8, prepack_rhs_i8_unchecked,
+};
 #[cfg(feature = "epilogue")]
 pub use packed::{
     gemm_packed_a_fused, gemm_packed_a_fused_unchecked, gemm_packed_a_fused_unchecked_with,

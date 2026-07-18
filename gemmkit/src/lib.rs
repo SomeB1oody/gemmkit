@@ -120,7 +120,11 @@ pub use api::{
     gemm_cplx_fused_with,
 };
 #[cfg(feature = "int8")]
-pub use api::{gemm_i8, gemm_i8_unchecked, gemm_i8_unchecked_with, gemm_i8_with};
+pub use api::{
+    gemm_i8, gemm_i8_packed_b, gemm_i8_packed_b_unchecked, gemm_i8_packed_b_unchecked_with,
+    gemm_i8_packed_b_with, gemm_i8_unchecked, gemm_i8_unchecked_with, gemm_i8_with, prepack_rhs_i8,
+    prepack_rhs_i8_unchecked,
+};
 #[cfg(feature = "complex")]
 pub use dispatch::ComplexScalar;
 pub use dispatch::GemmProblem;

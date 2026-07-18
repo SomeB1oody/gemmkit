@@ -313,6 +313,299 @@ pub unsafe fn gemm_packed_b_unchecked_with<T: GemmScalar>(
     }
 }
 
+/// Pre-pack a `k x n` **`i8`** RHS into a [`PackedRhs<i8>`] for reuse across many
+/// [`gemm_i8_packed_b`] calls: the fixed-weight quantized-inference pattern (constant `i8`
+/// weights, a stream of `i8` activation batches). The pack happens once, single-threaded, here;
+/// later products skip it. For the VNNI `vpdpbusd` kernel this matters most: its RHS pack is
+/// **mandatory every call** (the k-quad-interleaved layout can't be read in place), so at small
+/// `m` the per-call `O(k*n)` pack otherwise dominates the `O(m*k*n)` compute
+///
+/// The buffer is packed through whichever integer kernel the process's memoized dispatch selected
+/// (the VNNI k-quad-interleaved layout, or the widen kernel's plain panels) and records the
+/// blocking geometry it was built for; [`gemm_i8_packed_b`] reads it back verbatim and always runs
+/// that same family, so the buffer is never misread. Any layout of `B` is accepted (the pack reads
+/// it through its strides); the result is valid for products whose `(k, n)` match this `B` and
+/// whose `C` is column-major-ish (`|csc| >= |rsc|`)
+///
+/// # Panics
+/// If `B`'s view addresses outside its slice (same bounds check as [`gemm_i8`]), or if `B` is so
+/// large (broadcast strides allow logical dimensions up to `isize::MAX`) that the pack buffer size
+/// overflows `usize`
+#[cfg(feature = "int8")]
+pub fn prepack_rhs_i8(b: MatRef<'_, i8>) -> PackedRhs<i8> {
+    check_view(b.data, b.rows, b.cols, b.rs, b.cs, "B");
+    // SAFETY: `b` is validated in-bounds directly above
+    unsafe { prepack_rhs_i8_unchecked(b.data.as_ptr(), b.rs, b.cs, b.rows, b.cols) }
+}
+
+/// As [`prepack_rhs_i8`] but over a raw `k x n` `B` pointer + strides, with **no** bounds check:
+/// the raw counterpart for adapters / FFI that validate their own inputs
+///
+/// # Safety
+/// `b` must be valid for reads at every offset `i*rsb + j*csb`, for `i in 0..k` and `j in 0..n`
+#[cfg(feature = "int8")]
+pub unsafe fn prepack_rhs_i8_unchecked(
+    b: *const i8,
+    rsb: isize,
+    csb: isize,
+    k: usize,
+    n: usize,
+) -> PackedRhs<i8> {
+    // Resolve the panel geometry through the same ISA tile the consuming call will use; the
+    // `tiny_block_dim() + 1` sentinel row count dodges the tiny-matrix branch so the geometry is
+    // `m`-independent (the consume reads it back verbatim). i8 packs in 1-byte units
+    let (mr, nr) = dispatch::i8_rhs_tile();
+    // An empty operand packs to nothing (see the `prepack_rhs` rationale)
+    if k == 0 || n == 0 {
+        return PackedRhs {
+            buf: Vec::new(),
+            k,
+            n,
+            nr,
+            kc: 1,
+            nc: nr,
+        };
+    }
+    let dodge_tiny = crate::tuning::tiny_block_dim().saturating_add(1);
+    let blk = crate::cache::topology().blocking(mr, nr, 1, dodge_tiny, n, k);
+    let depth_multiple = dispatch::i8_rhs_depth_multiple();
+    // The VNNI dot kernel (`DEPTH_MULTIPLE = 4`) packs the whole contraction as one depth slice
+    // (the driver's prepacked single-slice guard for a depth-padded family); the widen kernel keeps
+    // the cache-model `kc`. Integer accumulation is exact (wrapping i32 is associative), so single
+    // vs multi-slice `kc` is bit-identical either way. (i8's `Out == Acc == i32` makes it
+    // `OUT_IS_ACC`, so the depth multiple, not `OUT_IS_ACC`, is what forces the single slice here,
+    // unlike the bf16 dot path)
+    let kc = if depth_multiple > 1 {
+        k.max(1)
+    } else {
+        blk.kc.max(1)
+    };
+    let nc = blk.nc.next_multiple_of(nr).max(nr);
+
+    // A dot kernel (VNNI `vpdpbusd`) packs depth in groups, so the panel depth is rounded up to its
+    // `DEPTH_MULTIPLE`; `1` (the widen kernel) leaves this unchanged
+    let k_pad = k.next_multiple_of(depth_multiple);
+    // Checked: a broadcast (zero-stride) view passes `check_view` with a tiny backing slice, so a
+    // logically huge `n`/`k` can reach this product; a wrapped size would under-allocate the buffer
+    let total = n
+        .div_ceil(nr)
+        .checked_mul(nr)
+        .and_then(|v| v.checked_mul(k_pad))
+        .unwrap_or_else(|| {
+            panic!("gemmkit: prepacked RHS of {k}x{n} is too large; the pack buffer size overflows usize")
+        });
+    let mut buf = vec![0i8; total];
+    if total > 0 {
+        // SAFETY: `buf` holds `ceil(n/nr)*nr*k_pad` elements (the exact layout size, depth padded to
+        // the selected family's `DEPTH_MULTIPLE`); `b` is caller-promised valid for the `(k, n)`
+        // strided reads; `pack_rhs_full_i8` writes only that range through the selected family's pack
+        unsafe {
+            dispatch::pack_rhs_full_i8(buf.as_mut_ptr(), b, rsb, csb, k, n, kc, nc, nr);
+        }
+    }
+    PackedRhs {
+        buf,
+        k,
+        n,
+        nr,
+        kc,
+        nc,
+    }
+}
+
+/// `C(i32) <- alpha*A(i8)*(prepacked B) + beta*C` reusing a [`PackedRhs<i8>`] (pre-packed `i8` `B`),
+/// via the thread-local workspace pool. The integer (`i8 -> i32`) twin of [`gemm_packed_b`]: it
+/// skips the per-call RHS repack, which for the VNNI kernel is otherwise mandatory on every call
+///
+/// The result is **bit-identical** to a plain [`gemm_i8`] under the same config for every valid
+/// shape/stride (integer accumulation is exact and ISA-independent, so the prepacked and plain
+/// paths agree exactly, and the output is deterministic across thread counts)
+///
+/// # Panics
+/// If the dimensions disagree (`A.cols != B.rows`, `A.rows != C.rows`, `B.cols != C.cols`), if `A`
+/// or `C` addresses outside its slice, if `C` aliases itself or `A`, or if `C` is **not**
+/// column-major-ish (`|csc| >= |rsc|`): a row-major `C` would make the engine swap `A`/`B`, which a
+/// prepacked `B` cannot support (use plain [`gemm_i8`] there)
+#[cfg(feature = "int8")]
+pub fn gemm_i8_packed_b(
+    alpha: i32,
+    a: MatRef<'_, i8>,
+    packed: &PackedRhs<i8>,
+    beta: i32,
+    c: MatMut<'_, i32>,
+    par: Parallelism,
+) {
+    workspace::with_thread_pool(|ws| gemm_i8_packed_b_with(ws, alpha, a, packed, beta, c, par));
+}
+
+/// Like [`gemm_i8_packed_b`] but reuses a caller-owned [`Workspace`]
+///
+/// # Panics
+/// Same conditions as [`gemm_i8_packed_b`]
+#[cfg(feature = "int8")]
+pub fn gemm_i8_packed_b_with(
+    ws: &mut Workspace,
+    alpha: i32,
+    a: MatRef<'_, i8>,
+    packed: &PackedRhs<i8>,
+    beta: i32,
+    c: MatMut<'_, i32>,
+    par: Parallelism,
+) {
+    assert_eq!(
+        a.cols, packed.k,
+        "gemmkit: A.cols ({}) != packed B.rows ({})",
+        a.cols, packed.k
+    );
+    assert_eq!(
+        packed.n, c.cols,
+        "gemmkit: packed B.cols ({}) != C.cols ({})",
+        packed.n, c.cols
+    );
+    assert_eq!(
+        a.rows, c.rows,
+        "gemmkit: A.rows ({}) != C.rows ({})",
+        a.rows, c.rows
+    );
+
+    check_view(a.data, a.rows, a.cols, a.rs, a.cs, "A");
+    check_view(c.data, c.rows, c.cols, c.rs, c.cs, "C");
+
+    if self_aliases(c.rows, c.cols, c.rs, c.cs) {
+        panic!(
+            "gemmkit: C view aliases itself (strides {},{} map distinct elements to the same \
+             memory); C must address each (i,j) uniquely",
+            c.rs, c.cs
+        );
+    }
+
+    // C (i32) must not alias A (i8); byte ranges (heterogeneous element sizes). The prepacked B is
+    // a separate owned buffer, so it cannot alias C
+    if overlaps_bytes(
+        c.data.as_ptr() as *const u8,
+        c.data.len(),
+        core::mem::size_of::<i32>(),
+        a.data.as_ptr() as *const u8,
+        a.data.len(),
+        core::mem::size_of::<i8>(),
+    ) {
+        panic!("gemmkit: C aliases A");
+    }
+
+    // SAFETY: A/C strides are in bounds and C does not alias A (checked above)
+    unsafe {
+        gemm_i8_packed_b_unchecked_with(
+            ws,
+            alpha,
+            a.rows,
+            a.data.as_ptr(),
+            a.rs,
+            a.cs,
+            packed,
+            beta,
+            c.data.as_mut_ptr(),
+            c.rs,
+            c.cs,
+            par,
+        );
+    }
+}
+
+/// As [`gemm_i8_packed_b`] but over raw `A`/`C` pointers + strides, with **no** bounds/alias
+/// checks: the heterogeneous (`i8 -> i32`) counterpart of [`gemm_packed_b_unchecked`]. The shared
+/// `k` and output `n` come from `packed`; `m` is A's rows (= C's rows). Uses the thread-local
+/// workspace pool
+///
+/// # Safety
+/// `a` valid for reads over `(m, packed.rows())` and `c` for read+write over `(m, packed.cols())`
+/// at the given strides; `c` does not alias `a`; and when `beta == 0`, `c` need not be initialized
+///
+/// # Panics
+/// If `C` is not column-major-ish (`|csc| >= |rsc|`): a prepacked RHS cannot serve a row-major C
+/// (use plain [`gemm_i8`] for that layout)
+#[cfg(feature = "int8")]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gemm_i8_packed_b_unchecked(
+    alpha: i32,
+    m: usize,
+    a: *const i8,
+    rsa: isize,
+    csa: isize,
+    packed: &PackedRhs<i8>,
+    beta: i32,
+    c: *mut i32,
+    rsc: isize,
+    csc: isize,
+    par: Parallelism,
+) {
+    // SAFETY: preconditions forwarded to the caller (see # Safety)
+    unsafe {
+        workspace::with_thread_pool(|ws| {
+            gemm_i8_packed_b_unchecked_with(
+                ws, alpha, m, a, rsa, csa, packed, beta, c, rsc, csc, par,
+            );
+        });
+    }
+}
+
+/// As [`gemm_i8_packed_b_unchecked`] but with a caller-owned [`Workspace`]
+///
+/// # Safety
+/// See [`gemm_i8_packed_b_unchecked`]
+///
+/// # Panics
+/// See [`gemm_i8_packed_b_unchecked`]
+#[cfg(feature = "int8")]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gemm_i8_packed_b_unchecked_with(
+    ws: &mut Workspace,
+    alpha: i32,
+    m: usize,
+    a: *const i8,
+    rsa: isize,
+    csa: isize,
+    packed: &PackedRhs<i8>,
+    beta: i32,
+    c: *mut i32,
+    rsc: isize,
+    csc: isize,
+    par: Parallelism,
+) {
+    // A prepacked B is only valid for the no-swap orientation (same assert + message as the float
+    // `gemm_packed_b_unchecked_with`)
+    assert!(
+        csc.unsigned_abs() >= rsc.unsigned_abs(),
+        "gemmkit: gemm_packed_b requires column-major-ish C (|csc| >= |rsc|); a row-major C \
+         would swap A/B and invalidate the prepacked RHS — use gemm() for that layout"
+    );
+    // SAFETY: the caller guarantees A/C validity and that C does not alias A (see # Safety); the
+    // packed buffer (owned by `packed`, read-only) outlives the call and matches its recorded
+    // (nr, kc, nc) geometry
+    unsafe {
+        dispatch::execute_int_packed(
+            dispatch::IntPackedConsume {
+                m,
+                k: packed.k,
+                n: packed.n,
+                alpha,
+                a,
+                rsa,
+                csa,
+                packed: packed.buf.as_ptr(),
+                nr: packed.nr,
+                kc: packed.kc,
+                nc: packed.nc,
+                beta,
+                c,
+                rsc,
+                csc,
+            },
+            par,
+            ws,
+        );
+    }
+}
+
 /// `C <- act(alpha*A*(prepacked B) + beta*C + bias)` in 1 pass: a **fused** epilogue over a reused
 /// [`PackedRhs`], via the thread-local workspace pool. The fused twin of [`gemm_packed_b`]: the
 /// bias is added by 1 IEEE add after the final `beta`-fold, then the activation is applied, fused

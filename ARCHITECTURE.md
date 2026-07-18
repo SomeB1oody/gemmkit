@@ -250,7 +250,17 @@ geometry back verbatim so panels always match their tiling (`gemm_packed_a`
 consumes through the transposed problem). The layout comes from
 `driver::pack_rhs_full`, the same code the per-call pack uses, so a prepacked
 GEMM reproduces a plain one under the same config; the buffer is read-only and
-shared across workers with no synchronization.
+shared across workers with no synchronization. The `int8` feature adds the
+heterogeneous twin `prepack_rhs_i8`/`gemm_i8_packed_b` (a `PackedRhs<i8>`, bit-
+identical to plain `gemm_i8` since integer accumulation is exact): its layout is
+pinned to whichever integer kernel the memoized dispatch chose, so the consume
+call always runs that same family and deliberately bypasses the dynamic small-
+parallel widen fallback (a `vpdpbusd` buffer is k-quad-interleaved and not
+consumable by the widen kernel). For that VNNI dot kernel the RHS pack is
+otherwise mandatory on every call, so prepacking is the bigger win there;
+`prepack_rhs_i8` rounds the buffer depth up to `DEPTH_MULTIPLE = 4` and packs the
+whole contraction as one depth slice (the driver's single-slice guard for a
+depth-padded family).
 
 `Workspace` (`gemmkit/src/workspace.rs`) is a growable 64-byte-aligned scratch
 buffer. `Workspace::regions` carves per-worker (or per-row-block) LHS regions

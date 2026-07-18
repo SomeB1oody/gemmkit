@@ -218,6 +218,182 @@ fn prepack_equals_gemm_mixed() {
     check::<gemmkit::bf16>();
 }
 
+/// Prepacked-**i8** RHS must be **bit-identical** to a plain `gemm_i8()` on the same inputs, for
+/// any thread count and any B layout (C column-major = the supported no-swap orientation).
+/// Integer accumulation is exact (wrapping i32, associative), so this is a hard equality across
+/// the auto-dispatched integer kernel (the VNNI `vpdpbusd` dot kernel on a VNNI box, the widen
+/// kernel elsewhere) - including the auto-VNNI *small parallel* problems the plain path hands to
+/// the widen fallback (the prepacked path always runs the buffer's own family). Covers `k` not a
+/// multiple of 4 (the VNNI depth pad), `n` not a multiple of the panel width, `k == 1`, and the
+/// small-`m` fixed-weight inference shape
+#[cfg(feature = "int8")]
+#[test]
+fn prepack_i8_equals_gemm_i8() {
+    use gemmkit::{MatMut, MatRef};
+    for (m, k, n) in [
+        (200usize, 130, 175),
+        (128, 96, 112),
+        (65, 64, 64),
+        (64, 65, 100), // k not a multiple of 4, n not a multiple of nr
+        (96, 129, 129),
+        (33, 17, 19),
+        (256, 257, 129),
+        (300, 1, 256), // k == 1 (below the small-k gate on the plain path)
+        (8, 2048, 96), // small m, long k: the fixed-weight inference shape
+        (2, 1023, 12), // tiny m, k not a multiple of 4, n == nr
+    ] {
+        let a = rand_i8(m * k, 0x51 + (m * 7 + n) as u64);
+        let b_rm = rand_i8(k * n, 0x62 + (n * 3 + k) as u64); // logical k x n stored row-major
+        // column-major copy of the same logical B (so both layouts describe the same matrix)
+        let mut b_cm = vec![0i8; k * n];
+        for i in 0..k {
+            for j in 0..n {
+                b_cm[j * k + i] = b_rm[i * n + j];
+            }
+        }
+        let c0: Vec<i32> = (0..m * n).map(|x| (x as i32 % 7) - 3).collect();
+
+        for lb in 0..2 {
+            // lb 0: row-major B (rsb=n, csb=1); lb 1: column-major B (rsb=1, csb=k)
+            let (bbuf, rsb, csb): (&[i8], isize, isize) = if lb == 0 {
+                (&b_rm, n as isize, 1)
+            } else {
+                (&b_cm, 1, k as isize)
+            };
+            let bview = MatRef::new(bbuf, k, n, rsb, csb);
+            let packed = gemmkit::prepack_rhs_i8(bview);
+            assert_eq!(packed.rows(), k);
+            assert_eq!(packed.cols(), n);
+
+            for &(alpha, beta) in &[(1i32, 0i32), (2, 3), (3, -2), (0, 5)] {
+                let mut c_ref = c0.clone();
+                gemmkit::gemm_i8(
+                    alpha,
+                    MatRef::from_col_major(&a, m, k),
+                    bview,
+                    beta,
+                    MatMut::from_col_major(&mut c_ref, m, n),
+                    Parallelism::Serial,
+                );
+                for par in [
+                    Parallelism::Serial,
+                    Parallelism::Rayon(2),
+                    Parallelism::Rayon(4),
+                    Parallelism::Rayon(8),
+                ] {
+                    let mut c_pk = c0.clone();
+                    gemmkit::gemm_i8_packed_b(
+                        alpha,
+                        MatRef::from_col_major(&a, m, k),
+                        &packed,
+                        beta,
+                        MatMut::from_col_major(&mut c_pk, m, n),
+                        par,
+                    );
+                    assert_eq!(
+                        c_ref, c_pk,
+                        "prepack_i8 != gemm_i8 for {m}x{k}x{n} lb={lb} a={alpha} b={beta} par={par:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The raw i8 packed entries (`prepack_rhs_i8_unchecked` + `gemm_i8_packed_b_unchecked`) must equal
+/// a plain `gemm_i8()`: the adapter/FFI-facing signatures, exercised directly through raw pointers
+/// + strides (the safe packed path forwards through them)
+#[cfg(feature = "int8")]
+#[test]
+fn packed_i8_unchecked_matches_gemm_i8() {
+    use gemmkit::{MatMut, MatRef};
+    for (m, k, n) in [(200usize, 130, 175), (65, 64, 64), (8, 512, 96)] {
+        let a = rand_i8(m * k, 0x71 + (m + n) as u64);
+        let b = rand_i8(k * n, 0x82 + (k + n) as u64); // column-major k x n
+        let c0: Vec<i32> = (0..m * n).map(|x| (x as i32 % 5) - 2).collect();
+        for &(alpha, beta) in &[(1i32, 0i32), (2, 3)] {
+            let mut c_ref = c0.clone();
+            gemmkit::gemm_i8(
+                alpha,
+                MatRef::from_col_major(&a, m, k),
+                MatRef::from_col_major(&b, k, n),
+                beta,
+                MatMut::from_col_major(&mut c_ref, m, n),
+                Parallelism::Serial,
+            );
+            // SAFETY: views are in bounds; B is a distinct buffer read through its (col-major) strides
+            let packed =
+                unsafe { gemmkit::prepack_rhs_i8_unchecked(b.as_ptr(), 1, k as isize, k, n) };
+            for par in [Parallelism::Serial, Parallelism::Rayon(4)] {
+                let mut c = c0.clone();
+                // SAFETY: A/C in bounds, C column-major (packed_b orientation), distinct buffers
+                unsafe {
+                    gemmkit::gemm_i8_packed_b_unchecked(
+                        alpha,
+                        m,
+                        a.as_ptr(),
+                        1,
+                        m as isize,
+                        &packed,
+                        beta,
+                        c.as_mut_ptr(),
+                        1,
+                        m as isize,
+                        par,
+                    );
+                }
+                assert_eq!(
+                    c_ref, c,
+                    "packed_i8_unchecked != gemm_i8 {m}x{k}x{n} a={alpha} b={beta} par={par:?}"
+                );
+            }
+        }
+    }
+}
+
+/// A row-major-ish C is unsupported by the i8 prepacked path (it would swap A/B); `gemm_i8_packed_b`
+/// must reject it with the same wording as the float packed path
+#[cfg(feature = "int8")]
+#[test]
+#[should_panic(expected = "column-major-ish C")]
+fn prepack_i8_row_major_c_panics() {
+    use gemmkit::{MatMut, MatRef};
+    let (m, k, n) = (100, 80, 120);
+    let a = vec![0i8; m * k];
+    let b = vec![0i8; k * n];
+    let mut c = vec![0i32; m * n];
+    let packed = gemmkit::prepack_rhs_i8(MatRef::from_col_major(&b, k, n));
+    gemmkit::gemm_i8_packed_b(
+        1,
+        MatRef::from_col_major(&a, m, k),
+        &packed,
+        0,
+        MatMut::from_row_major(&mut c, m, n), // row-major C -> swap -> reject
+        Parallelism::Serial,
+    );
+}
+
+/// An empty i8 operand must prepack and round-trip through the consume call as `C <- beta*C`
+/// without running the pack-geometry arithmetic
+#[cfg(feature = "int8")]
+#[test]
+fn prepack_i8_empty_roundtrips() {
+    use gemmkit::{MatMut, MatRef};
+    let packed = gemmkit::prepack_rhs_i8(MatRef::new(&[], 0, 4, 1, 1));
+    assert_eq!(packed.rows(), 0);
+    assert_eq!(packed.cols(), 4);
+    let mut c = vec![2i32; 3 * 4];
+    gemmkit::gemm_i8_packed_b(
+        1,
+        MatRef::new(&[], 3, 0, 1, 1),
+        &packed,
+        3, // beta
+        MatMut::from_col_major(&mut c, 3, 4),
+        Parallelism::Serial,
+    );
+    assert!(c.iter().all(|&x| x == 6), "k==0 packed_b must beta-scale C");
+}
+
 /// f64 prepacked path is bit-identical too (exercises the f64 tile + the packed
 /// geometry for a 2nd element type)
 #[test]

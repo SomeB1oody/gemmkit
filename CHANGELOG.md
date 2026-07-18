@@ -34,7 +34,10 @@ Initial release.
   map, except the `f16`/`bf16` ones, which apply the epilogue before the final
   narrowing (one rounding, more precise; documented on the entries)
 - Prepacked operand reuse: `prepack_rhs`/`prepack_lhs` with
-  `gemm_packed_b`/`gemm_packed_a` consumers for fixed-weight inner loops
+  `gemm_packed_b`/`gemm_packed_a` consumers for fixed-weight inner loops, plus
+  the `int8` twin `prepack_rhs_i8`/`gemm_i8_packed_b` (bit-identical to plain
+  `gemm_i8`; the layout is pinned to the selected integer kernel, so the VNNI
+  `vpdpbusd` path skips its otherwise-mandatory per-call RHS repack)
 - Batched GEMM (`gemm_batched*`) with an internal per-batch parallel policy
 - Bandwidth-bound special paths (gemv/gevv, small-k, and the small-m,n
   inner-product route) selected automatically behind the same entry points
