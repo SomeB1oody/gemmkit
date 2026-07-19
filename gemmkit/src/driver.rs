@@ -490,26 +490,31 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize, E>(
         // predicate covers every A-pack site. When it is false the A region is
         // reserved but never written, so skip reserving it entirely
         let need_a_pack = rsa != 1 || !m.is_multiple_of(mr) || want_pack_lhs;
+        // The overflow guards run UNCONDITIONALLY, before the pack gating: a broadcast
+        // operand passes validation with a logically huge `k` (the mixed single panel makes
+        // `kc_pad_block == k`), and on a no-pack route (`need_a_pack` and `pack_b` both
+        // false - reachable when nothing forces packing and reuse is low) skipping the
+        // sizing would also skip the "too large" abort, sending an absurd `k` into the
+        // in-place loops to spin ~forever instead of failing closed. The products are what
+        // packing WOULD allocate, so the bound is identical on every route
+        let a_full_region = mc
+            .next_multiple_of(mr)
+            .checked_mul(kc_pad_block)
+            .unwrap_or_else(|| {
+                panic!("gemmkit: GEMM {m}x{k}x{n} is too large; the LHS pack region size overflows usize")
+            });
+        let b_full_elems = nc
+            .next_multiple_of(nr)
+            .checked_mul(kc_pad_block)
+            .unwrap_or_else(|| {
+                panic!("gemmkit: GEMM {m}x{k}x{n} is too large; the RHS pack region size overflows usize")
+            });
         let (a_per_region, a_regions) = if need_a_pack {
-            let per = mc
-                .next_multiple_of(mr)
-                .checked_mul(kc_pad_block)
-                .unwrap_or_else(|| {
-                    panic!("gemmkit: GEMM {m}x{k}x{n} is too large; the LHS pack region size overflows usize")
-                });
-            (per, if shared_a { n_mc } else { n_threads })
+            (a_full_region, if shared_a { n_mc } else { n_threads })
         } else {
             (0, 0)
         };
-        let b_elems = if pack_b {
-            nc.next_multiple_of(nr)
-                .checked_mul(kc_pad_block)
-                .unwrap_or_else(|| {
-                    panic!("gemmkit: GEMM {m}x{k}x{n} is too large; the RHS pack region size overflows usize")
-                })
-        } else {
-            0
-        };
+        let b_elems = if pack_b { b_full_elems } else { 0 };
         // Reserve pack scratch only when a side actually packs. When neither
         // does, hand out null bases (never dereferenced: every tile reads A in
         // place and B is read in place or from the prepacked buffer), so an
