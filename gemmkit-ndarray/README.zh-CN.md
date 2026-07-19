@@ -8,6 +8,8 @@
 
 该适配器完整镜像了核心 API：实数 `f32` / `f64`（在 `half` 下还有 `f16` / `bf16`）、`complex` 下的复数、`int8` 下的 `i8 -> i32`，以及 `epilogue` 下的融合尾部运算（fused epilogue）入口（偏置、激活、`i8` / `u8` 重量化，以及用户自定义的逐元素映射），另外还有预打包操作数的复用路径（`prepack_lhs` / `prepack_rhs`）。它也是唯一带有批量 GEMM 入口的适配器，映射到 ndarray 的三维数组类型（`Ix3`，批次维为 0 轴）。完整的入口点列表见 [API 文档](https://docs.rs/gemmkit-ndarray)。
 
+本适配器的分步教程见 [gemmkit 指南](https://someb1oody.github.io/gemmkit/zh-Hans/gemmkit-ndarray/在ndarray中使用gemmkit.html)。
+
 ## 用法
 
 ```toml

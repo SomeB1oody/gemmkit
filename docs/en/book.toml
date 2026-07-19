@@ -1,0 +1,13 @@
+[book]
+title = "gemmkit Guide"
+authors = ["SomeB1oody"]
+description = "User guide and architecture walkthrough for the gemmkit GEMM engine."
+language = "en"
+src = "src"
+
+[build]
+build-dir = "../book/en"
+
+[output.html]
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/SomeB1oody/gemmkit"

@@ -89,6 +89,8 @@ fn main() {
 
 ## 文档
 
+- [gemmkit 指南](https://someb1oody.github.io/gemmkit/zh-Hans/)：完整的指南书
+  （使用指南、适配器指南以及深入的架构说明）
 - API 参考：[docs.rs/gemmkit](https://docs.rs/gemmkit)
 - [ARCHITECTURE.md](https://github.com/SomeB1oody/gemmkit/blob/master/ARCHITECTURE.md)：内部设计与扩展接缝
 - [CHANGELOG.md](https://github.com/SomeB1oody/gemmkit/blob/master/CHANGELOG.md)：发布说明

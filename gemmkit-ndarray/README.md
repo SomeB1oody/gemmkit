@@ -8,6 +8,8 @@ Zero-copy [`ndarray`](https://crates.io/crates/ndarray) adapter for the [`gemmki
 
 The adapter mirrors the full core surface: real `f32` / `f64` (plus `f16` / `bf16` under `half`), complex under `complex`, `i8 -> i32` under `int8`, and the fused-epilogue entries (bias, activation, `i8` / `u8` requantization, and a user per-element map) under `epilogue`, alongside the prepacked-operand reuse path (`prepack_lhs` / `prepack_rhs`). It is also the only adapter with a batched GEMM entry, mapped onto ndarray's rank-3 array type (`Ix3`, batch on axis 0). See the [API documentation](https://docs.rs/gemmkit-ndarray) for the full list of entry points.
 
+A step-by-step guide for this adapter lives in the [gemmkit Guide](https://someb1oody.github.io/gemmkit/en/gemmkit-ndarray/Using_gemmkit_with_ndarray.html).
+
 ## Usage
 
 ```toml

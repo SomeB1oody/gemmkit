@@ -1,0 +1,13 @@
+[book]
+title = "gemmkit 指南"
+authors = ["SomeB1oody"]
+description = "gemmkit GEMM 引擎的使用指南与架构说明。"
+language = "zh-Hans"
+src = "src"
+
+[build]
+build-dir = "../book/zh-Hans"
+
+[output.html]
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/SomeB1oody/gemmkit"

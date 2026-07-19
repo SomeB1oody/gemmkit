@@ -8,6 +8,8 @@ Zero-copy [faer](https://crates.io/crates/faer) adapter for the [gemmkit](https:
 
 The entry points mirror the core gemmkit surface, including the feature-gated element families (`half`, `complex`, `int8`) and the fused epilogue entries (`epilogue`). faer has no rank-3 array type, so batched GEMM (`gemm_batched`) takes the batch as a slice of per-element `(A, B)` `MatRef` inputs paired with a slice of `&mut C` `MatMut` outputs (over gemmkit's pointer-array batched engine), with heterogeneous per-element shapes.
 
+A step-by-step guide for this adapter lives in the [gemmkit Guide](https://someb1oody.github.io/gemmkit/en/gemmkit-faer/Using_gemmkit_with_faer.html).
+
 ## Usage
 
 ```toml

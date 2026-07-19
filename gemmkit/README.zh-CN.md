@@ -79,6 +79,13 @@ fn main() {
 旋钮，并输出一份可直接 source 的环境变量配置；各个旋钮的说明见
 [docs.rs](https://docs.rs/gemmkit)。
 
+## 文档
+
+- [使用指南](https://someb1oody.github.io/gemmkit/zh-Hans/gemmkit-guide/快速上手.html)：
+  指南书中关于 gemmkit 的章节，从第一次调用讲到进阶用法。
+- [架构说明](https://someb1oody.github.io/gemmkit/zh-Hans/architecture/设计目标与总体图景.html)：
+  比 ARCHITECTURE.md 更详细、更易读的引擎内部讲解。
+
 ## 相关 crate
 
 - [gemmkit-ndarray](https://crates.io/crates/gemmkit-ndarray)：面向 `ndarray` 矩阵

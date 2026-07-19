@@ -17,6 +17,9 @@ gemmkit's compiled-in defaults were calibrated on one machine (a Ryzen 9950X), s
 that same machine a run re-discovers essentially the same values; the payoff is on a
 different machine.
 
+A fuller guide, including how the sweep works inside, lives in the
+[gemmkit Guide](https://someb1oody.github.io/gemmkit/en/gemmkit-tune/Tuning_with_gemmkit-tune.html).
+
 ## Usage
 
 Install the binary and run it on the target machine:

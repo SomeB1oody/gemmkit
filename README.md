@@ -94,6 +94,8 @@ bias/activation, `i8`/`u8` requantization, and the user per-element map). With
 
 ## Documentation
 
+- The [gemmkit Guide](https://someb1oody.github.io/gemmkit/en/): the full book
+  (user guide, adapter guides, and an in-depth architecture walkthrough)
 - API reference: [docs.rs/gemmkit](https://docs.rs/gemmkit)
 - [ARCHITECTURE.md](https://github.com/SomeB1oody/gemmkit/blob/master/ARCHITECTURE.md): the internal design and extension seams
 - [CHANGELOG.md](https://github.com/SomeB1oody/gemmkit/blob/master/CHANGELOG.md): release notes

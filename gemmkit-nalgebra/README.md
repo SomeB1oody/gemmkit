@@ -24,6 +24,9 @@ nalgebra has no rank-3 array type, so batched GEMM (`gemm_batched`) takes the ba
 slice of per-element `(&A, &B)` inputs paired with a slice of `&mut C` outputs (over
 gemmkit's pointer-array batched engine), with heterogeneous per-element shapes.
 
+A step-by-step guide for this adapter lives in the
+[gemmkit Guide](https://someb1oody.github.io/gemmkit/en/gemmkit-nalgebra/Using_gemmkit_with_nalgebra.html).
+
 ## Usage
 
 ```toml

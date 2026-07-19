@@ -1,0 +1,56 @@
+# Parallel Execution
+
+Parallelism in gemmkit is one small layer (`gemmkit/src/parallel.rs`, L5) with two jobs: decide *how many* workers a problem deserves, and hand *which* work to each of them. Both decisions are deliberately conservative - more threads are not free, and the layer's design starts from the observation that the wrong worker count loses more performance than the wrong schedule - and both are shaped so that the numerical result never depends on either. The user-facing surface is a single enum: `Parallelism::Serial`, or `Parallelism::Rayon(n)` with `Rayon(0)` (the default) meaning auto.
+
+## Workload-aware worker resolution
+
+`Parallelism::resolve` turns the request into an actual partition count, and the request is only one input; the workload is the other. First comes the total-work serial gate: below `GEMMKIT_PARALLEL_THRESHOLD` (default `48*48*256` for `m*n*k`) everything stays serial, before even sampling the core count - forking rayon for a product that takes microseconds costs more than the product. The gate precedes the request, so even an explicit `Rayon(n)` stays serial below it. Above the gate an explicit count is honored, capped by the core count and by the number of available jobs, so `Rayon(huge)` can neither over-subscribe the machine nor over-allocate per-worker pack regions - only the auto path is heuristic, which keeps forced widths exact for tests and scaling diagnostics.
+
+The auto path is a ramp, not a jump. It computes the linear problem size `cbrt(m*n*k)` - roughly `n` for a square problem - and divides by a stride to get the worker count, capped by cores and jobs. The stride is derived from the core count (`clamp(cores^2 / 16, 16, 64)`, overridable via `GEMMKIT_THREAD_DIM_STRIDE`), so a small machine ramps to full width quickly while a many-core part ramps slowly. The reason a gentle ramp beats jumping to all cores is mid-size thread over-subscription: a mid-size GEMM has enough parallelism to *occupy* every core but not enough work per worker to *amortize* them, so the extra workers contribute mostly fork/join latency, pack-region traffic, and shared-cache contention - a mid-size problem's throughput peaks well below the full logical width of a many-core part. The ramp reaches full width only when the problem is large enough to feed it. The stride formula is an empirical two-point fit, not a derivation - the honest driver is memory-domain topology, which cannot be robustly detected - so the env knob is the escape hatch for machines the fit misses.
+
+Bandwidth-bound shapes get a different rule entirely. A gemv or gevv does O(1) arithmetic per byte, so the compute ramp's logic does not transfer: `resolve_bandwidth` gates on *bytes touched* instead. Below an LLC-derived byte floor (`gemv_parallel_floor_bytes` in `cache.rs`: a quarter of the per-core L3 share, or half the full shared cluster-L2 on L3-less parts; `GEMMKIT_GEMV_PARALLEL_BYTES` overrides) the touched data is cache-resident and a single core already gets the full LLC bandwidth - splitting only adds fork/join and shared-cache contention with no DRAM bandwidth to gain. Above the floor, the auto count steps *straight* to a bandwidth cap (a quarter of the logical cores on x86 - halved once for SMT siblings sharing load/store units, halved again because a fraction of the physical cores saturates DRAM - half on SMT-less aarch64, floored at 2; `GEMMKIT_GEMV_THREAD_CAP` overrides). No ramp, because on a bandwidth scaling curve *a few workers is the worst point*: the curve dips there - fork/join and contention costs are already paid, aggregate DRAM bandwidth has not yet arrived - so any ramp through the dip loses to both endpoints. Serial below the floor, the cap above it, nothing in between.
+
+Batched GEMM has its own resolver, `resolve_batch`, choosing between three plans: `Serial`, `BatchParallel(n)` - workers each run whole cache-hot GEMMs, one fork/join for the batch, bit-identical across worker counts because no element is ever split - and `SequentialInternal`, which loops the batch giving each large, DRAM-bound element the full engine parallelism in turn. The split plan is gated to `m, n > 1` shapes, whose routes are worker-count independent; a gemv-shaped element always stays whole on one worker. [Special Paths](Special_Paths.md) covers the routing, [Batched GEMM](../gemmkit-guide/Batched_GEMM.md) the API.
+
+## Demand-driven work distribution
+
+Given a worker count, the driver does not build a nested task tree. For each column block and depth slice it flattens the inner work into a flat 1-D job list - `n_mc` row blocks times `n_nt` column tiles, job `q` decoding to `(ic_idx, jt) = (q / n_nt, q % n_nt)` - and workers pull contiguous chunks from a shared lock-free cursor until it is empty:
+
+```rust
+// gemmkit/src/parallel.rs
+impl JobCursor {
+    /// Atomically claim the next `[start, end)` chunk, or `None` once the job space
+    /// is exhausted
+    #[inline]
+    pub(crate) fn next_chunk(&self) -> Option<(usize, usize)> {
+        let start = self.next.fetch_add(self.grain, Ordering::Relaxed);
+        if start >= self.n_jobs {
+            None
+        } else {
+            Some((start, (start + self.grain).min(self.n_jobs)))
+        }
+    }
+}
+```
+
+One `fetch_add` per claim, no locks, no per-job queues. Demand-driven pulling is what makes heterogeneous cores work well: on a big.LITTLE part a P-core that finishes chunks faster simply pulls proportionally more of them, where a static `n_jobs / n_threads` split would leave every core waiting on the slowest. The same property absorbs OS noise and frequency differences on homogeneous machines.
+
+The chunk grain balances two costs. Too coarse and the tail of the job list leaves workers idle at the join; too fine and the atomic claims (and, on the packed-LHS path, re-packing at chunk edges) start to show. The general grain oversamples the worker count: `job_grain` targets `GEMMKIT_PARALLEL_OVERSAMPLE` chunks per worker (default 8), so each worker expects several pulls and imbalance self-corrects. The packed-LHS path is special: its natural chunk is a whole row block (`n_nt` consecutive jobs), so a worker packs the block's `A` panel once and reuses it across all the block's column tiles. That yields only `n_mc` chunks, so when the row-block count is small, `packed_block_grain` splits each block into power-of-two column sub-chunks until there are about `GEMMKIT_PACKED_OVERSAMPLE * n_threads` chunks (default target 2) - but only by divisors of `n_nt`, so a chunk never straddles a row-block boundary and re-packs `A` mid-chunk. The split target is a swept optimum: splitting harder re-packs too often and regresses.
+
+Two parallel phases precede the compute region in each depth slice, and their boundaries are the only barriers in the driver. When `B` packs, workers pull `nr`-wide column panels from their own cursor and the fork/join of that region is the write-before-read barrier the compute region depends on - packed `B` is the one buffer shared non-disjointly across workers. The shared-`A` pre-pass (large parallel problems only) packs each row block's panel once into a shared slot under the same discipline. Everything else is disjoint by construction: workers write only their own output tiles and their own pack regions, which is the invariant that lets the `Ptr` shim declare the captured raw pointers `Send + Sync` in one audited place.
+
+## The wasm story
+
+On `wasm32-wasip1` there are no threads to spawn, and rayon would trap trying. The compile-time constant `RAYON_USABLE` captures whether the target can run workers at all: on a wasm build without the threading opt-in, every resolver returns 1 and `for_each_worker` runs the plain serial loop - `parallel` degrades gracefully instead of trapping. The opt-in is the `wasm_threads` feature, targeting `wasm32-wasip1-threads` (or a browser with SharedArrayBuffer): since `available_parallelism` is unsupported on wasm, rayon's global pool would silently size itself to one thread, so gemmkit builds its own pool, sized by the `GEMMKIT_WASM_THREADS` knob (default 8), and installs it around the worker loop. The deployer states the width; everything else is unchanged. Details of the wasm builds live in [no_std and WebAssembly](../gemmkit-guide/no_std_and_WebAssembly.md).
+
+## The reproducibility contract, assembled
+
+gemmkit promises that a fixed input, environment, and configuration produces identical output regardless of the worker count. By this point all three mechanisms behind that promise have appeared; here is how they compose.
+
+First, the work itself is worker-count independent. [Blocking](Blocking_and_the_Cache_Model.md) never sees the thread count, so the panel boundaries, the depth slices, and the flat job list are identical whether one worker drains the cursor or thirty-two do. The worker count changes how the fixed job list is *partitioned*, never its contents.
+
+Second, no reduction is ever split. Within a depth slice, one worker computes an output tile's whole update - a chunk is a set of whole tiles - and the depth slices themselves run sequentially (the `pc` loop is never parallel), with `beta` applied on the first slice and accumulation after. So every output element's floating-point reduction runs in one fixed order, determined by the blocking alone. The special paths keep the same discipline: gemv partitions output *rows* on register-panel boundaries so each row's SIMD/scalar split is partition-independent - which makes gemv outright bit-identical across worker counts - and batched plans either keep whole elements on one worker or split only shapes whose routes are worker-count independent.
+
+Third, packed bytes do not depend on who packs them. `pack_panels` is a pure reorder with both of its branches writing identical bytes, so a panel packed by worker 3, by the shared-`A` pre-pass, or by `prepack_rhs` weeks earlier is the same sequence of bytes ([Packing and Workspaces](Packing_and_Workspaces.md)); the kernel cannot observe who staged its input.
+
+Which worker computes a given tile genuinely varies run to run - the cursor hands chunks to whoever asks first - but by the three mechanisms above, nothing numerical depends on it. Today serial and parallel runs are in fact bitwise equal on the driver paths, since both run the same kernel over the same schedule; the *promised* contract is the slightly weaker reproducibility-under-a-fixed-config, which is what leaves room for tolerance-held kernels like the bf16 dot path. How to choose worker counts in practice, and what the contract means for testing, is covered in [Parallelism in Practice](../gemmkit-guide/Parallelism_in_Practice.md).

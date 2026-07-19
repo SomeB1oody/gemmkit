@@ -8,6 +8,8 @@
 
 各入口点镜像了 gemmkit 的核心 API，包括 feature 门控的元素类型族（`half`、`complex`、`int8`）和融合尾部运算（fused epilogue）入口（`epilogue`）。faer 没有三维数组类型，所以批量 GEMM（`gemm_batched`）以每个批次元素的 `(A, B)` `MatRef` 输入切片搭配 `&mut C` `MatMut` 输出切片的形式接收批次（走 gemmkit 的指针数组批量引擎），且每个批次元素可以有不同的形状。
 
+本适配器的分步教程见 [gemmkit 指南](https://someb1oody.github.io/gemmkit/zh-Hans/gemmkit-faer/在faer中使用gemmkit.html)。
+
 ## 用法
 
 ```toml

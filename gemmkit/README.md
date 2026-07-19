@@ -91,6 +91,14 @@ then a `GEMMKIT_*` env var, then a compile-time default. The
 on the target machine and emits a ready-to-source env profile; the individual
 knobs are documented on [docs.rs](https://docs.rs/gemmkit).
 
+## Documentation
+
+- [User guide](https://someb1oody.github.io/gemmkit/en/gemmkit-guide/Getting_Started.html):
+  the gemmkit chapters of the workspace book, from the first call to the
+  advanced surface.
+- [Architecture walkthrough](https://someb1oody.github.io/gemmkit/en/architecture/Design_Goals_and_the_Big_Picture.html):
+  how the engine works inside, in more depth than ARCHITECTURE.md.
+
 ## Related crates
 
 - [gemmkit-ndarray](https://crates.io/crates/gemmkit-ndarray): zero-copy adapter

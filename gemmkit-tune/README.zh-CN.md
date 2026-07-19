@@ -8,6 +8,8 @@
 
 请在部署机器上运行它，而不是放进 `build.rs`：构建主机通常并非部署主机，而这些旋钮是针对真正执行计算的 CPU 校准的。gemmkit 编译期内置的默认值是在某一台机器（Ryzen 9950X）上校准的，因此在同一台机器上运行基本只会重新得到相同的取值；真正的收益出现在换一台机器时。
 
+更完整的教程（包括扫描过程的内部原理）见 [gemmkit 指南](https://someb1oody.github.io/gemmkit/zh-Hans/gemmkit-tune/使用gemmkit-tune调优.html)。
+
 ## 用法
 
 安装该二进制并在目标机器上运行：
