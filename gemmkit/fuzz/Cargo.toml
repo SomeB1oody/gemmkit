@@ -1,7 +1,3 @@
-# An empty `[workspace]` table makes this crate its own workspace root. Required
-# because `gemmkit/fuzz` sits *inside* the `gemmkit` member directory, so the root
-# `exclude` alone does not stop cargo from resolving the outer workspace; this pins
-# the fuzz crate to its own Cargo.lock / target so nightly never leaks into stable.
 [workspace]
 
 [package]
@@ -16,16 +12,12 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 arbitrary = "1"
-# gemmkit default features (std, parallel) ON + every element-type family, so all
-# entry families (float, half, int8, complex, batched/prepack) are fuzzable.
 gemmkit = { path = "..", features = ["complex", "half", "int8"] }
 
 [lib]
 name = "gemmkit_fuzz"
 path = "src/lib.rs"
 
-# One [[bin]] per target; test/doc/bench off so a `cargo test` inside the fuzz
-# crate never tries to run them.
 [[bin]]
 name = "fuzz_gemm"
 path = "fuzz_targets/fuzz_gemm.rs"

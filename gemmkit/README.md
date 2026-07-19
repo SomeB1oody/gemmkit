@@ -1,3 +1,5 @@
+[简体中文](https://github.com/SomeB1oody/gemmkit/blob/master/gemmkit/README.zh-CN.md) | [English](https://github.com/SomeB1oody/gemmkit/blob/master/gemmkit/README.md)
+
 # gemmkit
 
 [![crates.io](https://img.shields.io/crates/v/gemmkit.svg)](https://crates.io/crates/gemmkit) [![docs.rs](https://img.shields.io/docsrs/gemmkit)](https://docs.rs/gemmkit)

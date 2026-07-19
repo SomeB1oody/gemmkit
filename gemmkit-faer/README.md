@@ -1,3 +1,5 @@
+[简体中文](https://github.com/SomeB1oody/gemmkit/blob/master/gemmkit-faer/README.zh-CN.md) | [English](https://github.com/SomeB1oody/gemmkit/blob/master/gemmkit-faer/README.md)
+
 # gemmkit-faer
 
 [![crates.io](https://img.shields.io/crates/v/gemmkit-faer.svg)](https://crates.io/crates/gemmkit-faer) [![docs.rs](https://img.shields.io/docsrs/gemmkit-faer)](https://docs.rs/gemmkit-faer)

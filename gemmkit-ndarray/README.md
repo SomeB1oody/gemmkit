@@ -1,3 +1,5 @@
+[简体中文](https://github.com/SomeB1oody/gemmkit/blob/master/gemmkit-ndarray/README.zh-CN.md) | [English](https://github.com/SomeB1oody/gemmkit/blob/master/gemmkit-ndarray/README.md)
+
 # gemmkit-ndarray
 
 [![crates.io](https://img.shields.io/crates/v/gemmkit-ndarray.svg)](https://crates.io/crates/gemmkit-ndarray) [![docs.rs](https://img.shields.io/docsrs/gemmkit-ndarray)](https://docs.rs/gemmkit-ndarray)

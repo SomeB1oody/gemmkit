@@ -1,3 +1,5 @@
+[简体中文](https://github.com/SomeB1oody/gemmkit/blob/master/gemmkit/fuzz/README.zh-CN.md) | [English](https://github.com/SomeB1oody/gemmkit/blob/master/gemmkit/fuzz/README.md)
+
 # gemmkit fuzzing harness
 
 A [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz) (libFuzzer + AddressSanitizer)

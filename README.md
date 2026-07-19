@@ -1,3 +1,5 @@
+[简体中文](https://github.com/SomeB1oody/gemmkit/blob/master/README.zh-CN.md) | [English](https://github.com/SomeB1oody/gemmkit/blob/master/README.md)
+
 # gemmkit
 
 [![CI](https://github.com/SomeB1oody/gemmkit/actions/workflows/ci.yml/badge.svg)](https://github.com/SomeB1oody/gemmkit/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/gemmkit.svg)](https://crates.io/crates/gemmkit) [![docs.rs](https://img.shields.io/docsrs/gemmkit)](https://docs.rs/gemmkit)
