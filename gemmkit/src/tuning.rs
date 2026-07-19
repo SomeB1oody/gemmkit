@@ -368,6 +368,84 @@ pub const I8_VNNI_MIN_PAR_MNK_DEFAULT: usize = 768 * 768 * 768;
 static I8_VNNI_MIN_PAR_MNK: Threshold =
     Threshold::new("GEMMKIT_I8_VNNI_MIN_PAR_MNK", I8_VNNI_MIN_PAR_MNK_DEFAULT);
 
+// Canonical enumeration of every knob's GEMMKIT_* env name
+//
+// This is the single source of truth the out-of-crate knob consumers assert against (the
+// gemmkit-tune sweep table, tests/props_knobs.rs KNOBS, and the fuzz SETTERS list), so a knob
+// added above cannot silently escape their coverage. Statics cannot be iterated without macros
+// (forbidden here), so this is the required manual mirror: every `Threshold` static declared
+// above MUST appear in this list. The 23 always-present knobs are in `KNOB_ENV_NAMES_BASE`; the 2
+// cfg-gated ones (whose `Threshold` statics carry the same cfg) are appended only when compiled
+// in - I8_VNNI_MIN_PAR_MNK (feature int8) and WASM_THREADS (wasm32 + wasm_threads). Adding a
+// Threshold without adding it here is a 2-line diff away and is caught by the consumer sync tests
+const KNOB_ENV_NAMES_BASE: [&str; 23] = [
+    "GEMMKIT_PARALLEL_THRESHOLD",
+    "GEMMKIT_RHS_PACK_THRESHOLD",
+    "GEMMKIT_LHS_PACK_THRESHOLD",
+    "GEMMKIT_LHS_PACK_STRIDE",
+    "GEMMKIT_GEMV_THRESHOLD",
+    "GEMMKIT_SMALL_K_THRESHOLD",
+    "GEMMKIT_SMALL_MN_DIM",
+    "GEMMKIT_SMALL_MN_PACK_MIN_K",
+    "GEMMKIT_GEMV_PARALLEL_BYTES",
+    "GEMMKIT_GEMV_THREAD_CAP",
+    "GEMMKIT_PARALLEL_OVERSAMPLE",
+    "GEMMKIT_THREAD_DIM_STRIDE",
+    "GEMMKIT_SHARED_LHS_MNK",
+    "GEMMKIT_K_STREAM_MAX",
+    "GEMMKIT_SEQ_INTERNAL_BYTES_PER_WORKER",
+    "GEMMKIT_PACKED_OVERSAMPLE",
+    "GEMMKIT_MC_REG_PANELS",
+    "GEMMKIT_NC_NO_L3_PANELS",
+    "GEMMKIT_TINY_BLOCK_DIM",
+    "GEMMKIT_KC",
+    "GEMMKIT_KC_MIN",
+    "GEMMKIT_DEEP_KC_BYTES",
+    "GEMMKIT_PACK_TRANSPOSE_TILE",
+];
+
+// Count of cfg-gated knob names appended to the base list on this target. `cfg!` is a compile-time
+// bool, so this whole count folds to a constant (no runtime work)
+const KNOB_ENV_NAMES_GATED: usize = cfg!(feature = "int8") as usize
+    + cfg!(all(target_arch = "wasm32", feature = "wasm_threads")) as usize;
+
+const KNOB_ENV_NAMES_LEN: usize = KNOB_ENV_NAMES_BASE.len() + KNOB_ENV_NAMES_GATED;
+
+// Assemble the base names plus whichever cfg-gated names are compiled in, at compile time, so the
+// getter is a plain slice return. The trailing `assert!` both consumes the running index and makes
+// a length miscount a compile error rather than a truncated list
+const fn build_knob_env_names() -> [&'static str; KNOB_ENV_NAMES_LEN] {
+    let mut out = [""; KNOB_ENV_NAMES_LEN];
+    let mut i = 0;
+    while i < KNOB_ENV_NAMES_BASE.len() {
+        out[i] = KNOB_ENV_NAMES_BASE[i];
+        i += 1;
+    }
+    if cfg!(feature = "int8") {
+        out[i] = "GEMMKIT_I8_VNNI_MIN_PAR_MNK";
+        i += 1;
+    }
+    if cfg!(all(target_arch = "wasm32", feature = "wasm_threads")) {
+        out[i] = "GEMMKIT_WASM_THREADS";
+        i += 1;
+    }
+    assert!(i == KNOB_ENV_NAMES_LEN);
+    out
+}
+
+static KNOB_ENV_NAMES: [&str; KNOB_ENV_NAMES_LEN] = build_knob_env_names();
+
+/// Every knob's `GEMMKIT_*` env name, cfg-accurate for the current target/features
+///
+/// A `#[doc(hidden)]` machine-readable registry (not a stable API): the knob consumers
+/// (gemmkit-tune, `tests/props_knobs.rs`, the fuzz `SETTERS`) assert their hand-maintained lists
+/// against this so a new knob cannot escape their coverage. Zero runtime cost (a compile-time
+/// `static`) and `no_std`-compatible
+#[doc(hidden)]
+pub fn knob_env_names() -> &'static [&'static str] {
+    &KNOB_ENV_NAMES
+}
+
 /// Get the serial/parallel work gate (`m*n*k` threshold)
 pub fn parallel_threshold() -> usize {
     PARALLEL_THRESHOLD.get()

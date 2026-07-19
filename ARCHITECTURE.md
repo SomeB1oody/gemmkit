@@ -411,7 +411,12 @@ variable (`GEMMKIT_*`) > compiled default (calibrated on a Zen5 x86 part, with
 arch-split defaults where aarch64 measured differently). Env vars are read
 once and cached; malformed values warn on stderr and fall back rather than
 panic. Knobs cover the serial/parallel gate, pack gates and strides,
-special-path thresholds, scheduler grains, and blocking caps.
+special-path thresholds, scheduler grains, and blocking caps. The full set of
+`GEMMKIT_*` names is enumerated once in `tuning::knob_env_names` (a
+`#[doc(hidden)]`, zero-cost, `no_std` registry); the out-of-crate knob consumers
+(the `gemmkit-tune` sweep table, `tests/props_knobs.rs`, the fuzz `KNOB_SETTERS`)
+assert their hand-maintained lists against it, so a new knob cannot silently
+escape their coverage.
 
 `gemmkit-tune` (`gemmkit-tune/src/main.rs`) automates host calibration: run on
 the deploy machine, it sweeps each knob independently over a probe-shape set,
@@ -438,8 +443,8 @@ for `--save-baseline` regression tracking.
 - **Conformance** (`tests/simd_conformance.rs`, plus in-module sweeps like
   `requant_store` in `gemmkit/src/simd.rs`): every available token checked
   against scalar models.
-- **Fuzzing** (`gemmkit/fuzz/`): five libFuzzer targets (gemm, batched,
-  prepack, API validation, knobs) in a nightly-only sub-workspace.
+- **Fuzzing** (`gemmkit/fuzz/`): six libFuzzer targets (gemm, batched,
+  prepack, prepack-i8, API validation, knobs) in a nightly-only sub-workspace.
 - **Knob and env surface** (`tests/tuning.rs`, `tests/env.rs`,
   `tests/props_knobs.rs`, `tests/deep_k_narrow.rs`): the tests that mutate the
   process-global tuning knobs or `GEMMKIT_*` environment live in their own

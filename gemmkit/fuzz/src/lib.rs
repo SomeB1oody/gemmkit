@@ -26,6 +26,6 @@ mod reference;
 pub use api_validation::{DimClass, EntryKind, StrideClass, ValidationPlan, drive_validation};
 pub use common::LayoutPlan;
 pub use plans::{
-    BatchedPlan, GemmPlan, KnobsPlan, PrepackPlan, Scenario, TypeTag, run_batched, run_gemm,
-    run_knobs, run_prepack,
+    BatchedPlan, GemmPlan, KnobsPlan, PrepackI8Plan, PrepackPlan, Scenario, TypeTag, run_batched,
+    run_gemm, run_knobs, run_prepack, run_prepack_i8,
 };

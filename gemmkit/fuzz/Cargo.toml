@@ -61,6 +61,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "fuzz_prepack_i8"
+path = "fuzz_targets/fuzz_prepack_i8.rs"
+test = false
+doc = false
+bench = false
+
 # cargo-fuzz builds the release profile; keep line-table symbols for readable
 # crash traces, and pin panic=unwind so fuzz_api_validation's catch_unwind (which
 # filters documented `gemmkit:` validation panics) works regardless of the

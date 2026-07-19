@@ -9,7 +9,8 @@ use crate::reference::{
 };
 use gemmkit::{
     BatchProblem, MatMut, MatRef, Parallelism, Workspace, gemm, gemm_batched, gemm_batched_slice,
-    gemm_cplx, gemm_i8, gemm_packed_a, gemm_packed_b, gemm_with, prepack_lhs, prepack_rhs,
+    gemm_cplx, gemm_i8, gemm_i8_packed_b, gemm_packed_a, gemm_packed_b, gemm_with, prepack_lhs,
+    prepack_rhs, prepack_rhs_i8,
 };
 
 // generic differential drivers (shared across targets)
@@ -146,6 +147,79 @@ pub(crate) fn differential_gemm_i8(
     );
 
     i8_gate(&cbuf, rsc, csc, m, n, &cref, ctx);
+    assert_no_gap_writes(&cbuf, m, n, rsc, csc, ctx);
+}
+
+/// Prepacked-i8-RHS round trip: `prepack_rhs_i8(B)` then `gemm_i8_packed_b` with column-major-ish
+/// C (the orientation the API requires). Integer GEMM is exact, so the gate is EXACT (stronger than
+/// the float prepack tolerance): the packed output must equal both the wrapping-i32 reference and a
+/// plain `gemm_i8` bit-for-bit (the API's documented bit-identity)
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn differential_prepack_i8(
+    m: usize,
+    k: usize,
+    n: usize,
+    la: LayoutPlan,
+    lb: LayoutPlan,
+    alpha: i32,
+    beta: i32,
+    par: Parallelism,
+    a_seed: u64,
+    b_seed: u64,
+    c_seed: u64,
+    ctx: &str,
+) {
+    let mut ra = Rng::new(a_seed);
+    let mut rb = Rng::new(b_seed);
+    let mut rc = Rng::new(c_seed);
+    let (abuf, rsa, csa) = build_operand::<i8>(m, k, la, 0, || ra.next_i8());
+    let (bbuf, rsb, csb) = build_operand::<i8>(k, n, lb, 0, || rb.next_i8());
+    // Column-major-ish C (|csc| >= |rsc|) is what gemm_i8_packed_b requires; dims are >= 1 so the
+    // invariant holds. C0 in [-128, 127] keeps the i32 epilogue in a sane magnitude
+    let lc = LayoutPlan::ColIsh { il: 1, pad: 1 };
+    let (mut cbuf, rsc, csc) =
+        build_operand::<i32>(m, n, lc, i32::SENTINEL, || rc.next_i8() as i32);
+    // Identical C0 (buffer clone, sentinel gaps included) for the plain cross-check below
+    let mut cplain = cbuf.clone();
+
+    let da = dense_i32_from_i8(&abuf, m, k, rsa, csa);
+    let db = dense_i32_from_i8(&bbuf, k, n, rsb, csb);
+    let dc0 = dense_i32(&cbuf, m, n, rsc, csc);
+    let cref = ref_gemm_i8(&da, &db, &dc0, m, k, n, alpha, beta);
+
+    let packed = prepack_rhs_i8(MatRef::new(&bbuf, k, n, rsb, csb));
+    if packed.rows() != k || packed.cols() != n {
+        panic!(
+            "{ctx}: prepack_rhs_i8 echo mismatch: rows {} cols {}",
+            packed.rows(),
+            packed.cols()
+        );
+    }
+
+    gemm_i8_packed_b(
+        alpha,
+        MatRef::new(&abuf, m, k, rsa, csa),
+        &packed,
+        beta,
+        MatMut::new(&mut cbuf, m, n, rsc, csc),
+        par,
+    );
+    // Plain gemm_i8 on the identical inputs / C0: the packed path is documented bit-identical to it
+    gemm_i8(
+        alpha,
+        MatRef::new(&abuf, m, k, rsa, csa),
+        MatRef::new(&bbuf, k, n, rsb, csb),
+        beta,
+        MatMut::new(&mut cplain, m, n, rsc, csc),
+        par,
+    );
+
+    // Exact vs the independent reference, then exact vs the plain path (whole buffer, gaps included:
+    // both must keep the sentinel in every non-view slot and write identical view values)
+    i8_gate(&cbuf, rsc, csc, m, n, &cref, ctx);
+    if cbuf != cplain {
+        panic!("{ctx}: prepacked i8 output differs from plain gemm_i8 (bit-identity broken)");
+    }
     assert_no_gap_writes(&cbuf, m, n, rsc, csc, ctx);
 }
 

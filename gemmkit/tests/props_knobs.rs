@@ -42,7 +42,7 @@ impl KnobGuard {
     fn capture() -> Self {
         #[allow(unused_mut)]
         let mut restore: Vec<(fn(usize), usize)> =
-            KNOBS.iter().map(|&(set, get)| (set, get())).collect();
+            KNOBS.iter().map(|&(_, set, get)| (set, get())).collect();
         // i8 VNNI stays a separate cfg'd append: it is captured/restored but deliberately
         // excluded from the swept `KNOBS` table (int8/f32-inert; exercised by P20)
         #[cfg(feature = "int8")]
@@ -68,49 +68,152 @@ fn thread_dim_stride_restore() -> usize {
     0
 }
 
-/// One swept knob: its setter paired with the capture fn that reads the value the setter
-/// round-trips to
-type Knob = (fn(usize), fn() -> usize);
+/// One swept knob: its canonical `GEMMKIT_*` env name, its setter, and the capture fn that reads
+/// the value the setter round-trips to. The name backs the `knobs_table_covers_every_knob` sync
+/// test against `tuning::knob_env_names`; the two fns drive the sweep/restore
+type Knob = (&'static str, fn(usize), fn() -> usize);
 
 /// The 23 general-path knobs P16 sweeps (i8 VNNI is int8/f32-inert, exercised by P20), each
 /// paired with the capture fn that reads the value its setter round-trips to. Order-independent:
 /// each is set to an independently-drawn value. Both `KnobGuard::capture` (restore side) and
 /// `apply_knobs` (sweep side) drive this single table, so their lengths (and hence
-/// [`KNOB_COUNT`]) can never drift apart
+/// [`KNOB_COUNT`]) can never drift apart. The leading env name is asserted to cover
+/// [`tuning::knob_env_names`] by `knobs_table_covers_every_knob`
 const KNOBS: &[Knob] = &[
-    (tuning::set_parallel_threshold, tuning::parallel_threshold),
-    (tuning::set_rhs_pack_threshold, tuning::rhs_pack_threshold),
-    (tuning::set_lhs_pack_threshold, tuning::lhs_pack_threshold),
-    (tuning::set_lhs_pack_stride, tuning::lhs_pack_stride),
-    (tuning::set_gemv_threshold, tuning::gemv_threshold),
-    (tuning::set_small_k_threshold, tuning::small_k_threshold),
-    (tuning::set_small_mn_dim, tuning::small_mn_dim),
-    (tuning::set_small_mn_pack_min_k, tuning::small_mn_pack_min_k),
-    (tuning::set_gemv_parallel_bytes, tuning::gemv_parallel_bytes),
-    (tuning::set_gemv_thread_cap, tuning::gemv_thread_cap),
-    (tuning::set_parallel_oversample, tuning::parallel_oversample),
-    (tuning::set_thread_dim_stride, thread_dim_stride_restore),
-    (tuning::set_shared_lhs_mnk, tuning::shared_lhs_mnk),
-    (tuning::set_k_stream_max, tuning::k_stream_max),
     (
+        "GEMMKIT_PARALLEL_THRESHOLD",
+        tuning::set_parallel_threshold,
+        tuning::parallel_threshold,
+    ),
+    (
+        "GEMMKIT_RHS_PACK_THRESHOLD",
+        tuning::set_rhs_pack_threshold,
+        tuning::rhs_pack_threshold,
+    ),
+    (
+        "GEMMKIT_LHS_PACK_THRESHOLD",
+        tuning::set_lhs_pack_threshold,
+        tuning::lhs_pack_threshold,
+    ),
+    (
+        "GEMMKIT_LHS_PACK_STRIDE",
+        tuning::set_lhs_pack_stride,
+        tuning::lhs_pack_stride,
+    ),
+    (
+        "GEMMKIT_GEMV_THRESHOLD",
+        tuning::set_gemv_threshold,
+        tuning::gemv_threshold,
+    ),
+    (
+        "GEMMKIT_SMALL_K_THRESHOLD",
+        tuning::set_small_k_threshold,
+        tuning::small_k_threshold,
+    ),
+    (
+        "GEMMKIT_SMALL_MN_DIM",
+        tuning::set_small_mn_dim,
+        tuning::small_mn_dim,
+    ),
+    (
+        "GEMMKIT_SMALL_MN_PACK_MIN_K",
+        tuning::set_small_mn_pack_min_k,
+        tuning::small_mn_pack_min_k,
+    ),
+    (
+        "GEMMKIT_GEMV_PARALLEL_BYTES",
+        tuning::set_gemv_parallel_bytes,
+        tuning::gemv_parallel_bytes,
+    ),
+    (
+        "GEMMKIT_GEMV_THREAD_CAP",
+        tuning::set_gemv_thread_cap,
+        tuning::gemv_thread_cap,
+    ),
+    (
+        "GEMMKIT_PARALLEL_OVERSAMPLE",
+        tuning::set_parallel_oversample,
+        tuning::parallel_oversample,
+    ),
+    (
+        "GEMMKIT_THREAD_DIM_STRIDE",
+        tuning::set_thread_dim_stride,
+        thread_dim_stride_restore,
+    ),
+    (
+        "GEMMKIT_SHARED_LHS_MNK",
+        tuning::set_shared_lhs_mnk,
+        tuning::shared_lhs_mnk,
+    ),
+    (
+        "GEMMKIT_K_STREAM_MAX",
+        tuning::set_k_stream_max,
+        tuning::k_stream_max,
+    ),
+    (
+        "GEMMKIT_SEQ_INTERNAL_BYTES_PER_WORKER",
         tuning::set_seq_internal_bytes_per_worker,
         tuning::seq_internal_bytes_per_worker,
     ),
-    (tuning::set_packed_oversample, tuning::packed_oversample),
-    (tuning::set_mc_reg_panels, tuning::mc_reg_panels),
-    (tuning::set_nc_no_l3_panels, tuning::nc_no_l3_panels),
-    (tuning::set_tiny_block_dim, tuning::tiny_block_dim),
-    (tuning::set_kc, tuning::kc),
-    (tuning::set_kc_min, tuning::kc_min),
-    (tuning::set_pack_transpose_tile, tuning::pack_transpose_tile),
-    (tuning::set_deep_kc_bytes, tuning::deep_kc_bytes),
+    (
+        "GEMMKIT_PACKED_OVERSAMPLE",
+        tuning::set_packed_oversample,
+        tuning::packed_oversample,
+    ),
+    (
+        "GEMMKIT_MC_REG_PANELS",
+        tuning::set_mc_reg_panels,
+        tuning::mc_reg_panels,
+    ),
+    (
+        "GEMMKIT_NC_NO_L3_PANELS",
+        tuning::set_nc_no_l3_panels,
+        tuning::nc_no_l3_panels,
+    ),
+    (
+        "GEMMKIT_TINY_BLOCK_DIM",
+        tuning::set_tiny_block_dim,
+        tuning::tiny_block_dim,
+    ),
+    ("GEMMKIT_KC", tuning::set_kc, tuning::kc),
+    ("GEMMKIT_KC_MIN", tuning::set_kc_min, tuning::kc_min),
+    (
+        "GEMMKIT_PACK_TRANSPOSE_TILE",
+        tuning::set_pack_transpose_tile,
+        tuning::pack_transpose_tile,
+    ),
+    (
+        "GEMMKIT_DEEP_KC_BYTES",
+        tuning::set_deep_kc_bytes,
+        tuning::deep_kc_bytes,
+    ),
 ];
 const KNOB_COUNT: usize = KNOBS.len();
 
 fn apply_knobs(vals: &[usize]) {
-    for (&(set, _), &v) in KNOBS.iter().zip(vals) {
+    for (&(_, set, _), &v) in KNOBS.iter().zip(vals) {
         set(v);
     }
+}
+
+// P16c registry sync: the KNOBS table (plus the cfg-gated i8 VNNI knob it deliberately omits) must
+// exactly cover tuning::knob_env_names(), gemmkit's canonical knob registry. A knob added to
+// gemmkit but not to KNOBS silently loses its metamorphic coverage; this catches that at test time
+#[test]
+fn knobs_table_covers_every_knob() {
+    use std::collections::BTreeSet;
+    let canonical: BTreeSet<&str> = tuning::knob_env_names().iter().copied().collect();
+    let mut swept: BTreeSet<&str> = KNOBS.iter().map(|&(name, _, _)| name).collect();
+    assert_eq!(swept.len(), KNOBS.len(), "KNOBS has a duplicate env name");
+    // i8 VNNI is captured/restored (KnobGuard) but excluded from the swept KNOBS table (exercised
+    // by P20); it is the one knob legitimately not in KNOBS, so add it to match the canonical set
+    if cfg!(feature = "int8") {
+        swept.insert("GEMMKIT_I8_VNNI_MIN_PAR_MNK");
+    }
+    assert_eq!(
+        swept, canonical,
+        "props_knobs KNOBS is out of sync with tuning::knob_env_names()"
+    );
 }
 
 /// Value pool that lands on the small multipliers (1-3 forces deep multi-block driver

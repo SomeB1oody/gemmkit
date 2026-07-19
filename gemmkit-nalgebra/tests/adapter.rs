@@ -746,11 +746,15 @@ fn packed_b_fused_matches_packed_then_map() {
 }
 
 /// `gemm_packed_a_fused` (a `PerRow` bias + `ReLU`) is **bit-identical** to plain `gemm_packed_a`
-/// off the same handle then the same scalar map, into a row-major C (the packed_a orientation)
+/// off the same handle then the same scalar map, into a row-major C (the packed_a orientation).
+/// Also covers the `_with` (caller-owned `Workspace`) twin
 #[cfg(feature = "epilogue")]
 #[test]
 fn packed_a_fused_matches_packed_then_map() {
-    use gemmkit_nalgebra::{Activation, Bias, gemm_packed_a, gemm_packed_a_fused, prepack_lhs};
+    use gemmkit::Workspace;
+    use gemmkit_nalgebra::{
+        Activation, Bias, gemm_packed_a, gemm_packed_a_fused, gemm_packed_a_fused_with, prepack_lhs,
+    };
     use nalgebra::DMatrixViewMut;
     let (m, k, n) = (96usize, 50, 72);
     let a = rand2(m, k, 261);
@@ -781,6 +785,23 @@ fn packed_a_fused_matches_packed_then_map() {
                 par,
             );
         }
+        // _with entry, same args
+        let mut data_w = base.clone();
+        {
+            let mut ws = Workspace::new();
+            let mut c = DMatrixViewMut::from_slice_with_strides_mut(&mut data_w, m, n, n, 1);
+            gemm_packed_a_fused_with(
+                &mut ws,
+                alpha,
+                &packed,
+                &b,
+                beta,
+                &mut c,
+                Some(Bias::PerRow(&bias)),
+                Some(Activation::Relu),
+                par,
+            );
+        }
         let mut data_r = base.clone();
         {
             let mut c = DMatrixViewMut::from_slice_with_strides_mut(&mut data_r, m, n, n, 1);
@@ -794,6 +815,11 @@ fn packed_a_fused_matches_packed_then_map() {
                     data_f[i * n + j].to_bits(),
                     want.to_bits(),
                     "a_fused ({i},{j})"
+                );
+                assert_eq!(
+                    data_w[i * n + j].to_bits(),
+                    want.to_bits(),
+                    "a_fused_with ({i},{j})"
                 );
             }
         }

@@ -6,6 +6,7 @@ use crate::common::{AB_TABLE, I8_AB_TABLE, LayoutPlan, ab_index, arb_par, arb_pa
 use crate::differential::{
     differential_batched_real, differential_gemm_cplx, differential_gemm_i8,
     differential_gemm_real, differential_packed_a_real, differential_packed_b_real,
+    differential_prepack_i8,
 };
 use gemmkit::{Parallelism, bf16, c32, c64, f16, tuning};
 
@@ -483,5 +484,91 @@ pub fn run_prepack(p: PrepackPlan) {
         TypeTag::F32 => both!(f32),
         TypeTag::F64 => both!(f64),
         _ => both!(bf16),
+    }
+}
+
+// fuzz_prepack_i8
+
+/// i8 prepack round-trip plan (the integer twin of [`PrepackPlan`]): shapes/strides/alpha-beta/
+/// parallelism arbitrary. There is no i8 LHS prepack (only `prepack_rhs_i8` + `gemm_i8_packed_b`),
+/// so this exercises the RHS path alone - the one with the uninit `set_len` pack alloc and the VNNI
+/// k-quad-interleaved layout pinning
+#[derive(Debug)]
+pub struct PrepackI8Plan {
+    pub m: usize,
+    pub k: usize,
+    pub n: usize,
+    pub la: LayoutPlan,
+    pub lb: LayoutPlan,
+    pub alpha_i: usize,
+    pub beta_i: usize,
+    pub par: Parallelism,
+    pub seed: u64,
+}
+
+impl<'a> Arbitrary<'a> for PrepackI8Plan {
+    fn arbitrary(u: &mut Unstructured<'a>) -> Result<Self> {
+        Ok(PrepackI8Plan {
+            // dims 1..=48 cross the AVX-512 i8 tile edges; k additionally crosses the VNNI
+            // DEPTH_MULTIPLE (4) pack padding and partial-depth panels. 0 excluded (empty prepack
+            // is covered by the API-validation target and would give a trivially exact 0-result)
+            m: u.int_in_range(1usize..=48)?,
+            k: u.int_in_range(1usize..=48)?,
+            n: u.int_in_range(1usize..=48)?,
+            la: LayoutPlan::arbitrary_general(u, true)?,
+            lb: LayoutPlan::arbitrary_general(u, true)?,
+            alpha_i: ab_index(u)?,
+            beta_i: ab_index(u)?,
+            par: arb_par(u)?,
+            seed: u64::arbitrary(u)?,
+        })
+    }
+}
+
+pub fn run_prepack_i8(p: PrepackI8Plan) {
+    let ctx = "fuzz_prepack_i8";
+    let (s1, s2, s3) = (p.seed ^ 0x11, p.seed ^ 0x22, p.seed ^ 0x33);
+    differential_prepack_i8(
+        p.m,
+        p.k,
+        p.n,
+        p.la,
+        p.lb,
+        I8_AB_TABLE[p.alpha_i],
+        I8_AB_TABLE[p.beta_i],
+        p.par,
+        s1,
+        s2,
+        s3,
+        ctx,
+    );
+}
+
+#[cfg(test)]
+mod knob_sync {
+    use super::KNOB_SETTERS;
+    use std::collections::BTreeSet;
+
+    /// The fuzz `KNOB_SETTERS` list must exactly cover gemmkit's canonical knob registry
+    /// (`tuning::knob_env_names`), so a knob added to gemmkit but not wired into `fuzz_knobs`
+    /// fails here. The crate builds gemmkit with complex,half,int8 on native, so the registry is
+    /// the 23 general knobs + I8_VNNI (no wasm_threads); env names map to setter suffixes by
+    /// dropping the `GEMMKIT_` prefix and lowercasing
+    #[test]
+    fn setters_cover_every_knob() {
+        let canonical: BTreeSet<String> = gemmkit::tuning::knob_env_names()
+            .iter()
+            .map(|n| n.strip_prefix("GEMMKIT_").unwrap_or(n).to_ascii_lowercase())
+            .collect();
+        let setters: BTreeSet<String> = KNOB_SETTERS.iter().map(|&(n, _)| n.to_string()).collect();
+        assert_eq!(
+            setters.len(),
+            KNOB_SETTERS.len(),
+            "KNOB_SETTERS has a duplicate name"
+        );
+        assert_eq!(
+            setters, canonical,
+            "fuzz KNOB_SETTERS is out of sync with gemmkit::tuning::knob_env_names()"
+        );
     }
 }

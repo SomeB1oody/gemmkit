@@ -2,8 +2,6 @@ name: Fuzz smoke
 
 # Non-mandatory harness-breadth check
 on:
-  schedule:
-    - cron: "0 5 * * *"
   workflow_dispatch: {}
 
 env:
@@ -33,7 +31,7 @@ jobs:
         run: |
           # Accumulate failures so one crashing target doesn't skip the rest of the sweep.
           fail=0
-          for t in fuzz_gemm fuzz_knobs fuzz_api_validation fuzz_batched fuzz_prepack; do
+          for t in fuzz_gemm fuzz_knobs fuzz_api_validation fuzz_batched fuzz_prepack fuzz_prepack_i8; do
             cargo fuzz run "$t" -- \
               -max_total_time=60 -max_len=512 -timeout=60 -malloc_limit_mb=1024 || fail=1
           done

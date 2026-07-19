@@ -1393,3 +1393,97 @@ fn build_profile(
     }
     s
 }
+
+// Knob-coverage guard
+//
+// Every canonical gemmkit knob must be either swept by this tool (on at least one supported
+// target/config) or in the small documented never-tuned allowlist. The lists below are asserted
+// against `gemmkit::tuning::knob_env_names` so a knob added to gemmkit cannot silently escape the
+// autotuner: it fails this test until it is classified as TUNED (with a real `knob!` sweep) or
+// NEVER_TUNED (with a reason)
+
+/// Knobs this tool sweeps on at least one supported target/config. Some are arch- or flag-gated -
+/// SEQ_INTERNAL_BYTES_PER_WORKER only on aarch64, I8_VNNI_MIN_PAR_MNK only on x86, NC_NO_L3_PANELS
+/// only on a no-L3 host, K_STREAM_MAX / SHARED_LHS_MNK only under --large-matrices - but each
+/// appears as a `knob!` sweep in `main`
+#[cfg(test)]
+const TUNED: &[&str] = &[
+    "GEMMKIT_RHS_PACK_THRESHOLD",
+    "GEMMKIT_LHS_PACK_THRESHOLD",
+    "GEMMKIT_LHS_PACK_STRIDE",
+    "GEMMKIT_GEMV_THRESHOLD",
+    "GEMMKIT_SMALL_K_THRESHOLD",
+    "GEMMKIT_SMALL_MN_DIM",
+    "GEMMKIT_SMALL_MN_PACK_MIN_K",
+    "GEMMKIT_GEMV_PARALLEL_BYTES",
+    "GEMMKIT_GEMV_THREAD_CAP",
+    "GEMMKIT_PARALLEL_OVERSAMPLE",
+    "GEMMKIT_THREAD_DIM_STRIDE",
+    "GEMMKIT_SHARED_LHS_MNK",
+    "GEMMKIT_K_STREAM_MAX",
+    "GEMMKIT_SEQ_INTERNAL_BYTES_PER_WORKER",
+    "GEMMKIT_PACKED_OVERSAMPLE",
+    "GEMMKIT_MC_REG_PANELS",
+    "GEMMKIT_NC_NO_L3_PANELS",
+    "GEMMKIT_TINY_BLOCK_DIM",
+    "GEMMKIT_KC",
+    "GEMMKIT_KC_MIN",
+    "GEMMKIT_PACK_TRANSPOSE_TILE",
+    "GEMMKIT_I8_VNNI_MIN_PAR_MNK",
+];
+
+/// Knobs deliberately never swept, each with why (mirrors the owned `skipped` reasons in `report`)
+#[cfg(test)]
+const NEVER_TUNED: &[(&str, &str)] = &[
+    (
+        "GEMMKIT_PARALLEL_THRESHOLD",
+        "serial/parallel break-even is strongly shape-dependent; the cross-shape default is kept",
+    ),
+    (
+        "GEMMKIT_DEEP_KC_BYTES",
+        "narrow-only (f16/bf16 deep-contraction twin); no narrow probe here, auto default is L2-derived",
+    ),
+];
+
+#[cfg(test)]
+mod knob_coverage {
+    use super::{NEVER_TUNED, TUNED};
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn sweep_table_covers_every_knob() {
+        // gemmkit-tune always builds with the int8 feature and is native-only, so knob_env_names()
+        // is exactly the 23 general knobs + I8_VNNI (no wasm_threads); TUNED + NEVER_TUNED must
+        // partition it exactly
+        let names: BTreeSet<&str> = gemmkit::tuning::knob_env_names().iter().copied().collect();
+        let tuned: BTreeSet<&str> = TUNED.iter().copied().collect();
+        let never: BTreeSet<&str> = NEVER_TUNED.iter().map(|&(n, _)| n).collect();
+
+        assert_eq!(tuned.len(), TUNED.len(), "TUNED has a duplicate entry");
+        assert_eq!(
+            never.len(),
+            NEVER_TUNED.len(),
+            "NEVER_TUNED has a duplicate entry"
+        );
+        assert!(
+            tuned.is_disjoint(&never),
+            "a knob is both tuned and never-tuned"
+        );
+
+        let handled: BTreeSet<&str> = tuned.union(&never).copied().collect();
+
+        // Coverage: every canonical knob is classified (catches a knob added to gemmkit that the
+        // sweep table forgot)
+        let missing: Vec<&str> = names.difference(&handled).copied().collect();
+        assert!(
+            missing.is_empty(),
+            "gemmkit knobs neither swept nor in the never-tuned allowlist: {missing:?}"
+        );
+        // No stale/typo entries: every TUNED / NEVER_TUNED name is a real canonical knob
+        let unknown: Vec<&str> = handled.difference(&names).copied().collect();
+        assert!(
+            unknown.is_empty(),
+            "TUNED/NEVER_TUNED name is not a gemmkit knob (typo or removed?): {unknown:?}"
+        );
+    }
+}

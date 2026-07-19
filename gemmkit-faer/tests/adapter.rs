@@ -916,11 +916,15 @@ fn packed_b_fused_matches_packed_then_map() {
 }
 
 /// `gemm_packed_a_fused` (a `PerRow` bias + `ReLU`) is **bit-identical** to plain `gemm_packed_a`
-/// off the same handle then the same scalar map, into a row-major C (the packed_a orientation)
+/// off the same handle then the same scalar map, into a row-major C (the packed_a orientation).
+/// Also covers the `_with` (caller-owned `Workspace`) twin
 #[cfg(feature = "epilogue")]
 #[test]
 fn packed_a_fused_matches_packed_then_map() {
-    use gemmkit_faer::{Activation, Bias, gemm_packed_a, gemm_packed_a_fused, prepack_lhs};
+    use gemmkit::Workspace;
+    use gemmkit_faer::{
+        Activation, Bias, gemm_packed_a, gemm_packed_a_fused, gemm_packed_a_fused_with, prepack_lhs,
+    };
     let (m, k, n) = (96usize, 50, 72);
     let a = rand_mat(m, k, 361);
     let b = rand_mat(k, n, 362);
@@ -950,6 +954,23 @@ fn packed_a_fused_matches_packed_then_map() {
                 par,
             );
         }
+        // _with entry, same args
+        let mut data_w = base.clone();
+        {
+            let mut ws = Workspace::new();
+            let c = MatMut::from_row_major_slice_mut(&mut data_w, m, n);
+            gemm_packed_a_fused_with(
+                &mut ws,
+                alpha,
+                &packed,
+                b.as_dyn_stride(),
+                beta,
+                c,
+                Some(Bias::PerRow(&bias)),
+                Some(Activation::Relu),
+                par,
+            );
+        }
         let mut data_r = base.clone();
         {
             let c = MatMut::from_row_major_slice_mut(&mut data_r, m, n);
@@ -963,6 +984,11 @@ fn packed_a_fused_matches_packed_then_map() {
                     data_f[i * n + j].to_bits(),
                     want.to_bits(),
                     "a_fused ({i},{j})"
+                );
+                assert_eq!(
+                    data_w[i * n + j].to_bits(),
+                    want.to_bits(),
+                    "a_fused_with ({i},{j})"
                 );
             }
         }
