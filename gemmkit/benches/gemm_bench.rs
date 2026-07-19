@@ -1,31 +1,75 @@
-//! Benchmark gemmkit against the `gemm` crate (faer's backend) and
-//! `matrixmultiply` (ndarray's current backend) across a range of square sizes
+//! Public `cargo bench` surface for gemmkit (criterion)
 //!
-//! Run: `cargo bench -p gemmkit`. GFLOP/s = 2*m*n*k / median_time
+//! A small, curated set of statistically-rigorous benches over the crate's
+//! headline surfaces. This is the regression-tracking entry point
+//! (`--save-baseline`); the exhaustive internal investigation suite lives in
+//! `tests/perf/` (median-of-9 harness, `#[ignore]` tests) and is not duplicated
+//! here. GFLOP/s = throughput / median time, counting `2*m*n*k` flops
+//! (`8*m*n*k` for complex: 4 real mul + 4 real add per mul-add)
+//!
+//! Groups:
+//!   sgemm      square f32 vs the `gemm` crate + `matrixmultiply`, serial + parallel
+//!   dtypes     gemmkit-only 1024^3 throughput by element type, serial + parallel:
+//!              f32, and behind their cargo features f16 / bf16 / i8 / c32
+//!   gemv       n=1 at m=k=4096, dot (row-major A) + axpy (col-major A) vs the
+//!              `gemm` crate, serial + parallel
+//!   prepacked  fixed-weight inference (small m, fixed B): plain gemm vs a reused
+//!              prepacked B, f32 and behind `int8` the i8 twin
+//!   batched    gemm_batched vs a naive per-call loop, auto parallelism
+//!
+//! Run (default features cover sgemm, dtypes f32, gemv, prepacked f32, batched):
+//!   cargo bench -p gemmkit
+//! Unlock the f16/bf16/i8/c32 dtypes and the i8 prepacked arm:
+//!   cargo bench -p gemmkit --all-features
+//! Track regressions against a saved baseline:
+//!   cargo bench -p gemmkit --all-features -- --save-baseline main
+//!   cargo bench -p gemmkit --all-features -- --baseline main
+//! Smoke every bench once, no measurement (fast):
+//!   cargo bench -p gemmkit -- --test
 //!
 //! Built only when not under Miri: `criterion`/`gemm`/`matrixmultiply` are
 //! `cfg(not(miri))` dev-dependencies (see `Cargo.toml`)
 #![cfg(not(miri))]
 
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
+use std::time::Duration;
 
-use gemmkit::{MatMut, MatRef, Parallelism, gemm};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
+use gemmkit::{MatMut, MatRef, Parallelism, gemm, gemm_batched};
+
+/// Shared per-group criterion config: enough samples for a stable estimate while
+/// keeping the whole default run in the low minutes. `criterion_group!` appends
+/// `.configure_from_args()`, so any CLI flag (`--sample-size`, `--save-baseline`,
+/// `--test`, a filter) still overrides these
+fn config() -> Criterion {
+    Criterion::default()
+        .sample_size(20)
+        .measurement_time(Duration::from_secs(2))
+        .warm_up_time(Duration::from_secs(1))
+}
+
+/// Deterministic pseudo-random f32 fill in [0, 1)
 fn fill(n: usize) -> Vec<f32> {
     (0..n)
         .map(|i| ((i * 1103515245 + 12345) % 1000) as f32 / 1000.0)
         .collect()
 }
 
-fn bench_square(c: &mut Criterion) {
+fn par_of(label: &str) -> Parallelism {
+    if label == "serial" {
+        Parallelism::Serial
+    } else {
+        Parallelism::Rayon(0)
+    }
+}
+
+/// Square f32 sgemm vs the `gemm` crate (faer's backend) and `matrixmultiply`
+/// (ndarray's current backend), serial + parallel
+fn bench_sgemm(c: &mut Criterion) {
     let sizes = [128usize, 256, 512, 1024, 2048];
     for par_label in ["serial", "parallel"] {
-        let par = if par_label == "serial" {
-            Parallelism::Serial
-        } else {
-            Parallelism::Rayon(0)
-        };
+        let par = par_of(par_label);
         let mut group = c.benchmark_group(format!("sgemm_square_{par_label}"));
         for &s in &sizes {
             let (m, k, n) = (s, s, s);
@@ -112,5 +156,369 @@ fn bench_square(c: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, bench_square);
-criterion_main!(benches);
+/// gemmkit-only element-type throughput at a single representative 1024^3 shape,
+/// serial + parallel. f32 is always present; f16/bf16/i8/c32 appear only when
+/// their cargo feature is enabled (so `--all-features` shows more). Flops are
+/// counted like `tests/perf/dtypes.rs`: `2*m*n*k` for the real types, `8*m*n*k`
+/// for complex
+fn bench_dtypes(c: &mut Criterion) {
+    let s = 1024usize;
+    let (m, k, n) = (s, s, s);
+    let af = fill(m * k);
+    let bf = fill(k * n);
+    for par_label in ["serial", "parallel"] {
+        let par = par_of(par_label);
+        let mut group = c.benchmark_group(format!("dtypes_{par_label}"));
+
+        // f32 baseline (homogeneous driver)
+        {
+            let mut cc = vec![0.0f32; m * n];
+            group.throughput(Throughput::Elements((2 * m * n * k) as u64));
+            group.bench_function("f32", |bch| {
+                bch.iter(|| {
+                    gemm(
+                        1.0,
+                        MatRef::from_col_major(&af, m, k),
+                        MatRef::from_col_major(&bf, k, n),
+                        0.0,
+                        MatMut::from_col_major(&mut cc, m, n),
+                        par,
+                    );
+                    black_box(&cc);
+                });
+            });
+        }
+
+        // f16 (col-major, f32 accumulate) and bf16 (row-major A + col-major B, the
+        // contiguous vdpbf16ps pack path)
+        #[cfg(feature = "half")]
+        {
+            use gemmkit::{bf16, f16};
+            let a16: Vec<f16> = af.iter().map(|&x| f16::from_f32(x)).collect();
+            let b16: Vec<f16> = bf.iter().map(|&x| f16::from_f32(x)).collect();
+            let mut c16 = vec![f16::from_f32(0.0); m * n];
+            group.throughput(Throughput::Elements((2 * m * n * k) as u64));
+            group.bench_function("f16", |bch| {
+                bch.iter(|| {
+                    gemm(
+                        f16::from_f32(1.0),
+                        MatRef::from_col_major(&a16, m, k),
+                        MatRef::from_col_major(&b16, k, n),
+                        f16::from_f32(0.0),
+                        MatMut::from_col_major(&mut c16, m, n),
+                        par,
+                    );
+                    black_box(&c16);
+                });
+            });
+
+            let ab: Vec<bf16> = af.iter().map(|&x| bf16::from_f32(x)).collect();
+            let bb: Vec<bf16> = bf.iter().map(|&x| bf16::from_f32(x)).collect();
+            let mut cb = vec![bf16::from_f32(0.0); m * n];
+            group.throughput(Throughput::Elements((2 * m * n * k) as u64));
+            group.bench_function("bf16", |bch| {
+                bch.iter(|| {
+                    gemm(
+                        bf16::from_f32(1.0),
+                        MatRef::from_row_major(&ab, m, k),
+                        MatRef::from_col_major(&bb, k, n),
+                        bf16::from_f32(0.0),
+                        MatMut::from_col_major(&mut cb, m, n),
+                        par,
+                    );
+                    black_box(&cb);
+                });
+            });
+        }
+
+        // i8 -> i32 widen kernel (col-major)
+        #[cfg(feature = "int8")]
+        {
+            let ai: Vec<i8> = (0..m * k).map(|i| (i % 17) as i8 - 8).collect();
+            let bi: Vec<i8> = (0..k * n).map(|i| (i % 13) as i8 - 6).collect();
+            let mut ci = vec![0i32; m * n];
+            group.throughput(Throughput::Elements((2 * m * n * k) as u64));
+            group.bench_function("i8", |bch| {
+                bch.iter(|| {
+                    gemmkit::gemm_i8(
+                        1,
+                        MatRef::from_col_major(&ai, m, k),
+                        MatRef::from_col_major(&bi, k, n),
+                        0,
+                        MatMut::from_col_major(&mut ci, m, n),
+                        par,
+                    );
+                    black_box(&ci);
+                });
+            });
+        }
+
+        // c32 split-layout kernel (col-major, no conjugation); 8 flops per mul-add
+        #[cfg(feature = "complex")]
+        {
+            use gemmkit::Complex;
+            let mkc = |seed: u64, len: usize| {
+                let mut z = seed | 1;
+                (0..len)
+                    .map(|_| {
+                        z ^= z << 13;
+                        z ^= z >> 7;
+                        z ^= z << 17;
+                        Complex::new((z >> 40) as f32 / (1u64 << 24) as f32 - 0.5, 0.25)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let ac = mkc(1, m * k);
+            let bc = mkc(2, k * n);
+            let mut cc = vec![Complex::new(0.0f32, 0.0); m * n];
+            group.throughput(Throughput::Elements((8 * m * n * k) as u64));
+            group.bench_function("c32", |bch| {
+                bch.iter(|| {
+                    gemmkit::gemm_cplx(
+                        Complex::new(1.0f32, 0.0),
+                        MatRef::from_col_major(&ac, m, k),
+                        false,
+                        MatRef::from_col_major(&bc, k, n),
+                        false,
+                        Complex::new(0.0f32, 0.0),
+                        MatMut::from_col_major(&mut cc, m, n),
+                        par,
+                    );
+                    black_box(&cc);
+                });
+            });
+        }
+
+        group.finish();
+    }
+}
+
+/// f32 gemv (n == 1) at m = k = 4096, serial + parallel: the dot layout (row-major
+/// A routes to `dot_rows`) and the axpy layout (col-major A routes to the axpy
+/// path), each vs the `gemm` crate on the same m,k,1 shape. Flops = `2*m*k`
+fn bench_gemv(c: &mut Criterion) {
+    let (m, k, n) = (4096usize, 4096usize, 1usize);
+    let a = fill(m * k);
+    let x = fill(k * n);
+    for par_label in ["serial", "parallel"] {
+        let par = par_of(par_label);
+        let mut group = c.benchmark_group(format!("gemv_{par_label}"));
+        group.throughput(Throughput::Elements((2 * m * n * k) as u64));
+        let mut cc = vec![0.0f32; m * n];
+
+        group.bench_function("gemmkit_dot", |bch| {
+            bch.iter(|| {
+                gemm(
+                    1.0,
+                    MatRef::from_row_major(&a, m, k),
+                    MatRef::from_col_major(&x, k, n),
+                    0.0,
+                    MatMut::from_col_major(&mut cc, m, n),
+                    par,
+                );
+                black_box(&cc);
+            });
+        });
+
+        group.bench_function("gemmkit_axpy", |bch| {
+            bch.iter(|| {
+                gemm(
+                    1.0,
+                    MatRef::from_col_major(&a, m, k),
+                    MatRef::from_col_major(&x, k, n),
+                    0.0,
+                    MatMut::from_col_major(&mut cc, m, n),
+                    par,
+                );
+                black_box(&cc);
+            });
+        });
+
+        let gpar = if par_label == "serial" {
+            gemm::Parallelism::None
+        } else {
+            gemm::Parallelism::Rayon(0)
+        };
+        group.bench_function("gemm_crate", |bch| {
+            bch.iter(|| {
+                unsafe {
+                    gemm::gemm(
+                        m,
+                        n,
+                        k,
+                        cc.as_mut_ptr(),
+                        m as isize,
+                        1,
+                        false,
+                        a.as_ptr(),
+                        m as isize,
+                        1,
+                        x.as_ptr(),
+                        k as isize,
+                        1,
+                        0.0,
+                        1.0,
+                        false,
+                        false,
+                        false,
+                        gpar,
+                    );
+                }
+                black_box(&cc);
+            });
+        });
+
+        group.finish();
+    }
+}
+
+/// Fixed-weight inference pattern (serial): a small activation batch `m` against a
+/// fixed `k = n = 2048` weight matrix B. Plain gemm re-reads/re-packs B every call;
+/// `gemm_packed_b` reuses a B packed once outside the timed loop, so at small `m`
+/// (pack `O(k*n)` >> compute `O(m*k*n)`) the reuse wins. B is row-major here (the
+/// strided case where plain never packs and the contiguous prepacked panel pays
+/// most). The i8 arm (behind `int8`) is the stronger case: the VNNI `vpdpbusd`
+/// kernel's k-quad-interleaved layout forces a per-call repack for plain `gemm_i8`
+fn bench_prepacked(c: &mut Criterion) {
+    let (k, n) = (2048usize, 2048usize);
+    let par = Parallelism::Serial;
+    let mut group = c.benchmark_group("prepacked");
+
+    // f32: plain gemm vs a reused prepacked B (row-major B)
+    {
+        let b = fill(k * n);
+        let packed = gemmkit::prepack_rhs(MatRef::from_row_major(&b, k, n));
+        for &m in &[8usize, 64] {
+            let a = fill(m * k);
+            let mut cc = vec![0.0f32; m * n];
+            group.throughput(Throughput::Elements((2 * m * n * k) as u64));
+            group.bench_with_input(BenchmarkId::new("f32_plain", m), &m, |bch, _| {
+                bch.iter(|| {
+                    gemm(
+                        1.0,
+                        MatRef::from_col_major(&a, m, k),
+                        MatRef::from_row_major(&b, k, n),
+                        0.0,
+                        MatMut::from_col_major(&mut cc, m, n),
+                        par,
+                    );
+                    black_box(&cc);
+                });
+            });
+            group.bench_with_input(BenchmarkId::new("f32_packed_b", m), &m, |bch, _| {
+                bch.iter(|| {
+                    gemmkit::gemm_packed_b(
+                        1.0,
+                        MatRef::from_col_major(&a, m, k),
+                        &packed,
+                        0.0,
+                        MatMut::from_col_major(&mut cc, m, n),
+                        par,
+                    );
+                    black_box(&cc);
+                });
+            });
+        }
+    }
+
+    // i8: plain gemm_i8 vs a reused prepacked B (col-major B; the VNNI repack is
+    // mandatory each plain call regardless of layout)
+    #[cfg(feature = "int8")]
+    {
+        let b: Vec<i8> = (0..k * n).map(|i| (i % 13) as i8 - 6).collect();
+        let packed = gemmkit::prepack_rhs_i8(MatRef::from_col_major(&b, k, n));
+        for &m in &[8usize, 64] {
+            let a: Vec<i8> = (0..m * k).map(|i| (i % 17) as i8 - 8).collect();
+            let mut cc = vec![0i32; m * n];
+            group.throughput(Throughput::Elements((2 * m * n * k) as u64));
+            group.bench_with_input(BenchmarkId::new("i8_plain", m), &m, |bch, _| {
+                bch.iter(|| {
+                    gemmkit::gemm_i8(
+                        1,
+                        MatRef::from_col_major(&a, m, k),
+                        MatRef::from_col_major(&b, k, n),
+                        0,
+                        MatMut::from_col_major(&mut cc, m, n),
+                        par,
+                    );
+                    black_box(&cc);
+                });
+            });
+            group.bench_with_input(BenchmarkId::new("i8_packed_b", m), &m, |bch, _| {
+                bch.iter(|| {
+                    gemmkit::gemm_i8_packed_b(
+                        1,
+                        MatRef::from_col_major(&a, m, k),
+                        &packed,
+                        0,
+                        MatMut::from_col_major(&mut cc, m, n),
+                        par,
+                    );
+                    black_box(&cc);
+                });
+            });
+        }
+    }
+
+    group.finish();
+}
+
+/// Batched f32 GEMM: `gemm_batched` (auto parallelism, whole GEMMs assigned to
+/// workers) vs a naive per-call loop of `gemm(Rayon)` calls, over the same
+/// contiguously-packed batch. Total throughput `2*batch*m*n*k`. Two regimes: many
+/// small cubes (batch = 64 of 48^3, where the naive loop's per-element fork/join
+/// dominates) and a few larger cubes (batch = 8 of 256^3)
+fn bench_batched(c: &mut Criterion) {
+    let mut group = c.benchmark_group("batched");
+    for &(batch, s) in &[(64usize, 48usize), (8, 256)] {
+        let (m, k, n) = (s, s, s);
+        let a = fill(batch * m * k);
+        let b = fill(batch * k * n);
+        let mut cc = vec![0.0f32; batch * m * n];
+        group.throughput(Throughput::Elements((2 * batch * m * n * k) as u64));
+        let id = format!("b{batch}_{s}cube");
+
+        group.bench_with_input(BenchmarkId::new("batched", &id), &id, |bch, _| {
+            bch.iter(|| {
+                gemm_batched(
+                    batch,
+                    1.0,
+                    MatRef::new(&a, m, k, 1, m as isize),
+                    (m * k) as isize,
+                    MatRef::new(&b, k, n, 1, k as isize),
+                    (k * n) as isize,
+                    0.0,
+                    MatMut::new(&mut cc, m, n, 1, m as isize),
+                    (m * n) as isize,
+                    Parallelism::Rayon(0),
+                );
+                black_box(&cc);
+            });
+        });
+
+        group.bench_with_input(BenchmarkId::new("naive_loop", &id), &id, |bch, _| {
+            bch.iter(|| {
+                for bi in 0..batch {
+                    let (ao, bo, co) = (bi * m * k, bi * k * n, bi * m * n);
+                    gemm(
+                        1.0,
+                        MatRef::from_col_major(&a[ao..ao + m * k], m, k),
+                        MatRef::from_col_major(&b[bo..bo + k * n], k, n),
+                        0.0,
+                        MatMut::from_col_major(&mut cc[co..co + m * n], m, n),
+                        Parallelism::Rayon(0),
+                    );
+                }
+                black_box(&cc);
+            });
+        });
+    }
+    group.finish();
+}
+
+criterion_group! { name = sgemm; config = config(); targets = bench_sgemm }
+criterion_group! { name = dtypes; config = config(); targets = bench_dtypes }
+criterion_group! { name = gemv; config = config(); targets = bench_gemv }
+criterion_group! { name = prepacked; config = config(); targets = bench_prepacked }
+criterion_group! { name = batched; config = config(); targets = bench_batched }
+criterion_main!(sgemm, dtypes, gemv, prepacked, batched);

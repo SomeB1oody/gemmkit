@@ -421,8 +421,12 @@ noise-aware tie-break, and writes a `gemmkit-tune.env` profile of
 
 ## Testing strategy
 
-The suites live in `gemmkit/tests/`; the performance harnesses there
-(`tests/perf/`, `benches/`) are measurement tools, not CI gates.
+The suites live in `gemmkit/tests/`; the performance harnesses (`tests/perf/`
+and `gemmkit/benches/`) are measurement tools, not CI gates. `tests/perf/` is
+the exhaustive internal investigation suite (`#[ignore]` tests over a
+median-of-9 harness); `benches/gemm_bench.rs` is the curated public `cargo
+bench` surface (criterion, grouped `sgemm`/`dtypes`/`gemv`/`prepacked`/`batched`)
+for `--save-baseline` regression tracking.
 
 - **Correctness** (`tests/correctness/`): shapes x layouts x alpha/beta swept
   against an independent `f64` reference GEMM (`tests/oracle_common/`) with
