@@ -1,4 +1,5 @@
-//! Homogeneous (f32/f64, plus f16/bf16 under half) GEMM entries
+//! GEMM entries for gemmkit's homogeneous scalar types: f32/f64 unconditionally, plus f16/bf16
+//! under the half feature
 use super::*;
 use crate::common::{filled_mat, ref_parts};
 
@@ -17,7 +18,7 @@ pub fn gemm<T: GemmScalar>(
     gemm_common(None, alpha, a, b, beta, c, par);
 }
 
-/// Like [`gemm`] but reuses a caller-owned [`Workspace`]
+/// [`gemm`], threading a caller-owned [`Workspace`] through instead of the thread-local pool
 ///
 /// # Panics
 /// If the inner dimensions disagree
@@ -53,10 +54,9 @@ fn gemm_common<T: GemmScalar>(
     let (rsc, csc) = (c.row_stride(), c.col_stride());
     let cp = c.as_ptr_mut();
 
-    // SAFETY: dims validated; faer's `MatRef`/`MatMut` guarantee the pointer + element-unit `isize`
-    // strides describe a valid in-bounds layout (possibly negative for a reversed view, which
-    // gemmkit's unchecked path handles). `c` is a `MatMut` (an exclusive borrow), so C cannot alias
-    // A/B
+    // SAFETY: dims validated above; faer's `MatRef`/`MatMut` guarantee the pointer + element-unit
+    // `isize` strides describe a valid in-bounds layout (possibly negative for a reversed view,
+    // which gemmkit's unchecked path handles), and `c` (a `MatMut` exclusive borrow) can't alias A/B
     unsafe {
         match ws {
             Some(ws) => gemm_unchecked_with(
@@ -69,11 +69,11 @@ fn gemm_common<T: GemmScalar>(
     }
 }
 
-/// `A*B` into a fresh column-major [`Mat`] (the `.dot()`-style convenience)
+/// `A*B` into a fresh column-major [`Mat`] (a `.dot()`-style convenience over [`gemm`])
 pub fn dot<T: GemmScalar>(a: MatRef<'_, T>, b: MatRef<'_, T>) -> Mat<T> {
     let m = a.nrows();
     let n = b.ncols();
-    // beta == 0, so the initial fill is never read
+    // beta == 0, so the fill value below is never read
     let mut c = filled_mat(m, n, T::ZERO);
     gemm(
         T::ONE,

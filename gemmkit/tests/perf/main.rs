@@ -1,20 +1,25 @@
-//! Performance suite: `#[ignore]` benchmarks (not correctness gates), run manually
+//! Root of the `perf` integration-test binary: a collection of `#[ignore]`d throughput
+//! benchmarks, not correctness gates, meant to be run and read by hand
 //!
-//! * **Native cross-library benchmarks**: gemmkit vs the `gemm` crate / `matrixmultiply`.
-//!   These depend on those dev-deps, which **do not build for wasm** (they are
-//!   `cfg(all(not(miri), not(target_family = "wasm")))` dev-deps, see `Cargo.toml`), so
-//!   each bench that calls them is individually gated `cfg(not(target_family = "wasm"))`.
-//! * **The wasm `simd128` benchmark** (`perf_simd128`): simd128 vs the scalar token,
-//!   mirroring the native `NativeTok` + `bench_native_equal_isa` pattern with the *scalar
-//!   token* as the reference (no external crate on wasm). The shared harness
-//!   (`fill`/`measure`/`gflops`/`Stat`) is `std`-only, so it serves both worlds and the
-//!   file compiles on wasm. (Correctness of the simd128 path is gated separately by
-//!   `isa_simd128` in `tests/correctness/isa.rs`; this is the throughput sanity print.)
+//! * **Native cross-library benches** (`bandwidth`, `batched`, `dtypes`, `prepack`,
+//!   `sgemm`, `small_mn`) compare gemmkit against the `gemm` crate and/or
+//!   `matrixmultiply`. Those are dev-dependencies under
+//!   `cfg(all(not(miri), not(target_family = "wasm")))` in `Cargo.toml`, so any bench that
+//!   calls into them is itself gated `cfg(not(target_family = "wasm"))`.
+//! * **The wasm bench** (`simd128`, `perf_simd128`) has no external crate to compare
+//!   against on that target, so it instead measures gemmkit's `simd128` token against its
+//!   own scalar token, the same `NativeTok`-vs-baseline shape `bench_native_equal_isa`
+//!   uses natively. `harness.rs` (`fill`/`measure`/`gflops`/`Stat`) needs only `std`, so it
+//!   compiles for both worlds unmodified. Correctness of the simd128 kernel itself is
+//!   proven separately by `isa_simd128` in `tests/correctness/isa.rs`; what runs here is
+//!   only the throughput comparison
 //!
-//! The whole file compiles away under Miri. The benchmarks each saturate every core, so
-//! they must not run concurrently: they take a shared `BENCH_GUARD` lock, so even the
-//! default multi-threaded harness serializes them and `--test-threads=1` is optional.
-//! Run them with:
+//! This whole file is `cfg(not(miri))`: Miri cannot execute the target-feature-gated SIMD
+//! intrinsics these benches drive, so there is nothing for it to run. Every bench here
+//! saturates all available cores, so 2 of them running at once would corrupt each other's
+//! numbers; each takes the shared `BENCH_GUARD` lock as its first line, which serializes
+//! them even under the harness's default multi-threaded test runner (no need to also pass
+//! `--test-threads=1`). Run them with:
 //!   cargo test -p gemmkit --release --test perf -- --ignored --nocapture
 //! Run the wasm benchmark (compile-time `+simd128`) under a wasm runtime:
 //!   RUSTFLAGS="-C target-feature=+simd128" CARGO_TARGET_WASM32_WASIP1_RUNNER=wasmtime \
@@ -22,14 +27,14 @@
 //!       --no-default-features --features std --test perf -- --ignored --nocapture
 #![cfg(not(miri))]
 
-// Shared bench harness: BENCH_GUARD, fill/measure/Stat, native-ISA token
+// Shared harness (BENCH_GUARD, fill, measure/measure_gbps, Stat, the native-ISA token)
 mod harness;
 
-// Bandwidth-bound shapes: STREAM ceilings, gemv, gevv, small-k, gemv scaling
+// Bandwidth-bound shapes: STREAM Triad/Copy ceilings, gemv (axpy/dot/mixed), gevv, small-k
 mod bandwidth;
-// Batched GEMM vs naive gemm() loops
+// Batched GEMM (gemm_batched) vs naive gemm() loops, serial and parallel
 mod batched;
-// f16 / i8 / c32 element-type throughput benches
+// f16 / bf16 / i8 / c32 element-type throughput, each vs its available external baseline
 #[cfg(all(
     not(target_family = "wasm"),
     any(feature = "half", feature = "int8", feature = "complex")
@@ -40,7 +45,7 @@ mod prepack;
 // f32 sgemm vs gemm crate / matrixmultiply, thread-scaling, per-call latency
 #[cfg(not(target_family = "wasm"))]
 mod sgemm;
-// wasm simd128 vs scalar-token throughput
+// wasm simd128 vs the scalar token, single-threaded
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 mod simd128;
 // Small-m,n horizontal (inner-product) route benches

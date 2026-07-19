@@ -1,42 +1,42 @@
 //! User-defined per-element map-epilogue tests (`gemm_map`): the headline `map == gemm-then-map`
-//! oracle, every route (general driver, gemv both orientations, small-`m,n`, small-`k`), strided /
-//! row-major (swapped) C, degenerate cases, environment-capturing closures, serial == parallel, and
-//! the `_with` / `_unchecked` twin equivalences
+//! oracle across every route (general driver, both gemv orientations, small-`m,n`, small-`k`),
+//! strided / row-major (orientation-swapped) C, degenerate cases, environment-capturing closures,
+//! serial == parallel, and the `_with` / `_unchecked` twin equivalences
 //!
-//! Every comparison is **bitwise**. The oracle is "plain `gemm`, then the exact scalar map": the
-//! map epilogue sets `VECTOR = true` so every element takes the **same** fast/scratch path plain
-//! `gemm` takes (`apply_reg` drains the fast-path fused register per lane), making the value handed
-//! to the closure bit-for-bit the value plain `gemm` stores. A scratch-only (`VECTOR = false`)
-//! epilogue would instead diverge by 1 ULP for `beta` outside `{0, 1}` (unfused `mul_add` vs the
-//! fast path's hardware FMA), and the `beta = 0.7` cases here would catch that. So the fused result
-//! must equal the oracle for **every** shape and route. The closure is asymmetric and position-dependent
-//! (`f(v, r, c) != f(v, c, r)`), so a wrong orientation-coordinate flip (row-major C) diverges loudly
+//! Every comparison is **bitwise**. The oracle is "plain `gemm`, then the exact scalar map,
+//! applied by hand": the map epilogue sets `VECTOR = true`, so a full column-major tile takes the
+//! same `apply_reg` fast path plain `gemm`'s own store would, handing the closure the identical
+//! value plain `gemm` writes. A `VECTOR = false` epilogue would instead force every element
+//! through the scratch path regardless of tile shape, risking a different rounding of the
+//! `beta*C + alpha*A*B` combine once `beta` sits outside `{0, 1}`; the `beta = 0.7` cases here are
+//! what would catch that. The closure is asymmetric and position-dependent (`f(v, r, c) != f(v, c,
+//! r)`), so a wrong orientation-coordinate flip (row-major C) diverges loudly
 
 use crate::common::*;
 use gemmkit::{MatMut, MatRef, Parallelism, Workspace, gemm, gemm_map, gemm_map_unchecked};
 
-/// The asymmetric, value- and position-dependent map, computed **entirely in `T`** so it is
-/// bitwise-reproducible, and used verbatim by both the closure under test and the reference. It is
-/// deliberately **not symmetric** in `(r, c)`: `lut[r % L]` depends only on the row, and the offset
-/// `r - 0.25*c` weights row and column differently, so swapping `r` and `c` changes the result -
-/// which is what makes the row-major-C (orientation-swapped) route a falsifier for the coordinate
-/// flip. `mul_add` mirrors the kernel's fused form
+/// The asymmetric, position-dependent map both the closure under test and the oracle use
+/// verbatim, computed entirely in `T` so it is bitwise-reproducible. `lut[r % L]` depends only on
+/// the row, and the offset `r - 0.25*c` weights row and column differently, so `f(v, r, c) !=
+/// f(v, c, r)` in general: this is what makes the row-major-C (orientation-swapped) route a
+/// falsifier for a wrong coordinate flip. `mul_add` mirrors the kernel's own fused combine
 fn map_expr<T: Flt>(v: T, r: usize, c: usize, lut: &[T]) -> T {
     let scale = lut[r % lut.len()];
     let offset = T::of(r as f64) - T::of(0.25) * T::of(c as f64);
     v.mul_add(scale, offset)
 }
 
-/// A small captured lookup table (length 5, coprime with the tile widths so `r % 5` cycles across
-/// tile boundaries). Deterministic from a seed so the oracle uses the identical values
+/// A small captured lookup table (length 5, prime, so `r % 5` does not stay aligned with a
+/// power-of-two tile width). Deterministic from a seed, so the oracle can rebuild the same values
 fn make_lut<T: Flt>(rng: &mut Rng) -> Vec<T> {
     (0..5).map(|_| T::of(rng.unit() * 1.5 + 0.5)).collect()
 }
 
-/// Run 1 `gemm_map` case and its `gemm`-then-`map_expr` oracle over the identical inputs; assert
-/// bitwise-equal C. The closure captures `lut` **by reference** (the environment-capture contract).
-/// Handles the degenerate shapes too (`k == 0` builds empty A/B; `alpha == 0` is passed straight
-/// through), since the oracle path (plain `gemm` then the map) is identical there
+/// Runs 1 `gemm_map_with` case and its plain-`gemm`-then-[`map_expr`] oracle over identical
+/// inputs, then asserts every C element's bits match. The closure captures `lut` by reference,
+/// exercising the environment-capture contract. Also covers the degenerate shapes (`k == 0`
+/// builds empty A/B; `alpha == 0` is passed straight through), since the oracle path is the same
+/// either way
 #[allow(clippy::too_many_arguments)]
 fn check_map<T: Flt + gemmkit::MapScalar>(
     rng: &mut Rng,
@@ -49,13 +49,13 @@ fn check_map<T: Flt + gemmkit::MapScalar>(
     par: Parallelism,
     tag: &str,
 ) {
-    let a = make::<T>(rng, m, k); // col-major mxk (empty when k == 0)
-    let b = make::<T>(rng, k, n); // col-major kxn
+    let a = make::<T>(rng, m, k); // col-major m x k (empty when k == 0)
+    let b = make::<T>(rng, k, n); // col-major k x n
     let (rsc, csc, clen) = c_strides(layout, m, n);
     let c0 = make::<T>(rng, clen.max(1), 1);
     let lut = make_lut::<T>(rng);
 
-    // fused: gemm_map with an environment-capturing closure (borrows `lut`)
+    // the call under test: a closure borrowing lut, run through gemm_map_with
     let mut c_map = c0.clone();
     {
         let f = |v: T, r: usize, c: usize| map_expr::<T>(v, r, c, &lut);
@@ -66,7 +66,7 @@ fn check_map<T: Flt + gemmkit::MapScalar>(
         gemmkit::gemm_map_with(&mut ws, alpha, ar, br, beta, cm, &f, par);
     }
 
-    // oracle: plain gemm, then the identical scalar map in the user frame
+    // oracle: plain gemm, then map_expr in the user frame
     let mut c_ref = c0.clone();
     {
         let ar = MatRef::new(&a, m, k, 1, m as isize);
@@ -103,12 +103,12 @@ fn driver_matrix<T: Flt + gemmkit::MapScalar>(par: Parallelism) {
         (17usize, 20usize, 19usize),
         (33, 40, 24),
         (48, 96, 129),
-        (40, 4096, 40), // multi-panel K: fire-once (a per-panel map would diverge)
+        (40, 4096, 40), // multi-panel K: fires only on the last panel, a per-panel map would diverge
     ];
-    // Under GEMMKIT_FAST_TEST run the full coefficient/layout lattice on one representative
-    // shape (index 0, the smallest) and reduce the other 3 shapes to a single non-trivial
-    // combo each. The kc-crossing k = 4096 fire-once shape still runs at least once (with the
-    // divergence-catching beta = 0.7). Off, `fast` is false and the sweep is byte-for-byte full
+    // Under GEMMKIT_FAST_TEST, run the full lattice only on shape index 0 (the smallest) and
+    // reduce the other 3 shapes to 1 non-trivial combo each. The k = 4096 fire-once shape still
+    // runs at least once, with the divergence-catching beta = 0.7. Off, fast is false and nothing
+    // is skipped
     let fast = fast_test();
     let full_lattice = 0usize;
     for (si, &(m, k, n)) in shapes.iter().enumerate() {
@@ -144,9 +144,9 @@ fn map_eq_gemm_then_map_parallel() {
 
 // the special routes: gemv (both orientations), small-m,n, small-k
 
-/// gemv (`m == 1` and `n == 1`): the map is applied as a final in-place sweep in the **user** frame
-/// (gemv routes before orientation), so both the `(i, 0)` and `(0, i)` coordinate mappings are
-/// exercised
+/// gemv (`n == 1` or `m == 1`) routes before any orientation swap, so the map runs directly in
+/// the user frame; running both an `n == 1` (coordinate `(i, 0)`) and an `m == 1` (coordinate
+/// `(0, j)`) shape exercises both output layouts
 #[test]
 fn gemv_both_orientations() {
     let mut rng = Rng::new(0x9E0F_1201);
@@ -182,8 +182,10 @@ fn gemv_both_orientations() {
     }
 }
 
-/// small-`m,n` horizontal route: `m, n <= 16` with a long contraction (`k > small_k_threshold`),
-/// A rows / B cols unit-stride so the gate engages. Col-major C keeps `csa == 1 && rsb == 1`
+/// small-`m,n` horizontal route: `m, n <= 16` (the `small_mn_dim` default) with a contraction
+/// past `small_mn_pack_min_k`. `check_map`'s A and B are always column-major, giving `rsb == 1`
+/// but `csa != 1`, so this engages the pack tier (`small_mn_pack_eligible`), which copies A into
+/// k-contiguous scratch before running the same horizontal kernel
 #[test]
 fn small_mn_route() {
     let mut rng = Rng::new(0x5A11_3D0E);
@@ -207,8 +209,9 @@ fn small_mn_route() {
     }
 }
 
-/// small-`k` route: `k <= small_k_threshold` (skinny / low-depth), col-major A so the in-place
-/// microkernel path is taken (`rsa == 1`). Non-tile-multiple m/n exercise the edge tiles + pad panel
+/// small-`k` route: `k <= small_k_threshold` (skinny, low-depth), col-major A so its unit row
+/// stride (`rsa == 1`) takes the in-place microkernel path. Non-tile-multiple m/n exercise the
+/// edge tiles and the pad panel
 #[test]
 fn small_k_route() {
     let mut rng = Rng::new(0x0DEE_5C0F);
@@ -222,18 +225,19 @@ fn small_k_route() {
     }
 }
 
-// the swapped-coordinate falsifier: row-major C must still see user-frame (r, c)
+// the swapped-coordinate falsifier: row-major C must still see the user-frame (r, c)
 
-/// A row-major C makes the driver compute `C^T = B^T*A^T` (swapping `m<->n`), so the epilogue runs in
-/// the transposed frame. `MapEpi::apply` must flip the coordinates back so the closure sees the
-/// **user** `(r, c)`. With the asymmetric `map_expr` and a non-square shape, a mishandled flip would
-/// feed the closure `(c, r)` and diverge; the `check_map` oracle (which maps in the user frame) is
-/// therefore the falsifier. This test first asserts the map really is asymmetric (so the check has
-/// teeth), then drives row-major C on a rectangular driver shape across parallelism
+/// A row-major C makes the driver compute `C^T = B^T*A^T` (swapping `m` and `n` internally), so
+/// the epilogue runs in the transposed frame; `MapEpi::apply` flips `(row, col)` back to `(col,
+/// row)` before calling the closure, so it always sees the **user** `(r, c)`. With the asymmetric
+/// `map_expr` and a non-square shape, a mishandled flip would feed the closure `(c, r)` instead
+/// and diverge from `check_map`'s user-frame oracle. This first asserts the map really is
+/// asymmetric (so the check below has teeth), then drives row-major C on rectangular driver
+/// shapes across parallelism
 #[test]
 fn swapped_coord_falsifier() {
-    // Sanity: the map is genuinely asymmetric, so feeding transposed coordinates gives a *different*
-    // answer - i.e. a wrong `swapped` flag cannot accidentally pass
+    // sanity: the map is genuinely asymmetric, so a swapped (c, r) call gives a different answer,
+    // meaning a wrong coordinate flip cannot accidentally pass the check below
     let lut = make_lut::<f64>(&mut Rng::new(1));
     let v = 1.25f64;
     assert_ne!(
@@ -243,7 +247,7 @@ fn swapped_coord_falsifier() {
     );
 
     let mut rng = Rng::new(0x5A9A_FEED);
-    // rectangular (m != n) so transposition is observable, row-major C forces the orientation swap
+    // rectangular (m != n) so a wrong swap is observable; Layout::Row forces the orientation swap
     for &(m, k, n) in &[(33usize, 40usize, 24usize), (48, 33, 65), (17, 96, 29)] {
         for par in [Parallelism::Serial, Parallelism::Rayon(8)] {
             for &beta in &[0.0f32, 1.0, 0.7] {
@@ -264,7 +268,7 @@ fn swapped_coord_falsifier() {
     }
 }
 
-// degenerate cases: alpha == 0 and k == 0 => C[r,c] = f(beta*C[r,c], r, c)
+// degenerate cases: alpha == 0 or k == 0 collapses the A*B term, so C[r,c] = f(beta*C[r,c], r, c)
 
 #[test]
 fn degenerate_alpha0_and_k0() {
@@ -272,7 +276,7 @@ fn degenerate_alpha0_and_k0() {
     for par in [Parallelism::Serial, Parallelism::Rayon(4)] {
         for layout in [Layout::Col, Layout::Row, Layout::ColPadded] {
             for &beta in &[0.0f32, 1.0, 0.7] {
-                // alpha == 0: A*B term dropped
+                // alpha == 0: the A*B term is dropped, but A/B are still real-sized
                 check_map::<f32>(&mut rng, 20, 24, 19, 0.0, beta, layout, par, "alpha0");
                 check_map::<f64>(
                     &mut rng,
@@ -285,7 +289,7 @@ fn degenerate_alpha0_and_k0() {
                     par,
                     "alpha0",
                 );
-                // k == 0: empty contraction
+                // k == 0: A and B are both empty
                 check_map::<f32>(&mut rng, 20, 0, 19, 1.0, beta, layout, par, "k0");
                 check_map::<f64>(&mut rng, 20, 0, 19, 1.0, beta as f64, layout, par, "k0");
             }
@@ -295,9 +299,9 @@ fn degenerate_alpha0_and_k0() {
 
 // environment capture: the closure reads a captured &[T] table
 
-/// The closure captures a lookup-table **slice** (`&[T]`) by reference and indexes it per output
-/// element. Exercised end-to-end through `gemm_map` and compared bitwise to the same table applied
-/// scalar-side, proving borrowed environment capture works across the parallel workers
+/// The closure captures a per-column gain table (`&[f64]`) by reference and indexes it per output
+/// element, run through `gemm_map` at `Parallelism::Rayon(8)` and compared bitwise to the same
+/// table applied by hand on the plain-`gemm` result, so the borrow crosses into the workers intact
 #[test]
 fn closure_captures_slice() {
     let mut rng = Rng::new(0xCAB7_5111);
@@ -307,7 +311,7 @@ fn closure_captures_slice() {
     let a = make::<f64>(&mut rng, m, k);
     let b = make::<f64>(&mut rng, k, n);
     let c0 = make::<f64>(&mut rng, m * n, 1);
-    // a per-column gain table, captured by reference
+    // the table `f` below borrows through `tref`, not owns
     let table: Vec<f64> = (0..n).map(|_| rng.unit() * 2.0 + 0.1).collect();
     let tref: &[f64] = &table;
 
@@ -342,9 +346,9 @@ fn closure_captures_slice() {
 
 // serial == parallel, bitwise
 
-/// The output-tile / output-row partition never splits an element's reduction, so `gemm_map` is
-/// bit-identical across thread counts (same guarantee plain `gemm` has). Compared directly here
-/// (not only via the oracle) on a driver shape and a small-`k` shape
+/// Worker partitioning never splits a single output element's reduction, so `gemm_map` stays
+/// bit-identical across thread counts, the same guarantee plain `gemm` has. Compared directly
+/// here (not only through the `check_map` oracle) on a driver shape and a small-`k` shape
 #[test]
 fn serial_eq_parallel_bitwise() {
     let mut rng = Rng::new(0x5E21_9A11);
@@ -377,8 +381,8 @@ fn serial_eq_parallel_bitwise() {
 
 // twin equivalences: _with == allocating, unchecked == checked
 
-/// `gemm_map` (thread-local pool) and `gemm_map_with` (caller workspace) are parallel entry points;
-/// exercise them against each other bit-for-bit
+/// `gemm_map` (thread-local pool) and `gemm_map_with` (caller-owned `Workspace`) are parallel
+/// entry points; drives them against each other bit-for-bit on the same closure and inputs
 #[test]
 fn map_with_matches_allocating() {
     let mut rng = Rng::new(0x0F05_ED20);
@@ -413,9 +417,9 @@ fn map_with_matches_allocating() {
     }
 }
 
-/// `gemm_map_unchecked` and `gemm_map` are parallel entry points (the checked twin does not delegate
-/// to the unchecked one); exercise the raw fn against the checked twin bit-for-bit on a driver shape,
-/// a small-`k` shape, and a gemv shape
+/// `gemm_map_unchecked` and `gemm_map` are parallel entry points (the checked one does not call
+/// the unchecked one internally); drives the raw fn against the checked twin bit-for-bit on a
+/// driver shape, a small-`k` shape, and a gemv shape
 #[test]
 fn map_unchecked_matches_checked() {
     let mut rng = Rng::new(0x0F05_ED21);
@@ -436,7 +440,7 @@ fn map_unchecked_matches_checked() {
         let mut c_unchecked = c0.clone();
         {
             let f = |v: f64, r: usize, c: usize| map_expr::<f64>(v, r, c, &lut);
-            // SAFETY: valid in-bounds col-major layouts; C aliases neither A nor B
+            // SAFETY: valid in-bounds col-major views; C aliases neither A nor B
             unsafe {
                 gemm_map_unchecked(
                     m,
@@ -468,7 +472,7 @@ fn map_unchecked_matches_checked() {
     }
 }
 
-// validation panics: the standard gemm view checks (byte-identical wording)
+// validation panics: gemm_map runs the same view checks plain gemm does, same wording
 
 mod validation {
     use super::*;
@@ -477,7 +481,7 @@ mod validation {
     #[should_panic(expected = "A.cols")]
     fn dim_mismatch() {
         let a = vec![1.0f32; 4 * 3];
-        let b = vec![1.0f32; 4 * 4]; // B.rows = 4 != A.cols = 3
+        let b = vec![1.0f32; 4 * 4]; // B.rows == 4, A.cols == 3: mismatched
         let mut c = vec![0.0f32; 4 * 4];
         let f = |v: f32, _r: usize, _c: usize| v;
         gemm_map(
@@ -496,7 +500,8 @@ mod validation {
     fn c_aliases_a() {
         let mut buf = vec![1.0f32; 4 * 4];
         let b = vec![1.0f32; 4 * 4];
-        // A and C share `buf`: an aliasing output, rejected before any compute
+        // `a` is a raw view into the same storage `buf` (and C) uses, so the call must reject
+        // the aliasing before any compute
         let a: &[f32] = unsafe { core::slice::from_raw_parts(buf.as_ptr(), 16) };
         let f = |v: f32, _r: usize, _c: usize| v;
         gemm_map(
@@ -517,7 +522,7 @@ mod validation {
         let b = vec![1.0f32; 4 * 4];
         let mut c = vec![0.0f32; 4];
         let f = |v: f32, _r: usize, _c: usize| v;
-        // rsc = 0 maps every row of a column to the same cell: a self-aliasing output
+        // rsc == 0 maps every row of a column onto the same cell: C aliases itself
         gemm_map(
             1.0,
             MatRef::from_col_major(&a, 4, 4),

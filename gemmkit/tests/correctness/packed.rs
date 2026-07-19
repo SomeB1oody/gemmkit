@@ -1,23 +1,25 @@
-//! Prepacked-LHS/RHS paths vs plain gemm: bit-identity, both-tiny accuracy,
-//! and the packed-orientation panic guarantees
+//! Correctness tests for the prepacked-LHS/RHS API surface: bit-identical (or, on
+//! both-tiny/gemv shapes, accurate-and-deterministic) agreement with plain `gemm`/`gemm_i8`,
+//! the raw `_unchecked` pointer entries, and the C-orientation panics each packed path enforces
 
 use crate::common::*;
 use gemmkit::{MatMut, MatRef, Parallelism, gemm};
 
-/// Prepacked-RHS must be **bit-identical** to a plain `gemm()` on the same
-/// inputs, for any thread count and any B layout (C column-major = the supported
-/// no-swap orientation). This is the determinism gate for the reuse path: packing
-/// only rearranges B's values, so the microkernel does the identical fused FMAs in
-/// the identical order
+/// Prepacked-RHS (`prepack_rhs` + `gemm_packed_b`) must be bit-identical to plain `gemm` on
+/// the same inputs, across every B layout, alpha/beta pair, and thread count: packing only
+/// rearranges B's values into the driver's own micropanel layout, so the microkernel runs
+/// the identical FMAs in the identical order either way. A and C stay column-major
+/// throughout, the only orientation a prepacked RHS can serve
 #[test]
 fn prepack_equals_gemm() {
-    // All shapes are non-both-tiny (not m<=64 && n<=64), the supported regime
+    // Every shape clears the both-tiny gate (m <= 64 && n <= 64), which the separate
+    // accuracy test below covers instead
     for (m, k, n) in [
         (200, 130, 175),
         (384, 96, 320),
         (256, 257, 129),
-        (65, 64, 64), // just above the tiny shortcut on m
-        (64, 64, 65), // just above on n
+        (65, 64, 64), // m=65 is just past the tiny-shortcut gate (m<=64)
+        (64, 64, 65), // n=65 is just past the tiny-shortcut gate (n<=64)
         (300, 1, 256),
         (40, 200, 300),
     ] {
@@ -68,10 +70,11 @@ fn prepack_equals_gemm() {
     }
 }
 
-/// The raw packed entries (`prepack_rhs_unchecked` + `gemm_packed_b_unchecked`, and the LHS pair
-/// `prepack_lhs_unchecked` + `gemm_packed_a_unchecked`) must equal a plain `gemm()`. These are the
-/// adapter/FFI-facing signatures, exercised directly through raw pointers + strides (the safe
-/// packed path forwards through them, so the result is bit-identical to `gemm`)
+/// The raw `_unchecked` entries (`prepack_rhs_unchecked` + `gemm_packed_b_unchecked` for the
+/// RHS pack, `prepack_lhs_unchecked` + `gemm_packed_a_unchecked` for the LHS pack) must match
+/// plain `gemm`, exercised directly through raw pointers and strides instead of `MatRef`/
+/// `MatMut`. The checked API (`prepack_rhs`/`gemm_packed_b`, etc.) is a thin bounds-check
+/// wrapper around these, so this also stands in for the FFI/adapter-facing contract
 #[test]
 fn packed_unchecked_matches_gemm() {
     for (m, k, n) in [(200usize, 130, 175), (65, 64, 64), (40, 200, 300)] {
@@ -82,7 +85,7 @@ fn packed_unchecked_matches_gemm() {
             let (abuf, rsa, csa) = build_view(&a, Layout::Col);
             let (bbuf, rsb, csb) = build_view(&b, Layout::Col);
 
-            // RHS-packed: requires column-major-ish C
+            // gemm_packed_b_unchecked requires column-major-ish C
             {
                 let (cbase, rsc, csc) = build_view(&c0, Layout::Col);
                 let mut c_ref = cbase.clone();
@@ -94,12 +97,13 @@ fn packed_unchecked_matches_gemm() {
                     MatMut::new(&mut c_ref, m, n, rsc, csc),
                     Parallelism::Serial,
                 );
-                // SAFETY: views are in bounds; B is a distinct buffer read through its strides
+                // SAFETY: bbuf addresses (k, n) at (rsb, csb) in bounds
                 let packed =
                     unsafe { gemmkit::prepack_rhs_unchecked(bbuf.as_ptr(), rsb, csb, k, n) };
                 for par in [Parallelism::Serial, Parallelism::Rayon(4)] {
                     let mut c = cbase.clone();
-                    // SAFETY: A/C in bounds, C column-major (packed_b orientation), distinct buffers
+                    // SAFETY: abuf/c address (m, k)/(m, n) at (rsa,csa)/(rsc,csc) in bounds;
+                    // c does not alias abuf
                     unsafe {
                         gemmkit::gemm_packed_b_unchecked(
                             al as f32,
@@ -122,7 +126,7 @@ fn packed_unchecked_matches_gemm() {
                 }
             }
 
-            // LHS-packed: requires row-major-ish C
+            // gemm_packed_a_unchecked requires row-major-ish C
             {
                 let (cbase, rsc, csc) = build_view(&c0, Layout::Row);
                 let mut c_ref = cbase.clone();
@@ -134,12 +138,13 @@ fn packed_unchecked_matches_gemm() {
                     MatMut::new(&mut c_ref, m, n, rsc, csc),
                     Parallelism::Serial,
                 );
-                // SAFETY: views are in bounds; A is a distinct buffer read through its strides
+                // SAFETY: abuf addresses (m, k) at (rsa, csa) in bounds
                 let packed =
                     unsafe { gemmkit::prepack_lhs_unchecked(abuf.as_ptr(), rsa, csa, m, k) };
                 for par in [Parallelism::Serial, Parallelism::Rayon(4)] {
                     let mut c = cbase.clone();
-                    // SAFETY: B/C in bounds, C row-major (packed_a orientation), distinct buffers
+                    // SAFETY: bbuf/c address (k, n)/(m, n) at (rsb,csb)/(rsc,csc) in bounds;
+                    // c does not alias bbuf
                     unsafe {
                         gemmkit::gemm_packed_a_unchecked(
                             al as f32,
@@ -165,10 +170,13 @@ fn packed_unchecked_matches_gemm() {
     }
 }
 
-/// Mixed-precision prepacked-RHS must be **bit-identical** to plain `gemm()` for
-/// the narrow types too: the prepack blocks with the packed-input (`Lhs`) size and
-/// the same `kc = k` the driver uses, so packed and unpacked never diverge. Includes
-/// a `k > 512` cross-panel case
+/// Mixed-precision (`f16`/`bf16`) prepacked-RHS must be bit-identical to plain `gemm` too.
+/// Both `prepack_rhs` and the driver derive `kc` from `GemmScalar::OUT_IS_ACC`, `false` for
+/// these narrow-output types, so both always block the whole contraction as a single depth
+/// panel (`kc = k`) instead of the general cache-model `kc`: the packed buffer's geometry can
+/// never disagree with what the consuming kernel expects. `(128, 1024, 96)` pushes `k` past
+/// the default 512-element cache-model `kc`, where a homogeneous `f32`/`f64` family would
+/// split into multiple depth slices but this single-panel rule leaves it undivided
 #[cfg(feature = "half")]
 #[test]
 fn prepack_equals_gemm_mixed() {
@@ -218,14 +226,16 @@ fn prepack_equals_gemm_mixed() {
     check::<gemmkit::bf16>();
 }
 
-/// Prepacked-**i8** RHS must be **bit-identical** to a plain `gemm_i8()` on the same inputs, for
-/// any thread count and any B layout (C column-major = the supported no-swap orientation).
-/// Integer accumulation is exact (wrapping i32, associative), so this is a hard equality across
-/// the auto-dispatched integer kernel (the VNNI `vpdpbusd` dot kernel on a VNNI box, the widen
-/// kernel elsewhere) - including the auto-VNNI *small parallel* problems the plain path hands to
-/// the widen fallback (the prepacked path always runs the buffer's own family). Covers `k` not a
-/// multiple of 4 (the VNNI depth pad), `n` not a multiple of the panel width, `k == 1`, and the
-/// small-`m` fixed-weight inference shape
+/// Prepacked-i8 RHS (`prepack_rhs_i8` + `gemm_i8_packed_b`) must be bit-identical to plain
+/// `gemm_i8` on the same inputs, across B's layout, alpha/beta, and thread count. Wrapping
+/// i32 addition is associative, so the sum does not depend on which family, or how many
+/// depth/n panels, computes it: this holds across the auto-dispatched VNNI `vpdpbusd` kernel
+/// and its widen fallback too. Under multi-threading, the plain path reroutes an auto-VNNI
+/// selection to the widen kernel once the problem volume (`m*n*k`) drops below a threshold
+/// (VNNI's mandatory RHS pack outweighs the compute it saves there), but the prepacked path
+/// always runs the buffer's own packed family regardless, and the 2 stay bit-identical either
+/// way. Shapes cover k not a multiple of 4 (the VNNI depth pad), k == 1, and a small-m/long-k
+/// fixed-weight inference shape
 #[cfg(feature = "int8")]
 #[test]
 fn prepack_i8_equals_gemm_i8() {
@@ -234,17 +244,17 @@ fn prepack_i8_equals_gemm_i8() {
         (200usize, 130, 175),
         (128, 96, 112),
         (65, 64, 64),
-        (64, 65, 100), // k not a multiple of 4, n not a multiple of nr
+        (64, 65, 100), // k=65 not a multiple of 4 (the VNNI depth pad)
         (96, 129, 129),
         (33, 17, 19),
         (256, 257, 129),
-        (300, 1, 256), // k == 1 (below the small-k gate on the plain path)
+        (300, 1, 256), // k == 1, below the plain path's small-k reroute
         (8, 2048, 96), // small m, long k: the fixed-weight inference shape
-        (2, 1023, 12), // tiny m, k not a multiple of 4, n == nr
+        (2, 1023, 12), // tiny m, k=1023 not a multiple of 4
     ] {
         let a = rand_i8(m * k, 0x51 + (m * 7 + n) as u64);
-        let b_rm = rand_i8(k * n, 0x62 + (n * 3 + k) as u64); // logical k x n stored row-major
-        // column-major copy of the same logical B (so both layouts describe the same matrix)
+        let b_rm = rand_i8(k * n, 0x62 + (n * 3 + k) as u64); // logical k x n, row-major
+        // column-major copy of the same logical B, for the lb==1 case below
         let mut b_cm = vec![0i8; k * n];
         for i in 0..k {
             for j in 0..n {
@@ -300,16 +310,17 @@ fn prepack_i8_equals_gemm_i8() {
     }
 }
 
-/// The raw i8 packed entries (`prepack_rhs_i8_unchecked` + `gemm_i8_packed_b_unchecked`) must equal
-/// a plain `gemm_i8()`: the adapter/FFI-facing signatures, exercised directly through raw pointers
-/// + strides (the safe packed path forwards through them)
+/// The raw `prepack_rhs_i8_unchecked` + `gemm_i8_packed_b_unchecked` entries must match plain
+/// `gemm_i8`: the i8 mirror of `packed_unchecked_matches_gemm`, exercised through raw
+/// pointers and strides. The checked `prepack_rhs_i8`/`gemm_i8_packed_b` are thin
+/// bounds-check wrappers around these
 #[cfg(feature = "int8")]
 #[test]
 fn packed_i8_unchecked_matches_gemm_i8() {
     use gemmkit::{MatMut, MatRef};
     for (m, k, n) in [(200usize, 130, 175), (65, 64, 64), (8, 512, 96)] {
         let a = rand_i8(m * k, 0x71 + (m + n) as u64);
-        let b = rand_i8(k * n, 0x82 + (k + n) as u64); // column-major k x n
+        let b = rand_i8(k * n, 0x82 + (k + n) as u64); // B stored column-major (rsb=1, csb=k)
         let c0: Vec<i32> = (0..m * n).map(|x| (x as i32 % 5) - 2).collect();
         for &(alpha, beta) in &[(1i32, 0i32), (2, 3)] {
             let mut c_ref = c0.clone();
@@ -321,12 +332,13 @@ fn packed_i8_unchecked_matches_gemm_i8() {
                 MatMut::from_col_major(&mut c_ref, m, n),
                 Parallelism::Serial,
             );
-            // SAFETY: views are in bounds; B is a distinct buffer read through its (col-major) strides
+            // SAFETY: b addresses (k, n) at (rsb=1, csb=k) in bounds
             let packed =
                 unsafe { gemmkit::prepack_rhs_i8_unchecked(b.as_ptr(), 1, k as isize, k, n) };
             for par in [Parallelism::Serial, Parallelism::Rayon(4)] {
                 let mut c = c0.clone();
-                // SAFETY: A/C in bounds, C column-major (packed_b orientation), distinct buffers
+                // SAFETY: a/c address (m, k)/(m, n) column-major-strided in bounds; c does
+                // not alias a
                 unsafe {
                     gemmkit::gemm_i8_packed_b_unchecked(
                         alpha,
@@ -351,8 +363,9 @@ fn packed_i8_unchecked_matches_gemm_i8() {
     }
 }
 
-/// A row-major-ish C is unsupported by the i8 prepacked path (it would swap A/B); `gemm_i8_packed_b`
-/// must reject it with the same wording as the float packed path
+/// `gemm_i8_packed_b` rejects a row-major-ish C: that orientation would force an A/B swap,
+/// which a prepacked B (packed as the genuine RHS) cannot support. Same panic wording as the
+/// float packed path
 #[cfg(feature = "int8")]
 #[test]
 #[should_panic(expected = "column-major-ish C")]
@@ -368,13 +381,14 @@ fn prepack_i8_row_major_c_panics() {
         MatRef::from_col_major(&a, m, k),
         &packed,
         0,
-        MatMut::from_row_major(&mut c, m, n), // row-major C -> swap -> reject
+        MatMut::from_row_major(&mut c, m, n), // row-major C forces the A/B swap this rejects
         Parallelism::Serial,
     );
 }
 
-/// An empty i8 operand must prepack and round-trip through the consume call as `C <- beta*C`
-/// without running the pack-geometry arithmetic
+/// `prepack_rhs_i8` on a `k == 0` B returns the empty-buffer sentinel (the geometry
+/// arithmetic never runs), and a matching `k == 0` A through `gemm_i8_packed_b` then only
+/// performs `C <- beta*C`
 #[cfg(feature = "int8")]
 #[test]
 fn prepack_i8_empty_roundtrips() {
@@ -394,8 +408,8 @@ fn prepack_i8_empty_roundtrips() {
     assert!(c.iter().all(|&x| x == 6), "k==0 packed_b must beta-scale C");
 }
 
-/// f64 prepacked path is bit-identical too (exercises the f64 tile + the packed
-/// geometry for a 2nd element type)
+/// f64 prepacked-RHS path is bit-identical too, exercising the f64 tile and the packed
+/// geometry for a 2nd element type
 #[test]
 fn prepack_equals_gemm_f64() {
     for (m, k, n) in [(160, 96, 208), (96, 65, 65)] {
@@ -429,12 +443,13 @@ fn prepack_equals_gemm_f64() {
     }
 }
 
-/// Both-tiny products (`m <= 64 && n <= 64`) still work via the prepacked path: it
-/// uses the buffer's own blocking (which may round differently from plain gemm's
-/// small-matrix shortcut), so it checks *accuracy* against the f64 reference rather
-/// than bit-identity to plain gemm, and the output must stay bit-identical across
-/// thread counts. `(60, 600, 60)` exercises the `k > 512` case where the
-/// general/tiny blocking diverges
+/// Both-tiny shapes (`m <= 64 && n <= 64`) still work through `prepack_rhs`/`gemm_packed_b`,
+/// but not bit-identically to plain `gemm`: the prepack constructor deliberately dodges the
+/// tiny-matrix shortcut (it must serve every future `m`), so it always blocks through the
+/// general cache model, while plain `gemm` takes the dedicated small-matrix path with its own
+/// (differently rounded) `kc`. This checks accuracy against the f64 reference instead, and
+/// that output stays bit-identical across thread counts. `(60, 600, 60)` pushes `k` past the
+/// tiny-shortcut's 512-element `kc` clamp, where the 2 blocking models diverge furthest
 #[test]
 fn prepack_both_tiny_accurate_and_deterministic() {
     for (m, k, n) in [(48, 40, 48), (60, 600, 60), (10, 9, 12)] {
@@ -486,32 +501,32 @@ fn prepack_both_tiny_accurate_and_deterministic() {
     }
 }
 
-/// Prepacked-LHS (the mirror of `prepack_equals_gemm`): reusing a prepacked `A`
-/// must be **bit-identical** to a plain `gemm()` for any thread count and any A
-/// layout, with a **row-major-ish C** (the supported no-extra-swap orientation:
-/// the engine drives the prepacked-A product transposed). Packing only rearranges
-/// A's values, so the microkernel does the identical fused FMAs in the identical
-/// order
+/// Prepacked-LHS (`prepack_lhs` + `gemm_packed_a`), the mirror of `prepack_equals_gemm`:
+/// reusing a prepacked A must be bit-identical to plain `gemm`, across A's layout,
+/// alpha/beta, and thread count. C stays row-major throughout, the only orientation a
+/// prepacked A (packed as the transposed product's RHS) can serve; B stays column-major.
+/// Packing only rearranges A's values, so the microkernel still runs the identical FMAs in
+/// the identical order
 #[test]
 fn prepack_lhs_equals_gemm() {
     for (m, k, n) in [
         (200, 130, 175),
         (384, 96, 320),
         (256, 257, 129),
-        (65, 64, 64), // just above the tiny shortcut on m
-        (64, 64, 65), // just above on n
+        (65, 64, 64), // m=65 is just past the tiny-shortcut gate (m<=64)
+        (64, 64, 65), // n=65 is just past the tiny-shortcut gate (n<=64)
         (300, 1, 256),
         (40, 200, 300),
     ] {
         for &la in &[Layout::Col, Layout::Row] {
-            // A and its packed buffer depend only on the (shape, layout): hoist the
-            // pack above the alpha/beta loop so it happens once, not per combo
+            // The pack depends only on (m, k, la), not alpha/beta: build it once per
+            // layout and reuse it across the alpha/beta sweep below
             let a = Mat::<f32>::rand(m, k, 0x5A + (m * 7 + n) as u64);
             let b = Mat::<f32>::rand(k, n, 0x6B + (n * 3 + k) as u64);
             let c0 = Mat::<f32>::rand(m, n, 0x7C + (k + m) as u64);
             let (abuf, rsa, csa) = build_view(&a, la);
             let (bbuf, rsb, csb) = build_view(&b, Layout::Col);
-            // Row-major C is the supported orientation for the packed-LHS path
+            // gemm_packed_a only serves row-major-ish C
             let (cbase, rsc, csc) = build_view(&c0, Layout::Row);
             let packed = gemmkit::prepack_lhs(MatRef::new(&abuf, m, k, rsa, csa));
             assert_eq!(packed.rows(), m);
@@ -553,8 +568,8 @@ fn prepack_lhs_equals_gemm() {
     }
 }
 
-/// f64 prepacked-LHS path is bit-identical too (exercises the f64 tile + the packed
-/// geometry for a 2nd element type)
+/// f64 prepacked-LHS path is bit-identical too, exercising the f64 tile and the packed
+/// geometry for a 2nd element type
 #[test]
 fn prepack_lhs_equals_gemm_f64() {
     for (m, k, n) in [(160, 96, 208), (96, 65, 65)] {
@@ -588,12 +603,12 @@ fn prepack_lhs_equals_gemm_f64() {
     }
 }
 
-/// Mixed-precision prepacked-**LHS** must be bit-identical to plain `gemm()` for the
-/// narrow types: the LHS transpose-pack path at `Acc != Lhs` sizes. This is the only
-/// path that simultaneously hits a narrow type, the transpose/packing framework, and
-/// the `kc = k` single-panel rule (`prepack_equals_gemm_mixed` covers the RHS pack;
-/// `prepack_lhs_equals_gemm` covers the transpose at `Acc == Lhs`). Mirrors the RHS
-/// mixed test on the `gemm_packed_a` side, with both A layouts and a `k > 512` case
+/// Mixed-precision (`f16`/`bf16`) prepacked-LHS must be bit-identical to plain `gemm` too:
+/// the narrow-type twin of `prepack_lhs_equals_gemm`, run through the same LHS-as-transposed-
+/// RHS pack `prepack_lhs_unchecked` delegates to. This is the only test in the file that
+/// combines a narrow type, the transpose-pack path, and the `kc = k` single-panel rule
+/// `prepack_equals_gemm_mixed` exercises on the RHS side. Covers both A layouts and a
+/// `k > 512` case past the general cache-model `kc`
 #[cfg(feature = "half")]
 #[test]
 fn prepack_lhs_equals_gemm_mixed() {
@@ -605,7 +620,7 @@ fn prepack_lhs_equals_gemm_mixed() {
                 let c0 = Mat::<T>::rand(m, n, 0x4C + (k + m) as u64);
                 let (abuf, rsa, csa) = build_view(&a, la);
                 let (bbuf, rsb, csb) = build_view(&b, Layout::Col);
-                // Row-major C is the supported orientation for the packed-LHS path
+                // gemm_packed_a only serves row-major-ish C
                 let (cbase, rsc, csc) = build_view(&c0, Layout::Row);
                 let packed = gemmkit::prepack_lhs(MatRef::new(&abuf, m, k, rsa, csa));
                 assert_eq!(packed.rows(), m);
@@ -648,10 +663,10 @@ fn prepack_lhs_equals_gemm_mixed() {
     check::<gemmkit::bf16>();
 }
 
-/// Both-tiny products (`m <= 64 && n <= 64`) via the prepacked-LHS path: like the
-/// RHS case it uses the buffer's own blocking, so check *accuracy* against the f64
-/// reference rather than bit-identity to plain gemm, and the output must stay
-/// bit-identical across thread counts
+/// Both-tiny shapes (`m <= 64 && n <= 64`) through the prepacked-LHS path: like the RHS case,
+/// the prepack dodges the tiny-matrix shortcut and always blocks through the general cache
+/// model, so this checks accuracy against the f64 reference rather than bit-identity to plain
+/// `gemm`, and that output stays bit-identical across thread counts
 #[test]
 fn prepack_lhs_both_tiny_accurate_and_deterministic() {
     for (m, k, n) in [(48, 40, 48), (60, 600, 60), (10, 9, 12)] {
@@ -703,16 +718,15 @@ fn prepack_lhs_both_tiny_accurate_and_deterministic() {
     }
 }
 
-/// gemv shapes (`n == 1` and `m == 1`) through the prepacked-LHS path. Plain `gemm`
-/// routes these to the dedicated gemv kernel, but `gemm_packed_a` runs them through
-/// the general driver (the transpose maps a unit dimension onto a unit *driver*
-/// dimension), so this checks **accuracy** against the f64 reference, and that the
-/// row-major-ish C contract admits the natural vector layouts (a unit column/row is
-/// addressed with `|csc| <= |rsc|`)
+/// gemv shapes (`n == 1` or `m == 1`) through the prepacked-LHS path. Plain `gemm` routes
+/// these to a dedicated gemv kernel, but `gemm_packed_a` always drives the general
+/// (transposed) prepacked kernel instead, so this checks accuracy against the f64 reference
+/// rather than bit-identity, and that the row-major-ish C contract (`|csc| <= |rsc|`) still
+/// admits the natural vector layout on either axis
 #[test]
 fn prepack_lhs_gemv_accurate() {
     // (m, k, n, rsc, csc): n==1 column-vector C (rsc=1,csc=1) and m==1 row-vector C
-    // (rsc=n,csc=1), both row-major-ish so the packed-LHS guard accepts them
+    // (rsc=n,csc=1), both row-major-ish so gemm_packed_a's C-orientation guard accepts them
     for &(m, k, n, rsc, csc) in &[
         (64usize, 40, 1usize, 1isize, 1isize),
         (255, 129, 1, 1, 1),
@@ -724,7 +738,7 @@ fn prepack_lhs_gemv_accurate() {
         let c0 = Mat::<f32>::rand(m, n, 0xCC + (m + n) as u64);
         let (abuf, rsa, csa) = build_view(&a, Layout::Col);
         let (bbuf, rsb, csb) = build_view(&b, Layout::Col);
-        let mut cbuf = c0.v.clone(); // row-major m*n vector (rs=csc-major chosen above)
+        let mut cbuf = c0.v.clone(); // already laid out for either (rsc, csc) above, since one of m,n is 1
         let cref = reference(&a, &b, &c0, 1.3, -0.4);
 
         for par in [Parallelism::Serial, Parallelism::Rayon(4)] {
@@ -743,8 +757,9 @@ fn prepack_lhs_gemv_accurate() {
     }
 }
 
-/// A column-major-ish C is unsupported by the prepacked-LHS path (it would keep A
-/// in the genuine LHS role); `gemm_packed_a` must reject it
+/// `gemm_packed_a` rejects a column-major-ish C: that orientation would keep A in the
+/// genuine LHS role, which a prepacked A (laid out as the transposed product's RHS) cannot
+/// serve
 #[test]
 #[should_panic(expected = "row-major-ish C")]
 fn prepack_lhs_col_major_c_panics() {
@@ -758,13 +773,13 @@ fn prepack_lhs_col_major_c_panics() {
         &packed,
         MatRef::from_col_major(&b, k, n),
         0.0,
-        MatMut::from_col_major(&mut c, m, n), // column-major C -> reject
+        MatMut::from_col_major(&mut c, m, n), // column-major C keeps A in the LHS role
         Parallelism::Serial,
     );
 }
 
-/// A row-major-ish C is unsupported by the prepacked path (it would swap A/B);
-/// `gemm_packed_b` must reject it instead of silently computing the wrong thing
+/// `gemm_packed_b` rejects a row-major-ish C: that orientation would force an A/B swap,
+/// which a prepacked B (packed as the genuine RHS) cannot support
 #[test]
 #[should_panic(expected = "column-major-ish C")]
 fn prepack_row_major_c_panics() {
@@ -778,7 +793,7 @@ fn prepack_row_major_c_panics() {
         MatRef::from_col_major(&a, m, k),
         &packed,
         0.0,
-        MatMut::from_row_major(&mut c, m, n), // row-major C -> swap -> reject
+        MatMut::from_row_major(&mut c, m, n), // row-major C forces the A/B swap this rejects
         Parallelism::Serial,
     );
 }

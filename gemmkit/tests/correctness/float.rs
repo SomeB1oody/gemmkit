@@ -1,22 +1,24 @@
-//! Float shapes x layouts x alpha/beta via the public dispatched API, workspace
-//! reuse, parallel/serial bit-identity, and gemv shapes
+//! Real float (f32/f64) GEMM through the public dispatched API: shapes x layouts x
+//! alpha/beta, workspace reuse, parallel/serial bit-identity, and gemv shapes
 
 use crate::common::*;
 use gemmkit::{MatMut, MatRef, Parallelism, Workspace, gemm, gemm_unchecked};
 
+/// `m` values (crossed with fixed `k`/`n` lists and a few big squares below) spanning
+/// the AVX-512 f32 tile boundaries (`MR=32`, `NR=12`) and general blocking edges
+///
+/// Under `GEMMKIT_FAST_TEST` this drops to the classes that matter (0, 1, a
+/// sub-tile, the `NR`/`MR` boundary and boundary+1, a multi-tile, a large multi-block)
+/// and cuts the redundant middle (2, 11, 16, 31, 48, 100); the `k`/`n` lists and the
+/// big squares are unaffected either way
 fn dims() -> Vec<(usize, usize, usize)> {
-    // Edge values around the AVX-512 f32 tile (MR=32, NR=12) and blocking. Under
-    // GEMMKIT_FAST_TEST keep the edge / tile-boundary / multi-block classes and drop the
-    // redundant middle (11, 16, 31, 48, 100 and the near-duplicate 2): zero, one, a sub-tile,
-    // both NR and MR boundary+1, a multi-tile, and the large multi-block remain. The k / n
-    // lists and the big squares below are unchanged
     let vals: &[usize] = if fast_test() {
         &[0, 1, 5, 12, 13, 32, 33, 64, 257]
     } else {
         &[0, 1, 2, 5, 11, 12, 13, 16, 31, 32, 33, 48, 64, 100, 257]
     };
     let mut out = Vec::new();
-    // A representative cross-section (full cross product is huge)
+    // A representative cross-section: the full m x k x n cross product is huge
     for &m in vals {
         for &k in &[1usize, 2, 7, 32, 65] {
             for &n in &[1usize, 11, 12, 13, 64] {
@@ -24,13 +26,14 @@ fn dims() -> Vec<(usize, usize, usize)> {
             }
         }
     }
-    // A few big squares
     for &s in &[128usize, 200, 384] {
         out.push((s, s, s));
     }
     out
 }
 
+/// f32 over the [`dims`] shape spread, row-major A, col-major B, and both C layouts,
+/// `alpha=1, beta=0`, against the f64 reference
 #[test]
 fn correctness_f32_layouts() {
     for (m, k, n) in dims() {
@@ -50,6 +53,8 @@ fn correctness_f32_layouts() {
     }
 }
 
+/// f64 twin of [`correctness_f32_layouts`], with A/B layouts swapped (col-major A,
+/// row-major B) so the 2 float types don't share identical operand orientations
 #[test]
 fn correctness_f64_layouts() {
     for (m, k, n) in dims() {
@@ -69,6 +74,8 @@ fn correctness_f64_layouts() {
     }
 }
 
+/// General (non-unit, non-trivial) strides on every operand: [`Layout::GeneralPad`]
+/// throughout for f32, and mixed with row/col for f64, over a small shape set
 #[test]
 fn correctness_general_strides() {
     for (m, k, n) in [(7, 9, 5), (32, 32, 32), (33, 17, 19), (64, 64, 64)] {
@@ -97,6 +104,8 @@ fn correctness_general_strides() {
     }
 }
 
+/// An alpha/beta sweep (both signs, zero, and 1) crossed with a few shapes, f32
+/// row-major throughout and f64 col-major throughout
 #[test]
 fn correctness_alpha_beta() {
     let combos = [
@@ -137,12 +146,13 @@ fn correctness_alpha_beta() {
     }
 }
 
-/// beta==0 must not read C, proved by seeding C with NaN. Each kernel family has
-/// its own `BetaStatus::Zero` branch (float / mixed / int / complex), so cover every
-/// real element type, not just f32: a family that load-then-stored C would propagate
-/// the NaN (`0 * NaN == NaN`) and fail the finite check in `assert_accurate`. Sizes
-/// hit both the small-matrix branch (40x33x28) and a real tile with partial edges
-/// (64x16x96, exercising the strided copy-back `Zero` branch)
+/// beta==0 must never read C: seed C with NaN and check the output is finite.
+/// `kernel::float` and `kernel::mixed` each have their own `BetaStatus::Zero` branch,
+/// so this runs f32/f64 and (under `half`) f16/bf16, not just f32: a branch that
+/// loaded C anyway would propagate the NaN (`0*NaN == NaN`) into a failed finite
+/// check. `(40,33,28)` sits inside the small-matrix blocking shortcut (both dims
+/// under the 64-element default); `(64,16,96)` exceeds it (`n=96 > 64`), covering
+/// the general blocking path's `Zero` branch too
 #[test]
 fn beta_zero_does_not_read_c() {
     fn check<T: Elem>() {
@@ -183,9 +193,9 @@ fn beta_zero_does_not_read_c() {
     }
 }
 
-/// The workspace-reuse entry `gemm_with` must match the pool-allocating `gemm`
-/// numerically (it otherwise has only a zero-alloc test). Reuse one `Workspace` across
-/// 2 calls to also cover the warm (no-alloc) path
+/// `gemm_with` (`workspace_alloc.rs` only checks it allocates nothing on reuse, not
+/// that the result is correct) must match `gemm` numerically; reuse 1 `Workspace`
+/// across 2 calls so both the cold and warm paths are checked
 #[test]
 fn workspace_reuse_matches_allocating() {
     fn check<T: Elem>() {
@@ -232,15 +242,16 @@ fn workspace_reuse_matches_allocating() {
     check::<f64>();
 }
 
-/// Serial and parallel runs are bit-identical **under the current thread-independent
-/// blocking**: float add isn't associative, so this holds only because every thread
-/// count reduces in the same order, not because the library promises it. The *contract*
-/// is weaker: reproducible under a fixed config, not bitwise serial-vs-parallel (see the
-/// consistency docs and the `accumulate_tile` contract). The exact check is kept as the
-/// strongest net against an *accidental* reduction-order divergence (a race, a
-/// thread-count-dependent tail bug); relax it to determinism + tolerance only if blocking
-/// is ever made parallelism-dependent on purpose (e.g. split-K). (Canonical caveat; the
-/// other float `parallel_equals_serial_*` tests share it.)
+/// Serial and parallel runs land on identical bits, for every thread count, on
+/// col-major operands. Float add isn't associative, so this holds only because
+/// `blocking()` derives `mc`/`kc`/`nc` from shape and cache topology alone, never the
+/// thread count, so every run reduces in the same fixed order; the actual contract
+/// (see `driver.rs` and the `accumulate_tile` seam) is reproducibility under a fixed
+/// config, not bitwise serial-vs-parallel identity. The exact check stays as the
+/// strongest net against an accidental reduction-order divergence (a race, a
+/// thread-count-dependent tail bug); relax to determinism + tolerance only if blocking
+/// is ever made parallelism-dependent on purpose (e.g. split-K). This caveat applies to
+/// every `parallel_equals_serial_*` test in this file
 #[test]
 fn parallel_equals_serial_bit_identical() {
     for (m, k, n) in [
@@ -286,12 +297,12 @@ fn parallel_equals_serial_bit_identical() {
     }
 }
 
-/// Serial == parallel bit-identity (same thread-independent-blocking caveat as
-/// `parallel_equals_serial_bit_identical`) with a **row-major A** (`rsa != 1`), which forces per-row-block LHS
-/// packing and so exercises the dynamic scheduler's whole-row-block ("packed")
-/// grain path under multiple threads: distinct from the column-major case above.
-/// Sizes are chosen so the row-block count straddles the thread count (so both the
-/// `grain = n_nt` branch and its fine-grain fallback run)
+/// The row-major-A twin of [`parallel_equals_serial_bit_identical`] (same
+/// thread-independent-blocking caveat): `rsa != 1` routes A through per-row-block
+/// packing, which schedules jobs via `packed_block_grain`'s whole-row-block grain
+/// instead of the column-major case's fine-grain cursor. Sizes are chosen so the
+/// row-block count interacts differently with each thread count, reaching both the
+/// undivided whole-block grain and its split fallback
 #[test]
 fn parallel_equals_serial_row_major_a() {
     for (m, k, n) in [(200, 130, 175), (384, 96, 320), (256, 64, 200)] {
@@ -299,7 +310,7 @@ fn parallel_equals_serial_row_major_a() {
             let a = Mat::<f32>::rand(m, k, 0xA11 + m as u64);
             let b = Mat::<f32>::rand(k, n, 0xB22 + n as u64);
             let c0 = Mat::<f32>::rand(m, n, 0xC33 + k as u64);
-            let (abuf, rsa, csa) = build_view(&a, Layout::Row); // rsa = k != 1 -> packs A
+            let (abuf, rsa, csa) = build_view(&a, Layout::Row); // rsa=k, not 1: triggers packing
             let (bbuf, rsb, csb) = build_view(&b, Layout::Col);
             let (cbase, rsc, csc) = build_view(&c0, Layout::Col);
 
@@ -332,21 +343,22 @@ fn parallel_equals_serial_row_major_a() {
     }
 }
 
-/// Shared-LHS A-pack: with the workload gate forced fully open, the shared
-/// pre-pack path (one pack per row-block + indexed read) must stay bit-identical
-/// to the serial per-worker path, for every thread count. These sizes sit below
-/// the default gate, so this is the only coverage of the shared pre-pass; bit-
-/// identity holds whether the gate is on or off, so forcing it cannot disturb
-/// concurrently-running tests. Row-major A (`rsa != 1`) forces the packed path
+/// `set_shared_lhs_mnk(1)` opens the shared-A-pack gate for any nonzero `m*n*k`, so
+/// the shared pre-pack path (1 pack per row-block, read by every worker) runs for
+/// every thread count here and must still land on the same bits as serial. All 3
+/// shapes stay well under the real default gate (50M on aarch64, 8B elsewhere), so
+/// this is otherwise the only coverage this path gets; since bit-identity is expected
+/// whether the gate is open or closed, forcing it open cannot disturb concurrently
+/// running tests. Row-major A (`rsa != 1`) is what makes A pack in the first place
 #[test]
 fn shared_lhs_a_bit_identical() {
     let prev = gemmkit::tuning::shared_lhs_mnk();
-    gemmkit::tuning::set_shared_lhs_mnk(1); // force shared-A on for any parallel run
+    gemmkit::tuning::set_shared_lhs_mnk(1); // open the gate for every shape below
     for (m, k, n) in [(200, 130, 175), (384, 96, 320), (256, 64, 200)] {
         let a = Mat::<f32>::rand(m, k, 0xA1 + m as u64);
         let b = Mat::<f32>::rand(k, n, 0xB2 + n as u64);
         let c0 = Mat::<f32>::rand(m, n, 0xC3 + k as u64);
-        let (abuf, rsa, csa) = build_view(&a, Layout::Row); // rsa = k != 1 -> packs A
+        let (abuf, rsa, csa) = build_view(&a, Layout::Row); // rsa=k, not 1: triggers packing
         let (bbuf, rsb, csb) = build_view(&b, Layout::Col);
         let (cbase, rsc, csc) = build_view(&c0, Layout::Col);
 
@@ -378,7 +390,11 @@ fn shared_lhs_a_bit_identical() {
     gemmkit::tuning::set_shared_lhs_mnk(prev);
 }
 
-/// Negative strides via the unchecked API (reversed-row view of A)
+/// `gemm_unchecked` accepts a negative row stride for A (the safe `MatRef` surface
+/// cannot express one): point the base at A's last physical row and walk backwards
+/// with `rs = -rs`. C is written in ordinary forward row order, so output row `i`
+/// ends up holding the product for A's physical row `m-1-i`; the check below reads
+/// the f64 reference the same way
 #[test]
 fn negative_strides_unchecked() {
     let (m, k, n) = (12, 9, 7);
@@ -396,18 +412,13 @@ fn negative_strides_unchecked() {
         0.0,
     );
 
-    // A laid out row-major; present it with a *negative* row stride by pointing
-    // at the last row and walking backwards. C is also stored that way
-    let (abuf, rsa, csa) = build_view(&a, Layout::Row); // rsa = k, csa = 1
+    let (abuf, rsa, csa) = build_view(&a, Layout::Row); // rsa == k, csa == 1
     let (bbuf, rsb, csb) = build_view(&b, Layout::Col);
     let mut cbuf = vec![0.0f64; m * n];
 
     unsafe {
         let a_last = abuf.as_ptr().add(((m - 1) as isize * rsa) as usize);
         let c_ptr = cbuf.as_mut_ptr();
-        // Reversed A rows: base = last row, row stride = -rsa, but C in natural
-        // order means C rows also reverse: instead reverse A's rows and B stays,
-        // producing C with reversed rows; compare against reversed reference
         gemm_unchecked(
             m,
             k,
@@ -426,7 +437,7 @@ fn negative_strides_unchecked() {
             Parallelism::Serial,
         );
     }
-    // gemm computed C[i,j] = sum_k A[m-1-i, k] * B[k,j]; compare to reversed ref
+    // C[i,j] holds sum_k A[m-1-i,k]*B[k,j]; index the reference the same way
     for i in 0..m {
         for j in 0..n {
             let got = cbuf[i * n + j];
@@ -439,11 +450,12 @@ fn negative_strides_unchecked() {
     }
 }
 
-// gemv shapes
+// gemv shapes (n == 1 or m == 1, routed through gemm's gemv fast path)
 
+/// `n == 1` (mat*vec) and `m == 1` (vec*mat) shapes, including a `k == 1` degenerate
+/// case, across every A/B layout combination, alpha/beta both nonzero
 #[test]
 fn gemv_shapes() {
-    // n == 1 and m == 1, across layouts
     for &(m, k, n) in &[
         (64, 40, 1),
         (1, 40, 64),

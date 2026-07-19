@@ -1,8 +1,10 @@
-//! Real (f32/f64, plus f16/bf16 under half) ndarray GEMM entries
+//! Real f32/f64 (plus f16/bf16 under the half feature) ndarray GEMM entries
 use super::*;
 use crate::common::dims_strides;
 
-/// `C <- alpha*A*B + beta*C`
+/// `C <- alpha*A*B + beta*C`. Reads the pointer/strides directly out of `a`/`b`/`c`, so
+/// C-order, F-order, general-stride, and reversed (negative-stride) views all work without
+/// copying
 ///
 /// # Panics
 /// If the inner dimensions disagree
@@ -25,7 +27,7 @@ pub fn gemm<T, S1, S2, SC>(
 /// Like [`gemm`] but reuses a caller-owned [`Workspace`]
 ///
 /// # Panics
-/// If the inner dimensions disagree
+/// Same conditions as [`gemm`]
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_with<T, S1, S2, SC>(
     ws: &mut Workspace,
@@ -69,8 +71,8 @@ fn gemm_common<T, S1, S2, SC>(
     let (rsc, csc) = (cs[0], cs[1]);
     let cp = c.as_mut_ptr();
 
-    // SAFETY: dims validated; ndarray guarantees the pointer/strides describe a
-    // valid in-bounds layout, and `c` (a `&mut` borrow) cannot alias `a`/`b`
+    // SAFETY: dims validated above; ndarray guarantees the pointer/strides are in-bounds, and
+    // `c` (a `&mut` borrow) cannot alias `a`/`b`
     unsafe {
         match ws {
             Some(ws) => gemm_unchecked_with(
@@ -112,7 +114,7 @@ fn gemm_common<T, S1, S2, SC>(
     }
 }
 
-/// `A*B` into a fresh row-major [`Array2`]: the `.dot()`-style convenience
+/// `A*B` into a fresh row-major [`Array2`]: the `.dot()`-style convenience over [`gemm`]
 pub fn dot<T, S1, S2>(a: &ArrayBase<S1, Ix2>, b: &ArrayBase<S2, Ix2>) -> Array2<T>
 where
     T: GemmScalar,
@@ -121,7 +123,7 @@ where
 {
     let (m, _) = a.dim();
     let (_, n) = b.dim();
-    // beta == 0, so the initial fill is never read
+    // beta is 0 here, so the fill value below is never read
     let mut c = Array2::from_elem((m, n), T::ZERO);
     gemm(T::ONE, a, b, T::ZERO, &mut c, Parallelism::default());
     c

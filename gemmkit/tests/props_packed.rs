@@ -1,7 +1,8 @@
-//! Property-based tests for the prepacked-reuse API (prepack_rhs/gemm_packed_b and
-//! prepack_lhs/gemm_packed_a): bit-identity to plain gemm on the general regime,
-//! accuracy + cross-thread determinism on the documented tiny/gemv exception set, and
-//! the orientation-guard panics. Never mutates knobs. See props_common for shared bars
+//! Property tests for the prepacked-reuse API (`prepack_rhs`/`gemm_packed_b` and
+//! `prepack_lhs`/`gemm_packed_a`): bit-identity to plain `gemm` on the general regime,
+//! tolerance accuracy plus cross-thread determinism on the documented tiny/gemv exception
+//! set, and the C-orientation-guard panics. Never mutates a tuning knob. See props_common
+//! for the shared strategies, oracle, and accuracy gates
 #![cfg(all(not(miri), not(target_family = "wasm")))]
 
 // Shared proptest strategies, oracle references, and accuracy gates
@@ -14,12 +15,13 @@ use gemmkit::{
 use props_common::*;
 use proptest::prelude::*;
 
-/// The frob-vs-BIT split keys off the documented prepack exception set: `m==1 || n==1`
-/// (gemv-shaped) or both-tiny (`m,n <= tiny_block_dim()`), read via getters so it tracks
-/// ambient env. Plain `gemm` also routes `m,n <= small_mn_dim() && k > small_k_threshold()`
-/// to the horizontal path (whose summation order differs from the packed driver); that set
-/// is a subset of both-tiny **iff** `small_mn_dim <= tiny_block_dim`, asserted here so a
-/// horizontal-routed shape can never fall into the strict BIT branch
+/// The frob-vs-BIT split below keys off the documented prepack exception set: `m == 1 ||
+/// n == 1` (gemv-shaped) or both dimensions tiny (`m, n <= tiny_block_dim()`), read through
+/// the getters so the check tracks whatever ambient env overrides them. Plain `gemm` also
+/// routes `m,n <= small_mn_dim() && k > small_k_threshold()` to the horizontal path, whose
+/// summation order differs from the packed driver's; that routed set is a subset of
+/// both-tiny **iff** `small_mn_dim <= tiny_block_dim`, which this asserts so a
+/// horizontal-routed shape can never slip into the strict bit-identity branch below
 fn assert_packed_env_sane() {
     assert!(
         tuning::small_mn_dim() <= tuning::tiny_block_dim(),
@@ -68,8 +70,9 @@ fn prepack_rhs_check<T: Elem>(
     assert_eq!(packed.cols(), n);
 
     if is_tiny_or_gemv(m, n) {
-        // Buffer's own blocking may round differently from plain gemm's tiny shortcut, so
-        // check accuracy vs the f64 reference and bit-identity across thread counts
+        // The tiny/gemv shortcuts may round differently from the packed driver's own
+        // blocking, so only accuracy vs the f64 reference is guaranteed; check that, plus
+        // bit-identity across thread counts within this one call
         let cref = reference(&a, &b, &c0, al, be);
         let mut first: Option<Vec<T>> = None;
         for par in PACKED_PARS {
@@ -104,8 +107,8 @@ fn prepack_rhs_check<T: Elem>(
             }
         }
     } else {
-        // General regime: packing only rearranges B's values, so it is bit-identical to a
-        // plain gemm() for every thread count
+        // General regime: packing only rearranges B's values in memory, so gemm_packed_b
+        // must be bit-identical to a plain gemm() call at every thread count
         let mut c_ref = cbase.clone();
         gemm(
             alpha,
@@ -257,8 +260,10 @@ proptest! {
     }
 }
 
-/// k drawn with an extra tail across the single-panel (`kc = k`) rule (api.rs:835-839),
-/// including `1024`, for the mixed-precision packed paths
+/// `k` drawn like [`kdim_pos`] but with an extra tail (`513`, `1024`) for the mixed-precision
+/// packed paths: a narrow-output family (f16/bf16) still runs `kc = k` as a single depth
+/// panel at these depths, so the tail just exercises deeper single-panel packing, well short
+/// of the byte gate that switches to the f32-output multi-slice twin
 #[cfg(feature = "half")]
 fn kdim_mixed() -> impl Strategy<Value = usize> {
     prop_oneof![
@@ -304,8 +309,9 @@ proptest! {
     }
 }
 
-// P14 packed paths reject the wrong C orientation. m,n >= 2 and a strict stride
-// inequality (the guards use >=/<=, so square-ish rs==cs C is accepted, not a panic)
+// P14: the packed paths must reject the wrong C orientation. m,n >= 2 and a strict stride
+// inequality so the layout is unambiguous (the guards accept |csc| == |rsc|, so a square-ish
+// C with rs == cs is not expected to panic)
 
 proptest! {
     #![proptest_config(ProptestConfig { cases: cases(64), ..ProptestConfig::default() })]

@@ -1,5 +1,7 @@
-//! `c32`/`c64` complex GEMM dispatch (optional conjA/conjB): the runtime->compile-time
-//! conj branch, per-ISA wrappers, descriptors, selection, and the `ComplexScalar` impls
+//! `Complex<f32>`/`Complex<f64>` GEMM dispatch: resolves the runtime conjA/conjB flags to a
+//! compile-time `ComplexGemm<T, CONJ_A, CONJ_B>` monomorphization, then the per-ISA wrappers,
+//! memoized descriptors, ISA selection, and the `ComplexScalar` impls that plug into the
+//! dispatch layer
 
 #[cfg(feature = "std")]
 use std::sync::OnceLock;
@@ -19,19 +21,22 @@ use crate::simd::{Avx512, Fma};
 use crate::simd::{KernelSimd, ScalarTok};
 use crate::workspace::Workspace;
 
-/// `c32` / `c64` element-type aliases (the complex-GEMM dispatch types)
+/// c32 dispatch alias
 #[cfg(feature = "complex")]
 type C32 = num_complex::Complex<f32>;
+/// c64 dispatch alias
 #[cfg(feature = "complex")]
 type C64 = num_complex::Complex<f64>;
 
-// Complex GEMM (c32 / c64, with optional conjA / conjB)
+// c32 / c64 complex GEMM: conjA/conjB dispatch
 
-/// Run a complex GEMM for a concrete `(complex type, ISA, tile)`: do the
-/// orientation swap (which also **swaps the conj flags**, since
-/// `(conj(A)*B)^T = B^T*conj(A)^T` puts old-A's conj on the new RHS), then dispatch the now-fixed
-/// `(conj_a, conj_b)` to the matching const-generic `ComplexGemm` variant: the
-/// runtime->compile-time conj branch lives here, never in the hot loop
+/// Run a complex GEMM for one concrete `(T, ISA, tile)`. Applies the orientation swap, then
+/// dispatches the resulting `(conj_a, conj_b)` to the matching const-generic
+/// `ComplexGemm<T, CONJ_A, CONJ_B>` monomorphization: the runtime conj flags become a
+/// compile-time branch here, never in the hot loop
+///
+/// The orientation swap also exchanges the conj flags: `(conj(A)*B)^T = B^T*conj(A)^T` moves
+/// old A's conjugation onto what is now the RHS operand
 ///
 /// # Safety
 /// `t`'s pointers valid; `c` not aliasing `a`/`b`. Run after the degenerate check
@@ -75,19 +80,18 @@ unsafe fn run_complex<T, S, const MR_REG: usize, const NR: usize>(
     }
 }
 
-/// **Fused-bias** complex GEMM for a concrete `(complex type, ISA, tile)`: the mirror of
-/// [`run_complex`] with the bias epilogue threaded into the driver's store. The orientation swap
-/// swaps **both** the conj flags (`(conj(A)*B)^T = B^T*conj(A)^T` puts old-A's conj on the new
-/// RHS) **and** the bias axis (a row-major-ish C makes the engine compute `C^T = B^T*A^T`,
-/// swapping `m<->n`, so a user per-row bias becomes per-col in the oriented frame: the same
-/// `C^T` reasoning as the float path; a field write, not a new monomorphization)
+/// Fused-bias complex GEMM for one concrete `(T, ISA, tile)`: the mirror of [`run_complex`]
+/// that threads `epi` into [`driver::run_epilogue`] instead of [`driver::run`]
 ///
-/// Complex has **no** special paths to mirror: [`run_complex`] routes everything to
-/// [`driver::run`] (no gemv / small_mn / small_k arms), so this single [`driver::run_epilogue`]
-/// mirror is complete. The complex family stores exactly the bits plain `gemm_cplx` would and the
-/// epilogue's tile-local post-pass maps them in place on the final depth panel, so the result is
-/// bit-identical to `gemm_cplx` then the same element-wise bias add, for every shape and conj
-/// combination
+/// The orientation swap exchanges both the conj flags (as in [`run_complex`]) and the bias axis:
+/// a row-major-ish `C` makes the engine compute `C^T = B^T*A^T`, swapping `m<->n`, so a per-row
+/// bias becomes per-col in the oriented frame
+///
+/// Complex has no special paths to mirror: [`run_complex`] always calls [`driver::run`] (no
+/// gemv / small_mn / small_k arms), so this is the only fused entry point needed. The complex
+/// kernel stores the same bits plain `gemm_cplx` would and then, on the final depth panel only,
+/// sweeps the tile applying the bias in place, so the fused result is bit-identical to `gemm_cplx`
+/// followed by the same element-wise bias add, for every shape and conj combination
 ///
 /// # Safety
 /// `t`'s pointers valid; `c` not aliasing `a`/`b`; `epi`'s bias valid for the (pre-swap) problem's
@@ -111,7 +115,7 @@ unsafe fn run_complex_fused<T, S, const MR_REG: usize, const NR: usize>(
         let (mut ca, mut cb) = (conj_a, conj_b);
         if orient_transpose(&mut t) {
             core::mem::swap(&mut ca, &mut cb);
-            // The `C^T = B^T*A^T` swap of `m<->n` flips the bias axis too (per-row <-> per-col)
+            // row-major-ish C computes C^T = B^T*A^T (m<->n swap), so bias axis flips too
             epi.bias = match epi.bias {
                 BiasSpec::None => BiasSpec::None,
                 BiasSpec::Row(p) => BiasSpec::Col(p),
@@ -147,13 +151,14 @@ unsafe fn run_complex_fused<T, S, const MR_REG: usize, const NR: usize>(
     }
 }
 
-/// Complex element types gemmkit can dispatch (`Complex<f32>` / `Complex<f64>`).
-/// Separate from [`GemmScalar`](super::GemmScalar) because complex carries the conj op-family. The
-/// [`crate::scalar::ComplexFloat`] supertrait supplies the real component type and the
+/// Complex element types gemmkit can dispatch: `Complex<f32>` and `Complex<f64>`
+///
+/// Separate from [`GemmScalar`](super::GemmScalar) because complex carries the conj op-family.
+/// The [`crate::scalar::ComplexFloat`] supertrait supplies the real component type and the
 /// re/im split the SoA kernel and its epilogue need
 #[cfg(feature = "complex")]
 pub trait ComplexScalar: crate::scalar::ComplexFloat {
-    /// Dispatch a complex GEMM (with conj flags) to the best ISA
+    /// Dispatch a complex GEMM (with conj flags) to the best available ISA
     ///
     /// # Safety
     /// `t`'s pointers valid; `c` not aliasing `a`/`b`
@@ -166,7 +171,7 @@ pub trait ComplexScalar: crate::scalar::ComplexFloat {
         ws: &mut Workspace,
     );
 
-    /// Dispatch a **fused-bias** complex GEMM (with conj flags) to the best ISA
+    /// Dispatch a fused-bias complex GEMM (with conj flags) to the best available ISA
     ///
     /// # Safety
     /// `t`'s pointers valid; `c` not aliasing `a`/`b`; `epi`'s bias valid for the problem's
@@ -183,7 +188,8 @@ pub trait ComplexScalar: crate::scalar::ComplexFloat {
     );
 }
 
-/// Top-level complex entry: degenerate cases (`C <- beta*C`) then the ISA dispatch
+/// Top-level complex entry (called by the API layer): handle the degenerate case
+/// (`C <- beta*C` when `k == 0` or `alpha == 0`), then the ISA dispatch
 ///
 /// # Safety
 /// `t`'s pointers valid for the implied regions; `c` not aliasing `a`/`b`
@@ -207,11 +213,11 @@ pub(crate) unsafe fn execute_complex<T: ComplexScalar>(
     }
 }
 
-/// The degenerate fused complex epilogue `C[i,j] <- beta*C[i,j] + bias`, in the **user** frame,
-/// run when the `A*B` term vanishes (`k == 0` or `alpha == 0`). Mirrors `fused_degenerate_float`
-/// but the epilogue is **bias-only** (complex has no activation), so it reuses `epi.apply`, which
-/// for the complex family is exactly the bias add. The conj flags do not appear: with no `A*B`
-/// term there is nothing to conjugate, so they are irrelevant here
+/// The degenerate fused complex epilogue `C[i,j] <- beta*C[i,j] + bias`, in the user frame, run
+/// when the `A*B` term vanishes (`k == 0` or `alpha == 0`). Mirrors `fused_degenerate_float`
+/// but the epilogue is bias-only (complex has no activation), so it reuses `epi.apply`, which for
+/// the complex family is exactly the bias add. The conj flags never appear here: with no `A*B`
+/// term there is nothing to conjugate
 ///
 /// # Safety
 /// `c` valid for the `m x n` region; `epi`'s bias valid for the problem's `m`/`n`
@@ -225,8 +231,7 @@ where
         for j in 0..t.n {
             for i in 0..t.m {
                 let p = t.c.offset(i as isize * t.rsc + j as isize * t.csc);
-                // `beta*C` combined in `T`; then the (bias-only) epilogue adds the bias. Exactly
-                // the real-float `fused_degenerate_float` shape, complex-typed
+                // Same beta-then-bias shape as the real-float degenerate path, complex-typed
                 let base = if t.beta == T::ZERO {
                     T::ZERO
                 } else if t.beta == T::ONE {
@@ -242,8 +247,8 @@ where
     }
 }
 
-/// Top-level fused-bias complex entry: the degenerate cases (`C <- beta*C + bias`) in the **user**
-/// frame, then the ISA dispatch
+/// Top-level fused-bias complex entry (called by the API layer): handle the degenerate case
+/// (`C <- beta*C + bias`, in the user frame) then the ISA dispatch
 ///
 /// # Safety
 /// `t`'s pointers valid for the implied regions; `c` not aliasing `a`/`b`; `epi`'s bias valid for
@@ -261,8 +266,8 @@ pub(crate) unsafe fn execute_complex_fused<T: ComplexScalar>(
         if t.m == 0 || t.n == 0 {
             return;
         }
-        // The `A*B` term vanishes (`k == 0` or `alpha == 0`): `C <- beta*C + bias`, element-wise
-        // in the user frame; conj is irrelevant (no product to conjugate)
+        // A*B vanishes (k == 0 or alpha == 0): C <- beta*C + bias, element-wise in the user
+        // frame; conj is irrelevant since there is no product to conjugate
         if t.k == 0 || t.alpha == T::ZERO {
             fused_degenerate_cplx(&t, &epi);
             return;
@@ -275,7 +280,7 @@ pub(crate) unsafe fn execute_complex_fused<T: ComplexScalar>(
 type CplxFn<T> = unsafe fn(bool, bool, Task<T>, Parallelism, &mut Workspace);
 
 /// The fused-bias complex kernel entry: a plain [`Task`] plus the runtime-composed [`FusedEpi`]
-/// (bias-only for complex). Non-optional: every dispatched complex type supplies one
+/// (bias-only for complex). Every dispatched complex type supplies one
 #[cfg(all(feature = "complex", feature = "epilogue"))]
 type CplxFusedFn<T> = unsafe fn(bool, bool, Task<T>, FusedEpi<T>, Parallelism, &mut Workspace);
 
@@ -283,7 +288,7 @@ type CplxFusedFn<T> = unsafe fn(bool, bool, Task<T>, FusedEpi<T>, Parallelism, &
 #[derive(Copy, Clone)]
 struct CplxDispatched<T> {
     run: CplxFn<T>,
-    /// Fused-bias entry (same tile as `run`; the epilogue is tile-local)
+    /// Fused-bias entry (same tile as `run`; the epilogue is a tile-local post-pass)
     #[cfg(feature = "epilogue")]
     run_fused: CplxFusedFn<T>,
 }
@@ -296,53 +301,52 @@ unsafe fn gemm_c32_scalar(ca: bool, cb: bool, t: Task<C32>, par: Parallelism, ws
 unsafe fn gemm_c64_scalar(ca: bool, cb: bool, t: Task<C64>, par: Parallelism, ws: &mut Workspace) {
     unsafe { run_complex::<C64, ScalarTok, 4, 4>(ScalarTok, ca, cb, t, par, ws) }
 }
-// SoA tiles use *real*-lane geometry: `LANES = SimdOps<real>::LANES` (real lanes =
-// complex rows), and the kernel needs `2*MR_REG*NR` accumulator registers (re + im
-// banks) plus `2*MR_REG` A-plane regs, so the tiles are smaller than the old AoS ones
+// SoA tiles size against *real*-lane geometry: LANES = SimdOps<Real>::LANES (real lanes =
+// complex rows). The kernel needs 2*MR_REG*NR accumulator registers (re + im banks) plus
+// 2*MR_REG A-plane registers, twice a real kernel's budget for the same (MR_REG, NR)
 #[cfg(all(feature = "complex", any(target_arch = "x86", target_arch = "x86_64")))]
 unsafe fn gemm_c32_fma(ca: bool, cb: bool, t: Task<C32>, par: Parallelism, ws: &mut Workspace) {
     // c32 FMA: real LANES = 8, MR = 1*8 = 8 complex rows, NR = 5 -> 10 acc + 2 A + 2 B
-    // splat = 14 of 16 YMM. The 2 spare matter: a full 16/16 tile (NR = 6) spills
-    // accumulators and roughly halves throughput
+    // splat live at once = 14 of 16 YMM. The 2 spare matter: a full 16/16 tile (NR = 6)
+    // spills accumulators and roughly halves throughput
     unsafe { run_complex::<C32, Fma, 1, 5>(Fma, ca, cb, t, par, ws) }
 }
 #[cfg(all(feature = "complex", any(target_arch = "x86", target_arch = "x86_64")))]
 unsafe fn gemm_c64_fma(ca: bool, cb: bool, t: Task<C64>, par: Parallelism, ws: &mut Workspace) {
-    // c64 FMA: real LANES = 4, MR = 1*4 = 4 complex rows, NR = 5 (same 14-YMM budget)
+    // c64 FMA: real LANES = 4, MR = 1*4 = 4 complex rows, NR = 5, same 14-YMM budget as c32
     unsafe { run_complex::<C64, Fma, 1, 5>(Fma, ca, cb, t, par, ws) }
 }
 #[cfg(all(feature = "complex", any(target_arch = "x86", target_arch = "x86_64")))]
 unsafe fn gemm_c32_avx512(ca: bool, cb: bool, t: Task<C32>, par: Parallelism, ws: &mut Workspace) {
-    // c32 AVX-512: real LANES = 16, MR = 2*16 = 32, NR = 6 -> 24 acc + 4 A + 2 B = 30 ZMM
+    // c32 AVX-512: real LANES = 16, MR = 2*16 = 32, NR = 6 -> 24 acc + 4 A + 2 B splat = 30 ZMM
     unsafe { run_complex::<C32, Avx512, 2, 6>(Avx512, ca, cb, t, par, ws) }
 }
 #[cfg(all(feature = "complex", any(target_arch = "x86", target_arch = "x86_64")))]
 unsafe fn gemm_c64_avx512(ca: bool, cb: bool, t: Task<C64>, par: Parallelism, ws: &mut Workspace) {
-    // c64 AVX-512: real LANES = 8, MR = 2*8 = 16, NR = 6 (same 30-ZMM budget)
+    // c64 AVX-512: real LANES = 8, MR = 2*8 = 16, NR = 6, same 30-ZMM budget as c32
     unsafe { run_complex::<C64, Avx512, 2, 6>(Avx512, ca, cb, t, par, ws) }
 }
 #[cfg(all(feature = "complex", target_arch = "aarch64"))]
 unsafe fn gemm_c32_neon(ca: bool, cb: bool, t: Task<C32>, par: Parallelism, ws: &mut Workspace) {
     // c32 NEON: real LANES = 4, MR = 2*4 = 8 complex rows, NR = 5 -> 20 acc + 4 A + 2 B
-    // splat = 26 of the 32 v0-v31, leaving room for the in-flight load/lane temporaries
+    // splat live at once = 26 of the 32 v0-v31, leaving headroom for load/lane temporaries
     unsafe { run_complex::<C32, Neon, 2, 5>(Neon, ca, cb, t, par, ws) }
 }
 #[cfg(all(feature = "complex", target_arch = "aarch64"))]
 unsafe fn gemm_c64_neon(ca: bool, cb: bool, t: Task<C64>, par: Parallelism, ws: &mut Workspace) {
-    // c64 NEON: real LANES = 2, MR = 2*2 = 4 complex rows, NR = 5 (same 26-vreg budget and
-    // the same MR_REG=2 / NR=5 rationale as c32 above)
+    // c64 NEON: real LANES = 2, MR = 2*2 = 4 complex rows, NR = 5, same 26-vreg budget and
+    // MR_REG/NR rationale as c32 above
     unsafe { run_complex::<C64, Neon, 2, 5>(Neon, ca, cb, t, par, ws) }
 }
-// wasm simd128 complex
-// real `Reg` = v128
-// The SoA kernel needs `2*MR_REG*NR` accumulators (re+im) + `2*MR_REG` A regs + 2 B splats
+// wasm simd128 complex: real Reg = v128; the SoA kernel needs 2*MR_REG*NR accumulators
+// (re+im) plus 2*MR_REG A regs plus 2 B splats, same register math as the other ISAs above
 #[cfg(all(
     feature = "complex",
     target_arch = "wasm32",
     target_feature = "simd128"
 ))]
 unsafe fn gemm_c32_simd128(ca: bool, cb: bool, t: Task<C32>, par: Parallelism, ws: &mut Workspace) {
-    // c32 simd128: real LANES = 4, MR = 1*4 = 4 complex rows, NR = 4
+    // c32 simd128: real LANES = 4, MR = 1*4 = 4 complex rows, NR = 4 -> 8 acc + 2 A + 2 B = 12 v128
     unsafe { run_complex::<C32, Simd128, 1, 4>(Simd128, ca, cb, t, par, ws) }
 }
 #[cfg(all(
@@ -351,12 +355,12 @@ unsafe fn gemm_c32_simd128(ca: bool, cb: bool, t: Task<C32>, par: Parallelism, w
     target_feature = "simd128"
 ))]
 unsafe fn gemm_c64_simd128(ca: bool, cb: bool, t: Task<C64>, par: Parallelism, ws: &mut Workspace) {
-    // c64 simd128: real LANES = 2, MR = 1*2 = 2 complex rows, NR = 4 (same 12-v128 budget)
+    // c64 simd128: real LANES = 2, MR = 1*2 = 2 complex rows, NR = 4, same 12-v128 budget as c32
     unsafe { run_complex::<C64, Simd128, 1, 4>(Simd128, ca, cb, t, par, ws) }
 }
 
-// fused-bias entry points: one per (c32/c64, ISA), same tiles as the plain wrappers (the
-// bias epilogue is a tile-local post-pass, so the accumulator-register budget is unchanged)
+// fused-bias entry points: one per (c32/c64, ISA), reusing the plain wrappers' tiles above
+// (the bias epilogue is a tile-local post-pass, so the accumulator budget is unchanged)
 
 #[cfg(all(feature = "complex", feature = "epilogue"))]
 unsafe fn gemm_c32_scalar_fused(
@@ -564,7 +568,8 @@ const CDISP_C64_SIMD128: CplxDispatched<C64> = CplxDispatched {
     run_fused: gemm_c64_simd128_fused,
 };
 
-/// `c32` ISA selection (the complex multiply uses only AVX2/AVX-512 float ops)
+/// c32 ISA selection: the complex kernel only needs plain AVX2/AVX-512 float ops (no
+/// VNNI/BF16 dot path)
 #[cfg(feature = "complex")]
 fn select_c32() -> CplxDispatched<C32> {
     match forced_isa() {
@@ -614,7 +619,7 @@ fn select_c32() -> CplxDispatched<C32> {
     {
         CDISP_C32_NEON
     }
-    // `simd128` on wasm32, else scalar
+    // wasm32: simd128 if enabled, else scalar
     #[cfg(target_arch = "wasm32")]
     {
         #[cfg(target_feature = "simd128")]
@@ -632,7 +637,7 @@ fn select_c32() -> CplxDispatched<C32> {
     }
 }
 
-/// `c64` ISA selection
+/// c64 ISA selection (mirrors [`select_c32`])
 #[cfg(feature = "complex")]
 fn select_c64() -> CplxDispatched<C64> {
     match forced_isa() {
@@ -682,7 +687,7 @@ fn select_c64() -> CplxDispatched<C64> {
     {
         CDISP_C64_NEON
     }
-    // `simd128` on wasm32, else scalar
+    // wasm32: simd128 if enabled, else scalar
     #[cfg(target_arch = "wasm32")]
     {
         #[cfg(target_feature = "simd128")]

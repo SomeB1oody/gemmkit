@@ -1,4 +1,5 @@
-//! Valid-by-construction plans and entries for fuzz_gemm / fuzz_knobs / fuzz_batched / fuzz_prepack
+//! Valid-by-construction plans and entries for fuzz_gemm, fuzz_knobs, fuzz_batched,
+//! fuzz_prepack, and fuzz_prepack_i8
 
 use arbitrary::{Arbitrary, Result, Unstructured};
 
@@ -59,14 +60,14 @@ impl<'a> Arbitrary<'a> for GemmPlan {
         };
         Ok(GemmPlan {
             ty,
-            // m,n cross the AVX-512 f32 tile edges (MR=32, NR=12); k crosses the
-            // bf16/VNNI DEPTH_MULTIPLE padding and partial-depth panels
+            // m, n range past the AVX-512 f32 tile edges (mr=32, nr=12 on this dispatch);
+            // k ranges past the bf16/i8-VNNI DEPTH_MULTIPLE padding, into partial-depth panels
             m: u.int_in_range(0usize..=48)?,
             k: u.int_in_range(0usize..=130)?,
             n: u.int_in_range(0usize..=48)?,
             la: LayoutPlan::arbitrary_general(u, true)?,
             lb: LayoutPlan::arbitrary_general(u, true)?,
-            lc: LayoutPlan::arbitrary_general(u, false)?, // self-aliasing C is a documented panic
+            lc: LayoutPlan::arbitrary_general(u, false)?, // self-aliasing C is a documented reject
             alpha_i: ab_index(u)?,
             beta_i: ab_index(u)?,
             alpha_im_i: ab_index(u)?,
@@ -160,8 +161,9 @@ pub fn run_gemm(p: GemmPlan) {
 
 // fuzz_knobs
 
-/// Every `set_*` compiled on x86_64 + `std,parallel,complex,half,int8`
-/// (`gemmkit/src/tuning.rs`); `set_wasm_threads` is wasm-gated and excluded
+/// Every `tuning::set_*` compiled under this crate's features (`std,parallel,complex,
+/// half,int8` on x86_64): the 23 general knobs plus `set_i8_vnni_min_par_mnk` (`int8`).
+/// `set_wasm_threads` is wasm-only and so never compiled here
 pub(crate) const KNOB_SETTERS: &[(&str, fn(usize))] = &[
     ("parallel_threshold", tuning::set_parallel_threshold),
     ("rhs_pack_threshold", tuning::set_rhs_pack_threshold),
@@ -194,20 +196,20 @@ pub(crate) const KNOB_SETTERS: &[(&str, fn(usize))] = &[
 
 pub(crate) const N_KNOBS: usize = KNOB_SETTERS.len();
 
-/// Knob-value classes exercising the setters' boundary behavior. Setters store
-/// unconditionally and clamp `usize::MAX` to `MAX-1` (the UNSET sentinel), so `MAX`
-/// exercises the clamp too
+/// Knob-value classes exercising the setters' boundary behavior. A setter stores its
+/// value unconditionally and clamps `usize::MAX` down to `MAX - 1` (`usize::MAX` is the
+/// internal UNSET sentinel), so drawing `MAX` here exercises that clamp
 pub(crate) fn knob_value(u: &mut Unstructured) -> Result<usize> {
     Ok(match u.int_in_range(0u8..=8)? {
-        0 => 0, // 0 = auto convention on several knobs
+        0 => 0, // several knobs treat 0 as "auto"
         1 => 1,
-        2 => u.int_in_range(2usize..=17)?,  // small
-        3 => u.int_in_range(31usize..=65)?, // dim-boundary (tile/tiny edges)
-        4 => 4096,                          // page-ish (lhs_pack_stride is in bytes)
-        5 => 1usize << 33,                  // > i32/f32-index range
-        6 => 1usize << 48,                  // huge
+        2 => u.int_in_range(2usize..=17)?,  // small, non-edge value
+        3 => u.int_in_range(31usize..=65)?, // straddles a tile/tiny-block dim boundary
+        4 => 4096,                          // a page size (lhs_pack_stride counts bytes)
+        5 => 1usize << 33,  // past i32/f32-index range
+        6 => 1usize << 48,  // huge
         7 => usize::MAX - 1,
-        _ => usize::MAX, // clamps to UNSET-1 in the setter
+        _ => usize::MAX, // a setter clamps this down to UNSET-1
     })
 }
 
@@ -269,9 +271,9 @@ impl<'a> Arbitrary<'a> for KnobsPlan {
 }
 
 pub fn run_knobs(p: KnobsPlan) {
-    // Set every knob on every input: setters store unconditionally, so each exec fully
-    // overwrites the knob set - no state leaks between libFuzzer execs, making every
-    // crash artifact self-contained/replayable
+    // Every knob is set on every input, and a setter stores unconditionally, so each
+    // exec fully overwrites the previous exec's knob values: no state leaks across
+    // libFuzzer execs, so a crash artifact reproduces on its own
     for (i, (_, setter)) in KNOB_SETTERS.iter().enumerate() {
         setter(p.values[i]);
     }
@@ -335,7 +337,7 @@ pub fn run_knobs(p: KnobsPlan) {
 
 #[derive(Debug)]
 pub struct BatchedPlan {
-    pub ty64: bool, // false => f32, true => f64
+    pub ty64: bool, // selects f64 in run_batched; false runs f32
     pub batch: usize,
     pub m: usize,
     pub k: usize,
@@ -358,7 +360,7 @@ impl<'a> Arbitrary<'a> for BatchedPlan {
     fn arbitrary(u: &mut Unstructured<'a>) -> Result<Self> {
         Ok(BatchedPlan {
             ty64: bool::arbitrary(u)?,
-            batch: u.int_in_range(0usize..=4)?, // 0 is the documented no-op
+            batch: u.int_in_range(0usize..=4)?, // batch == 0 is a documented no-op
             m: u.int_in_range(1usize..=24)?,
             k: u.int_in_range(1usize..=24)?,
             n: u.int_in_range(1usize..=24)?,
@@ -429,7 +431,7 @@ pub fn run_batched(p: BatchedPlan) {
 
 #[derive(Debug)]
 pub struct PrepackPlan {
-    pub ty: TypeTag, // F32, F64, or Bf16
+    pub ty: TypeTag, // one of F32, F64, Bf16 (see the Arbitrary impl below)
     pub m: usize,
     pub k: usize,
     pub n: usize,
@@ -446,12 +448,12 @@ impl<'a> Arbitrary<'a> for PrepackPlan {
         let ty = match u.int_in_range(0u8..=2)? {
             0 => TypeTag::F32,
             1 => TypeTag::F64,
-            _ => TypeTag::Bf16, // exercises the DEPTH_MULTIPLE single-slice depth-pad
+            _ => TypeTag::Bf16, // bf16's dot-kernel prepack packs the whole depth as 1 slice
         };
         Ok(PrepackPlan {
             ty,
-            // dims from 1..=48 (crossing tile edges); 0 excluded so the orientation
-            // invariant of the packed C holds for empty views too
+            // dims 1..=48 cross the AVX-512 tile edges; 0 is excluded since the trivial
+            // empty-prepack path is already covered by fuzz_api_validation
             m: u.int_in_range(1usize..=48)?,
             k: u.int_in_range(1usize..=48)?,
             n: u.int_in_range(1usize..=48)?,
@@ -489,10 +491,11 @@ pub fn run_prepack(p: PrepackPlan) {
 
 // fuzz_prepack_i8
 
-/// i8 prepack round-trip plan (the integer twin of [`PrepackPlan`]): shapes/strides/alpha-beta/
-/// parallelism arbitrary. There is no i8 LHS prepack (only `prepack_rhs_i8` + `gemm_i8_packed_b`),
-/// so this exercises the RHS path alone - the one with the uninit `set_len` pack alloc and the VNNI
-/// k-quad-interleaved layout pinning
+/// i8 prepack round-trip plan, the integer twin of [`PrepackPlan`]: shapes, strides,
+/// alpha/beta, and parallelism are all arbitrary. There is no i8 LHS prepack (only
+/// `prepack_rhs_i8` + `gemm_i8_packed_b`), so this exercises the RHS path alone: the pack
+/// pins the buffer to whichever family (VNNI k-quad-interleaved, or the widen kernel's
+/// plain panels) built it, and `gemm_i8_packed_b` must read that exact layout back
 #[derive(Debug)]
 pub struct PrepackI8Plan {
     pub m: usize,
@@ -509,9 +512,10 @@ pub struct PrepackI8Plan {
 impl<'a> Arbitrary<'a> for PrepackI8Plan {
     fn arbitrary(u: &mut Unstructured<'a>) -> Result<Self> {
         Ok(PrepackI8Plan {
-            // dims 1..=48 cross the AVX-512 i8 tile edges; k additionally crosses the VNNI
-            // DEPTH_MULTIPLE (4) pack padding and partial-depth panels. 0 excluded (empty prepack
-            // is covered by the API-validation target and would give a trivially exact 0-result)
+            // dims 1..=48 cross the AVX-512 i8 tile edges (mr=32, nr=12); k additionally
+            // crosses the VNNI DEPTH_MULTIPLE (4) pack padding into partial-depth panels
+            // 0 is excluded: an empty prepack is a trivial exact 0-result, and is already
+            // covered by fuzz_api_validation
             m: u.int_in_range(1usize..=48)?,
             k: u.int_in_range(1usize..=48)?,
             n: u.int_in_range(1usize..=48)?,
@@ -549,11 +553,12 @@ mod knob_sync {
     use super::KNOB_SETTERS;
     use std::collections::BTreeSet;
 
-    /// The fuzz `KNOB_SETTERS` list must exactly cover gemmkit's canonical knob registry
-    /// (`tuning::knob_env_names`), so a knob added to gemmkit but not wired into `fuzz_knobs`
-    /// fails here. The crate builds gemmkit with complex,half,int8 on native, so the registry is
-    /// the 23 general knobs + I8_VNNI (no wasm_threads); env names map to setter suffixes by
-    /// dropping the `GEMMKIT_` prefix and lowercasing
+    /// `KNOB_SETTERS` must exactly cover gemmkit's canonical knob registry
+    /// (`tuning::knob_env_names`), so a knob added to gemmkit but not wired into
+    /// `KNOB_SETTERS` fails this test. This crate builds gemmkit for `complex,half,int8`
+    /// on a native target, so the registry is the 23 general knobs plus i8_vnni_min_par_mnk
+    /// (no wasm_threads); an env name maps to its setter name by dropping the `GEMMKIT_`
+    /// prefix and lowercasing
     #[test]
     fn setters_cover_every_knob() {
         let canonical: BTreeSet<String> = gemmkit::tuning::knob_env_names()

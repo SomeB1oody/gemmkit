@@ -1,4 +1,5 @@
-//! Section 7.4: reusing a `Workspace` performs **zero heap allocations** after warmup
+//! Reusing a [`Workspace`] performs zero heap allocations once it has grown to a call's
+//! needed size
 //!
 //! A counting global allocator wraps the system allocator to verify that the
 //! 2nd and later `gemm_with` calls of the same size allocate nothing
@@ -29,13 +30,13 @@ unsafe impl GlobalAlloc for Counting {
 static GA: Counting = Counting;
 
 /// Both allocation-accounting phases live in this **single** test on purpose: `ALLOCS` is a
-/// process-global counter, so a second `#[test]` in this binary would let libtest record that
+/// process-global counter, so a 2nd `#[test]` in this binary would let libtest record that
 /// test's result on the main thread (an allocation) concurrently with a measured window here,
 /// forging a false positive. One test => no inter-test concurrency, the only robust design for a
 /// global-allocation assertion
 #[test]
 fn workspace_allocation_behavior() {
-    // Phase 1 (Section 7.4): reusing one workspace across same-size calls is zero-alloc
+    // Phase 1: reusing one workspace across same-size calls is zero-alloc
     {
         let (m, k, n) = (96usize, 80, 64);
         let a = vec![0.5f32; m * k];
@@ -76,13 +77,13 @@ fn workspace_allocation_behavior() {
 
     // Phase 2: a GEMM whose A is read in place (column-major, `m` an `mr` multiple) and whose
     // B is small enough never to pack must reserve no packing scratch at all, so a fresh, empty
-    // `Workspace` handed to it stays un-grown. Measured on a fresh workspace so that IF the
-    // driver reserved an A/B region it would have to grow from zero and allocate: the assertion
-    // that it does not is the allocation-behavior win. `m = 256` is a multiple of every
-    // dispatched `mr` (<= 32); `n = 96` (> the small-m,n dim) keeps the shape on the general
-    // driver while its per-worker column reuse stays under the LHS-pack gate; `k = 64` (> the
-    // small-k gate) avoids the in-place small-k route. Phase 1 already primed every one-time
-    // global, so nothing here allocates except (on the old code) the workspace growth
+    // `Workspace` handed to it stays un-grown. Measured on a fresh workspace so that if the
+    // driver did reserve an A/B region, it would have to grow from zero and allocate: the
+    // assertion that it does not is the allocation-behavior win. `m = 256` is a multiple of
+    // every dispatched `mr` (<= 32); `n = 96` (> the small-m,n dim) keeps the shape on the
+    // general driver while its per-worker column reuse stays under the LHS-pack gate; `k = 64`
+    // (> the small-k gate) avoids the in-place small-k route. Phase 1 already primed every
+    // one-time global, so nothing here allocates
     {
         let (m, k, n) = (256usize, 64, 96);
         let a = vec![0.5f32; m * k];
@@ -102,7 +103,7 @@ fn workspace_allocation_behavior() {
         };
 
         // A throwaway warm workspace primes this shape's own path (its blocking / job setup),
-        // so the measured fresh-workspace call below allocates nothing but pack scratch
+        // so the measured fresh-workspace call below allocates nothing
         let mut warm = Workspace::new();
         call(&mut warm, &mut c);
         call(&mut warm, &mut c);

@@ -1,11 +1,16 @@
-//! wasm simd128 vs scalar-token throughput
+//! wasm `simd128` throughput vs the scalar token, the wasm target's substitute for the
+//! native-vs-`gemm`-crate comparison the other perf benches run (no external GEMM crate
+//! builds for wasm)
 
 use crate::harness::{BENCH_GUARD, NATIVE_LABEL, NATIVE_MR, NATIVE_NR, NativeTok, fill, measure};
 use gemmkit::kernel::FloatGemm;
 use gemmkit::simd::ScalarTok;
 use gemmkit::{Parallelism, Workspace, driver};
 
-/// wasm `simd128`, column-major, single-threaded
+/// `simd128` vs `ScalarTok`, both driven directly through `driver::run` (bypassing
+/// dispatch, so each token's own microtile geometry is forced rather than auto-selected):
+/// single-threaded, column-major, square `m = k = n = s`. `ScalarTok` always uses a 4x4
+/// tile; `simd128` uses `NATIVE_MR`/`NATIVE_NR` from the harness
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 fn bench_simd128_vs_scalar(s: usize) {
     let (m, k, n) = (s, s, s);

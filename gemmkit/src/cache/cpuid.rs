@@ -1,15 +1,17 @@
 //! CPUID cache backend (x86 / x86-64)
 //!
-//! CPUID is an *instruction*, so this works regardless of OS, including in
-//! containers and most VMs (unless the hypervisor masks the leaves, in which
-//! case [`detect`] returns `None` and the caller falls through the chain).
-//! Intel exposes the deterministic cache leaf (CPUID.04h); AMD uses the legacy
-//! L1 (0x80000005) and L2/L3 (0x80000006) leaves
+//! Cache geometry comes straight from the CPUID instruction, so this works the
+//! same in a container or most VMs as on bare metal; only a hypervisor that
+//! masks the relevant leaves makes [`detect`] return `None`, in which case the
+//! caller falls through to the next backend. Intel exposes the deterministic
+//! cache leaf (CPUID.04h, walked sub-leaf by sub-leaf); AMD reports cache
+//! geometry through the legacy L1 (0x8000_0005) and L2/L3 (0x8000_0006) leaves
 
 use super::{CacheTopology, Level};
 use raw_cpuid::{Associativity, CacheType, CpuId, CpuIdReader};
 
-/// Best-effort cache topology from CPUID; `None` if the leaves are unavailable
+/// Best-effort cache topology from CPUID; `None` when the vendor string and both
+/// leaf families are unreadable
 pub fn detect() -> Option<CacheTopology> {
     let cpuid = CpuId::new();
     let vi = cpuid.get_vendor_info();
@@ -18,22 +20,29 @@ pub fn detect() -> Option<CacheTopology> {
     if vendor.contains("AMD") {
         detect_amd(&cpuid)
     } else {
-        // Intel deterministic leaf, with the AMD leaves as a secondary attempt
+        // Non-AMD (including an unreadable vendor string): try the Intel leaf
+        // first, and fall back to the AMD leaves in case they still decode
         detect_intel(&cpuid).or_else(|| detect_amd(&cpuid))
     }
 }
 
+// Map raw_cpuid's associativity encoding to a plain way count
 fn assoc_num(a: Associativity) -> usize {
     match a {
         Associativity::DirectMapped => 1,
         Associativity::NWay(n) => n as usize,
+        // Not a real way count, just a value large enough that the blocking model
+        // treats the cache as effectively unconstrained by associativity
         Associativity::FullyAssociative => 64,
-        // Unknown / Disabled / "see leaf 0x8000001D" -> a safe default the
-        // blocking model tolerates
+        // Disabled, or Unknown ("see leaf 0x8000_001d"): no ways figure to report,
+        // so fall back to a plausible default
         _ => 8,
     }
 }
 
+// AMD legacy leaves: the L1 (0x8000_0005) and L2/L3 (0x8000_0006) leaves must both
+// decode; L3 is reported inside the L2/L3 leaf and treated as absent below when its
+// size field reads 0, not by the leaf itself being unreadable
 fn detect_amd<R: CpuIdReader>(cpuid: &CpuId<R>) -> Option<CacheTopology> {
     let l1 = cpuid.get_l1_cache_and_tlb_info()?;
     let l23 = cpuid.get_l2_l3_cache_and_tlb_info()?;
@@ -52,7 +61,8 @@ fn detect_amd<R: CpuIdReader>(cpuid: &CpuId<R>) -> Option<CacheTopology> {
         shared_by: 1,
     };
 
-    // L3 size is reported in units of 512 KiB
+    // The L2/L3 leaf's EDX field reports L3 size in units of 512 KiB, unlike the
+    // ECX field's plain-KiB L2 size
     let l3_bytes = l23.l3cache_size() as usize * 512 * 1024;
     let l3 = (l3_bytes > 0).then(|| Level {
         bytes: l3_bytes,
@@ -64,6 +74,10 @@ fn detect_amd<R: CpuIdReader>(cpuid: &CpuId<R>) -> Option<CacheTopology> {
     Some(CacheTopology { l1d, l2, l3 })
 }
 
+// Intel deterministic leaf (CPUID.04h): the sub-leaf iterator stops on its own at
+// the Null terminator, so this just keeps the 1st Data-or-Unified entry seen at
+// each of levels 1-3. L3 is optional; L1d and L2 are not, so a topology missing
+// either comes back as None
 fn detect_intel<R: CpuIdReader>(cpuid: &CpuId<R>) -> Option<CacheTopology> {
     let params = cpuid.get_cache_parameters()?;
     let mut l1d = None;
@@ -97,14 +111,16 @@ fn detect_intel<R: CpuIdReader>(cpuid: &CpuId<R>) -> Option<CacheTopology> {
     })
 }
 
+// Canned-CPUID-reader tests for the Intel and AMD detection paths
 #[cfg(test)]
 mod tests {
     use raw_cpuid::{CpuId, CpuIdResult};
 
-    /// Encode one Intel deterministic-cache-leaf (04h) sub-leaf: `eax` carries the cache
-    /// type (bits 0-4) and level (bits 5-7); `ebx` the line size, physical partitions, and
-    /// ways (each stored as value-minus-1); `ecx` the set count minus 1. `bytes = ways *
-    /// line * sets * partitions`
+    /// Build a CPUID leaf-04h sub-leaf `CpuIdResult` from decoded fields, following the
+    /// real register layout: `eax` packs the cache type into bits 0-4 and the level into
+    /// bits 5-7; `ebx` packs line size, physical partitions, and ways, each biased by 1;
+    /// `ecx` is the set count, also biased by 1. The cache size those fields describe is
+    /// `ways * line * sets * partitions`
     fn leaf04(ctype: u32, level: u32, line: u32, parts: u32, ways: u32, sets: u32) -> CpuIdResult {
         CpuIdResult {
             eax: ctype | (level << 5),
@@ -114,25 +130,27 @@ mod tests {
         }
     }
 
-    /// A canned Intel CPUID with a plausible 3-level hierarchy on leaf 04h: L1d 48 KiB
-    /// / 12-way, an L1 *instruction* cache (skipped by the Data|Unified filter), L2 1 MiB /
-    /// 8-way unified, L3 32 MiB / 16-way unified, then a `Null` terminator. `detect_intel`
-    /// is generic over the reader, so this exercises the whole Intel path on any host: the
-    /// dev box takes the AMD branch and never runs it
+    /// Feed `detect_intel` a mock leaf-04h walk (L1d 48 KiB/12-way, an L1 *instruction*
+    /// cache that the `Data | Unified` filter must skip, L2 1 MiB/8-way unified, L3
+    /// 32 MiB/16-way unified) and check the resulting sizes and way counts. `detect_intel`
+    /// is generic over the CPUID reader, so a mock exercises the Intel path on any host:
+    /// the dev box's own vendor is AMD, so `detect()` never takes this branch there
     #[test]
     fn detect_intel_from_canned_leaf04() {
         let reader = |eax: u32, ecx: u32| -> CpuIdResult {
             match (eax, ecx) {
-                // Leaf 0: max basic leaf >= 4 and the "GenuineIntel" vendor string
+                // Leaf 0: report a max basic leaf of 4 or higher, and spell out
+                // "GenuineIntel" across ebx/edx/ecx in that order
                 (0x0, _) => CpuIdResult {
                     eax: 0x16,
                     ebx: 0x756e_6547, // "Genu"
                     ecx: 0x6c65_746e, // "ntel"
                     edx: 0x4965_6e69, // "ineI"
                 },
-                // Leaf 4 sub-leaves: L1d, L1i, L2, L3, then a Null (type 0) terminator
+                // Leaf 4 sub-leaves in order: L1d, L1i, L2, L3, then anything else
+                // falls through to the Null (type 0) terminator below
                 (0x4, 0) => leaf04(1, 1, 64, 1, 12, 64), // Data,  L1: 12*64*64      = 48 KiB
-                (0x4, 1) => leaf04(2, 1, 64, 1, 8, 64),  // Instruction, L1 (skipped)
+                (0x4, 1) => leaf04(2, 1, 64, 1, 8, 64),  // Instruction, L1 (skipped by the filter)
                 (0x4, 2) => leaf04(3, 2, 64, 1, 8, 2048), // Unified, L2: 8*64*2048  = 1 MiB
                 (0x4, 3) => leaf04(3, 3, 64, 1, 16, 32768), // Unified, L3: 16*64*32768 = 32 MiB
                 (0x4, _) => CpuIdResult {
@@ -163,38 +181,43 @@ mod tests {
         assert_eq!(l3.assoc, 16, "L3 ways");
     }
 
-    /// A canned AMD CPUID whose legacy L1 (0x8000_0005) and L2/L3 (0x8000_0006) leaves report
-    /// the *exotic* associativity encodings a real Zen part never emits: `DirectMapped` (L1d)
-    /// and `FullyAssociative` (L2 and L3), so `assoc_num` folds them to `1` and `64`
-    /// respectively. The dev box only ever hits the `NWay` arm, so this closes the remaining
-    /// `assoc_num` branches platform-independently
+    /// Feed `detect_amd` a mock AMD leaf pair whose associativity nibbles decode to
+    /// `DirectMapped` (L1d) and `FullyAssociative` (L2 and L3), encodings a real Zen
+    /// part does not emit for those fields, and check that `assoc_num` folds them to
+    /// `1` and `64` respectively. The dev box's own L1d and L2 nibbles decode to
+    /// `NWay`, and its L3 nibble decodes to `Unknown` (the catch-all default), so
+    /// this test is what exercises the `DirectMapped` and `FullyAssociative` arms
     #[test]
     fn detect_amd_exotic_associativities() {
         let reader = |eax: u32, _ecx: u32| -> CpuIdResult {
             match eax {
-                // Leaf 0: "AuthenticAMD" vendor string (max basic leaf value is unused here)
+                // Leaf 0: spell "AuthenticAMD" across ebx/edx/ecx (max basic leaf value,
+                // eax, is not read by this path)
                 0x0 => CpuIdResult {
                     eax: 0x10,
                     ebx: 0x6874_7541, // "Auth"
                     ecx: 0x444d_4163, // "cAMD"
                     edx: 0x6974_6e65, // "enti"
                 },
-                // Extended-function max leaf must reach 0x8000_0006 for the L1/L2/L3 leaves
+                // Extended-function max leaf: must be >= 0x8000_0006 so the L1/L2/L3
+                // leaves below are considered valid
                 0x8000_0000 => CpuIdResult {
                     eax: 0x8000_0008,
                     ebx: 0,
                     ecx: 0,
                     edx: 0,
                 },
-                // L1: ecx = size(KiB)<<24 | assoc<<16 | line. assoc 0x01 = DirectMapped
+                // L1 cache/TLB leaf: ecx = size(KiB) << 24 | assoc << 16 | line;
+                // assoc 0x01 decodes to DirectMapped
                 0x8000_0005 => CpuIdResult {
                     eax: 0,
                     ebx: 0,
                     ecx: (64 << 24) | (0x01 << 16) | 64,
                     edx: 0,
                 },
-                // L2/L3: ecx = l2size(KiB)<<16 | l2assoc<<12 | l2line; edx = l3size(*512KiB)<<18
-                // | l3assoc<<12 | l3line. assoc 0xF = FullyAssociative on both
+                // L2/L3 cache leaf: ecx = l2size(KiB) << 16 | l2assoc << 12 | l2line;
+                // edx = l3size(*512 KiB) << 18 | l3assoc << 12 | l3line;
+                // assoc 0xF decodes to FullyAssociative on both
                 0x8000_0006 => CpuIdResult {
                     eax: 0,
                     ebx: 0,
@@ -212,10 +235,8 @@ mod tests {
         let cpuid = CpuId::with_cpuid_fn(reader);
         let t = super::detect_amd(&cpuid).expect("canned AMD leaves must detect");
 
-        // DirectMapped -> 1
         assert_eq!(t.l1d.bytes, 64 * 1024, "L1d size");
         assert_eq!(t.l1d.assoc, 1, "DirectMapped L1d folds to assoc 1");
-        // FullyAssociative -> 64
         assert_eq!(t.l2.bytes, 512 * 1024, "L2 size");
         assert_eq!(t.l2.assoc, 64, "FullyAssociative L2 folds to assoc 64");
         let l3 = t.l3.expect("L3 present");

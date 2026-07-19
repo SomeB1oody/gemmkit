@@ -1,4 +1,5 @@
-//! Real-scalar (f32/f64, plus f16/bf16 under half) GEMM entries
+//! The plain real-scalar `gemm`/`gemm_with`/`dot` entries: `f32`/`f64` always, plus `f16`/`bf16`
+//! under the `half` feature (any `T: GemmScalar`)
 use super::*;
 use crate::common::{dims_strides, filled_dmatrix};
 
@@ -28,7 +29,8 @@ pub fn gemm<T, R1, C1, S1, R2, C2, S2, RC, CC, SC>(
     gemm_common(None, alpha, a, b, beta, c, par);
 }
 
-/// Like [`gemm`] but reuses a caller-owned [`Workspace`]
+/// As [`gemm`], but reuses a caller-owned [`Workspace`] instead of the thread-local pool [`gemm`]
+/// draws from
 ///
 /// # Panics
 /// If the inner dimensions disagree
@@ -87,8 +89,8 @@ fn gemm_common<T, R1, C1, S1, R2, C2, S2, RC, CC, SC>(
     let (rsc, csc) = (cs.0 as isize, cs.1 as isize);
     let cp = c.as_mut_ptr();
 
-    // SAFETY: dims validated; nalgebra guarantees the storage's pointer/strides describe a
-    // valid in-bounds layout, and `c` (a `&mut` borrow) cannot alias `a`/`b`
+    // SAFETY: dims checked above; nalgebra guarantees the storage's pointer/strides describe a
+    // valid in-bounds layout, and `c` (a `&mut` borrow) can't alias `a`/`b`
     unsafe {
         match ws {
             Some(ws) => gemm_unchecked_with(
@@ -130,7 +132,7 @@ fn gemm_common<T, R1, C1, S1, R2, C2, S2, RC, CC, SC>(
     }
 }
 
-/// `A*B` into a fresh column-major [`DMatrix`]: the `.dot()`-style convenience
+/// `A*B` into a fresh column-major [`DMatrix`]: a `.dot()`-style convenience over [`gemm`]
 pub fn dot<T, R1, C1, S1, R2, C2, S2>(
     a: &Matrix<T, R1, C1, S1>,
     b: &Matrix<T, R2, C2, S2>,
@@ -146,7 +148,7 @@ where
 {
     let (m, _) = a.shape();
     let (_, n) = b.shape();
-    // beta == 0, so the initial fill is never read
+    // beta = 0, so gemm overwrites every cell; the fill value is never read
     let mut c = filled_dmatrix(m, n, T::ZERO);
     gemm(T::ONE, a, b, T::ZERO, &mut c, Parallelism::default());
     c

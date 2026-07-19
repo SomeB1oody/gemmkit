@@ -1,8 +1,9 @@
-//! The workspace-reusing `_with` adapters: `gemm_with`, `gemm_packed_b_with`,
-//! `gemm_packed_a_with`, `gemm_i8_with`, and `gemm_cplx_with` must each produce the same result as
-//! their allocating counterpart (already checked in `adapter.rs`), reusing one caller-owned
-//! [`Workspace`] across calls. This also drives the `Some(ws)` match arm of every `_common` helper
-//! and, transitively, `gemmkit::gemm_unchecked_with`
+//! Correctness tests for the workspace-reusing `_with` adapters (`gemm_with`,
+//! `gemm_packed_b_with`, `gemm_packed_a_with`, `gemm_i8_with`, `gemm_cplx_with`,
+//! `gemm_fused_with`, `gemm_i8_requant_with`/`gemm_i8_requant_u8_with`, and
+//! `gemm_cplx_fused_with`): each must match its allocating counterpart (checked in `adapter.rs`)
+//! while reusing a caller-owned [`Workspace`] across calls, exercising the `Some(ws)` match arm of
+//! every `_common` helper and, transitively, `gemmkit::gemm_unchecked_with`
 
 use approx::assert_relative_eq;
 use nalgebra::{DMatrix, DMatrixViewMut, Dim, Matrix, RawStorage};
@@ -44,7 +45,8 @@ where
     }
 }
 
-/// `gemm_with` reusing one workspace across several shapes must equal the allocating `gemm`
+/// `gemm_with` reusing a workspace across several shapes and both parallelism modes must equal the
+/// allocating `gemm`
 #[test]
 fn gemm_with_matches_gemm() {
     let mut ws = Workspace::new();
@@ -63,8 +65,8 @@ fn gemm_with_matches_gemm() {
     }
 }
 
-/// `prepack_rhs` + `gemm_packed_b_with` (column-major C) must equal `gemm_packed_b` and the naive
-/// reference
+/// `prepack_rhs` + `gemm_packed_b_with`, into a column-major C, must equal `gemm_packed_b` and the
+/// naive reference
 #[test]
 fn gemm_packed_b_with_matches() {
     let (m, k, n) = (100usize, 64, 80);
@@ -74,7 +76,7 @@ fn gemm_packed_b_with_matches() {
     let packed = prepack_rhs(&b);
     let mut ws = Workspace::new();
     for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
-        let mut c_with = DMatrix::<f64>::zeros(m, n); // column-major (packed_b orientation)
+        let mut c_with = DMatrix::<f64>::zeros(m, n); // column-major: the orientation gemm_packed_b requires
         gemm_packed_b_with(&mut ws, 1.0, &a, &packed, 0.0, &mut c_with, par);
 
         let mut c_ref = DMatrix::<f64>::zeros(m, n);
@@ -85,7 +87,8 @@ fn gemm_packed_b_with_matches() {
     }
 }
 
-/// `prepack_lhs` + `gemm_packed_a_with` (row-major C) must equal `gemm_packed_a` and the reference
+/// `prepack_lhs` + `gemm_packed_a_with`, into a row-major C, must equal `gemm_packed_a` and the
+/// naive reference
 #[test]
 fn gemm_packed_a_with_matches() {
     let (m, k, n) = (96usize, 50, 72);
@@ -112,7 +115,7 @@ fn gemm_packed_a_with_matches() {
     }
 }
 
-/// The `dot` convenience keeps working: a smoke check the shared imports resolve
+/// `dot`, imported here alongside the `_with` entries, still matches the naive reference
 #[test]
 fn dot_still_matches_naive() {
     let a = rand2(12, 9, 71);
@@ -120,7 +123,8 @@ fn dot_still_matches_naive() {
     assert_close(&dot(&a, &b), &naive_ref(&a, &b), 1e-10);
 }
 
-/// `gemm_i8_with` (i8 -> i32) reusing a workspace must equal the allocating `gemm_i8`
+/// `gemm_i8_with` (i8 -> i32) reusing a workspace, both parallelism modes, must equal the
+/// allocating `gemm_i8`
 #[cfg(feature = "int8")]
 #[test]
 fn gemm_i8_with_matches_gemm_i8() {
@@ -151,7 +155,8 @@ fn gemm_i8_with_matches_gemm_i8() {
     }
 }
 
-/// `gemm_cplx_with` reusing a workspace must equal `gemm_cplx` for every conjugation combination
+/// `gemm_cplx_with` reusing a workspace must equal `gemm_cplx` across all 4 conjugation
+/// combinations
 #[cfg(feature = "complex")]
 #[test]
 fn gemm_cplx_with_matches_gemm_cplx() {
@@ -209,7 +214,8 @@ fn gemm_cplx_with_matches_gemm_cplx() {
     }
 }
 
-/// `gemm_fused_with` reusing a workspace must equal the allocating `gemm_fused` bit-for-bit
+/// `gemm_fused_with` reusing a workspace, both parallelism modes, with a `PerCol` bias and
+/// `LeakyRelu`, must equal the allocating `gemm_fused` bit-for-bit
 #[cfg(feature = "epilogue")]
 #[test]
 fn gemm_fused_with_matches_gemm_fused() {
@@ -257,8 +263,8 @@ fn gemm_fused_with_matches_gemm_fused() {
     }
 }
 
-/// `gemm_i8_requant_with` / `gemm_i8_requant_u8_with` reusing a workspace must equal the allocating
-/// entries
+/// `gemm_i8_requant_with` / `gemm_i8_requant_u8_with`, per-tensor and per-row scale, both
+/// parallelism modes, reusing a workspace must equal the allocating entries bit-for-bit
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 #[test]
 fn gemm_i8_requant_with_matches() {
@@ -281,7 +287,7 @@ fn gemm_i8_requant_with_matches() {
     let b = randi8(k, n, 0x2);
     let bias: Vec<i32> = (0..m).map(|i| 30 * i as i32 - 100).collect();
     let (scale, zp_i8, zp_u8) = (0.05f32, -7i32, 30i32);
-    // per-row (per-channel) scales, all finite and > 0, exercised through the `_with` twin too
+    // per-row (per-channel) scales: must be finite and > 0, exercised through the _with twin too
     let scales: Vec<f32> = (0..m).map(|i| 0.01 * (1 + i % 5) as f32).collect();
 
     let mut ws = Workspace::new();
@@ -303,7 +309,7 @@ fn gemm_i8_requant_with_matches() {
         gemm_i8_requant_u8(&a, &b, mk(zp_u8), &mut cu_ref, par);
         assert_eq!(cu_with, cu_ref);
 
-        // per-row scales: `_with` must equal the allocating entry bit-for-bit as well
+        // per-row scales: _with must equal the allocating entry bit-for-bit too
         let mk_row = |zp: i32| Requantize {
             scale: RequantScale::PerRow(&scales),
             zero_point: zp,
@@ -323,7 +329,8 @@ fn gemm_i8_requant_with_matches() {
     }
 }
 
-/// `gemm_cplx_fused_with` reusing a workspace must equal the allocating `gemm_cplx_fused`
+/// `gemm_cplx_fused_with` reusing a workspace, with `conj_a` and a `PerCol` bias, must equal the
+/// allocating `gemm_cplx_fused`
 #[cfg(all(feature = "complex", feature = "epilogue"))]
 #[test]
 fn gemm_cplx_fused_with_matches() {

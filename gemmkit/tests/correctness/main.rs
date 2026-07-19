@@ -1,26 +1,25 @@
-//! Correctness suite: numerical accuracy, full shape / layout / alpha-beta
-//! coverage, parallel/serial reproducibility, per-ISA kernels, gemv, and the safe
-//! API's panic guarantees
+//! Entry point for the `correctness` integration test binary: wires up every
+//! per-family test module below and re-exports the shared harness they all use
 
 #![allow(clippy::too_many_arguments)]
 
-// Shared test harness: element traits, random fills, views, references, accuracy gates
+// Element traits, random fills, matrix views, f64 references, and accuracy gates
 mod common;
 
-// Safe-API panic guarantees and cache-topology sanity
+// Safe-API panic guarantees and cache-topology sanity checks
 mod api;
-// Complex GEMM correctness (c32/c64, conj variants)
+// Complex (c32/c64) GEMM: conj variants, gemm-crate cross-check
 #[cfg(feature = "complex")]
 mod complex;
-// Float shapes x layouts x alpha/beta, workspace reuse, parallel bit-identity, gemv shapes
+// Real float GEMM: shapes, layouts, alpha/beta, workspace reuse, parallel/serial bit-identity, gemv
 mod float;
-// Integer GEMM (i8 -> i32) correctness
+// Integer (i8 -> i32) GEMM, including overflow-wrap and small_mn routing
 #[cfg(feature = "int8")]
 mod int8;
-// Per-ISA kernels via the generic driver, plus the Miri scalar-path suite
+// Per-ISA kernel checks through the generic driver, plus the Miri scalar-only suite
 mod isa;
-// Mixed-precision (f16/bf16) correctness and gemm-crate cross-check
+// Mixed-precision (f16/bf16) GEMM: shapes, gemv, gemm-crate cross-check
 #[cfg(feature = "half")]
 mod mixed;
-// Prepacked LHS/RHS vs plain gemm: bit-identity, both-tiny accuracy, packed-orientation panics
+// Prepacked LHS/RHS GEMM against plain gemm, and their orientation/shape panics
 mod packed;

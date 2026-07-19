@@ -1,13 +1,14 @@
-//! Complex GEMM entries with optional conjugation
+//! Complex GEMM entries with optional per-operand conjugation
 use super::*;
 #[cfg(feature = "epilogue")]
 use crate::common::lower_bias;
 use crate::common::{filled_mat, ref_parts};
 
 /// Complex `C <- alpha*op(A)*op(B) + beta*C`, with `op(A) = conj(A)` when `conj_a` (resp.
-/// `conj(B)` when `conj_b`). `T` is `Complex<f32>`/`Complex<f64>` (faer's `c32`/`c64`); needs the
-/// `complex` feature. Like [`gemm`], it reads pointer/strides directly, so transposed, reversed,
-/// and general-stride views work without copying
+/// `conj(B)` when `conj_b`); `conj_a = conj_b = false` is the plain product `A*B`. `T` is
+/// `Complex<f32>`/`Complex<f64>` (faer's `c32`/`c64`); needs the `complex` feature. Like [`gemm`],
+/// it reads the pointer/strides directly, so transposed, reversed, and general-stride views work
+/// without copying
 ///
 /// # Panics
 /// If the inner dimensions disagree
@@ -26,7 +27,7 @@ pub fn gemm_cplx<T: ComplexScalar>(
     gemm_cplx_common(None, alpha, a, conj_a, b, conj_b, beta, c, par);
 }
 
-/// Like [`gemm_cplx`] but reuses a caller-owned [`Workspace`]
+/// [`gemm_cplx`], threading a caller-owned [`Workspace`] through instead of the thread-local pool
 ///
 /// # Panics
 /// If the inner dimensions disagree
@@ -68,9 +69,9 @@ fn gemm_cplx_common<T: ComplexScalar>(
     let (rsc, csc) = (c.row_stride(), c.col_stride());
     let cp = c.as_ptr_mut();
 
-    // SAFETY: dims validated; faer guarantees the pointer/strides describe a valid in-bounds layout
-    // (element-unit `isize`, negative for reversed views, which gemmkit handles), and `c` (a
-    // `MatMut` exclusive borrow) cannot alias `a`/`b`
+    // SAFETY: dims validated above; faer guarantees the pointer + element-unit `isize` strides
+    // describe a valid in-bounds layout (negative for a reversed view, which gemmkit handles), and
+    // `c` (a `MatMut` exclusive borrow) can't alias `a`/`b`
     unsafe {
         match ws {
             Some(ws) => gemm_cplx_unchecked_with(
@@ -84,14 +85,13 @@ fn gemm_cplx_common<T: ComplexScalar>(
     }
 }
 
-/// Non-conjugated complex `A*B` into a fresh column-major [`Mat`] (the complex
-/// analogue of [`dot`]). For conjugated products use [`gemm_cplx`]. Needs the
-/// `complex` feature
+/// Non-conjugated complex `A*B` into a fresh column-major [`Mat`] (the complex analogue of
+/// [`dot`]). For a conjugated product use [`gemm_cplx`] directly. Needs the `complex` feature
 #[cfg(feature = "complex")]
 pub fn dot_cplx<T: ComplexScalar>(a: MatRef<'_, T>, b: MatRef<'_, T>) -> Mat<T> {
     let m = a.nrows();
     let n = b.ncols();
-    // beta == 0, so the initial fill is never read
+    // beta == 0, so the fill value below is never read
     let mut c = filled_mat(m, n, T::ZERO);
     gemm_cplx(
         T::ONE,
@@ -107,13 +107,14 @@ pub fn dot_cplx<T: ComplexScalar>(a: MatRef<'_, T>, b: MatRef<'_, T>) -> Mat<T> 
 }
 
 /// Complex `C <- alpha*op(A)*op(B) + beta*C + bias` in 1 fused pass, with `op(A) = conj(A)` when
-/// `conj_a` (resp. `conj(B)` when `conj_b`), the faer adapter over gemmkit's
+/// `conj_a` (resp. `conj(B)` when `conj_b`); the faer adapter over gemmkit's
 /// [`gemmkit::gemm_cplx_fused`]. The optional [`Bias`] is [`Bias::PerRow`] (length `A.rows`) or
-/// [`Bias::PerCol`] (length `B.cols`), added verbatim (never conjugated); `bias == None` is exactly
-/// [`gemm_cplx`]. There is **no** activation parameter: an ordering activation is undefined on
-/// complex numbers. Like [`gemm_cplx`], it reads the pointer/strides directly and forwards to
-/// gemmkit's raw engine, so transposed, sub-matrix, and reversed (negative-stride) views all work
-/// without copying
+/// [`Bias::PerCol`] (length `B.cols`), added verbatim to every element of that row/column, never
+/// conjugated; `bias == None` behaves exactly like [`gemm_cplx`]. There is **no** activation
+/// parameter: an ordering activation such as ReLU is undefined on complex numbers, which have no
+/// total order. Like [`gemm_cplx`], it reads the pointer/strides directly and forwards to gemmkit's
+/// raw engine, so transposed, sub-matrix, and reversed (negative-stride) views all work without
+/// copying
 ///
 /// # Panics
 /// If the inner dimensions disagree, or on a bias the adapter rejects (a `PerRow`/`PerCol` bias of
@@ -134,7 +135,8 @@ pub fn gemm_cplx_fused<T: ComplexScalar>(
     gemm_cplx_fused_common(None, alpha, a, conj_a, b, conj_b, beta, c, bias, par);
 }
 
-/// Like [`gemm_cplx_fused`] but reuses a caller-owned [`Workspace`]
+/// [`gemm_cplx_fused`], threading a caller-owned [`Workspace`] through instead of the thread-local
+/// pool
 ///
 /// # Panics
 /// Same conditions as [`gemm_cplx_fused`]
@@ -177,14 +179,14 @@ fn gemm_cplx_fused_common<T: ComplexScalar>(
     assert_eq!(n, cn, "gemmkit-faer: B.cols ({n}) != C.cols ({cn})");
     let (rsc, csc) = (c.row_stride(), c.col_stride());
     let cp = c.as_ptr_mut();
-    // Fused-bias validation, replicating gemmkit's checked entry (byte-identical wording): the bias
-    // length matches its axis and does not overlap C (raw pointer math, C is never referenced)
-    // Complex has no activation (undefined on complex numbers), so there is no slope check
+    // Bias validation, matching gemmkit's checked entry (same panic wording): the bias length
+    // matches its axis and doesn't overlap C. No activation, so there is no slope check
     let (bias_ptr, bias_dim, has_bias) = lower_bias(bias, m, n, cp, &[(cm, rsc), (cn, csc)]);
 
-    // SAFETY: dims validated; faer guarantees the pointer + element-unit `isize` strides describe a
-    // valid in-bounds layout (negative for a reversed view, which the raw engine handles) and `c` (a
-    // `MatMut` exclusive borrow) can't alias `a`/`b`; the bias was validated disjoint from C above
+    // SAFETY: dims validated above; faer guarantees the pointer + element-unit `isize` strides
+    // describe a valid in-bounds layout (negative for a reversed view, which the raw engine
+    // handles), `c` (a `MatMut` exclusive borrow) can't alias `a`/`b`, and the bias was validated
+    // disjoint from C above
     unsafe {
         match ws {
             Some(ws) => gemm_cplx_fused_unchecked_with(

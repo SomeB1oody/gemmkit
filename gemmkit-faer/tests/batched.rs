@@ -1,15 +1,16 @@
-//! faer batched adapter (`gemm_batched`): a slice of per-element `(A, B)` `MatRef` inputs paired
-//! with a slice of `&mut C` `MatMut` outputs must reproduce a serial loop of the adapter's own
-//! `gemm` per element bit-for-bit, over heterogeneous shapes and mixed layouts (natural
-//! column-major, transposed non-unit-stride, and reversed negative-stride views), and stay
-//! serial==parallel bit-identical. Count and inner-dimension mismatches panic
+//! `gemm_batched`: a slice of per-element `(A, B)` `MatRef` inputs paired with a slice of `&mut C`
+//! `MatMut` outputs must match, bit-for-bit, a loop of individual `gemm` calls over the same
+//! elements, across heterogeneous shapes and mixed layouts (natural column-major, transposed
+//! non-unit-stride, and reversed negative-stride views), and must give the same result under Serial
+//! and Rayon. Batch/output count mismatches and per-element inner-dimension mismatches panic; an
+//! empty batch is a no-op
 
 use faer::{Mat, MatMut, MatRef};
 use gemmkit::Parallelism;
 
 use gemmkit_faer::{gemm, gemm_batched};
 
-/// Deterministic column-major `Mat<f64>` fill (xorshift), values in `[-0.5, 0.5)`
+/// Column-major `Mat<f64>` fill from a `seed`-derived xorshift64 stream, values in `[-0.5, 0.5)`
 fn fill_mat(r: usize, c: usize, seed: u64) -> Mat<f64> {
     let mut s = seed.wrapping_add(0x9E3779B97F4A7C15) | 1;
     Mat::from_fn(r, c, |_, _| {
@@ -20,22 +21,23 @@ fn fill_mat(r: usize, c: usize, seed: u64) -> Mat<f64> {
     })
 }
 
-/// Run the batch under `par`, assert it equals a per-element `gemm(par)` loop bit-for-bit, and
-/// return the flattened batched outputs so the caller can also compare across thread counts. The 4
-/// heterogeneous elements exercise the natural column-major view, a transposed (non-unit positive
-/// stride) view, and a reversed (negative stride) view on `A`, `B`, and the output `C`
+/// Runs a 4-element batch through `gemm_batched(par)`, asserts it equals a per-element `gemm(par)`
+/// loop bit-for-bit, and returns the flattened batched output so the caller can also compare across
+/// `par` values. The 4 elements are heterogeneous in shape and layout: natural column-major,
+/// transposed (non-unit positive stride), and reversed (negative stride) views appear across `A`,
+/// `B`, and the output `C`
 fn run(par: Parallelism) -> Vec<f64> {
     let (alpha, beta) = (1.3f64, -0.7f64);
 
-    // A/B bases (read-only, shared between the batched call and the reference loop)
+    // A/B storage, read-only and shared between the batched call and the reference loop below
     let a0 = fill_mat(5, 7, 1);
     let b0 = fill_mat(7, 3, 2);
-    let a1t = fill_mat(4, 8, 3); // A1 is 8x4 via transpose
+    let a1t = fill_mat(4, 8, 3); // transposed to an 8x4 A1
     let b1 = fill_mat(4, 6, 4);
     let a2 = fill_mat(6, 9, 5);
     let b2 = fill_mat(9, 5, 6);
     let a3 = fill_mat(16, 5, 7);
-    let b3t = fill_mat(10, 5, 8); // B3 is 5x10 via transpose
+    let b3t = fill_mat(10, 5, 8); // transposed to a 5x10 B3
 
     let a0v = a0.as_dyn_stride();
     let a1v = a1t.as_dyn_stride().transpose(); // 8x4, non-unit row stride
@@ -48,14 +50,14 @@ fn run(par: Parallelism) -> Vec<f64> {
 
     let ab = [(a0v, b0v), (a1v, b1v), (a2v, b2v), (a3v, b3v)];
 
-    // Shared C init (cloned into the batched and reference buffers)
+    // Initial C values, cloned below into both the batched and the reference buffers
     let ci0 = fill_mat(5, 3, 10);
     let ci1 = fill_mat(8, 6, 11);
     let ci2 = fill_mat(6, 5, 12);
     let ci3 = fill_mat(16, 10, 13);
 
-    // Batched: one call over the slice of (A, B) inputs and &mut C outputs; element 3 writes into a
-    // reversed (negative-stride) output view
+    // 1 gemm_batched call over the slice of (A, B) inputs and &mut C outputs; element 3's output
+    // is a reversed (negative-stride) view
     let mut cb0 = ci0.clone();
     let mut cb1 = ci1.clone();
     let mut cb2 = ci2.clone();
@@ -70,7 +72,7 @@ fn run(par: Parallelism) -> Vec<f64> {
         gemm_batched(alpha, &ab, beta, &mut cbat, par);
     }
 
-    // Reference: a loop of single gemm(par) calls, same per-element views and output layout
+    // Reference: 1 gemm(par) call per element, same views and the same reversed output for element 3
     let mut cr0 = ci0.clone();
     let mut cr1 = ci1.clone();
     let mut cr2 = ci2.clone();
@@ -120,7 +122,7 @@ fn gemm_batched_count_mismatch_panics() {
     let a = fill_mat(2, 2, 1);
     let b = fill_mat(2, 2, 2);
     let ab = [(a.as_dyn_stride(), b.as_dyn_stride())];
-    let mut c: Vec<MatMut<'_, f64>> = Vec::new(); // 1 input, 0 outputs
+    let mut c: Vec<MatMut<'_, f64>> = Vec::new(); // 1 input pair, 0 outputs: count mismatch
     gemm_batched(1.0, &ab, 0.0, &mut c, Parallelism::Serial);
 }
 
@@ -128,14 +130,14 @@ fn gemm_batched_count_mismatch_panics() {
 #[should_panic(expected = "A.cols")]
 fn gemm_batched_inner_dim_mismatch_panics() {
     let a = fill_mat(3, 4, 1);
-    let b = fill_mat(5, 2, 2); // 4 != 5
+    let b = fill_mat(5, 2, 2); // A.cols 4 != B.rows 5
     let ab = [(a.as_dyn_stride(), b.as_dyn_stride())];
     let mut cc = Mat::<f64>::zeros(3, 2);
     let mut c = [cc.as_dyn_stride_mut()];
     gemm_batched(1.0, &ab, 0.0, &mut c, Parallelism::Serial);
 }
 
-/// An empty batch (no inputs, no outputs) is a well-formed no-op
+/// An empty batch (no inputs, no outputs) does not panic and leaves the output slice empty
 #[test]
 fn gemm_batched_empty_is_noop() {
     let ab: [(MatRef<'_, f64>, MatRef<'_, f64>); 0] = [];

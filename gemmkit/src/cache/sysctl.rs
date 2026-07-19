@@ -1,15 +1,17 @@
 //! macOS `sysctl` cache backend (Apple Silicon + Intel Macs)
 //!
-//! On Apple Silicon there is no CPUID, so this is the *primary* topology source;
-//! on Intel Macs the CPUID backend runs first and this is a fallback. Values are
-//! read through `sysctlbyname` via a tiny `extern "C"` block so the crate keeps
-//! its dependency surface minimal (no `libc`)
+//! Apple Silicon has no CPUID instruction, so this is the *primary* topology
+//! source there; on an Intel Mac the CPUID backend runs first and this only
+//! covers whatever it misses. Values come from `sysctlbyname` through a tiny
+//! hand-written `extern "C"` declaration, so the crate does not need to pull in
+//! `libc` just for this one call
 //!
 //! Apple Silicon exposes per-performance-level keys (`hw.perflevel0.*`, where
-//! `perflevel0` is the P-cores); the older flat keys (`hw.l1dcachesize`, ...) are
-//! used as a fallback for Intel Macs. Associativity is not exposed by `sysctl`,
-//! so conservative typical values are assumed, since the BLIS blocking model
-//! only needs them approximately and clamps with `.max(2)`
+//! `perflevel0` names the P-cores); the older flat keys (`hw.l1dcachesize`, and
+//! so on) are read as a fallback, which is what an Intel Mac actually has.
+//! `sysctl` has no associativity key at all, so this backend just assumes typical
+//! values: the BLIS blocking model only needs an approximate way count and
+//! clamps every level to at least 2 anyway
 
 use core::ffi::{c_char, c_int, c_void};
 
@@ -25,16 +27,17 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
-/// Read one integer sysctl by (NUL-terminated) name. `None` if the key is
-/// absent. Values may be 4- or 8-byte; read into a zeroed `u64` and rely on
-/// little-endian (every macOS target is) so a short 4-byte write still leaves
-/// the correct value in the low bytes
+/// Read one integer-valued sysctl by its (NUL-terminated) name. `None` when the
+/// key does not exist. The kernel may report the value as a 4-byte or an 8-byte
+/// integer; reading into a zeroed `u64` and relying on every macOS target being
+/// little-endian means a short 4-byte write still lands as the correct value in
+/// the low bytes, with the high bytes staying 0
 fn sysctl_u64(name: &[u8]) -> Option<u64> {
     debug_assert_eq!(name.last().copied(), Some(0), "name must be NUL-terminated");
     let mut val: u64 = 0;
     let mut len = core::mem::size_of::<u64>();
-    // SAFETY: `name` is a valid NUL-terminated C string; `&mut val`/`&mut len`
-    // are valid for `len` bytes; passing a null `newp` makes this a pure read
+    // SAFETY: name is a valid NUL-terminated C string; val and len are valid,
+    // properly sized out-parameters; a null newp makes this a read-only call
     let rc = unsafe {
         sysctlbyname(
             name.as_ptr() as *const c_char,
@@ -47,31 +50,32 @@ fn sysctl_u64(name: &[u8]) -> Option<u64> {
     (rc == 0 && len > 0).then_some(val)
 }
 
-/// Best-effort cache topology from `sysctl`; `None` if the required L1/L2 keys
-/// are unavailable (the caller then falls through the chain)
+/// Best-effort cache topology from `sysctl`; `None` when the L1d or L2 size key
+/// is missing (the caller then falls through to the next backend)
 pub fn detect() -> Option<CacheTopology> {
     let line = sysctl_u64(b"hw.cachelinesize\0").unwrap_or(64) as usize;
 
-    // Prefer the P-core (`perflevel0`) view; fall back to the flat Intel keys
+    // Prefer the P-core (perflevel0) view; an Intel Mac has no perflevel0 keys
+    // at all, so the flat key is what actually answers there
     let l1 =
         sysctl_u64(b"hw.perflevel0.l1dcachesize\0").or_else(|| sysctl_u64(b"hw.l1dcachesize\0"))?;
     let l2 =
         sysctl_u64(b"hw.perflevel0.l2cachesize\0").or_else(|| sysctl_u64(b"hw.l2cachesize\0"))?;
-    // Apple Silicon reports no conventional L3 (the system-level cache is not
-    // exposed as L3): treat L3 as absent unless a key is present and non-zero
+    // Apple Silicon has no conventional per-core L3 (its system-level cache is
+    // not exposed through this key), so treat a missing or zero reading as none
     let l3 = sysctl_u64(b"hw.perflevel0.l3cachesize\0")
         .or_else(|| sysctl_u64(b"hw.l3cachesize\0"))
         .filter(|&b| b > 0);
 
-    // On Apple Silicon the L2 is shared by a whole core cluster
-    // (`hw.perflevel0.cpusperl2`, e.g. 5 on an M-series P-cluster). Dividing by
-    // it gives the realistic per-core L2 budget the BLIS model should block for;
-    // L1d is per-core. Default to 1 (private) when the key is absent (Intel)
+    // `cpusperl2` counts the cores in one P-cluster sharing an L2 (e.g. 5 on an
+    // M-series P-cluster); dividing the raw L2 size by it gives the per-worker
+    // budget the BLIS model needs (see Level::shared_by). L1d has no such
+    // sharing. Default to 1 (private L2) when the key is absent, as on Intel
     let l2_shared = sysctl_u64(b"hw.perflevel0.cpusperl2\0")
         .filter(|&c| c > 0)
         .unwrap_or(1) as usize;
 
-    // `sysctl` exposes no associativity; use conservative typical values
+    // No associativity key exists in sysctl at all; fill in typical values
     let lvl = |bytes: u64, assoc: usize, shared_by: usize| Level {
         bytes: bytes as usize,
         assoc,

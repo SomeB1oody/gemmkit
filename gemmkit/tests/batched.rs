@@ -1,13 +1,13 @@
-//! Batched GEMM (`gemm_batched`) behavior: it must reproduce a loop of single `gemm()` calls
-//! bit-for-bit (same route per element), stay serial==parallel bit-identical, and reject the
-//! invalid batch layouts its new validation is responsible for
+//! Batched GEMM (`gemm_batched` and its siblings) must reproduce a loop of single `gemm()` calls
+//! bit-for-bit (each element takes the same route it would standalone), stay serial == parallel
+//! bit-identical, and reject the invalid batch layouts the validation layer is responsible for
 
 use gemmkit::{
     BatchProblem, GemmProblem, MatMut, MatRef, Parallelism, Workspace, gemm, gemm_batched,
     gemm_batched_ptr_unchecked, gemm_batched_slice, gemm_batched_unchecked, gemm_batched_with,
 };
 
-/// Deterministic `f32` fill (xorshift, non-constant so reductions are non-trivial)
+/// Deterministic xorshift `f32` fill, non-constant so the reduction it feeds is non-trivial
 fn fill(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed | 1;
     (0..n)
@@ -20,14 +20,13 @@ fn fill(n: usize, seed: u64) -> Vec<f32> {
         .collect()
 }
 
-/// Build `batch` contiguously-packed column-major elements of shape `m x k` (stride `m*k`)
+/// `batch` contiguously packed column-major `r x c` elements, back-to-back with stride `r*c`
 fn packed(batch: usize, r: usize, c: usize, seed: u64) -> Vec<f32> {
     fill(batch * r * c, seed)
 }
 
-/// `gemm_batched` must equal a loop of single `gemm(Serial)` calls **bit-for-bit**: each element
-/// takes the same route, and no element is split across workers. Contiguously-packed column-major
-/// elements; `c_init` seeds the `beta` term
+/// Checks `gemm_batched` against a loop of single `gemm(Serial)` calls, bit-for-bit, over
+/// contiguously packed column-major elements; `c_init` seeds the `beta` term
 fn assert_batched_matches_loop(
     batch: usize,
     m: usize,
@@ -41,7 +40,7 @@ fn assert_batched_matches_loop(
     let b = packed(batch, k, n, 2);
     let c_init = packed(batch, m, n, 3);
 
-    // Reference: independent single-GEMM per element on its own slice window
+    // Reference: an independent single gemm() per element, on that element's own slice window
     let mut c_ref = c_init.clone();
     for bi in 0..batch {
         let (ao, bo, co) = (bi * m * k, bi * k * n, bi * m * n);
@@ -77,19 +76,20 @@ fn assert_batched_matches_loop(
 
 #[test]
 fn batched_matches_gemm_loop_many_small() {
-    // batch not a multiple of the worker count; non-square, beta != 0, alpha != 1. Small elements
-    // exercise the batch-parallel schedule (and the horizontal route inside each element)
+    // Batch counts not a multiple of the worker count; non-square shapes; beta != 0, alpha != 1
+    // Small elements land on the batch-parallel schedule, and some also route through a small
+    // element's own horizontal kernel
     for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
         assert_batched_matches_loop(200, 8, 8, 8, 1.0, 0.0, par);
         assert_batched_matches_loop(101, 6, 40, 5, 2.5, -0.5, par);
         assert_batched_matches_loop(37, 16, 100, 4, -1.0, 1.0, par);
-        assert_batched_matches_loop(1, 12, 12, 12, 1.0, 0.0, par); // degenerate single-element batch
+        assert_batched_matches_loop(1, 12, 12, 12, 1.0, 0.0, par); // batch of 1, the degenerate case
     }
 }
 
-/// The raw `gemm_batched_unchecked` (pointers + strides, no checks) must equal a loop of single
-/// `gemm(Serial)` calls bit-for-bit: the ndarray/FFI-facing entry, tested through its raw
-/// signature. Contiguously-packed column-major elements
+/// `gemm_batched_unchecked` (raw pointers and strides, no validation; the entry FFI and adapter
+/// crates use) must equal a loop of single `gemm(Serial)` calls bit-for-bit, over contiguously
+/// packed column-major elements
 #[test]
 fn batched_unchecked_matches_gemm_loop() {
     let (batch, m, k, n) = (37usize, 16, 40, 5);
@@ -113,8 +113,9 @@ fn batched_unchecked_matches_gemm_loop() {
 
     for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
         let mut c = c_init.clone();
-        // SAFETY: contiguously-packed column-major elements: every element view is in bounds, the
-        // C regions are disjoint (batch stride m*n == element extent) and don't alias A/B
+        // SAFETY: elements are contiguously packed, so every element view is in bounds; the C
+        // batch stride equals the element extent m*n, so the C regions are disjoint and alias
+        // neither A nor B (distinct Vecs)
         unsafe {
             gemm_batched_unchecked(
                 batch,
@@ -147,22 +148,23 @@ fn batched_unchecked_matches_gemm_loop() {
 
 #[test]
 fn batched_matches_gemm_loop_few_large() {
-    // Few but large elements: batch-parallel assigns one element per worker (fewer than all
-    // cores when batch < cores), each run serially, still bit-identical to the gemm() loop
+    // Cache-resident elements (each fits L2), so a batch smaller than the core count still
+    // resolves to the batch-parallel schedule (1 element per worker, run serially) rather than
+    // splitting elements across workers, and stays bit-identical to the gemm() loop
     for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
         assert_batched_matches_loop(3, 200, 150, 180, 1.0, 0.0, par);
         assert_batched_matches_loop(2, 128, 96, 160, 0.75, 0.25, par);
     }
 }
 
-/// A few large, **DRAM-bound** elements (working set spills L2) select the sequential-internal
-/// schedule on a multi-core host: each element runs with the parallel engine. That splits an
-/// element across workers, so compare to a serial gemm() loop with a tolerance (the driver's
-/// serial and parallel reductions agree to a tight bound) rather than bit-for-bit. Correct
-/// whichever schedule the host's core count selects
+/// Elements whose working set spills L2 favor the sequential-internal schedule on a multi-core
+/// host: the batch loops, but each element runs with the full parallel engine, splitting it
+/// across workers. Compares against a serial gemm() loop with a tolerance rather than
+/// bit-for-bit, since that route is only accurate to a tight bound, and stays correct whichever
+/// schedule the host's core count actually picks
 #[test]
 fn batched_dram_bound_few_large_correct() {
-    let (batch, m, k, n) = (3usize, 384usize, 384usize, 384usize); // ~1.7 MB/element > L2
+    let (batch, m, k, n) = (3usize, 384usize, 384usize, 384usize); // A+B+C ~1.7 MB/element
     let a = packed(batch, m, k, 51);
     let b = packed(batch, k, n, 52);
     let c_init = packed(batch, m, n, 53);
@@ -203,16 +205,16 @@ fn batched_dram_bound_few_large_correct() {
     }
 }
 
-/// `gemm_batched` must not panic when called from **inside** a rayon worker. The batch-parallel
-/// schedule blocks the calling worker in its own `for_each`, and rayon may work-steal *another*
-/// nested `gemm_batched` onto that worker while it already holds the thread-local pool; the pool
-/// accessor is re-entrancy-safe (hands out a fresh scratch that one time) so this can't
-/// `BorrowMutError`. Enough outer tasks to queue past the core count and actually force the steal
+/// `gemm_batched` must not panic when called from inside a rayon worker. The batch-parallel
+/// schedule blocks its calling worker inside a `for_each`, and rayon can work-steal a 2nd, nested
+/// `gemm_batched` onto that same worker while it still holds the thread-local pool; the pool
+/// accessor falls back to a fresh one-off `Workspace` rather than double-borrowing, so this can't
+/// panic on a borrow conflict. Uses more outer tasks than the core count to actually force a steal
 #[cfg(all(feature = "parallel", not(miri)))]
 #[test]
 fn batched_from_inside_rayon_worker_does_not_panic() {
     use rayon::prelude::*;
-    let (batch, m, k, n) = (256usize, 12, 48, 9); // total work selects the batch-parallel schedule
+    let (batch, m, k, n) = (256usize, 12, 48, 9); // total work clears the parallel-threshold gate
     let a = packed(batch, m, k, 41);
     let b = packed(batch, k, n, 42);
     let sums: Vec<f32> = (0..256u32)
@@ -234,8 +236,8 @@ fn batched_from_inside_rayon_worker_does_not_panic() {
             c.iter().sum()
         })
         .collect();
-    // Every outer task computed the same product on the same batch-parallel schedule (each element
-    // driver-serial on one worker), so the results (and thus the checksums) are bit-identical
+    // Every outer task ran the same batch on the same schedule (each element serial on 1 worker,
+    // whether or not it hit the re-entrant fallback), so every checksum must agree
     for &s in &sums {
         assert_eq!(
             s, sums[0],
@@ -274,9 +276,9 @@ fn batched_serial_equals_parallel_bit_identical() {
 
 #[test]
 fn batched_broadcast_a_shared_across_elements() {
-    // a_batch_stride = 0 shares one A across the batch; each element has its own B and C
+    // a_batch_stride = 0 broadcasts a single A across every element; B and C are per-element
     let (batch, m, k, n) = (16, 8, 20, 6);
-    let a = fill(m * k, 21); // one element's worth
+    let a = fill(m * k, 21); // a single element's worth, reused by every element below
     let b = packed(batch, k, n, 22);
     let c_init = packed(batch, m, n, 23);
 
@@ -298,7 +300,7 @@ fn batched_broadcast_a_shared_across_elements() {
         batch,
         1.0,
         MatRef::new(&a, m, k, 1, m as isize),
-        0, // broadcast A
+        0, // broadcast: every element reads the same A
         MatRef::new(&b, k, n, 1, k as isize),
         (k * n) as isize,
         0.0,
@@ -311,10 +313,10 @@ fn batched_broadcast_a_shared_across_elements() {
 
 #[test]
 fn batched_zero_batch_is_noop() {
-    // A zero-length batch is a pure no-op even with mismatched / placeholder element shapes: the
-    // views are never dereferenced, so validation (shape/bounds) must be skipped, not panic
+    // batch == 0 short-circuits before validation, so mismatched/placeholder element shapes
+    // (which would otherwise panic) must not be dereferenced or checked at all
     let a = fill(4 * 3, 1);
-    let b = fill(5 * 2, 2); // B.rows (5) != A.cols (3) on purpose
+    let b = fill(5 * 2, 2); // B.rows (5) deliberately != A.cols (3)
     let mut c = vec![7.0f32; 4 * 2];
     let before = c.clone();
     gemm_batched(
@@ -337,7 +339,8 @@ fn batched_zero_batch_is_noop() {
 
 #[test]
 fn batched_reuses_workspace() {
-    // The `_with` form threads a caller workspace through the serial/few-large paths
+    // gemm_batched_with threads a caller-owned Workspace through the serial and few-large
+    // schedules instead of the thread-local pool
     let (batch, m, k, n) = (4, 64, 64, 64);
     let a = packed(batch, m, k, 31);
     let b = packed(batch, k, n, 32);
@@ -356,8 +359,8 @@ fn batched_reuses_workspace() {
         (m * n) as isize,
         Parallelism::Serial,
     );
-    // A 2nd call reuses the now-sized workspace with no reallocation (correctness is enough
-    // here; the no-realloc property is covered by the workspace tests)
+    // A 2nd call against the now-sized ws; just checks correctness here, since the workspace
+    // tests already cover the no-reallocation property
     gemm_batched_with(
         &mut ws,
         batch,
@@ -373,12 +376,12 @@ fn batched_reuses_workspace() {
     );
 }
 
-// validation: the batched API must reject invalid layouts
+// The batched API must reject invalid layouts
 
 #[test]
 #[should_panic(expected = "stay disjoint")]
 fn batched_rejects_overlapping_c() {
-    // C batch stride below the element extent (m*n) -> element 1 overwrites element 0's tail
+    // C batch stride set below the element extent m*n, so element 1 would overwrite element 0
     let (batch, m, n) = (2usize, 4usize, 4usize);
     let a = packed(batch, m, m, 1);
     let b = packed(batch, m, n, 2);
@@ -392,7 +395,7 @@ fn batched_rejects_overlapping_c() {
         (m * n) as isize,
         0.0,
         MatMut::new(&mut c, m, n, 1, m as isize),
-        (m * n - 1) as isize, // < element extent m*n
+        (m * n - 1) as isize, // 1 short of the element extent m*n
         Parallelism::Serial,
     );
 }
@@ -400,7 +403,7 @@ fn batched_rejects_overlapping_c() {
 #[test]
 #[should_panic(expected = "aliases itself")]
 fn batched_rejects_self_aliasing_c() {
-    // A broadcast column stride (cs = 0) makes distinct C columns share memory
+    // cs = 0 collapses every column onto the same memory, aliasing C against itself
     let (batch, m, n) = (2usize, 4usize, 4usize);
     let a = packed(batch, m, m, 1);
     let b = packed(batch, m, n, 2);
@@ -413,7 +416,7 @@ fn batched_rejects_self_aliasing_c() {
         MatRef::new(&b, m, n, 1, m as isize),
         (m * n) as isize,
         0.0,
-        MatMut::new(&mut c, m, n, 1, 0), // cs = 0
+        MatMut::new(&mut c, m, n, 1, 0), // broadcast column stride
         m as isize,
         Parallelism::Serial,
     );
@@ -422,9 +425,10 @@ fn batched_rejects_self_aliasing_c() {
 #[test]
 #[should_panic(expected = "needs")]
 fn batched_rejects_last_element_out_of_bounds() {
-    // The slice fits batch-1 elements but not the last one's extent
+    // The buffer is 1 element short of what `batch` elements need, so only the last element's
+    // view runs out of bounds; the check must not stop at element 0
     let (batch, m, k, n) = (4usize, 8usize, 8usize, 8usize);
-    let a = vec![0.0f32; batch * m * k - 1]; // one element short
+    let a = vec![0.0f32; batch * m * k - 1];
     let b = packed(batch, k, n, 2);
     let mut c = packed(batch, m, n, 3);
     gemm_batched(
@@ -452,7 +456,7 @@ fn batched_rejects_negative_batch_stride() {
         batch,
         1.0,
         MatRef::new(&a, m, k, 1, m as isize),
-        -((m * k) as isize), // negative
+        -((m * k) as isize), // negative batch stride
         MatRef::new(&b, k, n, 1, k as isize),
         (k * n) as isize,
         0.0,
@@ -474,7 +478,7 @@ fn batched_rejects_shape_mismatch() {
         1.0,
         MatRef::new(&a, m, k, 1, m as isize),
         (m * k) as isize,
-        MatRef::new(&b, k + 1, n, 1, (k + 1) as isize), // B.rows != A.cols
+        MatRef::new(&b, k + 1, n, 1, (k + 1) as isize), // B.rows = k+1 != A.cols = k
         (k * n) as isize,
         0.0,
         MatMut::new(&mut c, m, n, 1, m as isize),
@@ -483,12 +487,12 @@ fn batched_rejects_shape_mismatch() {
     );
 }
 
-// heterogeneous pointer-array batched: gemm_batched_slice / gemm_batched_ptr_unchecked
+// Heterogeneous pointer-array batched GEMM: gemm_batched_slice / gemm_batched_ptr_unchecked
 
-/// One heterogeneous element: `(m, k, n, alpha, beta, a, b, c_init)`, column-major
+/// 1 heterogeneous element: `(m, k, n, alpha, beta, a, b, c_init)`, all column-major
 type HeteroElem = (usize, usize, usize, f32, f32, Vec<f32>, Vec<f32>, Vec<f32>);
 
-/// 3 heterogeneous column-major elements (different shapes, alpha/beta)
+/// 3 column-major elements with different shapes and alpha/beta, for the heterogeneous batch
 fn hetero_case(seed: u64) -> [HeteroElem; 3] {
     let mk = |m, k, n, s| {
         (
@@ -510,13 +514,14 @@ fn hetero_case(seed: u64) -> [HeteroElem; 3] {
     ]
 }
 
-/// The checked pointer-array form (`gemm_batched_slice`) must equal a loop of single `gemm(par)`
-/// calls bit-for-bit: heterogeneous shapes, per-element alpha/beta, both Serial and Rayon
+/// `gemm_batched_slice` (the checked pointer-array form) must equal a loop of single `gemm(par)`
+/// calls bit-for-bit, over heterogeneous shapes and per-element alpha/beta, both serial and
+/// parallel
 #[test]
 fn batched_slice_matches_loop() {
     for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
         let case = hetero_case(1);
-        // Reference: one gemm() per element (C seeded from the shared init)
+        // Reference: 1 gemm() per element, C seeded from the shared c_init
         let mut refs: Vec<Vec<f32>> = case.iter().map(|e| e.7.clone()).collect();
         for (e, cref) in case.iter().zip(refs.iter_mut()) {
             let (m, k, n, alpha, beta, a, b, _) = e;
@@ -529,7 +534,7 @@ fn batched_slice_matches_loop() {
                 par,
             );
         }
-        // Batched: distinct MatMut per element (disjoint by construction)
+        // Batched: 1 distinct MatMut per element, so the outputs are disjoint by construction
         let mut c: Vec<Vec<f32>> = case.iter().map(|e| e.7.clone()).collect();
         {
             let mut probs: Vec<BatchProblem<'_, f32>> = c
@@ -554,7 +559,8 @@ fn batched_slice_matches_loop() {
     }
 }
 
-/// The unchecked pointer-array form must equal a loop of single `gemm(par)` calls bit-for-bit
+/// `gemm_batched_ptr_unchecked` (raw `GemmProblem` pointers, no validation) must equal a loop of
+/// single `gemm(par)` calls bit-for-bit
 #[test]
 fn batched_ptr_unchecked_matches_loop() {
     for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
@@ -595,8 +601,8 @@ fn batched_ptr_unchecked_matches_loop() {
                 }
             })
             .collect();
-        // SAFETY: each element's pointers are valid for its shape; the C buffers are distinct Vecs
-        // (pairwise disjoint) and don't alias the A/B inputs
+        // SAFETY: each element's pointers are valid for its own shape; the C buffers are distinct
+        // Vecs, so they are pairwise disjoint and alias neither A nor B
         unsafe { gemm_batched_ptr_unchecked(&problems, par) };
         for (ci, cref) in c.iter().zip(&refs) {
             assert_eq!(
@@ -607,12 +613,12 @@ fn batched_ptr_unchecked_matches_loop() {
     }
 }
 
-/// The heterogeneous batch runs each element serially on one worker, so serial == parallel
-/// bit-for-bit. Enough elements/work to actually split
+/// A heterogeneous batch runs every element serially on 1 worker, so serial must equal parallel
+/// bit-for-bit; enough elements and total work here to actually force a parallel split
 #[test]
 fn batched_slice_serial_equals_parallel() {
     let run = |par| {
-        // 40 elements, each 16x64x9 (routes through the horizontal kernel, element-serial)
+        // 40 elements of 16x64x9: small enough m,n to route through the horizontal kernel
         let (m, k, n) = (16usize, 64usize, 9usize);
         let a: Vec<Vec<f32>> = (0..40).map(|s| fill(m * k, s as u64 + 1)).collect();
         let b: Vec<Vec<f32>> = (0..40).map(|s| fill(k * n, s as u64 + 100)).collect();
@@ -640,13 +646,13 @@ fn batched_slice_serial_equals_parallel() {
     );
 }
 
-/// A heterogeneous batch whose *total* work clears `GEMMKIT_PARALLEL_THRESHOLD` with `Rayon(4)`
-/// exercises `run_ptr`'s parallel branch (and `resolve_batch_flat`'s budget grant) - the small
-/// cases above stay under the gate and never fork. Every element still runs wholly on one worker,
-/// so the batch must be bit-identical to the serial run and to a per-element `gemm()` loop
+/// A heterogeneous batch whose total work clears the `GEMMKIT_PARALLEL_THRESHOLD` gate under
+/// `Rayon(4)` exercises `run_ptr`'s parallel branch, unlike the smaller cases above, which stay
+/// under the gate and never fork. Every element still runs wholly on 1 worker, so the batch must
+/// be bit-identical both to the serial run and to a per-element `gemm()` loop
 #[test]
 fn batched_slice_parallel_matches_serial_bit_for_bit() {
-    // 4 ~128^3 elements: total m*k*n ~= 8.4M, well above the 48*48*256 threshold
+    // 4 elements around 128^3: total m*k*n ~= 8.5M, well above the 48*48*256 = 589824 threshold
     let shapes = [
         (128usize, 128usize, 128usize, 1.0f32, 0.0f32),
         (130, 120, 140, 2.5, -0.5),
@@ -698,7 +704,7 @@ fn batched_slice_parallel_matches_serial_bit_for_bit() {
         "heterogeneous parallel batch must equal the serial batch bit-for-bit"
     );
 
-    // Correctness: each element equals a standalone gemm() on the same inputs
+    // Also check against a standalone gemm() per element, not just the batch's own serial run
     for (i, &(m, k, n, alpha, beta)) in shapes.iter().enumerate() {
         let mut cref = c0[i].clone();
         gemm(
@@ -717,7 +723,7 @@ fn batched_slice_parallel_matches_serial_bit_for_bit() {
 #[should_panic(expected = "!= B.rows")]
 fn batched_slice_rejects_shape_mismatch() {
     let a = fill(4 * 3, 1);
-    let b = fill(5 * 2, 2); // B.rows (5) != A.cols (3)
+    let b = fill(5 * 2, 2); // B.rows = 5, deliberately != A.cols = 3
     let mut c = vec![0.0f32; 4 * 2];
     let mut probs = [BatchProblem {
         alpha: 1.0,

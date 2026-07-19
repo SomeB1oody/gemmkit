@@ -1,26 +1,26 @@
 //! Packing primitives (layer L2)
 //!
-//! The *layout* of a packed buffer is chosen by each [`crate::kernel::KernelFamily`]
-//! (so a future integer family can use VNNI-friendly interleaving), but the
-//! mechanical micropanel copy is identical for LHS and RHS - they differ only in
-//! which stride is "leading" vs "depth". That one reusable routine lives here
-//!
-//! This file is part of the fixed packing framework: adding a kernel family does
-//! not modify it
+//! Copies a strided A or B region into contiguous, microkernel-sized panels. Every
+//! [`crate::kernel::KernelFamily`] chooses its own packed layout (interleaved for a
+//! VNNI-style dot kernel, plain for a float FMA kernel), but the mechanical copy
+//! that walks source strides into destination panels is the same for LHS and RHS -
+//! they differ only in which stride plays "leading" and which plays "depth". That
+//! one reusable copy lives here, so adding a kernel family never touches this file
 
 use crate::scalar::Scalar;
 
-/// Pack into micropanel-major layout: `ceil(n_lead / width)` panels, each
-/// `width` long in the leading dimension and `depth_len` deep. Within a panel,
-/// elements are stored depth-major with `width` contiguous leading elements per
-/// depth step; the tail panel is zero-filled past `n_lead`
+/// Copy a strided `n_lead x depth_len` source region into micropanel-major layout:
+/// `ceil(n_lead / width)` panels, each `width` elements wide in the leading
+/// dimension and `depth_len` deep. Within a panel, storage is depth-major: `width`
+/// contiguous leading elements per depth step. A tail panel (`n_lead` not a multiple
+/// of `width`) is zero-padded past `n_lead`
 ///
-/// For LHS packing the leading dimension is rows (`lead = rs`, `depth = cs`,
-/// `width = mr`); for RHS it is columns (`lead = cs`, `depth = rs`, `width = nr`)
-/// - the caller swaps the strides accordingly
+/// LHS packing treats rows as the leading dimension (`lead = rs`, `depth = cs`,
+/// `width = mr`); RHS packing treats columns as leading (`lead = cs`, `depth = rs`,
+/// `width = nr`) - the caller picks which stride plays which role
 ///
 /// # Safety
-/// `src` must cover the `n_lead x depth_len` region addressed by the strides;
+/// `src` must cover the `n_lead x depth_len` region addressed by `lead`/`depth`;
 /// `dst` must hold `ceil(n_lead/width) * width * depth_len` elements
 #[inline]
 pub(crate) unsafe fn pack_panels<T: Scalar>(
@@ -39,14 +39,10 @@ pub(crate) unsafe fn pack_panels<T: Scalar>(
         while base < n_lead {
             let live = core::cmp::min(width, n_lead - base);
             if lead == 1 {
-                // Contiguous leading dimension: the `live` leading elements at each
-                // depth step are contiguous in `src`, so copy them straight and
-                // zero-fill the `[live, width)` pad tail. A full panel (`live ==
-                // width`) has no pad, so the fill loop is empty and this is the
-                // original straight copy; a tail panel (`live < width`, the last
-                // panel when `n_lead` is not a multiple of `width`) copies its `live`
-                // contiguous elements instead of walking the strided transpose. The
-                // packed bytes are identical to the transpose path either way
+                // `lead == 1`: the `live` leading elements at each depth step are
+                // contiguous in `src`, so copy them straight and zero-fill the
+                // `[live, width)` tail. Produces the same bytes as the general
+                // transpose branch below, just without a per-element stride walk
                 for p in 0..depth_len {
                     let s = src.offset(base as isize + p as isize * depth);
                     core::ptr::copy_nonoverlapping(s, d, live);
@@ -56,20 +52,19 @@ pub(crate) unsafe fn pack_panels<T: Scalar>(
                     d = d.add(width);
                 }
             } else {
-                // Cache-blocked transpose: walk the source along its contiguous
-                // dimension (`depth` - stride 1 for a row-major LHS or column-major
-                // RHS) in short strips and scatter each into the panel, rather than
-                // gathering `width` strided elements per depth step (a cache miss
-                // per element when `lead` is large). A pure reordered copy (packed
-                // bytes identical), but far cheaper for a strided source
+                // Strided leading dimension: walk short `tile`-long strips along the
+                // contiguous `depth` axis and scatter each into the panel, instead of
+                // gathering `width` strided elements per depth step (a cache miss per
+                // element once `lead` is large). Same bytes as the naive transpose,
+                // just cache-blocked
                 let panel = d;
                 let mut p0 = 0;
                 while p0 < depth_len {
                     let pe = core::cmp::min(p0 + tile, depth_len);
                     for i in 0..width {
-                        // Address each slot directly (no running pointer past the
-                        // panel end); LLVM strength-reduces the `p` loop. Every
-                        // `p*width + i < depth_len*width`, so it stays in bounds
+                        // Index each slot directly rather than track a running
+                        // pointer; `p*width + i < depth_len*width` always, so
+                        // this stays in bounds
                         if i < live {
                             let row = src.offset((base + i) as isize * lead);
                             for p in p0..pe {
@@ -90,20 +85,21 @@ pub(crate) unsafe fn pack_panels<T: Scalar>(
     }
 }
 
-/// Pack into **k-group-interleaved** micropanel-major layout for a dot-product kernel
-/// (VNNI `vpdpbusd`, `vdpbf16ps`): like [`pack_panels`], `ceil(n_lead / width)` panels of
-/// `width` leading elements, but within a panel the `depth` axis is grouped `Q` at a time
-/// so the `Q` consecutive depth values of one leading element are *contiguous* (lane/column
-/// `i`'s group `g` at panel offset `g*width*Q + i*Q + t`), ready to feed one dot
-/// instruction. The depth is padded up to a multiple of `Q`; padded leading positions
-/// (past `n_lead`) and padded depth (past `depth_len`) are filled with `xform(T::ZERO)`
+/// Pack into k-group-interleaved micropanel-major layout, for a dot-product kernel
+/// (VNNI `vpdpbusd`, `vdpbf16ps`) that consumes `Q` depth steps in one instruction.
+/// Like [`pack_panels`]: `ceil(n_lead / width)` panels of `width` leading elements.
+/// Unlike it: within a panel the depth axis is grouped `Q` at a time so lane `i`'s
+/// group `g` sits contiguous at panel offset `g*width*Q + i*Q + t`, ready to feed
+/// straight into one dot instruction. Depth is padded up to a multiple of `Q`; both
+/// the padded leading positions (past `n_lead`) and the padded depth (past
+/// `depth_len`) are filled with `xform(T::ZERO)`
 ///
-/// `xform` is the per-element transform applied on the way in: identity for a plain dot
-/// (bf16), or the `u8` bias `v -> v + 128` for VNNI's signed-to-unsigned A. The pad is
-/// `xform(0)` so it is consistent with the live elements (VNNI's A pad `= 128`, the bias of
-/// `0`; every other case `= 0`). LHS sets `lead = rows` / `depth = cols`, RHS swaps them,
-/// exactly as [`pack_panels`]. This is the single source of truth for the interleave index
-/// math, shared by every dot family
+/// `xform` is applied to every element on the way in: identity for a plain dot
+/// (bf16), or the `u8` bias `v -> v + 128` for VNNI's signed-to-unsigned A operand.
+/// Padding with `xform(0)` keeps the pad consistent with the live data (128 for the
+/// VNNI bias, 0 otherwise). LHS sets `lead = rows` / `depth = cols`, RHS swaps them,
+/// same convention as [`pack_panels`]. The single place the k-group interleave index
+/// math is written, shared by every dot family
 ///
 /// # Safety
 /// `src` must cover the `n_lead x depth_len` region addressed by `lead`/`depth`; `dst`
@@ -123,28 +119,25 @@ pub(crate) unsafe fn pack_kgroup_panels<T: Scalar, const Q: usize, F: Fn(T) -> T
 ) {
     unsafe {
         let kc_pad = depth_len.next_multiple_of(Q);
-        // Groups whose whole `Q`-run of depth positions is live (`dp < depth_len`). Only the
-        // last group can straddle `depth_len`, and only when `depth_len` is not a multiple of
-        // `Q`; splitting it off lets every interior group drop the per-element depth bound
-        // check (its guard could only ever fail in that one tail group)
+        // Groups whose whole Q-run of depth positions is live. Only the last group can
+        // straddle `depth_len` (and only when it is not a Q multiple); splitting that one
+        // off lets every full group skip the per-element depth bound check
         let full_groups = depth_len / Q;
         let has_tail = !depth_len.is_multiple_of(Q);
         let pad = xform(T::ZERO);
         let mut d = dst;
         let mut base = 0usize;
         while base < n_lead {
-            // Live leading positions in this panel; `base < n_lead` guarantees `live >= 1`
-            // Hoisted out of the group/quad loops - the lane bound is the only guard the
-            // full groups need
+            // Live leading positions in this panel (`base < n_lead` guarantees `live >= 1`);
+            // hoisted above the group loop since it is the only guard a full group needs
             let live = core::cmp::min(width, n_lead - base);
             for g in 0..full_groups {
                 let gbase = g * width * Q;
                 let dp0 = (g * Q) as isize;
                 if depth == 1 {
-                    // Contiguous source depth: lane `i`'s `Q` depth values are contiguous in
-                    // both src and dst, so copy the `Q`-run straight. A const-`Q` loop, which
-                    // LLVM lowers to a wide copy for the identity transform and to `Q`
-                    // transformed stores for the `+128` bias
+                    // Contiguous depth: lane `i`'s Q depth values are contiguous in both src
+                    // and dst, so copy the run straight. The const-Q loop lets LLVM lower this
+                    // to a wide copy (identity) or Q transformed stores (the +128 bias)
                     for i in 0..live {
                         let s = src.offset((base + i) as isize * lead + dp0);
                         let dd = d.add(gbase + i * Q);
@@ -153,8 +146,8 @@ pub(crate) unsafe fn pack_kgroup_panels<T: Scalar, const Q: usize, F: Fn(T) -> T
                         }
                     }
                 } else {
-                    // Strided source depth: gather the `Q`-run one depth step at a time, still
-                    // free of the depth bound check
+                    // Strided depth: gather the Q-run one depth step at a time; still free
+                    // of the per-element depth bound check
                     for i in 0..live {
                         let row = src.offset((base + i) as isize * lead + dp0 * depth);
                         let dd = d.add(gbase + i * Q);
@@ -163,7 +156,7 @@ pub(crate) unsafe fn pack_kgroup_panels<T: Scalar, const Q: usize, F: Fn(T) -> T
                         }
                     }
                 }
-                // Leading positions past `n_lead`: the whole group is `xform(0)` pad
+                // Leading positions past `n_lead` are pure `xform(0)` pad
                 for i in live..width {
                     let dd = d.add(gbase + i * Q);
                     for t in 0..Q {
@@ -172,8 +165,8 @@ pub(crate) unsafe fn pack_kgroup_panels<T: Scalar, const Q: usize, F: Fn(T) -> T
                 }
             }
             if has_tail {
-                // The single straddling group: keep the exact per-element guard so the padded
-                // depth slots (`dp >= depth_len`) stay byte-for-byte identical to the pad
+                // The one straddling group needs the full per-element guard, so padded
+                // depth slots (`dp >= depth_len`) come out byte-identical to the pad
                 let g = full_groups;
                 let gbase = g * width * Q;
                 for i in 0..width {
@@ -196,19 +189,18 @@ pub(crate) unsafe fn pack_kgroup_panels<T: Scalar, const Q: usize, F: Fn(T) -> T
     }
 }
 
-// Feature-independent byte-level oracle for [`pack_panels`]'s strided-transpose branch
-// (compiled on every build, unlike the kgroup oracle below which is gated to the dot
-// families): `check_case` forces `lead != 1`, so this reproduces only the pre-existing
-// transpose path bit-for-bit. The new `lead == 1` tail fast path is timed, not bit-checked,
-// by `bench_tail_panel_pack` below
+// Byte-level oracle for `pack_panels`, compiled on every build (unlike the k-group
+// oracle below, gated to the dot families). `check_case` always forces `lead != 1`,
+// so this exercises only the strided-transpose branch bit-for-bit; the `lead == 1`
+// straight-copy fast path is timed, not bit-checked, by `bench_tail_panel_pack`
 #[cfg(test)]
 mod panels_tests {
     use super::*;
 
-    // Naive reference for the plain micropanel layout: `ceil(n_lead/width)` panels, each
-    // `depth_len` steps of `width` leading elements, depth-major within a panel; a leading
-    // position past `n_lead` is `T::ZERO`. No restructuring - the routine under test must
-    // reproduce this buffer bit-for-bit
+    // Naive reference for the plain micropanel layout: `ceil(n_lead/width)` panels of
+    // `depth_len` depth-major steps, `width` leading elements per step; a leading
+    // position past `n_lead` reads as `T::ZERO`. `pack_panels` must reproduce this
+    // buffer bit-for-bit
     fn reference<T: Scalar>(
         base: *const T,
         lead: isize,
@@ -226,7 +218,7 @@ mod panels_tests {
                 for i in 0..width {
                     let lead_pos = b + i;
                     let v = if lead_pos < n_lead {
-                        // SAFETY: covered by `backing` in `check_case` for `lead_pos < n_lead`
+                        // SAFETY: `check_case` sizes `backing` to cover every lead_pos < n_lead
                         unsafe { *base.offset(lead_pos as isize * lead + p as isize * depth) }
                     } else {
                         T::ZERO
@@ -240,17 +232,17 @@ mod panels_tests {
         out
     }
 
-    // Raw-byte compare (the contract is bit-identity)
+    // Compare raw bytes, not element equality: the packing contract is bit-identity
     fn same_bytes<T>(a: &[T], b: &[T]) -> bool {
         let (pa, la) = (a.as_ptr() as *const u8, core::mem::size_of_val(a));
         let (pb, lb) = (b.as_ptr() as *const u8, core::mem::size_of_val(b));
-        // SAFETY: both slices are live for the read and `size_of_val` is their byte extent
+        // SAFETY: both slices are live for the read; `size_of_val` gives their exact byte extent
         unsafe { core::slice::from_raw_parts(pa, la) == core::slice::from_raw_parts(pb, lb) }
     }
 
-    // `depth_stride` only varies the depth-read stride inside the strided-transpose branch
-    // (contiguous at 1, strided at 4); `lead` steps past the whole depth extent so leading
-    // rows never alias, which also forces `lead != 1`, away from the straight-copy fast path
+    // `depth_stride` selects the contiguous (1) or strided (4) depth read; `lead` steps
+    // past the whole depth extent so leading rows never alias, which also keeps
+    // `lead != 1` and away from the straight-copy fast path
     fn check_case(n_lead: usize, depth_len: usize, width: usize, depth_stride: isize) {
         let depth = depth_stride;
         let lead = depth_len as isize * depth + 1;
@@ -268,8 +260,8 @@ mod panels_tests {
         let expected = reference::<f32>(base, lead, depth, n_lead, depth_len, width);
         let panels = n_lead.div_ceil(width);
         let mut actual = vec![0.0f32; panels * width * depth_len];
-        // SAFETY: `backing` covers every addressed offset for `lead_pos < n_lead`,
-        // `p < depth_len`; `actual` holds the exact layout size
+        // SAFETY: `backing` covers every offset addressed for `lead_pos < n_lead`,
+        // `p < depth_len`; `actual` is sized to the exact packed layout
         unsafe {
             pack_panels::<f32>(
                 actual.as_mut_ptr(),
@@ -287,9 +279,9 @@ mod panels_tests {
         );
     }
 
-    // Replica of the pre-change strided-transpose tail path (the `else` arm of `pack_panels`
-    // as it packed a `lead == 1`, `live < width` tail), kept here as the A/B baseline for the
-    // straight-copy microbench below. Same output bytes, walks `src` at the `depth` stride
+    // The old strided-transpose path for a `lead == 1`, `live < width` tail (before the
+    // straight-copy fast path existed), kept as the A/B baseline for the microbench
+    // below. Produces the same output bytes, just walks `src` at the `depth` stride
     fn transpose_tail<T: Scalar>(
         dst: *mut T,
         src: *const T,
@@ -322,15 +314,15 @@ mod panels_tests {
         }
     }
 
-    /// Isolated tail-panel pack cost: the new `lead == 1` straight-copy fast path vs the old
-    /// strided transpose, on the same `live`-row tail of a column-major LHS (`lead = 1`, depth
-    /// stride = the full row count). Reports median ns per pack; `run with --ignored --nocapture`
+    /// Times the `lead == 1` straight-copy fast path against the old strided transpose
+    /// on a column-major LHS tail (`lead = 1`, depth stride = the full row count).
+    /// Reports median ns per pack
     #[test]
     #[ignore = "microbench; run with --release --ignored --nocapture"]
     fn bench_tail_panel_pack() {
         use std::time::Instant;
         let (width, live, depth_len, m) = (32usize, 8usize, 4096usize, 520isize);
-        let (lead, depth) = (1isize, m); // column-major LHS tail: contiguous rows, depth stride m
+        let (lead, depth) = (1isize, m); // column-major tail: rows contiguous, depth strides by m
         let max_off = (live as isize - 1) * lead + (depth_len as isize - 1) * depth;
         let backing: Vec<f32> = (0..=max_off as usize).map(|i| i as f32 * 0.5).collect();
         let base = backing.as_ptr();
@@ -374,8 +366,8 @@ mod panels_tests {
         );
     }
 
-    // Sweep width tails (live < width via partial last panel), single- and multi-panel
-    // `n_lead`, varying depth, and both contiguous (depth == 1) and strided sources
+    // Sweeps width tails (partial last panel), single- and multi-panel `n_lead`, varying
+    // depth, and both contiguous (depth == 1) and strided sources
     #[test]
     fn panels_bit_identical() {
         const N_LEADS: [usize; 8] = [1, 3, 4, 5, 7, 8, 9, 17];
@@ -398,10 +390,9 @@ mod panels_tests {
 mod tests {
     use super::*;
 
-    // Independent byte-level oracle for [`pack_kgroup_panels`]: reimplements the current
-    // semantics naively (the same `live_lead && dp < depth_len` guard, the same `xform(0)`
-    // pad, the same `g*width*Q + i*Q + t` index math) with no restructuring. The routine
-    // under test must reproduce this buffer bit-for-bit in every case
+    // Independent oracle for `pack_kgroup_panels`: the same `live_lead && dp < depth_len`
+    // guard, the same `xform(0)` pad, the same `g*width*Q + i*Q + t` index math, written
+    // separately so the routine under test must reproduce it bit-for-bit
     #[allow(clippy::too_many_arguments)]
     fn reference<T: Scalar>(
         base: *const T,
@@ -444,19 +435,18 @@ mod tests {
         out
     }
 
-    // Compare two packed buffers by their raw bytes (not element equality): the contract is
-    // bit-identity, and a byte compare is immune to `bf16` NaN payloads that would make a
-    // float `PartialEq` reject even a bit-exact copy
+    // Byte compare, not element `PartialEq`: the contract is bit-identity, and a bf16
+    // NaN payload would otherwise make an exact copy fail equality
     fn same_bytes<T>(a: &[T], b: &[T]) -> bool {
         let (pa, la) = (a.as_ptr() as *const u8, core::mem::size_of_val(a));
         let (pb, lb) = (b.as_ptr() as *const u8, core::mem::size_of_val(b));
-        // SAFETY: both slices are live for the read and `size_of_val` is their byte extent
+        // SAFETY: both slices are live for the read; `size_of_val` gives their exact byte extent
         unsafe { core::slice::from_raw_parts(pa, la) == core::slice::from_raw_parts(pb, lb) }
     }
 
-    // Run one shape through the reference and the real routine and assert byte identity
-    // `depth_stride` picks the contiguous fast path (1) or a strided source (> 1); the lead
-    // stride steps past the whole depth extent so rows never alias
+    // Runs one shape through both the reference and the real routine and asserts byte
+    // identity. `depth_stride` picks the contiguous path (1) or a strided source (> 1);
+    // `lead` steps past the whole depth extent so rows never alias
     fn check_case<T: Scalar, const Q: usize>(
         n_lead: usize,
         depth_len: usize,
@@ -481,7 +471,7 @@ mod tests {
         let panels = n_lead.div_ceil(width);
         let mut actual = vec![T::ZERO; panels * width * kc_pad];
         // SAFETY: `backing` covers every `lead_pos*lead + dp*depth` offset addressed for
-        // `lead_pos < n_lead`, `dp < depth_len`; `actual` holds the exact layout size
+        // `lead_pos < n_lead`, `dp < depth_len`; `actual` is sized to the exact packed layout
         unsafe {
             pack_kgroup_panels::<T, Q, _>(
                 actual.as_mut_ptr(),
@@ -500,14 +490,14 @@ mod tests {
         );
     }
 
-    // Sweep width tails (live < width), depth tails (depth_len % Q != 0), multi-panel and
-    // partial-last-panel `n_lead`, and both contiguous (depth == 1) and strided sources
+    // Sweeps width tails, depth tails (depth_len % Q != 0), multi- and partial-last-panel
+    // `n_lead`, and both contiguous (depth == 1) and strided sources
     const N_LEADS: [usize; 7] = [1, 3, 7, 8, 9, 16, 17];
     const DEPTHS: [usize; 8] = [1, 2, 3, 4, 5, 6, 8, 11];
     const WIDTHS: [usize; 5] = [1, 3, 4, 5, 8];
     const STRIDES: [isize; 2] = [1, 5];
 
-    // A spread-out bit pattern so the pad `xform(0)` differs from the live payload and a
+    // Spread-out bit pattern so the `xform(0)` pad differs from live payload bytes and a
     // permuted index shows up in the byte compare
     fn i8_val(i: usize) -> i8 {
         (i as u32).wrapping_mul(2_654_435_761) as u8 as i8
@@ -516,17 +506,17 @@ mod tests {
     #[cfg(feature = "int8")]
     #[test]
     fn kgroup_bit_identical_i8() {
-        // The VNNI LHS `+128` bias (identity's non-trivial sibling) and plain identity
+        // VNNI's LHS `+128` bias transform, and plain identity
         let plus128 = |v: i8| ((v as i32 + 128) as u8) as i8;
         let ident = |v: i8| v;
         for &n_lead in &N_LEADS {
             for &depth_len in &DEPTHS {
                 for &width in &WIDTHS {
                     for &stride in &STRIDES {
-                        // Q = 4 (vpdpbusd) with both transforms
+                        // Q = 4: vpdpbusd's group size, both transforms
                         check_case::<i8, 4>(n_lead, depth_len, width, stride, i8_val, plus128);
                         check_case::<i8, 4>(n_lead, depth_len, width, stride, i8_val, ident);
-                        // Q = 2 (exercises the other group size with a byte element)
+                        // Q = 2: the other group size, same byte element
                         check_case::<i8, 2>(n_lead, depth_len, width, stride, i8_val, plus128);
                         check_case::<i8, 2>(n_lead, depth_len, width, stride, i8_val, ident);
                     }
@@ -539,14 +529,14 @@ mod tests {
     #[test]
     fn kgroup_bit_identical_bf16() {
         use half::bf16;
-        // Arbitrary bit patterns (including NaN payloads) - the byte compare is exact
+        // Arbitrary bit patterns, NaN payloads included: the byte compare is exact
         let val = |i: usize| bf16::from_bits((i as u32).wrapping_mul(40_503) as u16);
         let ident = |v: bf16| v;
         for &n_lead in &N_LEADS {
             for &depth_len in &DEPTHS {
                 for &width in &WIDTHS {
                     for &stride in &STRIDES {
-                        // bf16 dot kernel folds Q = 2 depth steps per vdpbf16ps
+                        // The bf16 dot kernel folds Q = 2 depth steps into each vdpbf16ps
                         check_case::<bf16, 2>(n_lead, depth_len, width, stride, val, ident);
                     }
                 }

@@ -1,14 +1,16 @@
-//! Integer (`i8` -> `i32`) and requantizing (`i8` -> `i8`) GEMM entries
+//! `i8 x i8 -> i32` GEMM, plus the fused requantizing entries that collapse an `i32` accumulator
+//! straight to a quantized `i8`/`u8` output
 use super::*;
 use crate::common::{dims_strides, filled_dmatrix};
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 use crate::common::{requant_bias, requant_scale};
 
-/// Integer `C(i32) <- alpha*A(i8)*B(i8) + beta*C`, the nalgebra adapter over gemmkit's
-/// [`gemmkit::gemm_i8`]. `i8` inputs accumulate into an `i32` output (`alpha`/`beta`/`C` are `i32`);
-/// arithmetic wraps on overflow, the conventional integer-GEMM semantics. A separate entry from
-/// [`gemm`] because input (`i8`) and output (`i32`) types differ. Reads pointers/strides directly,
-/// so transposed / general-stride views work without copying
+/// Integer `C(i32) <- alpha*A(i8)*B(i8) + beta*C`: the nalgebra adapter over gemmkit's
+/// [`gemmkit::gemm_i8`]. `i8` inputs accumulate into an `i32` output, so `alpha`/`beta`/`C` are
+/// `i32`; arithmetic wraps on overflow, the conventional integer-GEMM semantics. A separate entry
+/// from [`gemm`] because the input (`i8`) and output (`i32`) types differ, which `gemm`'s single
+/// `T` can't express. Reads pointers/strides directly off `a`/`b`/`c`, so transposed and
+/// general-stride views work without copying
 ///
 /// # Panics
 /// If the inner dimensions disagree
@@ -34,8 +36,8 @@ pub fn gemm_i8<R1, C1, S1, R2, C2, S2, RC, CC, SC>(
     gemm_i8_common(None, alpha, a, b, beta, c, par);
 }
 
-/// Like [`gemm_i8`] but reuses a caller-owned [`Workspace`]: the fixed-cost quantized-inference
-/// loop
+/// As [`gemm_i8`], but reuses a caller-owned [`Workspace`] instead of the thread-local pool: useful
+/// for a quantized-inference loop that calls this repeatedly
 ///
 /// # Panics
 /// Same conditions as [`gemm_i8`]
@@ -93,8 +95,8 @@ fn gemm_i8_common<R1, C1, S1, R2, C2, S2, RC, CC, SC>(
     let cs = c.strides();
     let (rsc, csc) = (cs.0 as isize, cs.1 as isize);
     let cp = c.as_mut_ptr();
-    // SAFETY: dims validated; nalgebra guarantees valid in-bounds layouts; `c` (a `&mut i32` borrow)
-    // can't alias `a`/`b` (`&i8`): different element types over distinct storage
+    // SAFETY: dims checked above; nalgebra guarantees valid in-bounds layouts; `c` (`&mut i32`)
+    // can't alias `a`/`b` (`&i8`): distinct element types can't share the same storage
     unsafe {
         match ws {
             Some(ws) => gemm_i8_unchecked_with(
@@ -136,7 +138,7 @@ fn gemm_i8_common<R1, C1, S1, R2, C2, S2, RC, CC, SC>(
     }
 }
 
-/// `A(i8)*B(i8)` into a fresh column-major `DMatrix<i32>`: the i8 analogue of [`dot`]
+/// `A(i8)*B(i8)` into a fresh column-major `DMatrix<i32>`: the `i8` analogue of [`dot`]
 #[cfg(feature = "int8")]
 pub fn dot_i8<R1, C1, S1, R2, C2, S2>(
     a: &Matrix<i8, R1, C1, S1>,
@@ -152,17 +154,19 @@ where
 {
     let (m, _) = a.shape();
     let (_, n) = b.shape();
-    // beta == 0, so the initial fill is never read
+    // beta = 0, so gemm_i8 overwrites every cell; the fill value is never read
     let mut c = filled_dmatrix(m, n, 0i32);
     gemm_i8(1, a, b, 0, &mut c, Parallelism::default());
     c
 }
 
-/// Requantizing integer GEMM: `i8` inputs multiplied into an `i32` accumulator, then requantized to
-/// an `i8` output in 1 pass: the nalgebra adapter over gemmkit's [`gemmkit::gemm_i8_requant`]. The
-/// [`Requantize`] carries the per-tensor or per-row `scale`, `zero_point`, and an optional per-row `i32` bias;
-/// there is no `alpha` (folds into `scale`) or `beta`. Reads the pointers/strides directly and
-/// forwards to gemmkit's raw engine, so transposed and general-stride views all work without copying
+/// Requantizing integer GEMM: `i8` inputs multiply into an `i32` accumulator, which is then
+/// requantized to an `i8` output in the same pass: the nalgebra adapter over gemmkit's
+/// [`gemmkit::gemm_i8_requant`]. [`Requantize`] carries the per-tensor or per-row `scale`, an
+/// integer `zero_point`, and an optional per-row `i32` bias; there is no separate `alpha` (it folds
+/// into `scale`) or `beta` (accumulating into an already-quantized `C` is not meaningful). Reads
+/// the pointers/strides directly and forwards to gemmkit's raw engine, so transposed and
+/// general-stride views all work without copying
 ///
 /// # Panics
 /// If the inner dimensions disagree, or on the requant parameters the adapter rejects (a non-finite
@@ -190,8 +194,8 @@ pub fn gemm_i8_requant<R1, C1, S1, R2, C2, S2, RC, CC, SC>(
     gemm_i8_requant_common(None, a, b, req, c, par);
 }
 
-/// Like [`gemm_i8_requant`] but reuses a caller-owned [`Workspace`]: the fixed-cost quantized
-/// inference loop
+/// As [`gemm_i8_requant`], but reuses a caller-owned [`Workspace`] instead of the thread-local pool:
+/// useful for a quantized-inference loop that calls this repeatedly
 ///
 /// # Panics
 /// Same conditions as [`gemm_i8_requant`]
@@ -245,10 +249,9 @@ fn gemm_i8_requant_common<R1, C1, S1, R2, C2, S2, RC, CC, SC>(
     let cs = c.strides();
     let (rsc, csc) = (cs.0 as isize, cs.1 as isize);
     let cp = c.as_mut_ptr();
-    // Requantize validation, replicating gemmkit's checked entry (byte-identical wording): a
-    // finite, positive per-tensor or per-row scale (per-row length A.rows disjoint from C);
-    // zero_point in the i8 band; a per-row bias of length A.rows disjoint from C (raw pointer math,
-    // C is never referenced)
+    // Checks the scale (finite, positive, and if per-row, length A.rows and disjoint from C), the
+    // zero_point range, and the bias (length A.rows, disjoint from C), matching the core checked
+    // entry's wording
     let (scale, row_scales, has_row_scales) =
         requant_scale(m, cp, &[(cm, rsc), (cn, csc)], req.scale);
     assert!(
@@ -258,8 +261,8 @@ fn gemm_i8_requant_common<R1, C1, S1, R2, C2, S2, RC, CC, SC>(
     );
     let (bias_ptr, has_bias) = requant_bias(m, cp, &[(cm, rsc), (cn, csc)], req.bias);
 
-    // SAFETY: dims validated; nalgebra guarantees valid in-bounds layouts; `c` (a `&mut i8` borrow)
-    // can't alias `a`/`b`, and the bias was validated disjoint from C above
+    // SAFETY: dims checked above; nalgebra guarantees valid in-bounds layouts; `c` (`&mut i8`)
+    // can't alias `a`/`b`, and the bias was checked disjoint from C above
     unsafe {
         match ws {
             Some(ws) => gemm_i8_requant_unchecked_with(
@@ -309,10 +312,10 @@ fn gemm_i8_requant_common<R1, C1, S1, R2, C2, S2, RC, CC, SC>(
     }
 }
 
-/// Requantizing integer GEMM with an **unsigned `u8` output** (ONNX-QLinearMatMul-style
-/// activation): the nalgebra adapter over gemmkit's [`gemmkit::gemm_i8_requant_u8`]. The `u8`-output
-/// twin of [`gemm_i8_requant`], differing only in the output domain `[0, 255]` and the `zero_point`
-/// range
+/// Requantizing integer GEMM with an **unsigned `u8` output** (the ONNX QLinearMatMul-style
+/// activation quantization): the nalgebra adapter over gemmkit's
+/// [`gemmkit::gemm_i8_requant_u8`]. The `u8`-output twin of [`gemm_i8_requant`], differing only in
+/// the output domain (`[0, 255]`) and the matching `zero_point` range
 ///
 /// # Panics
 /// If the inner dimensions disagree, or on the requant parameters the adapter rejects (a non-finite
@@ -340,7 +343,8 @@ pub fn gemm_i8_requant_u8<R1, C1, S1, R2, C2, S2, RC, CC, SC>(
     gemm_i8_requant_u8_common(None, a, b, req, c, par);
 }
 
-/// Like [`gemm_i8_requant_u8`] but reuses a caller-owned [`Workspace`]
+/// As [`gemm_i8_requant_u8`], but reuses a caller-owned [`Workspace`] instead of the thread-local
+/// pool
 ///
 /// # Panics
 /// Same conditions as [`gemm_i8_requant_u8`]
@@ -394,10 +398,9 @@ fn gemm_i8_requant_u8_common<R1, C1, S1, R2, C2, S2, RC, CC, SC>(
     let cs = c.strides();
     let (rsc, csc) = (cs.0 as isize, cs.1 as isize);
     let cp = c.as_mut_ptr();
-    // Requantize validation, replicating gemmkit's checked entry (byte-identical wording): a
-    // finite, positive per-tensor or per-row scale (per-row length A.rows disjoint from C);
-    // zero_point in the u8 band; a per-row bias of length A.rows disjoint from C (raw pointer math,
-    // C is never referenced)
+    // Checks the scale (finite, positive, and if per-row, length A.rows and disjoint from C), the
+    // zero_point range, and the bias (length A.rows, disjoint from C), matching the core checked
+    // entry's wording
     let (scale, row_scales, has_row_scales) =
         requant_scale(m, cp, &[(cm, rsc), (cn, csc)], req.scale);
     assert!(
@@ -407,8 +410,8 @@ fn gemm_i8_requant_u8_common<R1, C1, S1, R2, C2, S2, RC, CC, SC>(
     );
     let (bias_ptr, has_bias) = requant_bias(m, cp, &[(cm, rsc), (cn, csc)], req.bias);
 
-    // SAFETY: dims validated; nalgebra guarantees valid in-bounds layouts; `c` (a `&mut u8` borrow)
-    // can't alias `a`/`b`, and the bias was validated disjoint from C above
+    // SAFETY: dims checked above; nalgebra guarantees valid in-bounds layouts; `c` (`&mut u8`)
+    // can't alias `a`/`b`, and the bias was checked disjoint from C above
     unsafe {
         match ws {
             Some(ws) => gemm_i8_requant_u8_unchecked_with(

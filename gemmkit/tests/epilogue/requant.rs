@@ -1,6 +1,10 @@
-//! Requantize (i8 -> i8) fused-epilogue tests: bitwise vs `gemm_i8`-then-map, round-half-to-even
-//! ties, saturation, bias, and checked/unchecked twin equivalence. The `i32` accumulation is exact
-//! and ISA-independent, so the oracle holds bitwise under every `GEMMKIT_REQUIRE_ISA` pin
+//! Fused `i8` requantize epilogue tests, covering both output bytes (`gemm_i8_requant` -> `i8`,
+//! `gemm_i8_requant_u8` -> `u8`) and both `RequantScale` variants (per-tensor, per-row). Each
+//! fused result is checked bit-for-bit against an independent scalar model (`ref_requant` /
+//! `ref_requant_u8`) applied to a `gemm_i8`-computed exact `i32` accumulator, and the
+//! checked/unchecked and thread-local/caller-`Workspace` entry-point twins are cross-checked the
+//! same way. The `i32` accumulator is exact and ISA-independent, so every oracle here holds
+//! bitwise under any `GEMMKIT_REQUIRE_ISA` pin
 
 use crate::common::Rng;
 use gemmkit::{
@@ -8,24 +12,27 @@ use gemmkit::{
     gemm_i8_requant_u8,
 };
 
-/// The reference requantize map. The rounding uses the std `round_ties_even` (an
-/// *independent* implementation of the contract, NOT a copy of the kernel's `2^52`
-/// `round_ne_f64`), so a regression in the kernel's rounding is caught here rather than
-/// mirrored. Applied to the exact `i32` accumulator from `gemm_i8`
+/// Independent scalar model for the `i8` requantize map: `clamp(zp + round_ne(scale*(acc +
+/// bias)), -128, 127)`. Mirrors `KRequantize::apply`'s operation order (wrapping bias add, then
+/// scale, then round, then zero-point, then clamp) but rounds with the std `round_ties_even`
+/// rather than the kernel's `2^52` `round_ne_f64` trick, so a rounding regression in the kernel
+/// is caught here instead of silently mirrored
 fn ref_requant(acc: i32, bias: i32, scale: f32, zp: i32) -> i8 {
     let scaled = (f64::from(acc.wrapping_add(bias)) * f64::from(scale)).round_ties_even();
     let q = (scaled as i64).saturating_add(i64::from(zp));
     q.clamp(-128, 127) as i8
 }
 
+/// `n` pseudo-random `i8` values in `[-127, 127]`
 fn make_i8(rng: &mut Rng, n: usize) -> Vec<i8> {
     (0..n)
         .map(|_| ((rng.next_u64() % 255) as i64 - 127) as i8)
         .collect()
 }
 
-/// Bitwise: `gemm_i8_requant` == `gemm_i8` (into i32) then the scalar requant map. Since
-/// the `i32` accumulation is exact and ISA-independent, this holds under any ISA pin
+/// Run `gemm_i8` for the exact `i32` accumulator, then `gemm_i8_requant` for the fused output,
+/// and assert every element equals `ref_requant` applied to that accumulator: the `i32`
+/// accumulation is exact and ISA-independent, so this holds bitwise under any ISA pin
 fn check_requant(
     rng: &mut Rng,
     m: usize,
@@ -38,8 +45,8 @@ fn check_requant(
     par: Parallelism,
     tag: &str,
 ) {
-    let a = make_i8(rng, m * k); // col-major mxk
-    let b = make_i8(rng, k * n); // col-major kxn
+    let a = make_i8(rng, m * k); // col-major m x k
+    let b = make_i8(rng, k * n); // col-major k x n
     let bias: Vec<i32> = if has_bias {
         (0..m)
             .map(|_| (rng.next_u64() % 2001) as i64 as i32 - 1000)
@@ -110,9 +117,9 @@ fn requant_bitwise_matrix() {
     }
 }
 
-/// `gemm_i8_requant` and `gemm_i8_requant_unchecked` are **parallel** entry points (the
-/// checked twin does not delegate to the unchecked one), so exercise the unchecked fn
-/// against the checked twin bit-for-bit on a driver-shaped case (m,n,k > 16, with bias)
+/// `gemm_i8_requant` and `gemm_i8_requant_unchecked` both call into `execute_int_requant`
+/// independently (neither delegates to the other), so compare them directly, bit-for-bit, on a
+/// driver-shaped case (m, n, k > 16, with bias)
 #[test]
 fn requant_unchecked_matches_checked() {
     use gemmkit::gemm_i8_requant_unchecked;
@@ -240,9 +247,9 @@ fn requant_unchecked_with_matches_checked() {
     );
 }
 
-/// Hardcoded round-half-to-even ties, independent of any reference function: each row is a
-/// `1x1` product giving an exact `acc`, and `scale = 0.5` lands `scale*acc` on a half-integer.
-/// A round-half-up/away regression would flip 0.5->1, 2.5->3, etc.
+/// Hardcoded round-half-to-even ties, independent of `ref_requant`: each row is a `1x1` product
+/// giving an exact `acc`, and `scale = 0.5` lands `scale*acc` on a half-integer. A
+/// round-half-up/away regression would flip a result such as 0.5->1 or 2.5->3
 #[test]
 fn requant_ties_even_exact() {
     let a: [i8; 6] = [1, 3, 5, 7, -1, -3];
@@ -310,8 +317,9 @@ fn requant_ties_and_saturation() {
     }
 }
 
-/// Small mnk under Rayon(8): exercises the auto-VNNI small-parallel fallback to the widen
-/// `IntGemmQ` (bit-exact-equal), so the fused output still matches the oracle
+/// `m*n*k = 24^3`, well under `i8_vnni_min_par_mnk`'s default gate, driven under `Rayon(8)`: on
+/// a build that auto-selects VNNI, this hands the problem to the widen `IntGemmQ` fallback
+/// instead. The 2 kernels are bit-identical, so `check_requant`'s oracle still holds either way
 #[test]
 fn requant_small_parallel_fallback() {
     let mut rng = Rng::new(0xFA11);
@@ -329,8 +337,8 @@ fn requant_small_parallel_fallback() {
     );
 }
 
-/// Run `gemm_i8_requant` (col-major `mxk` A, `kxn` B) into a C with the given strides and
-/// return the (possibly padded) `i8` buffer of length `buflen`
+/// Run `gemm_i8_requant` (col-major `m x k` A, `k x n` B, per-tensor scale) into a C with the
+/// given strides and return the (possibly padded) `i8` buffer of length `buflen`
 fn run_requant(
     a: &[i8],
     b: &[i8],
@@ -358,18 +366,18 @@ fn run_requant(
     c
 }
 
-/// Phase 4: the vectorized requant map (unit-stride C, full lane-runs) must agree **bit-for-bit**
-/// with the scalar map (a strided C forces the scalar path for every element). `m = 64` spans
-/// several full lane-runs on every vector ISA; a `PerRow` bias including `i32::MAX`/`i32::MIN`
-/// exercises the wrapping integer bias-add on both paths. Independent of any platform constant:
-/// the 2 layouts are each other's oracle
+/// The vectorized requant store (unit-stride C, taken for a full lane-run) must agree
+/// **bit-for-bit** with the scalar `apply` map (a strided C forces the scalar path for every
+/// element, per `apply_store`'s `rsc == 1` gate). `m = 64` spans several full lane-runs on every
+/// vector ISA; a `PerRow` bias including `i32::MAX`/`i32::MIN` exercises the wrapping integer
+/// bias-add on both paths. No independent oracle needed: the 2 layouts are each other's reference
 #[test]
 fn requant_vector_scalar_bitwise() {
     let mut rng = Rng::new(0xB17E_5CA1);
     let (m, k, n) = (64usize, 37usize, 9usize);
     let a = make_i8(&mut rng, m * k);
     let b = make_i8(&mut rng, k * n);
-    // Per-row bias including the wrapping-add extremes
+    // Per-row bias including the wrapping bias-add extremes
     let bias: Vec<i32> = (0..m)
         .map(|i| match i % 5 {
             0 => i32::MAX,
@@ -432,16 +440,17 @@ fn requant_vector_scalar_bitwise() {
     }
 }
 
-/// Phase 4: round-half-to-even ties through the **vector** path. `m = 37 (>= 32)` with unit-stride
-/// C means full lane-runs hit the vector store on every vector ISA (plus a sub-lane tail); `1x1`
-/// products with `scale = 0.5` land `scale*acc` on exact half-integers for odd `acc`. Asserted
-/// against `ref_requant` (std `round_ties_even`, independent of the kernel), so a round-half-up/
-/// away regression in the vector path flips the tie
+/// Round-half-to-even ties through the vector store path. `m = 37` exceeds every ISA's `i32`
+/// lane width (16 lanes, the AVX-512 max), so a unit-stride C hits at least 1 full lane-run
+/// under the vector store, plus a sub-lane tail; `1x1` products with `scale = 0.5` land
+/// `scale*acc` on exact half-integers for odd `acc`. Checked against `ref_requant` (std
+/// `round_ties_even`, independent of the kernel), so a round-half-up/away regression in the
+/// vector path flips the tie
 #[test]
 fn requant_vector_ties() {
     let m = 37usize;
     let (k, n) = (1usize, 1usize);
-    // `acc[i] = a[i]*1`; spread across both parities so odd `acc` gives x.5 ties
+    // acc[i] = a[i]*1, spread across both parities so odd acc gives x.5 ties
     let a: Vec<i8> = (0..m).map(|i| (i as i32 - 18) as i8).collect();
     let b: [i8; 1] = [1];
     let scale = 0.5f32;
@@ -469,10 +478,11 @@ fn requant_vector_ties() {
     }
 }
 
-/// Phase 4: accumulator + bias driven into the `i32` wrapping / f64-saturation corners of the
-/// map (`a`/`b` in `{-128, 127}`, a per-row bias at the `i32` extremes) must requantize
-/// identically through the vector (unit-stride) and scalar (strided) paths. Covers the
-/// `t >= 2^52 -> hi` / `t <= -2^52 -> lo` clamp branches (via `scale = 1e30`)
+/// Accumulator and bias driven into the `i32` wrapping / f64-magnitude corners of the map
+/// (`a`/`b` in `{-128, 127}`, a per-row bias at the `i32` extremes): the vector (unit-stride) and
+/// scalar (strided) paths must requantize identically. `scale = 1e30` pushes the scaled value
+/// past `round_ne_f64`'s `2^52` pass-through threshold and on into the post-round saturating
+/// clamp at the output band's `LO`/`HI`
 #[test]
 fn requant_vector_extreme_acc() {
     let (m, k, n) = (37usize, 1usize, 7usize);
@@ -533,8 +543,8 @@ fn requant_vector_extreme_acc() {
     }
 }
 
-/// Degenerate `k == 0`: C fills with `clamp(zp + round_ne(scale*bias))` (= `zp` without
-/// bias)
+/// Degenerate `k == 0`: C fills with `clamp(zp + round_ne(scale*bias), -128, 127)`, which is
+/// `zp` alone wherever bias is absent or 0
 #[test]
 fn requant_degenerate_k0() {
     let m = 12usize;
@@ -625,22 +635,23 @@ fn requant_bad_bias_len() {
     );
 }
 
-// u8-output requantize (ONNX-QLinearMatMul activation, clamp band [0, 255])
-// Same bit-exactness bar as the i8 path: the `i32` accumulation is exact and ISA-independent,
-// so every oracle below holds bitwise under every `GEMMKIT_REQUIRE_ISA` pin. All expectations
-// are computed by an independent model (or hardcoded), never a machine number
+// u8-output requantize (the ONNX QLinearMatMul activation convention, clamp band [0, 255])
+// Same bit-exactness bar as the i8 path: the i32 accumulation is exact and ISA-independent, so
+// every oracle below holds bitwise under any GEMMKIT_REQUIRE_ISA pin. Every expected value below
+// comes from an independent model or a hardcoded constant, never a machine-computed number
 
-/// Independent reference for the `u8` requantize map: exact `i64` accumulate is done by the
-/// caller (or hardcoded), then f64 round-half-to-even (std `round_ties_even`, NOT the kernel's
-/// `2^52` trick) and clamp to the unsigned band `[0, 255]`
+/// Independent scalar model for the `u8` requantize map: `clamp(zp + round_ne(scale*(acc +
+/// bias)), 0, 255)`. `acc` is an exact `i64` sum supplied by the caller (computed directly or
+/// hardcoded), and rounding uses the std `round_ties_even`, not the kernel's `2^52`
+/// `round_ne_f64` trick
 fn ref_requant_u8(acc: i64, bias: i32, scale: f32, zp: i32) -> u8 {
     let scaled = ((acc + i64::from(bias)) as f64 * f64::from(scale)).round_ties_even();
     let q = (scaled as i64).saturating_add(i64::from(zp));
     q.clamp(0, 255) as u8
 }
 
-/// Run `gemm_i8_requant_u8` (col-major `mxk` A, `kxn` B) into a `u8` C with the given strides,
-/// returning the (possibly padded) buffer of length `buflen`
+/// Run `gemm_i8_requant_u8` (col-major `m x k` A, `k x n` B, per-tensor scale) into a `u8` C
+/// with the given strides, returning the (possibly padded) buffer of length `buflen`
 fn run_requant_u8(
     a: &[i8],
     b: &[i8],
@@ -668,18 +679,19 @@ fn run_requant_u8(
     c
 }
 
-/// General shape (mixed signs), bias Some/None, scale + zero-point sweep including `zp = 0` and
-/// `zp = 255`, compared against the independent `i64`-accumulate / round-ties-even / clamp-[0,255]
-/// model. The accumulator (`|acc| <= k*127^2 ~= 661k`) and bias stay far inside `i32`, so the
-/// kernel's `i32` accumulation is exactly the model's `i64` sum
+/// General shape (mixed signs), bias `Some`/`None`, scale + zero-point sweep including `zp = 0`
+/// and `zp = 255`, compared against `ref_requant_u8` fed the independently computed `i64`
+/// accumulator. `|acc| <= k*127^2 ~= 661k` here, far inside `i32`, so the kernel's `i32`
+/// accumulation carries exactly the same value as the model's `i64` sum
 #[test]
 fn requant_u8_matches_reference() {
     let mut rng = Rng::new(0x0075_8000);
     let (m, k, n) = (37usize, 41usize, 19usize);
-    let a = make_i8(&mut rng, m * k); // col-major mxk
-    let b = make_i8(&mut rng, k * n); // col-major kxn
+    let a = make_i8(&mut rng, m * k); // col-major m x k
+    let b = make_i8(&mut rng, k * n); // col-major k x n
 
-    // Exact i64 accumulator C = A^T-free plain matmul over the col-major layouts
+    // Exact i64 accumulator: the plain C[i,j] = sum_p A[i,p]*B[p,j] matmul over the col-major
+    // layouts, computed directly rather than through any gemmkit entry point
     let mut acc = vec![0i64; m * n];
     for j in 0..n {
         for i in 0..m {
@@ -734,9 +746,9 @@ fn requant_u8_matches_reference() {
     }
 }
 
-/// `gemm_i8_requant_u8` and `gemm_i8_requant_u8_unchecked` are **parallel** entry points (the
-/// checked twin does not delegate to the unchecked one), so exercise the unchecked fn against
-/// the checked twin bit-for-bit on a driver-shaped case (m,n,k > 16, with bias)
+/// `gemm_i8_requant_u8` and `gemm_i8_requant_u8_unchecked` both call into `execute_int_requant`
+/// independently (neither delegates to the other), so compare them directly, bit-for-bit, on a
+/// driver-shaped case (m, n, k > 16, with bias)
 #[test]
 fn requant_u8_unchecked_matches_checked() {
     use gemmkit::gemm_i8_requant_u8_unchecked;
@@ -864,8 +876,9 @@ fn requant_u8_unchecked_with_matches_checked() {
     );
 }
 
-/// Crafted `1x1` accumulators + a large scale drive both clamp rails: every positive product
-/// saturates to `255`, every negative to `0`. Hardcoded expected bytes (both rails present)
+/// Crafted `1x1` accumulators with `scale = 1000.0` drive both clamp rails: every positive
+/// product saturates to `255`, every negative product to `0`. Hardcoded expected bytes, with
+/// both rails asserted present so a regression collapsing one rail into the other is caught
 #[test]
 fn requant_u8_saturates() {
     let a: [i8; 8] = [127, -128, 100, -100, 1, -1, 64, -64];
@@ -890,11 +903,10 @@ fn requant_u8_saturates() {
     );
 }
 
-/// Hardcoded round-half-to-even ties in the `u8` domain (independent of any reference fn): each
+/// Hardcoded round-half-to-even ties in the `u8` domain, independent of `ref_requant_u8`: each
 /// row is a `1x1` product with `scale = 0.5`, landing `scale*acc` on a half-integer, then a
-/// nonzero `zp = 10` joins in integer. Ties land both **above** the zero-point (12, 14) and
-/// **below** it (8, 6). A round-half-up/away regression would flip 2.5->3 (->13), 4.5->5 (->15),
-/// -2.5->-3 (->7), -4.5->-5 (->5)
+/// nonzero `zp = 10` joins in integer after the round. Ties land both above the zero-point
+/// (12, 14) and below it (8, 6); a round-half-up/away regression would instead give 13, 15, 7, 5
 #[test]
 fn requant_u8_ties_even_exact() {
     let a: [i8; 6] = [1, 5, 9, -1, -5, -9];
@@ -916,19 +928,19 @@ fn requant_u8_ties_even_exact() {
     assert_eq!(c, expect, "u8 round-half-to-even ties");
 }
 
-/// The vectorized `u8` requant map (unit-stride C, full lane-runs) must agree **bit-for-bit**
-/// with the scalar map (a strided C forces the scalar path for every element). `m = 64` spans
-/// several full lane-runs on every vector ISA; a `PerRow` bias including `i32::MAX`/`i32::MIN`
-/// exercises the wrapping integer bias-add on both paths. This is the end-to-end proof of the
-/// vector low-byte store in the `(0, 255)` band. Independent of any platform constant: the 2
-/// layouts are each other's oracle
+/// The `u8` twin of `requant_vector_scalar_bitwise`: the vectorized requant store (unit-stride
+/// C) must agree **bit-for-bit** with the scalar `apply` map (a strided C forces the scalar
+/// path). `m = 64` spans several full lane-runs on every vector ISA; a `PerRow` bias including
+/// `i32::MAX`/`i32::MIN` exercises the wrapping integer bias-add on both paths. `requant_store`
+/// writes only the low byte of each clamped lane, so this is the end-to-end check that the byte
+/// it writes for a `[0, 255]`-clamped value matches the scalar `u8` cast, not just the `i8` one
 #[test]
 fn requant_u8_vector_scalar_bitwise() {
     let mut rng = Rng::new(0x0075_B17E);
     let (m, k, n) = (64usize, 37usize, 9usize);
     let a = make_i8(&mut rng, m * k);
     let b = make_i8(&mut rng, k * n);
-    // Per-row bias including the wrapping-add extremes
+    // Per-row bias including the wrapping bias-add extremes
     let bias: Vec<i32> = (0..m)
         .map(|i| match i % 5 {
             0 => i32::MAX,
@@ -991,8 +1003,8 @@ fn requant_u8_vector_scalar_bitwise() {
     }
 }
 
-/// Degenerate `k == 0` (u8 output): C fills with `clamp(zp + round_ne(scale*bias), 0, 255)`
-/// (= `zp` without bias), with and without a per-row bias. Compared to the model
+/// Degenerate `k == 0` (`u8` output): C fills with `clamp(zp + round_ne(scale*bias), 0, 255)`,
+/// checked with and without a per-row bias against `ref_requant_u8`
 #[test]
 fn requant_u8_zero_k_degenerate() {
     let m = 12usize;
@@ -1095,14 +1107,15 @@ fn requant_u8_bad_bias_len() {
     );
 }
 
-// Per-channel (per-row) requantize scales: `RequantScale::PerRow`. Same bit-exactness bar as the
-// per-tensor path (the `i32` accumulation is exact and ISA-independent), so every oracle below
-// holds bitwise under every `GEMMKIT_REQUIRE_ISA` pin, on both output types and both C
-// orientations. The scale resolves per row exactly as the bias does; a `PerTensor(s)` and a
-// `PerRow([s; m])` feed identical f64 arithmetic (only the lookup differs), hence are bitwise-equal
+// Per-channel requantize scales (RequantScale::PerRow). Same bit-exactness bar as the
+// per-tensor path above (the i32 accumulation is exact and ISA-independent), so every oracle
+// below holds bitwise under any GEMMKIT_REQUIRE_ISA pin, on both output types and both C
+// orientations. The scale is resolved at (r, c) by the same match arm that resolves the bias
+// (KRequantize::apply), so a PerTensor(s) and a PerRow(&[s; m]) feed identical f64 arithmetic at
+// a shared scale value and are bitwise-equal
 
-/// Run `gemm_i8_requant` (col-major `mxk` A, `kxn` B) with an explicit [`RequantScale`] into a C
-/// with the given strides, returning the (possibly padded) `i8` buffer of length `buflen`
+/// Run `gemm_i8_requant` (col-major `m x k` A, `k x n` B) with an explicit [`RequantScale`] into
+/// a C with the given strides, returning the (possibly padded) `i8` buffer of length `buflen`
 fn run_requant_scale(
     a: &[i8],
     b: &[i8],
@@ -1158,15 +1171,16 @@ fn run_requant_u8_scale(
     c
 }
 
-/// Per-row scales vs the independent scalar model (`ref_requant` / `ref_requant_u8`, std
-/// `round_ties_even`) applied with the per-row `scales[i]`, bit-exact for `i8` and `u8`, with and
-/// without bias. `m >= LANES` guarantees full lane-runs. The 2 orientations hit different store
-/// paths (the orientation swap fires on `|csc| < |rsc|`):
-/// * column-major C (`rsc == 1`, `csc == m`): NO swap, so the user `PerRow` stays a driver-frame
-///   `Row` scale -> the per-lane scalar branch of `apply_store` (varies per lane);
-/// * row-major C (`rsc == n`, `csc == 1`, `n > 1`): swap, so the user `PerRow` becomes a
-///   driver-frame `Col` scale (constant across the lane-run) -> the single-scale vector store on
-///   requant-vector ISAs
+/// Per-row scales against `ref_requant` / `ref_requant_u8` fed the per-row `scales[i]`, bit-exact
+/// for both `i8` and `u8`, with and without bias. `m` is large enough for a full lane-run on
+/// every ISA. The 2 C orientations exercise different `apply_store` branches (the orientation
+/// swap fires whenever `|csc| < |rsc|`):
+/// * column-major C (`rsc == 1`, `csc == m`): no swap, so the `PerRow` scale stays a driver-frame
+///   `Row` scale, which `apply_store` cannot serve from a single vector register and instead
+///   resolves through its per-lane scalar branch;
+/// * row-major C (`rsc == n`, `csc == 1`, `n > 1`): the swap fires, turning the `PerRow` scale
+///   into a driver-frame `Col` scale, constant across the lane-run, so it takes the single-scale
+///   vector store instead
 fn check_per_row(
     rng: &mut Rng,
     m: usize,
@@ -1268,8 +1282,9 @@ fn check_per_row(
     }
 }
 
-/// Per-row scales, both output types, both orientations, with / without bias, serial and parallel.
-/// `m = 48 (>= LANES on every ISA)` so full lane-runs occur on both store paths
+/// Per-row scales, both output types, both C orientations, with and without bias, serial and
+/// parallel. Every `m` here exceeds the widest `i32` lane width, so full lane-runs occur on both
+/// store paths
 #[test]
 fn requant_per_row_matrix() {
     let mut rng = Rng::new(0x00C0_FFEE);
@@ -1286,10 +1301,11 @@ fn requant_per_row_matrix() {
     }
 }
 
-/// `PerTensor(s)` must be **bitwise** identical to `PerRow(&[s; m])` for any `s` (same f64
-/// arithmetic, only the lookup differs). Swept for `i8` and `u8`, both orientations, both bias
-/// states, over a wide `s` range including the f64 saturation corners `1e30` / `1e-30`. `m = 48
-/// (>= LANES)` so full lane-runs occur on both store paths
+/// `PerTensor(s)` must be **bitwise** identical to `PerRow(&[s; m])` for any `s`: both feed the
+/// same `f64` arithmetic in `KRequantize::apply`/`apply_store`, only the lookup differs. Swept
+/// for `i8` and `u8`, both C orientations, both bias states, over a wide `s` range including the
+/// `round_ne_f64` magnitude extremes `1e30`/`1e-30`. `m = 48` exceeds the widest `i32` lane
+/// width, so full lane-runs occur on both store paths
 #[test]
 fn requant_per_tensor_eq_per_row_uniform() {
     let mut rng = Rng::new(0x5CA1_AB1E);
@@ -1380,9 +1396,9 @@ fn requant_per_tensor_eq_per_row_uniform() {
     }
 }
 
-/// Degenerate `k == 0` with per-row scales: C fills with `clamp(zp + round_ne(scale_i * bias_i))`
-/// (the scalar `apply` on a zero accumulator; the degenerate path is in the user frame, so per-row
-/// scales index by row `i`). Checked for `i8` and `u8`, with a per-row bias
+/// Degenerate `k == 0` with per-row scales: `execute_int_requant` handles `k == 0` before the
+/// orientation swap, so the fill runs in the user frame and `scales[i]`/`bias[i]` index by the
+/// user's row `i` directly. Checked for both `i8` and `u8` against `ref_requant`/`ref_requant_u8`
 #[test]
 fn requant_per_row_degenerate_k0() {
     let (m, n) = (48usize, 10usize);
@@ -1462,7 +1478,7 @@ fn requant_per_row_non_finite() {
     let a = vec![0i8; 16];
     let b = vec![0i8; 16];
     let mut c = vec![0i8; 16];
-    let scales = vec![1.0f32, f32::NAN, 0.5, 2.0]; // one non-finite element
+    let scales = vec![1.0f32, f32::NAN, 0.5, 2.0]; // 1 non-finite element
     let req = Requantize {
         scale: RequantScale::PerRow(&scales),
         zero_point: 0,
@@ -1483,7 +1499,7 @@ fn requant_per_row_non_positive() {
     let a = vec![0i8; 16];
     let b = vec![0i8; 16];
     let mut c = vec![0i8; 16];
-    let scales = vec![1.0f32, 0.5, -0.5, 2.0]; // one non-positive element
+    let scales = vec![1.0f32, 0.5, -0.5, 2.0]; // 1 non-positive element
     let req = Requantize {
         scale: RequantScale::PerRow(&scales),
         zero_point: 0,
@@ -1504,9 +1520,10 @@ fn requant_per_row_overlaps_c() {
     let a = vec![0i8; 16];
     let b = vec![0i8; 16];
     let mut buf = vec![0i8; 16]; // C (4x4, 16 bytes)
-    // A scales slice aliasing C's storage. It is raw-derived (its lifetime is not tied to `buf`),
-    // so `&mut buf` still type-checks; the overlap check panics before any element is read, so no
-    // aliased access occurs (4 f32 = 16 bytes, exactly C's footprint)
+    // A scales slice built from a raw pointer into buf's storage: the borrow checker does not
+    // tie its lifetime back to buf, so the later `&mut buf` still type-checks even though the 2
+    // regions alias. 4 f32 = 16 bytes, exactly C's footprint. The overlap check panics before any
+    // element is read, so the aliasing itself is never actually exercised
     let scales: &[f32] = unsafe { core::slice::from_raw_parts(buf.as_ptr() as *const f32, 4) };
     let req = Requantize {
         scale: RequantScale::PerRow(scales),

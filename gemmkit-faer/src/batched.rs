@@ -1,21 +1,21 @@
-//! Pointer-array-batched GEMM over a slice of per-element view triples
+//! Pointer-array batched GEMM over a slice of per-element (A, B) / C view triples
 use super::*;
 use crate::common::ref_parts;
 
-/// Batched `C_e <- alpha*A_e*B_e + beta*C_e` for each element `e`, 1 call, parallelized **across
-/// the batch** (whole GEMMs assigned to workers, each run serially and cache-hot). faer has no
-/// rank-3 type, so the batch is a slice of per-element `(A, B)` [`MatRef`] inputs paired
-/// positionally with a slice of `&mut C` [`MatMut`] outputs; `alpha`/`beta`/`par` are shared by
-/// every element. Element shapes may differ (heterogeneous batch), as long as
-/// `A_e.ncols == B_e.nrows`, `A_e.nrows == C_e.nrows`, and `B_e.ncols == C_e.ncols`. Each `A`/`B`/`C`
-/// is read straight through its pointer/strides, so faer's natural column-major layout, transposed
-/// views, sub-matrices, and reversed (negative-stride) views all work without copying, exactly like
-/// [`gemm`]
+/// Batched `C_e <- alpha*A_e*B_e + beta*C_e` for each element `e` of the batch, parallelized
+/// **across the batch**: whole GEMMs are handed to workers, each one run serially and staying
+/// cache-hot for its own inputs. faer has no rank-3 array type, so the batch is a slice of
+/// per-element `(A, B)` [`MatRef`] pairs matched positionally with a slice of `&mut C` [`MatMut`]
+/// outputs; `alpha`/`beta`/`par` are shared by every element. Element shapes may differ (a
+/// heterogeneous batch), as long as each element's own `A.cols == B.rows`, `A.rows == C.rows`, and
+/// `B.cols == C.cols`. Every `A`/`B`/`C` is read straight through its pointer and strides, so
+/// faer's column-major layout, transposed views, sub-matrices, and reversed (negative-stride)
+/// views all work without copying, exactly like [`gemm`]
 ///
-/// The `ab.len()` inputs and `c.len()` outputs must agree (the batch size). Each element
-/// re-dispatches through the full engine, so the result **reproduces** a loop of [`gemm`] calls and
-/// is **deterministic** across thread counts; each element runs wholly on one worker, so serial and
-/// parallel are additionally bit-identical
+/// `ab.len()` and `c.len()` must agree (the batch size). Each element re-dispatches through the
+/// full engine, so the result reproduces a loop of [`gemm`] calls and is deterministic across
+/// thread counts; since each element runs wholly on 1 worker, serial and parallel output are
+/// additionally bit-identical
 ///
 /// ```
 /// use faer::Mat;
@@ -40,7 +40,7 @@ use crate::common::ref_parts;
 ///
 /// # Panics
 /// If the input and output counts disagree (`ab.len() != c.len()`), or if any element's dimensions
-/// disagree (`A.ncols != B.nrows`, `A.nrows != C.nrows`, `B.ncols != C.ncols`)
+/// disagree (`A.cols != B.rows`, `A.rows != C.rows`, `B.cols != C.cols`)
 pub fn gemm_batched<T: GemmScalar>(
     alpha: T,
     ab: &[(MatRef<'_, T>, MatRef<'_, T>)],
@@ -94,13 +94,12 @@ pub fn gemm_batched<T: GemmScalar>(
         })
         .collect();
 
-    // SAFETY: each element's dims are validated above and faer's `MatRef`/`MatMut` guarantee the
-    // pointer + element-unit `isize` strides describe a valid in-bounds layout (possibly negative
-    // for a reversed view, which gemmkit's unchecked path handles) that addresses each (i,j)
-    // uniquely. The outputs are a `&mut [MatMut]` of distinct exclusive borrows, so the batch's `C`
-    // regions are pairwise disjoint and none aliases any `A`/`B` input (a `MatMut` and a `MatRef`
-    // over the same storage cannot coexist) - the disjointness `gemm_batched_ptr_unchecked` requires
-    // holds by construction
+    // SAFETY: each element's dims are validated above, and faer's `MatRef`/`MatMut` guarantee the
+    // pointer + element-unit `isize` strides describe a valid in-bounds layout (possibly negative for
+    // a reversed view, which gemmkit's unchecked path handles) addressing each (i,j) uniquely. `c` is
+    // a `&mut [MatMut]` of distinct exclusive borrows, so the batch's C regions are pairwise disjoint
+    // and none aliases any A/B input (a `MatMut` and a `MatRef` over the same storage can't coexist),
+    // which is exactly the disjointness `gemm_batched_ptr_unchecked` requires
     unsafe {
         gemm_batched_ptr_unchecked(&problems, par);
     }

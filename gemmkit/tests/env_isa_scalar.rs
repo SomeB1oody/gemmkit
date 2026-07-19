@@ -1,14 +1,15 @@
-//! `GEMMKIT_REQUIRE_ISA=scalar` prepacked-i8 bit-parity pin. Scalar is valid on every architecture,
-//! so no host feature gate is needed: it forces the widen scalar kernel's plain-panel prepack
-//! layout deterministically, regardless of what the auto path would pick. The single test pins
-//! through [`env_isa_common::pin`] (single `set_var` under a `Once` before any dispatch; the shared
-//! write overrides an inherited pin). Only meaningful with `std` (no-`std` never reads the
-//! environment)
+//! `GEMMKIT_REQUIRE_ISA=scalar` prepacked-i8 bit-parity pin
+//!
+//! `scalar` is valid on every architecture, so unlike the other `env_isa_*` binaries this needs
+//! no host feature gate: it deterministically forces the plain-panel widen kernel's prepack
+//! layout regardless of what auto-selection would otherwise pick on this host. Pins through
+//! [`env_isa_common::pin`] (a single `set_var` under a `Once`, before any dispatch). Only
+//! meaningful with `std`: a no-`std` build never reads the environment
 #![cfg(all(feature = "std", feature = "int8", not(miri)))]
 
-// Shared single-set_var pin helper (Once before any dispatch; this test pins `scalar`)
+// Shared GEMMKIT_REQUIRE_ISA pin helper; this binary's only test pins `scalar` with it
 mod env_isa_common;
-// Shared prepacked-i8 bit-parity check driven by the ISA pin binaries
+// Shared prepacked-vs-plain i8 bit-parity check, run under whichever ISA is pinned
 mod i8_packed_common;
 
 #[test]

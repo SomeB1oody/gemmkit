@@ -1,14 +1,15 @@
-//! nalgebra batched adapter (`gemm_batched`): a slice of per-element `(&A, &B)` inputs paired with
-//! a slice of `&mut C` outputs must reproduce a serial loop of the adapter's own `gemm` per element
-//! bit-for-bit, over heterogeneous shapes and mixed column-major (F-order) / row-major (C-order)
-//! layouts, and stay serial==parallel bit-identical. Count and inner-dimension mismatches panic
+//! Correctness tests for `gemm_batched`: 1 call over a slice of per-element `(&A, &B)` inputs
+//! paired with a slice of `&mut C` outputs must reproduce a per-element loop of `gemm` bit-for-bit,
+//! across a heterogeneous batch of shapes and mixed column-major (F-order) / row-major (C-order)
+//! layouts, and stay bit-identical between serial and parallel. Count and inner-dimension
+//! mismatches panic; an empty batch is a no-op
 
 use gemmkit::Parallelism;
 use nalgebra::{DMatrix, DMatrixView, DMatrixViewMut};
 
 use gemmkit_nalgebra::{gemm, gemm_batched};
 
-/// Deterministic xorshift fill in `[-0.5, 0.5)`
+/// Xorshift64 fill in `[-0.5, 0.5)`
 fn fill(n: usize, seed: u64) -> Vec<f64> {
     let mut s = seed.wrapping_add(0x9E3779B97F4A7C15) | 1;
     (0..n)
@@ -21,8 +22,8 @@ fn fill(n: usize, seed: u64) -> Vec<f64> {
         .collect()
 }
 
-/// Heterogeneous batch: `(m, k, n, A row-major, B row-major, C row-major)`. `false` means the
-/// natural column-major (F-order) layout, `true` a row-major (C-order) strided view
+/// The batch's 4 elements as `(m, k, n, A row-major, B row-major, C row-major)`; `false` selects
+/// the natural column-major (F-order) layout, `true` a row-major (C-order) strided view
 const ELEMS: [(usize, usize, usize, bool, bool, bool); 4] = [
     (5, 7, 3, false, false, false),
     (8, 4, 6, true, false, true),
@@ -30,14 +31,13 @@ const ELEMS: [(usize, usize, usize, bool, bool, bool); 4] = [
     (16, 5, 10, true, true, true),
 ];
 
-/// Element `i` strides for an `r x c` matrix in the chosen layout: column-major `(1, r)` or
-/// row-major `(c, 1)`
+/// Strides for an `r x c` matrix in the given layout: column-major `(1, r)` or row-major `(c, 1)`
 fn strides(r: usize, c: usize, row_major: bool) -> (usize, usize) {
     if row_major { (c, 1) } else { (1, r) }
 }
 
-/// Run the batch under `par`, assert it equals a per-element `gemm(par)` loop bit-for-bit, and
-/// return the batched output buffers so the caller can also compare across thread counts
+/// Runs the batch under `par`, asserts it matches a per-element `gemm(par)` loop bit-for-bit, and
+/// returns the batched outputs so the caller can also compare across parallelism settings
 fn run(par: Parallelism) -> Vec<Vec<f64>> {
     let (alpha, beta) = (1.3f64, -0.7f64);
 
@@ -57,8 +57,8 @@ fn run(par: Parallelism) -> Vec<Vec<f64>> {
         .map(|(i, &(m, _, n, _, _, _))| fill(m * n, 200 + i as u64))
         .collect();
 
-    // `from_slice_with_strides` yields a fully-dynamic-stride view, so let inference name the exact
-    // storage type rather than the unit-row-stride `DMatrixView` alias
+    // from_slice_with_strides only exists on the fully-dynamic-stride view (DMatrixView's own
+    // default assumes a unit row stride), so Vec<_> lets inference name the real return type
     let a_views: Vec<_> = ELEMS
         .iter()
         .enumerate()
@@ -76,7 +76,7 @@ fn run(par: Parallelism) -> Vec<Vec<f64>> {
         })
         .collect();
 
-    // Batched: one call over the slice of (&A, &B) inputs and &mut C outputs
+    // batched: 1 call over the slice of (&A, &B) inputs and &mut C outputs
     let mut c_bat = c_init.clone();
     {
         let mut c_views: Vec<_> = c_bat
@@ -92,7 +92,7 @@ fn run(par: Parallelism) -> Vec<Vec<f64>> {
         gemm_batched(alpha, &ab, beta, &mut c_views, par);
     }
 
-    // Reference: a serial-shaped loop of single gemm(par) calls, same per-element layout
+    // reference: a loop of single gemm(par) calls, same per-element layout
     let mut c_ref = c_init.clone();
     for (i, &(m, _, n, _, _, c_rm)) in ELEMS.iter().enumerate() {
         let (rs, cs) = strides(m, n, c_rm);
@@ -120,7 +120,7 @@ fn gemm_batched_count_mismatch_panics() {
     let a = DMatrix::from_element(2, 2, 1.0f64);
     let b = DMatrix::from_element(2, 2, 1.0f64);
     let ab = [(&a, &b)];
-    let mut c: Vec<DMatrix<f64>> = Vec::new(); // 1 input, 0 outputs
+    let mut c: Vec<DMatrix<f64>> = Vec::new(); // 1 A/B pair, 0 C outputs: count mismatch
     gemm_batched(1.0, &ab, 0.0, &mut c, Parallelism::Serial);
 }
 
@@ -128,13 +128,13 @@ fn gemm_batched_count_mismatch_panics() {
 #[should_panic(expected = "A.cols")]
 fn gemm_batched_inner_dim_mismatch_panics() {
     let a = DMatrix::from_element(3, 4, 1.0f64);
-    let b = DMatrix::from_element(5, 2, 1.0f64); // 4 != 5
+    let b = DMatrix::from_element(5, 2, 1.0f64); // A.cols=4 != B.rows=5
     let ab = [(&a, &b)];
     let mut c = vec![DMatrix::<f64>::zeros(3, 2)];
     gemm_batched(1.0, &ab, 0.0, &mut c, Parallelism::Serial);
 }
 
-/// An empty batch (no inputs, no outputs) is a well-formed no-op
+/// An empty batch, no A/B pairs and no C outputs, does not panic and leaves `c` empty
 #[test]
 fn gemm_batched_empty_is_noop() {
     let ab: [(&DMatrix<f64>, &DMatrix<f64>); 0] = [];

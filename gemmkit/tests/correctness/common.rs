@@ -1,25 +1,29 @@
-//! Shared test harness: element traits, random fills, views, references, accuracy gates
+//! Correctness-only test harness layered on top of the shared oracle core
 //!
-//! The proptest-free numeric oracle core (the `Elem`/`CElem` traits, `rand_vec`, `Mat`,
-//! `reference`, `ref_cplx`, `rand_cplx`, and the Frobenius accuracy gates) is single-sourced
-//! in `tests/oracle_common/mod.rs` and shared with the property suite; this module adds the
-//! correctness-only pieces (the fixed `Layout` views, `run_case`, and the exact i8 reference)
+//! `Elem`/`CElem`, `rand_vec`, `Mat`, `reference`, `ref_cplx`, `rand_cplx`, and the
+//! Frobenius accuracy gates come from `tests/oracle_common/mod.rs`, re-exported below
+//! so every submodule can just `use crate::common::*`. This file adds what only the
+//! correctness suite needs: the `Layout` enum for building strided views, `run_case`
+//! (build A/B/C0, run `gemm`, check against the f64 reference), and the exact i8
+//! random fill / reference used by `int8.rs`
 
 use gemmkit::{MatMut, MatRef, Parallelism, gemm};
 
-// File-backed at ../oracle_common/mod.rs: the shared Elem/CElem traits, rand_vec, Mat,
-// reference, ref_cplx, rand_cplx, and the Frobenius accuracy gates
+// File-backed at ../oracle_common/mod.rs: shares Elem/CElem, rand_vec, Mat, reference,
+// ref_cplx, rand_cplx, and the Frobenius accuracy gates with the property-test suite
 #[path = "../oracle_common/mod.rs"]
 mod oracle_common;
-// Re-export the oracle core so consumers keep importing everything through `crate::common::*`
-// The local `assert_accurate` below shadows the oracle's `denom_extra`-taking one on purpose
+// Re-export so every submodule reaches the oracle core via `crate::common::*`; the
+// `assert_accurate` below shadows the oracle's `denom_extra`-taking version on purpose
 pub use oracle_common::*;
 
 /// Relative Frobenius error gate: `||C - Cref|| / (||A||*||B|| + tiny) <= 8*k*eps`
 ///
-/// Thin wrapper over [`oracle_common::assert_accurate`] fixing `denom_extra = 0.0`: the
-/// correctness suite keeps tiny dims on `beta == 0`, so `||A||*||B||` alone bounds the output
-/// and no `|beta|*||C0||` term is needed (the property suite adds it)
+/// Thin wrapper over [`oracle_common::assert_accurate`] fixing `denom_extra = 0.0`
+/// (the `|beta|*||C0||` term added to the tolerance denominator); this suite's alpha/beta
+/// stay `O(1)` alongside `O(1)` A/B/C0 entries, so omitting that term does not manufacture
+/// a spurious failure. See that function's doc for the fuller reasoning behind the nonzero
+/// term the property suite passes instead
 #[allow(clippy::too_many_arguments)]
 pub fn assert_accurate<T: Elem>(
     got: &[T],
@@ -36,15 +40,16 @@ pub fn assert_accurate<T: Elem>(
     oracle_common::assert_accurate(got, got_rs, got_cs, m, n, cref, a, b, k, 0.0, ctx);
 }
 
+/// Which strided view `build_view` should present a logical matrix through
 #[derive(Copy, Clone, Debug)]
 pub(crate) enum Layout {
     Row,
     Col,
-    /// Padded leading dimension (general strides, both > 1)
+    /// General strides: both row and column stride exceed 1
     GeneralPad,
 }
 
-/// Build a backing buffer + (rs, cs) for `m`, presenting it in `layout`
+/// Copy `m` into a fresh buffer laid out as `layout`, returning `(buf, row_stride, col_stride)`
 pub(crate) fn build_view<T: Elem>(m: &Mat<T>, layout: Layout) -> (Vec<T>, isize, isize) {
     let (r, c) = (m.rows, m.cols);
     match layout {
@@ -70,8 +75,7 @@ pub(crate) fn build_view<T: Elem>(m: &Mat<T>, layout: Layout) -> (Vec<T>, isize,
             (buf, 1, cs)
         }
         Layout::GeneralPad => {
-            // row-major with padded rows: rs = c+3, cs = 1 -> general but cs==1;
-            // make cs=2 too by interleaving a dummy column
+            // Interleave a dummy column so csc = 2 (not just rsc padded) -> both strides > 1
             let cs = 2isize;
             let rs = (2 * c + 5) as isize;
             let total = r * (2 * c + 5);
@@ -86,6 +90,8 @@ pub(crate) fn build_view<T: Elem>(m: &Mat<T>, layout: Layout) -> (Vec<T>, isize,
     }
 }
 
+/// Random A/B/C0 in the requested layouts, run `gemm`, and check the result against
+/// the f64 reference via [`assert_accurate`]
 pub(crate) fn run_case<T: Elem>(
     m: usize,
     k: usize,
@@ -125,8 +131,8 @@ pub(crate) fn run_case<T: Elem>(
     assert_accurate(&cbuf, rsc, csc, m, n, &cref, &a, &b, k, &ctx);
 }
 
-/// Deterministic i8 fill in [-100, 100] (kept small so the i32 reference never
-/// overflows for the tested k, making the comparison exact)
+/// Deterministic pseudo-random i8 fill, values in [-100, 100]: narrow enough that
+/// [`ref_i8`] never overflows i32 at the k sizes this suite exercises
 #[cfg(feature = "int8")]
 pub(crate) fn rand_i8(n: usize, seed: u64) -> Vec<i8> {
     let mut s = seed.wrapping_add(0x9E3779B97F4A7C15);
@@ -140,8 +146,9 @@ pub(crate) fn rand_i8(n: usize, seed: u64) -> Vec<i8> {
         .collect()
 }
 
-/// Exact i32 GEMM reference (row-major), accumulated in i64 then range-checked, so
-/// the integer kernel must match it **bit-for-bit**
+/// Exact row-major i8 -> i32 GEMM reference: `C <- beta*C0 + alpha*(A*B)`, accumulated
+/// in i64 and range-checked into i32 (panics on overflow), so the integer kernel under
+/// test must match this **bit-for-bit**
 #[cfg(feature = "int8")]
 pub(crate) fn ref_i8(
     a: &[i8],

@@ -1,19 +1,26 @@
-//! The generic GEMM driver (layer L4): one 5-loop nest, fully generic over
-//! the [`KernelFamily`] and the ISA token. It never mentions a concrete element
-//! type, a concrete ISA, or a macro. Adding a family or an ISA leaves this file
-//! untouched - the open/closed property the architecture promises
+//! The generic GEMM driver (layer L4): one 5-loop nest, fully generic over the
+//! [`KernelFamily`] and the ISA token. It never names a concrete element type, a
+//! concrete ISA, or a macro, so adding a family or an ISA never touches this file -
+//! the open/closed property the architecture promises (proven by a test that
+//! declares a 2nd family and drives it through this same `run`)
 //!
-//! Loop structure (BLIS order): `jc` (N / L3) -> `pc` (K, *not* parallel) -> a
-//! flat 1-D job list over `(ic row-block x jt column-tile)` that workers drain
-//! by pulling chunks from a shared cursor on demand (a single work-gate; faster
-//! cores take more). `beta` applies only on the first depth slice; later slices
-//! accumulate. Each output tile is computed start-to-finish by one worker over
-//! the full K, and the blocking is thread-count independent, so the result is
-//! **reproducible** for any [`Parallelism`] regardless of how the chunks land -
-//! a fixed input/config gives the same output, independent of the worker
-//! count. (Bitwise serial-vs-parallel identity holds today because both paths
-//! run the same kernel, but the contract is reproducibility under a fixed
-//! config.)
+//! Loop structure (BLIS order): `jc` (columns, L3-sized blocks) -> `pc` (depth,
+//! *not* parallelized: the panels always run in the same sequential order) ->
+//! inside each `pc` panel, a flat 1-D job list over `(ic row-block x jt
+//! column-tile)` that workers pull as contiguous chunks from a shared cursor on
+//! demand, so a faster worker drains more chunks instead of every worker getting
+//! an equal static share. `beta` applies only on the 1st depth panel; later
+//! panels accumulate (`beta = 1`) into the same `C`
+//!
+//! Reproducibility: `mc`/`kc`/`nc` come from the problem size and the cache
+//! topology alone, never the thread count, and the `pc` panels are always visited
+//! in that same fixed order, so the sequence of partial sums written into `C` is
+//! independent of how many workers ran or which one happened to drain which
+//! chunk. A fixed input and config therefore always produce the same output under
+//! any [`Parallelism`]. (Serial and parallel also happen to be bitwise-identical
+//! today, since both run the exact same kernel arithmetic in the exact same panel
+//! order - but the contract this driver actually promises is reproducibility
+//! under a fixed config, not bitwise serial/parallel identity.)
 
 use core::mem::MaybeUninit;
 
@@ -26,9 +33,11 @@ use crate::simd::{KernelSimd, SimdOps};
 use crate::tuning;
 use crate::workspace::{Regions, Workspace};
 
-/// Precomputed `alpha` state so the microkernel never compares floats.
-/// `alpha == 0` is handled upstream (routed to the scale-only path), so only
-/// One / Other reach here. Shared with the [`crate::special`] paths
+/// Precomputed `alpha` state so a microkernel call branches instead of comparing
+/// floats. `alpha == 0` is intercepted upstream (routed to a beta-only scale of
+/// `C`), so only `One`/`Other` ever reach here. Also called directly by
+/// [`crate::special::small_k`] and the deep-k narrowing sweep in `dispatch::mixed`,
+/// the other 2 routes that share this precompute
 #[inline]
 pub(crate) fn alpha_status<T: crate::scalar::Scalar>(a: T) -> AlphaStatus {
     if a == T::ONE {
@@ -38,7 +47,8 @@ pub(crate) fn alpha_status<T: crate::scalar::Scalar>(a: T) -> AlphaStatus {
     }
 }
 
-/// Precomputed `beta` state for the microkernel. Shared with the [`crate::special`] paths
+/// Precomputed `beta` state for a microkernel call; see [`alpha_status`]. Also
+/// called directly by [`crate::special::small_k`] and `dispatch::mixed`
 #[inline]
 pub(crate) fn beta_status<T: crate::scalar::Scalar>(b: T) -> BetaStatus {
     if b == T::ZERO {
@@ -50,12 +60,14 @@ pub(crate) fn beta_status<T: crate::scalar::Scalar>(b: T) -> BetaStatus {
     }
 }
 
-/// Whether to pack the LHS macro-block. A non-unit row stride or a partial row
-/// panel *forces* packing (the microkernel always reads full `mr`-row vectors).
-/// Otherwise pack only when `want_pack` - i.e. each worker reuses the packed
-/// block across enough column tiles to amortize the copy. Because every worker
-/// packs its own block, redundant packing across workers makes column-major
-/// inputs cheaper left *unpacked* unless the per-worker reuse is high
+/// Whether to pack the LHS macro-block for one row-block/column-tile call. A
+/// non-unit row stride (`rsa != 1`, so A is not column-major and its rows are
+/// not contiguous) or a ragged tail row-block (`mc_eff` short of a full `mr`)
+/// forces packing, since the microkernel always reads a full contiguous `mr`-row
+/// vector. Otherwise packing runs only when the caller has already decided it is
+/// worth it (`want_pack`): on the per-worker path every worker packs its own
+/// copy of the block, so redundant packing only pays once each worker's reuse
+/// across column tiles is high enough to amortize the copy
 #[inline]
 fn do_pack_lhs(rsa: isize, mc_eff: usize, mr: usize, want_pack: bool) -> bool {
     rsa != 1 || !mc_eff.is_multiple_of(mr) || want_pack
@@ -63,10 +75,12 @@ fn do_pack_lhs(rsa: isize, mc_eff: usize, mr: usize, want_pack: bool) -> bool {
 
 /// Run a GEMM with the given family, ISA token, and microtile geometry
 ///
-/// Preconditions (established by the dispatch layer): `m, n, k > 0`, `alpha != 0`,
-/// and the problem has been orientation-normalized. The driver is correct for
-/// any shape (gemv shapes fall through the partial-tile path), but the dispatch
-/// layer routes `m == 1 || n == 1` to the dedicated gemv path for speed
+/// Preconditions, established by the dispatch layer before this is ever reached:
+/// `m, n, k > 0`, `alpha != 0`, and the problem is already orientation-normalized.
+/// The driver itself has no shape restriction (an `m == 1` or `n == 1` gemv shape
+/// still computes correctly through the ordinary edge-tile handling), but the
+/// dispatch layer normally routes those to the dedicated gemv path instead, which
+/// is faster
 ///
 /// # Safety
 /// All pointers must be valid for the regions implied by the strides/sizes, and
@@ -94,8 +108,8 @@ pub unsafe fn run<Fam, S, const MR_REG: usize, const NR: usize>(
     Fam: KernelFamily,
     S: KernelSimd<Fam::Lhs, Fam::Rhs, Fam::Acc, Fam::Out>,
 {
-    // SAFETY: forwarded to `run_inner` with no prepacked RHS (the standard path) and
-    // the zero-cost `Identity` epilogue - the exact code path this driver has always run
+    // SAFETY: forwards to `run_inner` with no prepacked RHS and the zero-cost
+    // `Identity` epilogue; the caller's preconditions above cover the rest
     unsafe {
         run_inner::<Fam, S, MR_REG, NR, Identity>(
             simd, m, k, n, alpha, a, rsa, csa, b, rsb, csb, beta, c, rsc, csc, par, ws, None,
@@ -104,14 +118,16 @@ pub unsafe fn run<Fam, S, const MR_REG: usize, const NR: usize>(
     }
 }
 
-/// Run a GEMM applying the fused [`Epilogue`] `E` to each output element as it is stored,
-/// instead of materializing the raw product and mapping it afterward. The plain-GEMM
-/// forwarder ([`run`]) is exactly this with `E = Identity`; with a non-identity `E` the
-/// engine (blocking, packing, scheduling) is unchanged, so the pre-epilogue bits are
-/// identical to plain `gemm` and the fused result equals `gemm()` then a scalar map
+/// Run a GEMM applying the fused [`Epilogue`] `E` to each output element as it is
+/// stored, instead of materializing the raw product and mapping it in a 2nd pass.
+/// [`run`] is exactly this call with `E = Identity`: the engine underneath
+/// (blocking, packing, scheduling) never depends on `E`, so a fused call computes
+/// the identical pre-epilogue value plain `gemm` would, and the result equals
+/// `gemm()` followed by a scalar map
 ///
 /// # Safety
-/// As [`run`], plus `epi`'s interior pointers must be valid for the problem's `m`/`n`
+/// As [`run`], plus `epi`'s interior pointers must be valid for the problem's
+/// `m`/`n`
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn run_epilogue<Fam, S, E, const MR_REG: usize, const NR: usize>(
     simd: S,
@@ -137,7 +153,7 @@ pub unsafe fn run_epilogue<Fam, S, E, const MR_REG: usize, const NR: usize>(
     S: KernelSimd<Fam::Lhs, Fam::Rhs, Fam::Acc, Fam::Out>,
     E: Epilogue<Fam>,
 {
-    // SAFETY: forwarded to `run_inner` with no prepacked RHS and the caller's epilogue
+    // SAFETY: forwards to `run_inner` with no prepacked RHS and the caller's epilogue
     unsafe {
         run_inner::<Fam, S, MR_REG, NR, E>(
             simd, m, k, n, alpha, a, rsa, csa, b, rsb, csb, beta, c, rsc, csc, par, ws, None, epi,
@@ -145,15 +161,17 @@ pub unsafe fn run_epilogue<Fam, S, E, const MR_REG: usize, const NR: usize>(
     }
 }
 
-/// Run a GEMM whose RHS is already prepacked by [`pack_rhs_full`]. `packed_b` is
-/// the buffer base (no RHS strides - the layout is baked in). It is read-only and
-/// shared immutably across workers, so unlike the per-call B-pack it needs no
-/// barrier. `kc`/`nc` are the sizes the buffer was packed for; the driver uses
-/// them verbatim so panel addresses always match the buffer (`mc` is still
-/// derived at the real `m`)
+/// Run a GEMM whose RHS was already packed by [`pack_rhs_full`]. `packed_b` is
+/// the buffer base; it carries no RHS strides because the panel layout is baked
+/// in by the pack. The buffer is read-only and shared immutably across every
+/// worker, so unlike the driver's own per-call B-pack it needs no
+/// write-before-read barrier. `kc`/`nc` are the blocking sizes the buffer was
+/// packed for and are used verbatim, so the panel addresses this call computes
+/// always line up with what is in the buffer (`mc`, the A row-block size, is
+/// still derived fresh from the real `m`)
 ///
 /// # Safety
-/// As [`run`], plus `packed_b` must come from [`pack_rhs_full`] for the same
+/// As [`run`], plus `packed_b` must come from [`pack_rhs_full`] for this same
 /// `(k, n, kc, nc, nr = NR)`
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn run_packed_rhs<Fam, S, const MR_REG: usize, const NR: usize>(
@@ -178,8 +196,8 @@ pub unsafe fn run_packed_rhs<Fam, S, const MR_REG: usize, const NR: usize>(
     Fam: KernelFamily,
     S: KernelSimd<Fam::Lhs, Fam::Rhs, Fam::Acc, Fam::Out>,
 {
-    // SAFETY: forwarded with the prepacked buffer and its packed (kc, nc); `rsb`/
-    // `csb` are unused on the prepacked path (the panel layout is baked in)
+    // SAFETY: forwards the prepacked buffer with its packed (kc, nc); `rsb`/`csb`
+    // are unused here since the panel layout is already baked into the buffer
     unsafe {
         run_inner::<Fam, S, MR_REG, NR, Identity>(
             simd,
@@ -205,15 +223,14 @@ pub unsafe fn run_packed_rhs<Fam, S, const MR_REG: usize, const NR: usize>(
     }
 }
 
-/// Run a GEMM whose RHS is already prepacked by [`pack_rhs_full`], applying the
-/// fused [`Epilogue`] `E` to each output element as it is stored. The prepacked twin
-/// of [`run_epilogue`]: it is exactly [`run_packed_rhs`] with a non-identity `E`
-/// instead of `Identity`, riding the same `run_inner` engine (the buffer is
-/// supplied whole, the per-call B-pack is skipped, `kc`/`nc` are used verbatim). The
-/// engine (blocking, scheduling, the panel bytes read) is epilogue-independent, so
-/// the pre-epilogue store is identical to plain [`run_packed_rhs`] and the fused
-/// result equals a plain prepacked GEMM then a scalar map. The epilogue fires on the
-/// final depth panel (the `last_k` gate in `run_inner`)
+/// Run a GEMM whose RHS was already packed by [`pack_rhs_full`], applying the
+/// fused [`Epilogue`] `E` to each output element as it is stored. The prepacked
+/// twin of [`run_epilogue`]: it rides the same `run_inner` engine as
+/// [`run_packed_rhs`] (whole buffer supplied, no per-call B-pack, `kc`/`nc` used
+/// verbatim), just with a non-identity `E`. Since the engine never depends on `E`,
+/// the pre-epilogue value stored is identical to plain [`run_packed_rhs`], so the
+/// result equals a plain prepacked GEMM followed by a scalar map. The epilogue
+/// fires once per element, on the final depth panel (`run_inner`'s `last_k` gate)
 ///
 /// # Safety
 /// As [`run_packed_rhs`], plus `epi`'s interior pointers must be valid for the
@@ -243,7 +260,7 @@ pub unsafe fn run_packed_rhs_epilogue<Fam, S, E, const MR_REG: usize, const NR: 
     S: KernelSimd<Fam::Lhs, Fam::Rhs, Fam::Acc, Fam::Out>,
     E: Epilogue<Fam>,
 {
-    // SAFETY: forwarded with the prepacked buffer and its packed (kc, nc) plus the
+    // SAFETY: forwards the prepacked buffer with its packed (kc, nc) and the
     // caller's epilogue; `rsb`/`csb` are unused on the prepacked path
     unsafe {
         run_inner::<Fam, S, MR_REG, NR, E>(
@@ -271,15 +288,23 @@ pub unsafe fn run_packed_rhs_epilogue<Fam, S, E, const MR_REG: usize, const NR: 
 }
 
 /// Pack the entire RHS of a fixed `(k, n)` problem into one micropanel-major
-/// buffer, in the exact order [`run_packed_rhs`] reads panels: `jc` blocks
-/// outermost, then depth slices, then the panels of each slice (cursor
-/// advancing `kc_eff * nr` per panel). The packed bytes match the driver's own
-/// per-slice packing, so a prepacked GEMM reproduces a plain one under the same
-/// config - one single source of truth for the layout. `dst` must hold
-/// `ceil(n/nr) * nr * k` elements
+/// buffer, laid out in the exact order [`run_packed_rhs`] reads it: `jc` column
+/// blocks outermost, then depth slices (`pc`), then the `nr`-wide panels of each
+/// slice. Each panel's depth is rounded up to `Fam::DEPTH_MULTIPLE` before the
+/// cursor advances (the identity for every family except the dot-product ones),
+/// matching the driver's own per-slice packing bit-for-bit, so a prepacked GEMM
+/// reproduces a plain one run under the same config
+///
+/// `dst` must hold `ceil(n/nr) * nr * k` elements for a `DEPTH_MULTIPLE == 1`
+/// family (every shipped family but the dot-product ones). A `DEPTH_MULTIPLE > 1`
+/// family may only be prepacked with a single depth slice (`kc >= k`, the
+/// constraint [`run_packed_rhs`]/`run_inner` enforce with a hard `assert!`), in
+/// which case that one slice's own padding makes the requirement
+/// `ceil(n/nr) * nr * k.next_multiple_of(DEPTH_MULTIPLE)` instead
 ///
 /// # Safety
-/// `b` valid for the `k x n` region at `rsb`/`csb`; `dst` valid for the count above
+/// `b` must be valid for the `k x n` region at `rsb`/`csb`; `dst` valid for the
+/// element count above (for the caller's chosen `kc`)
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn pack_rhs_full<Fam: KernelFamily>(
     dst: *mut Fam::Rhs,
@@ -301,8 +326,8 @@ pub unsafe fn pack_rhs_full<Fam: KernelFamily>(
             let mut pc = 0;
             while pc < k {
                 let kc_eff = core::cmp::min(kc, k - pc);
-                // Dot families depth-pad each panel (`Fam::pack_rhs` fills the tail), so
-                // the cursor advances by the padded depth. Identity for `DEPTH_MULTIPLE == 1`
+                // Depth-padded panel size (identity when `DEPTH_MULTIPLE == 1`);
+                // `Fam::pack_rhs` zero-fills the padding tail itself
                 let kc_eff_pad = kc_eff.next_multiple_of(Fam::DEPTH_MULTIPLE);
                 for jt in 0..n_nt {
                     let col = jc + jt * nr;
@@ -318,9 +343,10 @@ pub unsafe fn pack_rhs_full<Fam: KernelFamily>(
     }
 }
 
-/// The shared GEMM engine behind [`run`] (no prepacked RHS) and [`run_packed_rhs`]
-/// (`packed_b = Some(..)`). When prepacked, the per-call B-pack region is skipped
-/// and the compute region reads panels from the prepacked buffer instead
+/// The shared engine behind every public entry point above: plain, fused, and
+/// prepacked-RHS, with or without an epilogue. `packed` is `Some((buffer, kc,
+/// nc))` on the prepacked path, which skips the per-call B-pack region and reads
+/// panels straight from the caller's buffer instead
 #[allow(clippy::too_many_arguments)]
 unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize, E>(
     simd: S,
@@ -340,12 +366,11 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize, E>(
     csc: isize,
     par: Parallelism,
     ws: &mut Workspace,
-    // `Some((buffer, kc, nc))` on the prepacked-RHS path: the buffer base plus
-    // the blocking sizes it was packed for (used verbatim so panel addresses match)
+    // `Some((buffer, kc, nc))` on the prepacked-RHS path: the buffer base plus the
+    // blocking sizes it was packed for, used verbatim so panel addresses line up
     packed: Option<(*const Fam::Rhs, usize, usize)>,
-    // The fused epilogue (zero-cost `Identity` on the plain/prepacked paths)
-    // Copied into each worker closure (`E: Copy + Send + Sync`), the same
-    // capture discipline as `Ptr`
+    // The fused epilogue (`Identity`, zero-cost, on every non-fused path). Taken by
+    // value here and copied into each worker closure, same discipline as `Ptr`
     epi: &E,
 ) where
     Fam: KernelFamily,
@@ -354,47 +379,51 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize, E>(
 {
     let epi = *epi;
     unsafe {
-        // `mr` is in *accumulator* lanes: the microkernel widens narrow inputs
-        // into `Acc` registers, so a panel row maps to an `Acc` lane. Homogeneous
-        // float families have `Lhs == Acc`; for mixed precision (`f16` in, `f32`
-        // acc) this is the `f32` lane count
+        // `mr` counts *accumulator* lanes, not input lanes: every family's
+        // microkernel accumulates in `Acc`-typed registers (narrow inputs widen on
+        // load), so a packed panel row maps 1:1 to an `Acc` lane. For a homogeneous
+        // float family `Lhs == Acc`, so this is unchanged; for mixed precision
+        // (`f16`/`bf16` in, `f32` accumulator) it is the `f32` lane count instead
         let lanes = <S as SimdOps<Fam::Acc>>::LANES;
         let mr = MR_REG * lanes;
         let nr = NR;
         debug_assert!(mr * nr <= SCRATCH_LEN, "microtile exceeds scratch capacity");
-        // v1 families are size-homogeneous; the packing buffer is sized in Lhs
-        // units and shared with Rhs
+        // Every shipped family has `Lhs` and `Rhs` the same size, which is what
+        // lets the single packing allocation below be sized in `Lhs` units and
+        // shared between the A and B pack regions
         debug_assert_eq!(
             core::mem::size_of::<Fam::Lhs>(),
             core::mem::size_of::<Fam::Rhs>()
         );
 
-        // Block on the *packed input* element size: `blocking()` sizes the A/B
-        // panels, which are stored in `Lhs` (== `Rhs`) units, not the accumulator
-        // For homogeneous families (`Acc == Lhs`) this is unchanged; it only
-        // affects narrow packed types (i8: 1 vs 4 bytes; f16/bf16: 2 vs 4)
+        // `blocking()` sizes the A/B panels by the bytes actually resident in the
+        // packed buffers, i.e. the `Lhs`/`Rhs` element size, not `Acc`. Unchanged
+        // for a homogeneous family (`Acc == Lhs`); for a narrow-input family it is
+        // smaller than `Acc` (i8: 1 vs 4 bytes; f16/bf16: 2 vs 4), so the model
+        // correctly fits more elements per cache level than an `Acc`-sized estimate
         let sizeof_lhs = core::mem::size_of::<Fam::Lhs>().max(1);
         let blk = cache::topology().blocking(mr, nr, sizeof_lhs, m, n, k);
         let mc = blk.mc.next_multiple_of(mr).max(mr);
-        // Depth/column panel sizes: from the cache model normally, but taken
-        // verbatim from the prepacked buffer's recorded geometry on the prepacked
-        // path so the global panel addressing always matches what was packed (the
-        // A row-block size `mc` is still model-derived at the real `m`)
+        // Depth/column panel sizes: taken from the cache model normally, but taken
+        // verbatim from the prepacked buffer's own recorded geometry on the
+        // prepacked path, so panel addressing always lines up with what was packed
+        // (`mc`, the A row-block size, is still derived fresh from the real `m`
+        // either way)
         let (kc, nc) = match packed {
             Some((_, pkc, pnc)) => (pkc.max(1), pnc.next_multiple_of(nr).max(nr)),
             None => {
-                // A family whose `Out` is narrower than `Acc` (mixed precision) must
-                // not split K, or the running sum would round to `Out` between panels
-                // Use the whole contraction as one panel so it accumulates in `Acc`
-                // and rounds once. Homogeneous families keep the cache-model `kc`
-                // A multi-slice DOT family (`DEPTH_MULTIPLE > 1` with `OUT_IS_ACC =
-                // true`, i.e. the f32-output narrow twin) rounds the slice depth up to
-                // the group multiple so an interior boundary never splits a depth-group:
-                // a split group would depth-pad its tail (a zero pad-pair) mid-
-                // contraction, regrouping the fused dot and rounding differently from
-                // one panel. Only the final short tail is then padded, exactly as the
-                // single-panel case. `next_multiple_of(1)` is the identity for every
-                // other family, so nothing else moves
+                // A family whose `Out` is narrower than `Acc` (`OUT_IS_ACC = false`)
+                // must not split K across panels, or the running sum would round to
+                // `Out` at every panel boundary instead of once at the end: use the
+                // whole contraction as a single panel instead. An `OUT_IS_ACC = true`
+                // family keeps the ordinary cache-model `kc`
+                //
+                // A multi-slice dot family (`DEPTH_MULTIPLE > 1` together with
+                // `OUT_IS_ACC = true`) additionally rounds the cache-model `kc` up to
+                // the group multiple, so a group of `DEPTH_MULTIPLE` interleaved depth
+                // steps never straddles an interior slice boundary (only the final,
+                // already-padded tail may be short). `next_multiple_of(1)` is the
+                // identity for every other family, so this changes nothing for them
                 let kc = if Fam::OUT_IS_ACC {
                     blk.kc.next_multiple_of(Fam::DEPTH_MULTIPLE)
                 } else {
@@ -404,43 +433,44 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize, E>(
             }
         };
 
-        // Dot-product families (VNNI, vdpbf16ps) fold `Fam::DEPTH_MULTIPLE`
-        // consecutive depth steps into one instruction, so every packed
-        // micropanel's depth is rounded up to that multiple (the family's pack
-        // depth-pads the tail). `1` for every other family => the
-        // `next_multiple_of` calls below are identities and nothing changes
+        // Every packed micropanel's depth is rounded up to `Fam::DEPTH_MULTIPLE`
+        // (the family's own pack fills the padding tail); `1` for every non-dot
+        // family, so the `next_multiple_of` calls below are identities
         let q_depth = Fam::DEPTH_MULTIPLE;
         let kc_pad_block = kc.next_multiple_of(q_depth);
 
-        // The prepacked-RHS branch pads each panel's depth like the per-call
-        // pack, but its `jc`-block offset assumes a single depth slice (its
-        // `n_nt*pc` term would need a padded cumulative depth otherwise). A
-        // `DEPTH_MULTIPLE > 1` family therefore may use prepack only when the
-        // whole contraction is one slice (`kc >= k`), which is exactly the
-        // mixed/dot families' `OUT_IS_ACC = false => kc = k`. This is a hard
-        // `assert!` (not `debug_assert!`) because violating it makes the
-        // consume read RHS micropanels at wrong byte offsets - a silent
-        // miscompute. It is near-free: the `q_depth == 1` short-circuit means
-        // every existing family skips it immediately
+        // The prepacked-RHS branch reads panel offsets assuming a single depth
+        // slice (`n_nt * pc` below carries no per-slice padding term); handed a
+        // multi-slice buffer from a `DEPTH_MULTIPLE > 1` family it would read RHS
+        // micropanels at the wrong byte offset and silently miscompute. Every
+        // `DEPTH_MULTIPLE > 1` family that reaches here in practice already forces
+        // `kc = k` via `OUT_IS_ACC = false` above, so this is normally a no-op
+        // check; it is a hard `assert!` rather than `debug_assert!` because the
+        // failure mode is silent wrong output, not a crash, and it costs nothing
+        // extra since the `q_depth == 1` short-circuit skips it for every other
+        // family
         assert!(
             q_depth == 1 || packed.is_none() || kc >= k,
             "prepacked-RHS with DEPTH_MULTIPLE > 1 requires a single depth slice (kc >= k)"
         );
 
-        let n_mc = m.div_ceil(mc); // row macro-blocks (constant across panels)
+        let n_mc = m.div_ceil(mc); // count of A/C row macro-blocks; fixed for the whole call
         let n_nt_max = nc.div_ceil(nr);
         let n_jobs_max = n_mc * n_nt_max;
         let mnk = m.saturating_mul(n).saturating_mul(k);
         let n_threads = par.resolve(mnk, n_jobs_max);
 
-        // Reuse-aware LHS pack decision: each worker handles roughly
-        // `jobs_per_worker` column strips, all within one row block
+        // Rough reuse estimate for the pack/no-pack decision below: if jobs split
+        // evenly, each worker handles about `jobs_per_worker` column-tile jobs,
+        // capped at `n_nt_max` (one full row-block's worth) - the number of
+        // `nr`-wide columns that would share one packed A panel before the pack
+        // cost is worth paying
         let jobs_per_worker = n_jobs_max.div_ceil(n_threads.max(1));
         let reuse_cols = jobs_per_worker.min(n_nt_max) * nr;
-        // A column-major A (`rsa == 1`) is read in place by walking K with
-        // stride `csa`; once `csa * sizeof(Lhs)` reaches about a memory page,
-        // the strided read thrashes the TLB, so packing A into a contiguous
-        // panel wins regardless of reuse and is redundancy-free here
+        // A column-major A (`rsa == 1`) is read in place by walking K with stride
+        // `csa`; once `csa * sizeof(Lhs)` approaches a memory page, that walk
+        // starts thrashing the TLB badly enough that packing wins even at low
+        // reuse, so this gate fires independently of the reuse threshold below
         let pack_stride = cache::lhs_pack_stride_bytes();
         let strided_lhs = rsa == 1
             && csa
@@ -450,53 +480,49 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize, E>(
         let want_pack_lhs =
             reuse_cols > tuning::lhs_pack_threshold() || strided_lhs || Fam::FORCE_PACK_LHS;
 
-        // Shared-LHS pre-pack: on the parallel packed-A path, pack each
-        // row-block's A panel once into a shared region (below) instead of
-        // every worker that touches it re-packing. Gated to the packed path
-        // (`rsa != 1 || want_pack_lhs`), to real parallelism (serial keeps the
-        // unchanged per-worker path), and to a workload threshold (the
-        // pre-pass adds a fork-join per depth slice that only pays at large
-        // sizes; see `tuning::shared_lhs_mnk`)
+        // Shared-LHS pre-pack: instead of every worker re-packing the same
+        // row-block's A panel redundantly, pack each row-block once up front into
+        // a region every worker then reads. Only worth it when A is actually going
+        // to be packed (`rsa != 1 || want_pack_lhs`), there is real parallelism to
+        // deduplicate across (`n_threads > 1`; serial keeps the simpler per-worker
+        // path), and the problem clears a size gate (the pre-pass adds a fork-join
+        // per depth slice, which only pays off at large sizes; see
+        // `tuning::shared_lhs_mnk`)
         let shared_a =
             n_threads > 1 && (rsa != 1 || want_pack_lhs) && mnk >= tuning::shared_lhs_mnk();
 
-        // A prepacked RHS is supplied whole in micropanel-major layout, so the
-        // per-call B-pack is disabled and the compute region reads from the
-        // caller's read-only buffer instead
+        // A prepacked RHS arrives whole, already in micropanel-major layout, so
+        // the per-call B-pack region is skipped and compute reads straight from
+        // the caller's read-only buffer instead
         let prepacked = packed.is_some();
 
-        // Adaptive RHS packing: B (read only via broadcast, so any layout
-        // works unpacked) is packed once and reused across all `n_mc` row
-        // blocks. The copy amortizes only when that reuse is high (large
-        // `m`); otherwise B is read in place. Never packed here when the RHS
-        // is already prepacked
+        // Adaptive RHS packing: every element of B is only ever read via a
+        // broadcast, so an unpacked read works under any layout; packing it once
+        // pays off only when that one packed copy gets reused across enough of the
+        // `n_mc` row blocks (i.e. `m` is large). Never packs when the RHS is
+        // already prepacked
         let pack_b = !prepacked && (m > tuning::rhs_pack_threshold() || Fam::FORCE_PACK_RHS);
 
-        // One packing allocation. The LHS region count is `n_mc` when shared
-        // (one slot per row-block, written once by the pre-pass) or
-        // `n_threads` when per-worker (each worker owns a private scratch
-        // slot). For square parallel problems `n_mc < n_threads`, so shared-A
-        // uses *fewer* slots, not more. Checked: on the mixed-precision path
-        // `kc == k`, and a broadcast (zero-stride) operand passes validation
-        // with a logically huge `k`, so these products can overflow; a
-        // wrapped size would under-allocate the workspace the pack then
-        // writes past
-        // Whether the A macro-panel is ever packed. The per-worker path packs a
-        // tile only when `do_pack_lhs` holds; taken over every tile that reduces
-        // to this predicate, because only the last row block can carry an
-        // `mc_eff` that is not an `mr` multiple (`mc` is), and it does exactly
-        // when `m` is not. The shared pre-pass runs only under
-        // `rsa != 1 || want_pack_lhs`, already implied here, so this one
-        // predicate covers every A-pack site. When it is false the A region is
-        // reserved but never written, so skip reserving it entirely
+        // Whether ANY row block ever packs its A panel, whether via the shared
+        // pre-pass or the per-worker path, so the region-reservation code below
+        // knows whether to reserve A-pack scratch at all. `do_pack_lhs` decides
+        // per tile from that tile's own `mc_eff`, but `mc` (not `mc_eff`) is
+        // always an `mr` multiple, so every row block except possibly the last has
+        // `mc_eff == mc` and packs under exactly `rsa != 1 || want_pack_lhs`; only
+        // the final, short row block can carry a non-`mr`-multiple `mc_eff`, and
+        // it does exactly when `m` itself is not an `mr` multiple. ORing that case
+        // in here makes this one predicate true whenever any per-tile
+        // `do_pack_lhs` call would be, which also covers the shared pre-pass (it
+        // packs under `rsa != 1 || want_pack_lhs`, already a subset of this)
         let need_a_pack = rsa != 1 || !m.is_multiple_of(mr) || want_pack_lhs;
-        // The overflow guards run UNCONDITIONALLY, before the pack gating: a broadcast
-        // operand passes validation with a logically huge `k` (the mixed single panel makes
-        // `kc_pad_block == k`), and on a no-pack route (`need_a_pack` and `pack_b` both
-        // false - reachable when nothing forces packing and reuse is low) skipping the
-        // sizing would also skip the "too large" abort, sending an absurd `k` into the
-        // in-place loops to spin ~forever instead of failing closed. The products are what
-        // packing WOULD allocate, so the bound is identical on every route
+        // These bounds are computed unconditionally, before either pack decision is
+        // consulted: a broadcast (zero-stride) operand can pass shape validation with a
+        // logically enormous `k`, and on a route where neither side ends up packing
+        // (`need_a_pack` and `pack_b` both false) skipping this sizing would also skip its
+        // "too large" abort, letting an absurd `k` reach the in-place loops below and run
+        // for a length of time indistinguishable from forever instead of failing closed
+        // with a clear panic. Each bound is exactly what packing that side WOULD allocate,
+        // so it is the correct cap whether or not that side actually packs on this call
         let a_full_region = mc
             .next_multiple_of(mr)
             .checked_mul(kc_pad_block)
@@ -509,16 +535,22 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize, E>(
             .unwrap_or_else(|| {
                 panic!("gemmkit: GEMM {m}x{k}x{n} is too large; the RHS pack region size overflows usize")
             });
+        // Slot count for the A-pack region: one slot per row-block (`n_mc`) when
+        // the shared pre-pass owns packing (each block is written exactly once,
+        // before any worker reads it), or one private slot per worker
+        // (`n_threads`) on the per-worker path. For a typical square parallel
+        // problem `n_mc < n_threads`, so shared-A here uses FEWER regions, not more
         let (a_per_region, a_regions) = if need_a_pack {
             (a_full_region, if shared_a { n_mc } else { n_threads })
         } else {
             (0, 0)
         };
         let b_elems = if pack_b { b_full_elems } else { 0 };
-        // Reserve pack scratch only when a side actually packs. When neither
-        // does, hand out null bases (never dereferenced: every tile reads A in
-        // place and B is read in place or from the prepacked buffer), so an
-        // all-in-place workload never grows the pool
+        // Reserve workspace scratch only when some side actually packs on this
+        // call. When neither does, hand back null bases instead: they are never
+        // dereferenced (every tile then reads A in place, and B either in place or
+        // from the prepacked buffer), so an all-in-place workload never grows the
+        // pool
         let regions: Regions<Fam::Lhs> = if need_a_pack || pack_b {
             ws.regions::<Fam::Lhs>(a_per_region, a_regions, b_elems)
         } else {
@@ -530,7 +562,8 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize, E>(
         };
         let a_base = Ptr(regions.a_base);
         let a_stride = regions.a_stride;
-        // Prepacked: read from the caller buffer; else from the per-call scratch
+        // `b_base` points at the caller's prepacked buffer when there is one, else
+        // at this call's own scratch region, which is never read when B is not packed
         let b_base = match packed {
             Some((pb, _, _)) => Ptr(pb as *mut Fam::Rhs),
             None => Ptr(regions.b_base as *mut Fam::Rhs),
@@ -541,25 +574,25 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize, E>(
         let c = Ptr(c);
         let ash = alpha_status(alpha);
 
-        // Running element offset of the current `jc` block inside a prepacked
-        // RHS buffer: each block holds `n_nt * nr * k` elements (every padded
-        // column appears once per depth row). Unused when not prepacked
+        // Running element offset of the current `jc` block inside a prepacked RHS
+        // buffer: each block holds `n_nt * nr * k.next_multiple_of(DEPTH_MULTIPLE)`
+        // elements (the identity `k` for every family except a dot-product one)
+        // Unused when not prepacked
         let mut jc_off = 0usize;
         let mut jc = 0;
         while jc < n {
             let nc_eff = core::cmp::min(nc, n - jc);
             let n_nt = nc_eff.div_ceil(nr);
 
-            // Job count and cursor grain depend only on this column panel and
-            // the worker count - invariant across the depth (`pc`) loop, so
-            // compute them once here. The packed-LHS path (whole-row-block
-            // chunks) is split for load balance; the general path uses the
-            // shared `job_grain` oversample. See `packed_block_grain`
+            // `n_jobs` and `grain` depend only on this jc block's `n_nt` (via
+            // `nc_eff`) and the worker count, both fixed across every `pc`
+            // iteration below, so compute them once per jc block rather than once
+            // per depth panel
             let n_jobs = n_mc * n_nt;
             let grain = if shared_a {
-                // A is pre-packed once per block below, so whole-block
-                // chunking no longer buys pack reuse - use the fine grain for
-                // the best balance
+                // A is already pre-packed once per row-block below, so a worker no
+                // longer gains extra pack reuse from a whole-block chunk: use the
+                // finer general grain for the best load balance instead
                 parallel::job_grain(n_jobs, n_threads)
             } else if (rsa != 1 || want_pack_lhs) && n_mc >= n_threads {
                 parallel::packed_block_grain(n_nt, n_mc, n_threads)
@@ -570,13 +603,15 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize, E>(
             let mut pc = 0;
             while pc < k {
                 let kc_eff = core::cmp::min(kc, k - pc);
-                // Depth-padded panel stride for dot families (identity when `q_depth == 1`)
+                // Depth-padded panel size the packed buffers are strided by
+                // (identity when `q_depth == 1`)
                 let kc_eff_pad = kc_eff.next_multiple_of(q_depth);
                 let first = pc == 0;
-                // Whether this is the final depth slice: the fused epilogue
-                // applies only on the last panel (raw `Acc` partials store on
-                // the earlier ones). For an `OUT_IS_ACC = false` family
-                // (`kc = k`) this is always the single slice
+                // The final depth slice is the only one the fused epilogue may
+                // apply to (earlier slices store raw `Acc` partials, per
+                // `OUT_IS_ACC`'s contract); for an `OUT_IS_ACC = false` family
+                // (`kc = k`) there is only ever the one slice, so this is always
+                // `true`
                 let last = pc + kc_eff >= k;
                 let beta_eff = if first { beta } else { Fam::Acc::ONE };
                 let bst = if first {
@@ -585,14 +620,14 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize, E>(
                     BetaStatus::One
                 };
 
-                // Pack the RHS macro-panel in parallel (when packing): workers
-                // pull NR-wide column panels from a shared cursor. The
-                // `for_each_worker` join below is the write-before-read
-                // barrier the compute region depends on - packed B is the
-                // *one* buffer shared (non-disjoint) across all compute
-                // workers, so every panel must be written here before any
-                // worker reads it. Fusing this region into the compute loop,
-                // or moving packing inside it, would reintroduce a data race
+                // Pack this depth slice's RHS macro-panel in parallel: workers
+                // pull `nr`-wide column panels from a shared cursor. The
+                // `for_each_worker` join is the write-before-read barrier the
+                // compute region below relies on - the packed-B buffer is one
+                // region shared (not disjoint) across every compute worker, so
+                // every panel must finish writing here before any worker is
+                // allowed to read it. Interleaving this with the compute loop, or
+                // moving the pack inside it, would reintroduce that race
                 if pack_b {
                     let bcur = parallel::JobCursor::new(n_nt, parallel::job_grain(n_nt, n_threads));
                     parallel::for_each_worker(n_threads, |_tid| {
@@ -610,12 +645,12 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize, E>(
                     });
                 }
 
-                // Shared-LHS pre-pack: pack each row-block's A panel once
-                // into `a_base[ic_idx]`. The `for_each_worker` join is the
-                // write-before-read barrier the compute region depends on -
-                // same discipline as the packed-B region above. Workers pull
-                // disjoint `ic` ranges and write disjoint, ALIGN-rounded
-                // slots, so there is no intra-region race
+                // Shared-LHS pre-pack: pack each row-block's A panel exactly once
+                // into `a_base[ic_idx]`, ahead of the compute loop that reads it -
+                // the same write-before-read discipline as the packed-B region
+                // above, enforced by the same `for_each_worker` join. Workers here
+                // pull disjoint `ic` ranges and write disjoint, `ALIGN`-rounded
+                // slots, so there is no race even though it is the same region
                 if shared_a {
                     let acur = parallel::JobCursor::new(n_mc, parallel::job_grain(n_mc, n_threads));
                     parallel::for_each_worker(n_threads, |_tid| {
@@ -636,17 +671,18 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize, E>(
                 let cur = parallel::JobCursor::new(n_jobs, grain);
 
                 parallel::for_each_worker(n_threads, |tid| {
-                    // Force whole-struct capture of the `Send + Sync` pointer
-                    // shims; edition-2024 (RFC 2229) closures otherwise
-                    // capture the inner `*mut` fields disjointly, which are
-                    // not `Sync`, so the closure would fail the bound needed
-                    // to move into the rayon workers
+                    // Capture the `Send + Sync` pointer shims as whole structs
+                    // Edition 2024's disjoint closure capture (RFC 2229) would
+                    // otherwise capture each one's inner `*mut` field on its own,
+                    // which is not `Sync`, so the closure would fail the bound
+                    // rayon's worker spawn needs
                     let (a, b, c, a_base, b_base, epi) = (a, b, c, a_base, b_base, epi);
-                    // Per-worker scratch slot (per-worker path only). On the
-                    // shared-A path `tid` may exceed `n_mc`, so
-                    // `a_base + tid*a_stride` would be out-of-bounds pointer
-                    // arithmetic even though it is never read - use a null
-                    // base there instead
+                    // This worker's private A-pack scratch slot, per-worker path
+                    // only. On the shared-A path `tid` can run past `n_mc` (there
+                    // are only `n_mc` slots there), so `a_base + tid*a_stride`
+                    // would compute an out-of-bounds pointer even though nothing
+                    // ever reads through it - use a null base instead to stay
+                    // clear of that
                     let a_buf = if shared_a {
                         core::ptr::null_mut::<Fam::Lhs>()
                     } else {
@@ -655,11 +691,11 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize, E>(
                     let mut scratch = [const { MaybeUninit::<Fam::Acc>::uninit() }; SCRATCH_LEN];
                     let scratch_ptr = scratch.as_mut_ptr() as *mut Fam::Acc;
 
-                    // Cached LHS pack state for the current row block
-                    // `packed_a` is carried explicitly (not re-derived as
-                    // `a_cs == mr`, which could collide for a self-overlapping
-                    // column-major A whose `csa` equals `mr` and then read the
-                    // in-place A with the packed address formula)
+                    // Cached A-panel pack state for whichever row block the worker
+                    // is currently on. `packed_a` is tracked explicitly rather
+                    // than inferred from `a_cs == mr`, because an unpacked
+                    // column-major A could legitimately have `csa == mr` too,
+                    // which would then be misread as the packed address formula
                     let mut cur_ic = usize::MAX;
                     let mut a_panel_base: *const Fam::Lhs = core::ptr::null();
                     let mut a_cs: isize = 0;
@@ -675,11 +711,12 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize, E>(
                             if ic_idx != cur_ic {
                                 cur_ic = ic_idx;
                                 if shared_a {
-                                    // Read the block's A panel that the
-                                    // pre-pass packed once (same bytes, same
-                                    // packed read formula as the per-worker
-                                    // case => identical packed input, so the
-                                    // result reproduces it)
+                                    // This block's A panel was already packed once
+                                    // by the pre-pass above, at the same byte
+                                    // address and via the exact same pack call the
+                                    // per-worker branch below would make, so
+                                    // reading it here reproduces that packed input
+                                    // bit-for-bit
                                     a_panel_base =
                                         a_base.0.add(ic_idx * a_stride) as *const Fam::Lhs;
                                     a_cs = mr as isize;
@@ -702,17 +739,25 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize, E>(
 
                             let col = jc + jt * nr;
                             let nr_eff = core::cmp::min(nr, nc_eff - jt * nr);
-                            // Prepacked B -> global panel at the layout-identity
-                            //   offset jc_off + nr*(n_nt*pc + jt*kc_eff)
-                            //   (pc == sum of prior kc_eff, so this matches the
-                            //   per-(jc,pc) layout pack_rhs_full wrote)
-                            // packed B -> per-slice contiguous panel with (NR, 1)
-                            // unpacked B -> read in place with the original strides
+                            // Where this call reads its RHS panel from, and at what
+                            // strides:
+                            //  - prepacked: the global panel at
+                            //    `jc_off + nr*(n_nt*pc + jt*kc_eff_pad)`, matching
+                            //    the layout `pack_rhs_full` wrote for this exact
+                            //    (jc, pc, jt)
+                            //  - packed (this call's own B-pack): the per-slice
+                            //    contiguous panel at `jt*kc_eff_pad*nr`, strides
+                            //    (nr, 1)
+                            //  - unpacked: read straight from `b` at the original
+                            //    strides
                             let (bpan, b_rs_k, b_cs_k) = if prepacked {
-                                // Depth-padded panel stride (identity for
-                                // `q_depth == 1`). The single-slice guard
-                                // above keeps `pc == 0` for any `q_depth > 1`
-                                // family, so `n_nt * pc` needs no padding
+                                // `n_nt * pc` stands in for the padded depth
+                                // already consumed by earlier slices: exact when
+                                // `q_depth == 1` (every prior slice's
+                                // `kc_eff_pad == kc_eff == kc`), and trivially
+                                // exact otherwise because the assert above forces
+                                // `pc == 0` (a single slice) for any
+                                // `DEPTH_MULTIPLE > 1` family reaching this branch
                                 (
                                     b_base.0.add(jc_off + nr * (n_nt * pc + jt * kc_eff_pad))
                                         as *const Fam::Rhs,
@@ -734,7 +779,9 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize, E>(
                                 )
                             };
 
-                            // Process the whole column strip in the ISA's target-feature context
+                            // Everything in this column strip (every `mr`-row
+                            // sub-tile of the current row block) runs inside the
+                            // ISA's target-feature context
                             simd.vectorize(|| {
                                 let mut ir = 0;
                                 while ir < mc_eff {
@@ -746,11 +793,11 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize, E>(
                                     };
                                     let cptr =
                                         c.0.offset((ic + ir) as isize * rsc + col as isize * csc);
-                                    // `ic + ir` and `col` are the tile's
-                                    // origin in the oriented frame, so a
-                                    // per-row/per-col bias resolves its
-                                    // absolute base; `last` gates the
-                                    // once-per-element apply
+                                    // `ic + ir`/`col` are this sub-tile's origin in
+                                    // the oriented problem frame, letting a
+                                    // per-row/per-col epilogue bias resolve its
+                                    // absolute base; `last` gates the epilogue to
+                                    // fire at most once per output element
                                     Fam::microkernel_epi::<S, E, MR_REG, NR>(
                                         simd,
                                         kc_eff,
@@ -783,9 +830,10 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize, E>(
 
                 pc += kc;
             }
-            // Each prepacked `jc` block holds `n_nt` panels of `nr x kpad(k)`
-            // (single slice for any depth-padded family - see the guard
-            // above). `kpad == k` when q_depth == 1
+            // Advance past this jc block's region in the prepacked buffer: `n_nt`
+            // panels of `nr` columns by `k.next_multiple_of(q_depth)` depth (the
+            // single padded slice for any `q_depth > 1` family, by the guard
+            // above; plain `k` when `q_depth == 1`)
             jc_off += n_nt * nr * k.next_multiple_of(q_depth);
             jc += nc;
         }

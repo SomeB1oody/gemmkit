@@ -2,20 +2,20 @@
 use super::*;
 use crate::common::dims_strides;
 
-/// `C[r, c] <- f(alpha*A*B + beta*C, r, c)` in 1 fused pass: the ndarray adapter over
-/// gemmkit's [`gemmkit::gemm_map`]. The closure `f(value, row, col)` is applied to each output
-/// element at its final value, with `(row, col)` in the **user** frame of `C`, fired exactly once
-/// per element. `T` is `f32`/`f64` only. Like [`gemm`], it reads the pointer/strides directly and
-/// forwards to gemmkit's raw engine, so C-order, F-order, general-stride, transposed, and reversed
-/// (negative-stride) views all work without copying
+/// `C[r, c] <- f(alpha*A*B + beta*C, r, c)` in 1 fused pass: the ndarray adapter over gemmkit's
+/// [`gemmkit::gemm_map`]. The closure `f(value, row, col)` is applied to each output element at
+/// its final value, with `(row, col)` in the **user** frame of `C`, fired exactly once per
+/// element. `T` is `f32`/`f64` only. Like [`gemm`], it reads the pointer/strides directly and
+/// forwards to gemmkit's raw engine, so C-order, F-order, general-stride, transposed, and
+/// reversed (negative-stride) views all work without copying
 ///
 /// For a bias / activation prefer [`gemm_fused`] (it vectorizes); `gemm_map` is the general
-/// per-element extension point (GELU, sigmoid, clamps, position-dependent transforms), at the cost
-/// of 1 indirect call per output element. For `f32`/`f64` the result is bit-identical to [`gemm`]
-/// followed by mapping each `C[r, c]` through `f(C[r, c], r, c)`, for every shape
+/// per-element extension point (GELU, sigmoid, clamps, position-dependent transforms), at the
+/// cost of 1 indirect call per output element. For `f32`/`f64` the result is bit-identical to
+/// [`gemm`] followed by mapping each `C[r, c]` through `f(C[r, c], r, c)`, for every shape
 ///
 /// # Panics
-/// If the inner dimensions disagree (same conditions as [`gemm`])
+/// Same conditions as [`gemm`]
 #[cfg(feature = "epilogue")]
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_map<T, S1, S2, SC>(
@@ -86,9 +86,9 @@ fn gemm_map_common<T, S1, S2, SC>(
     let (rsc, csc) = (cs[0], cs[1]);
     let cp = c.as_mut_ptr();
 
-    // SAFETY: dims validated; ndarray guarantees the pointer/strides describe a valid in-bounds
-    // layout and `c` (a `&mut` borrow) can't alias `a`/`b`. Negative (reversed) strides forward
-    // straight through, exactly as the plain entry. The closure is total (applied to every element)
+    // SAFETY: dims validated above; ndarray guarantees the pointer/strides are in-bounds and `c`
+    // (a `&mut` borrow) can't alias `a`/`b`; `f` is total (applied to every output element), which
+    // is what the `_unchecked` closure contract requires
     unsafe {
         match ws {
             Some(ws) => gemm_map_unchecked_with(

@@ -1,4 +1,5 @@
-//! Shared dims/strides extraction and fused-epilogue validation helpers
+//! Shared dims/strides extraction, plus the bias/requant validation used by the epilogue-gated
+//! entries to replicate gemmkit's own checked-entry panics without materializing a `C` slice
 use super::*;
 
 #[inline]
@@ -10,13 +11,12 @@ pub(crate) fn dims_strides<T, S: Data<Elem = T>>(
     (r, c, s[0], s[1])
 }
 
-/// The half-open byte range `[lo, hi)` a strided C view based at `cp` (element `(0, ..., 0)`) actually
-/// touches, from the raw pointer plus `(dim, element-stride)` pairs. Strides may be negative
-/// (reversed views), so a negative axis extends `lo` below the base and a positive one extends `hi`
-/// above it; an empty (`dim == 0`) axis yields an empty range. **Raw pointer arithmetic only**: no
-/// reference is ever formed over the (possibly gappy / partly-uninitialized) span, which is exactly
-/// why the fused entries forward raw parts to gemmkit's `_unchecked` engine instead of fabricating a
-/// slice here
+/// The half-open byte range `[lo, hi)` a strided view based at `cp` (element `(0, ..., 0)`)
+/// touches, given the raw pointer plus its `(dim, element-stride)` pairs. A negative stride
+/// extends `lo` below the base, a positive one extends `hi` above it (a length-1 axis
+/// contributes neither); an empty (`dim == 0`) axis yields an empty range at `cp`. **Raw pointer
+/// arithmetic only**: no reference is ever formed over the (possibly gappy) span, so this can
+/// describe a `C` the caller has not yet proven in-bounds
 #[cfg(feature = "epilogue")]
 #[inline]
 pub(crate) fn c_byte_range<T>(cp: *const T, dims: &[(usize, isize)]) -> (usize, usize) {
@@ -28,7 +28,7 @@ pub(crate) fn c_byte_range<T>(cp: *const T, dims: &[(usize, isize)]) -> (usize, 
     let (mut lo, mut hi): (isize, isize) = (0, 0);
     for &(d, s) in dims {
         if d <= 1 {
-            continue; // a length-1 axis spans nothing, so its stride (any sign) is irrelevant
+            continue; // a length-1 axis has no extent, so its stride does not matter
         }
         let e = (d as isize - 1) * s;
         if e < 0 {
@@ -41,10 +41,10 @@ pub(crate) fn c_byte_range<T>(cp: *const T, dims: &[(usize, isize)]) -> (usize, 
     ((base + lo * sz) as usize, (base + (hi + 1) * sz) as usize)
 }
 
-/// `true` if the `bias` slice (`len` elements of `TB`) overlaps the byte range the strided C view
-/// touches: the raw-pointer replication of gemmkit's own byte-range overlap test (`a0 < b1 && b0 <
-/// a1`), so the adapter reproduces the core checked entry's bias-vs-`C` rejection without ever
-/// fabricating a `C` slice
+/// `true` if a `len`-element `TB` slice at `bias` overlaps the byte range the strided `C` view
+/// (`cp`/`c_dims`) touches: the standard half-open interval test `a0 < b1 && b0 < a1`, over
+/// [`c_byte_range`], so the adapter can reject a bias/`C` overlap without ever forming a `C`
+/// slice
 #[cfg(feature = "epilogue")]
 #[inline]
 pub(crate) fn bias_overlaps_c<TC, TB>(
@@ -62,10 +62,10 @@ pub(crate) fn bias_overlaps_c<TC, TB>(
     c_lo < b_hi && b_lo < c_hi
 }
 
-/// Validate a fused `Option<Bias>` against the output shape and `C`'s footprint, replicating the
-/// core checked entry's `validate_bias` (byte-identical panic wording), and lower it to the raw
-/// `(ptr, BiasDim, has_bias)` triple the `_unchecked` core entries take. `cp`/`c_dims` describe `C`
-/// for the overlap test via [`bias_overlaps_c`] (raw pointer math; `C` is never referenced)
+/// Validate a fused `Option<Bias>` against `(m, n)` and `C`'s footprint (`cp`/`c_dims`), panicking
+/// with the exact wording gemmkit's own checked entry uses, and lower it to the raw `(ptr,
+/// BiasDim, has_bias)` triple the `_unchecked` core entries take. `PerRow` must have length `m`,
+/// `PerCol` length `n`; either must not overlap `C` ([`bias_overlaps_c`], raw pointer math only)
 #[cfg(feature = "epilogue")]
 pub(crate) fn lower_bias<T>(
     bias: Option<Bias<'_, T>>,
@@ -105,10 +105,9 @@ pub(crate) fn lower_bias<T>(
     }
 }
 
-/// Validate a requantize per-row bias against `A.rows` and `C`'s footprint, replicating the core
-/// `requant_bias` (byte-identical panic wording), and lower it to the raw `(ptr, has_bias)` the
-/// `_unchecked` requant entries take. `cp`/`c_dims` describe the (`i8`/`u8`) `C` for the overlap
-/// test; raw pointer math only
+/// Validate an optional requantize `i32` bias (length `m == A.rows`) against `C`'s footprint
+/// (`cp`/`c_dims`, the `i8`/`u8` output), panicking with gemmkit's own checked-entry wording, and
+/// lower it to the raw `(ptr, has_bias)` pair the `_unchecked` requant entries take
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 pub(crate) fn requant_bias<TC>(
     m: usize,
@@ -134,12 +133,11 @@ pub(crate) fn requant_bias<TC>(
     }
 }
 
-/// Validate a requantize [`RequantScale`] against `A.rows` and `C`'s footprint, replicating the
-/// core `requant_scale` (byte-identical panic wording), and lower it to the raw `(scale,
-/// row_scales, has_row_scales)` the `_unchecked` requant entries take. A `PerTensor(s)` must be
-/// finite and `> 0`; a `PerRow` slice must have length `m`, every element finite and `> 0`, and
-/// must not overlap `C`. `cp`/`c_dims` describe the (`i8`/`u8`) `C` for the overlap test; raw
-/// pointer math only
+/// Validate a [`RequantScale`] against `C`'s footprint (`cp`/`c_dims`, the `i8`/`u8` output),
+/// panicking with gemmkit's own checked-entry wording, and lower it to the raw `(scale,
+/// row_scales, has_row_scales)` triple the `_unchecked` requant entries take. `PerTensor(s)` must
+/// be finite and `> 0`; `PerRow` must have length `m == A.rows`, every element finite and `> 0`,
+/// and must not overlap `C`
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 pub(crate) fn requant_scale<TC>(
     m: usize,

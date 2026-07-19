@@ -1,10 +1,10 @@
-//! Mixed-precision (f16/bf16) shapes x layouts, oracle cross-check against the
-//! `gemm` crate, and parallel/serial bit-identity
+//! Mixed-precision (f16/bf16) GEMM: shapes x layouts, gemv routes, an oracle
+//! cross-check against the `gemm` crate, and parallel/serial bit-identity
 
 use crate::common::*;
 use gemmkit::{MatMut, MatRef, Parallelism, gemm};
 
-/// Shapes for the mixed-precision (`f16`/`bf16`) accuracy and bit-identity tests
+/// Shared shape list for the f16/bf16 accuracy and bit-identity tests below
 #[cfg(feature = "half")]
 fn mixed_dims() -> [(usize, usize, usize); 9] {
     [
@@ -20,6 +20,8 @@ fn mixed_dims() -> [(usize, usize, usize); 9] {
     ]
 }
 
+/// f16 over the [`mixed_dims`] shapes, row-major A, col-major B, both C layouts, and an
+/// alpha/beta sweep including the alpha=0 scale-only case, against the f64 reference
 #[cfg(feature = "half")]
 #[test]
 fn correctness_f16_layouts() {
@@ -42,6 +44,8 @@ fn correctness_f16_layouts() {
     }
 }
 
+/// bf16 twin of [`correctness_f16_layouts`], with A/B layouts swapped (col-major A,
+/// row-major B)
 #[cfg(feature = "half")]
 #[test]
 fn correctness_bf16_layouts() {
@@ -64,12 +68,12 @@ fn correctness_bf16_layouts() {
     }
 }
 
-/// Mixed-precision (`f16`/`bf16`) serial == parallel bit-identity across thread counts,
-/// same caveat as `parallel_equals_serial_bit_identical`: it holds because narrowing is a
-/// pure per-position function of the f32 result *and* blocking is thread-independent, an
-/// implementation property, not a promised contract. (`bf16` here is the **dot** kernel,
-/// whose serial and parallel paths share one kernel + layout, so they coincide bitwise
-/// even though dot != widen.) Pins current behavior; relax with split-K, as noted there
+/// f16/bf16 serial and parallel runs land on identical bits, for every thread count:
+/// the same `float.rs`'s `parallel_equals_serial_bit_identical` caveat applies (holds
+/// because narrowing to f16/bf16 is a pure per-position function of the f32 result and
+/// blocking is thread-independent, an implementation property, not a promised contract).
+/// `bf16` here runs the dot (`vdpbf16ps`) kernel rather than f16's widen-FMA one, but
+/// dispatch picks the same kernel for serial and parallel, so the 2 still coincide bitwise
 #[cfg(feature = "half")]
 #[test]
 fn parallel_equals_serial_mixed() {
@@ -118,18 +122,19 @@ fn parallel_equals_serial_mixed() {
     check::<gemmkit::bf16>(Layout::Col);
 }
 
-/// Mixed-precision (`f16`/`bf16`) gemv shapes through the widen gemv route: `m == 1` and `n == 1`,
-/// both operand orientations plus a strided (`GeneralPad`) A, an alpha/beta sweep, checked against
-/// the f64 oracle within the per-type tolerance. Row-major A + unit vector hits `dot_rows_mixed`,
-/// col-major A + col-major C hits `axpy_mixed`, and `GeneralPad` A hits `strided_rows_mixed`; `k`
-/// spans the SIMD widen sweep plus a sub-lane scalar tail
+/// f16/bf16 gemv shapes (`m == 1` or `n == 1`) through the mixed-precision gemv core,
+/// checked against the f64 oracle. Row-major A pairs with a unit-stride vector to hit
+/// `dot_rows_mixed`, col-major A with col-major C hits `axpy_mixed`, and `GeneralPad` A
+/// falls through to `strided_rows_mixed`; `k` ranges from a sub-lane scalar tail up
+/// through several SIMD widths
 #[cfg(feature = "half")]
 #[test]
 fn correctness_mixed_gemv() {
     fn check<T: Elem>() {
-        // (m, k, n): the length-1 output dim makes it a gemv; k crosses the SIMD/scalar boundary
+        // Each shape has m == 1 or n == 1, so it dispatches as a gemv; k varies across
+        // the SIMD-lane/scalar-tail boundary
         let shapes = [
-            (1usize, 40usize, 1usize), // 1x1: a bare dot
+            (1usize, 40usize, 1usize), // a bare dot product
             (64, 64, 1),
             (129, 200, 1),
             (1, 64, 17),
@@ -160,12 +165,13 @@ fn correctness_mixed_gemv() {
     check::<gemmkit::bf16>();
 }
 
-/// The widen gemv output-row partition computes each output element as one worker's single `f32`
-/// reduction (never split), so serial == parallel **bit-for-bit** for every thread count: the
-/// mixed twin of the promise the float gemv partition makes. Covers the dot layout (row-major A)
-/// and the axpy layout (col-major A + col-major C), for `n == 1` and `m == 1`. The gemv parallel
-/// floor is forced to 1 byte (RAII-restored) so the bandwidth partition engages at modest sizes on
-/// any machine, rather than relying on the shape exceeding an L3-derived floor
+/// The mixed-precision gemv core splits work by output row, never by `k`, so each output
+/// element is always the single reduction of 1 worker: serial and parallel must land on
+/// identical bits for every thread count, the mixed twin of the float gemv partition's
+/// same guarantee. Covers the dot layout (row-major A) and the axpy layout (col-major A,
+/// col-major C), for both `n == 1` and `m == 1`. The gemv parallel byte floor is forced to
+/// 1 (RAII-restored on drop) so the row partition engages at these sizes on any machine,
+/// rather than depending on the shape clearing an L3-derived floor
 #[cfg(feature = "half")]
 #[test]
 fn parallel_equals_serial_mixed_gemv() {
@@ -176,10 +182,10 @@ fn parallel_equals_serial_mixed_gemv() {
         }
     }
     let _restore = RestoreFloor(gemmkit::tuning::gemv_parallel_bytes());
-    gemmkit::tuning::set_gemv_parallel_bytes(1); // tiny floor: force the row partition to engage
+    gemmkit::tuning::set_gemv_parallel_bytes(1); // any shape below now clears the floor
 
     fn check<T: Elem>(la: Layout, label: &str) {
-        // n == 1 (mat*vec) and m == 1 (vec*mat), sized so the row partition splits across workers
+        // n == 1 (mat*vec) and m == 1 (vec*mat), large enough to split across several workers
         for (m, k, n) in [
             (4096usize, 512usize, 1usize),
             (1, 512, 4096),
@@ -224,29 +230,28 @@ fn parallel_equals_serial_mixed_gemv() {
             }
         }
     }
-    check::<gemmkit::f16>(Layout::Row, "f16/dot"); // row-major A -> dot_rows_mixed
-    check::<gemmkit::f16>(Layout::Col, "f16/axpy"); // col-major A -> axpy_mixed
+    check::<gemmkit::f16>(Layout::Row, "f16/dot"); // routes through dot_rows_mixed
+    check::<gemmkit::f16>(Layout::Col, "f16/axpy"); // routes through axpy_mixed
     check::<gemmkit::bf16>(Layout::Row, "bf16/dot");
     check::<gemmkit::bf16>(Layout::Col, "bf16/axpy");
 }
 
-/// Cross-check `f16` against the `gemm` crate (the ecosystem oracle, which also
-/// accumulates `f16` in `f32`): the 2 must agree to a tight `f16` tolerance.
-/// `gemm`'s `f16` *is* `half::f16` *is* `gemmkit::f16`, so the comparison is direct.
-/// Gated out of Miri and wasm (the `gemm` dev-dep is `cfg(all(not(miri), not(wasm)))`)
+/// Cross-check f16 against the `gemm` crate, which also accumulates f16 in f32: `gemm`'s
+/// f16 is `half::f16` is `gemmkit::f16`, so the 2 outputs must agree to a tight f16
+/// tolerance. Gated the same as the `gemm` dev-dependency itself
+/// (`cfg(all(not(miri), not(target_family = "wasm")))`)
 #[test]
 #[cfg(all(not(miri), not(target_family = "wasm"), feature = "half"))]
 fn mixed_f16_matches_gemm_crate() {
-    // Includes a large-k case (k = 2048 > the f32 kc blocking ~= 512) to exercise the
-    // mixed-precision single-panel rule: because `Out` (f16) is narrower than `Acc`
-    // (f32), the driver forces `kc = k` (`OUT_IS_ACC = false`), so the whole
-    // contraction accumulates in f32 and rounds to f16 exactly ONCE at writeback:
-    // never between kc panels. (A homogeneous f32 kernel would instead split this k.)
-    // This is what keeps gemmkit matching `gemm`'s whole-k f32 accumulation
+    // k=2048 exceeds the f32 kc default (512), which would split a homogeneous f32
+    // kernel's contraction across several kc panels; the mixed family is `OUT_IS_ACC
+    // = false`, so the driver forces a single kc = k panel instead, accumulating the
+    // whole contraction in f32 and rounding to f16 exactly once, matching how `gemm`
+    // accumulates its own f16 output
     for (m, k, n) in [(64, 48, 40), (96, 65, 72), (33, 17, 19), (64, 2048, 64)] {
         let a = Mat::<gemmkit::f16>::rand(m, k, 0x16A + m as u64);
         let b = Mat::<gemmkit::f16>::rand(k, n, 0x16B + n as u64);
-        // Column-major buffers (gemm's preferred orientation), zero beta
+        // Column-major, the orientation gemm::gemm below expects; beta is 0
         let (abuf, rsa, csa) = build_view(&a, Layout::Col);
         let (bbuf, rsb, csb) = build_view(&b, Layout::Col);
         let mut c_kit = vec![gemmkit::f16::from_f64(0.0); m * n];
@@ -260,8 +265,8 @@ fn mixed_f16_matches_gemm_crate() {
             MatMut::from_col_major(&mut c_kit, m, n),
             Parallelism::Serial,
         );
-        // gemm crate: column-major operands -> (cs = leading dim, rs = 1), matching
-        // the bench harness; read_dst=false (beta=0)
+        // gemm::gemm's column-major convention: cs is the leading dimension, rs is 1;
+        // read_dst = false since beta is 0
         unsafe {
             gemm::gemm(
                 m,
@@ -285,9 +290,9 @@ fn mixed_f16_matches_gemm_crate() {
                 gemm::Parallelism::None,
             );
         }
-        // Both accumulate in f32 then round to f16; allow a few f16 ULPs of slack
-        // (the accumulation order differs). `assert_accurate` wants a *row-major*
-        // reference, so transpose the column-major `c_gemm` into one
+        // Both round f32 to f16 once; a few f16 ULPs of slack cover the differing
+        // accumulation order. assert_accurate wants a row-major reference, so
+        // transpose the column-major c_gemm into one
         let mut cref = vec![0.0f64; m * n];
         for i in 0..m {
             for j in 0..n {

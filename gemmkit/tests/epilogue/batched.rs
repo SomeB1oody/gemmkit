@@ -1,10 +1,9 @@
-//! Strided-batched fused-epilogue tests (spec section 10, Phase 3): `gemm_batched_fused` /
-//! `gemm_batched_fused_with`
+//! Strided-batched fused-epilogue tests: `gemm_batched_fused` / `gemm_batched_fused_with`
 //!
 //! The headline contract is that the batched-fused call is **bit-identical to a loop of
-//! `gemm_fused` calls**: one per element, sharing the single bias vector and single activation.
+//! `gemm_fused` calls**, one per element, sharing the single bias vector and single activation.
 //! That holds for every element type (`f32`/`f64` and, under `half`, `f16`/`bf16`), since each
-//! element re-dispatches through the very same fused engine `gemm_fused` uses. Comparisons are
+//! element re-dispatches through the same fused engine `gemm_fused` uses. Comparisons are
 //! **bitwise** (raw bit patterns). Fills are the deterministic, platform-independent
 //! [`crate::common::Rng`]; every reference is self-computed
 
@@ -14,20 +13,20 @@ use gemmkit::{
     gemm_batched_fused, gemm_fused_with,
 };
 
-/// Serializes the 2 threshold-mutating tests in this module, mirroring `tests/tuning.rs`'s
-/// `KNOB_LOCK`. `tuning::parallel_threshold` is process-global and the harness runs tests in this
-/// binary concurrently; without a shared lock one test's set/restore could interleave with another
-/// test's GEMM and flip a route. The plan-coverage tests here hold this via [`KnobGuard`] for their
-/// whole body and restore the prior value on drop, so no mutation is observed outside them. (The
-/// other epilogue tests do not take the lock: every contract in this suite is bitwise-invariant to
-/// scheduling, fused == gemm-then-map and serial == parallel both hold under any plan, so a
-/// transiently-lowered threshold cannot perturb their assertions)
+/// Serializes the 2 threshold-mutating tests in this module ([`batch_parallel_bitwise`] and
+/// [`seq_internal_bitwise`]), mirroring `tests/tuning.rs`'s own `KNOB_LOCK`. `tuning::
+/// parallel_threshold` is process-global and the harness runs tests in this binary concurrently,
+/// so without a shared lock one test's set/restore could interleave with another test's GEMM and
+/// flip its route. Those 2 tests hold this lock via [`KnobGuard`] for their whole body and restore
+/// the prior value on drop, so no mutation is observed outside them. Every other test in this
+/// module skips the lock: their contracts (fused == gemm-then-map, serial == parallel) hold under
+/// any plan, so a transiently-lowered threshold elsewhere cannot perturb their assertions
 static KNOB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Holds [`KNOB_LOCK`] and forces `tuning::parallel_threshold = override_to` for the calling test's
-/// duration, saving the prior value (read from the getter) and restoring it on drop. Recovers a
-/// poisoned lock so one panicking test does not cascade. The `_lock` field keeps the guard alive for
-/// the whole test body
+/// Holds [`KNOB_LOCK`] and forces `tuning::parallel_threshold = override_to` for the calling
+/// test's duration, saving the prior value (read from the getter) and restoring it on drop.
+/// Recovers a poisoned lock so one panicking test does not cascade. The `_lock` field only needs
+/// to keep the guard alive for the whole test body; nothing reads it directly
 struct KnobGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
     saved: usize,
@@ -46,9 +45,9 @@ impl Drop for KnobGuard {
     }
 }
 
-/// The element under test: real floats and (under `half`) narrow floats. `of`/`bits` give
-/// deterministic construction and a bitwise compare; `leaky` builds a `LeakyRelu` in `T` (the
-/// public `Activation` is not `Clone`, so it is rebuilt per call)
+/// The batched element under test: `f32`/`f64` and, under `half`, `f16`/`bf16`. `of`/`bits` give
+/// deterministic construction and a bitwise compare; `leaky` builds a `LeakyRelu` directly in `T`
+/// (`Activation` is not `Clone`, so each call needs its own fresh value rather than a clone)
 trait BEl: FusedScalar {
     fn of(x: f64) -> Self;
     fn bits(self) -> u64;
@@ -119,20 +118,20 @@ fn make_vec<T: BEl>(rng: &mut Rng, len: usize, scale: f64) -> Vec<T> {
     (0..len).map(|_| T::of(rng.unit() * scale)).collect()
 }
 
-// a. batched_fused == loop of gemm_fused, bitwise (PerRow bias + LeakyRelu, beta != 0)
+// batched_fused == a loop of gemm_fused calls, bitwise (PerRow bias plus LeakyReLU, beta != 0)
 
 fn matches_loop<T: BEl>() {
     let (batch, m, k, n) = (5usize, 31usize, 17usize, 23usize);
     let mut rng = Rng::new(0xBA7C_11FE);
-    // `batch` contiguously-packed column-major elements (element stride = m*k etc.)
+    // batch contiguously-packed column-major elements: element bi starts at offset bi * m * k etc
     let a = make_vec::<T>(&mut rng, batch * m * k, 1.0);
     let b = make_vec::<T>(&mut rng, batch * k * n, 1.0);
     let c0 = make_vec::<T>(&mut rng, batch * m * n, 1.0);
-    let bias_row = make_vec::<T>(&mut rng, m, 2.0); // ONE shared per-row bias (length m)
+    let bias_row = make_vec::<T>(&mut rng, m, 2.0); // 1 bias shared across the whole batch
     let alpha = T::of(0.9);
     let beta = T::of(0.7);
 
-    // Reference: one gemm_fused per element on its own manually-offset slice window, Serial
+    // reference: 1 Serial gemm_fused call per element, on its own offset slice window
     let mut c_ref = c0.clone();
     let mut ws = Workspace::new();
     for bi in 0..batch {
@@ -150,8 +149,9 @@ fn matches_loop<T: BEl>() {
         );
     }
 
-    // Each element runs serially under both schedules for these tiny shapes, so the batched result
-    // is bit-identical to the Serial loop regardless of which schedule the host selects
+    // total work (elem_mnk * batch) is far below parallel_threshold, so resolve_batch returns
+    // BatchPlan::Serial for both par values below: the batched call is a plain Serial loop either
+    // way, matching c_ref exactly
     for par in [Parallelism::Serial, Parallelism::Rayon(4)] {
         let mut c_bat = c0.clone();
         gemm_batched_fused(
@@ -192,13 +192,13 @@ fn batched_fused_matches_loop_narrow() {
     matches_loop::<gemmkit::bf16>();
 }
 
-// a'. checked/unchecked twin equivalence: gemm_batched_fused_unchecked(_with)
+// checked/unchecked twin equivalence: gemm_batched_fused_unchecked(_with)
 
 /// `gemm_batched_fused` and its raw twins `gemm_batched_fused_unchecked` (pool) / `_with`
-/// (caller-owned `Workspace`) are **parallel** entry points: the checked one does not delegate to
-/// the raw one, so a divergence in the raw `(ptr, strides, batch strides, bias)` lowering would go
-/// undetected. Exercise both raw forms against the checked twin bit-for-bit (PerRow bias +
-/// LeakyReLU, contiguously-packed elements)
+/// (caller-owned `Workspace`) are **parallel** entry points (the checked one does not call either
+/// raw one internally), so a divergence in the raw `(ptr, strides, batch strides, bias)` lowering
+/// would go undetected. Drives both raw forms against the checked twin bit-for-bit (PerRow bias
+/// plus LeakyReLU, contiguously-packed elements)
 fn unchecked_matches_checked<T: BEl>() {
     use gemmkit::{BiasDim, gemm_batched_fused_unchecked, gemm_batched_fused_unchecked_with};
 
@@ -207,7 +207,7 @@ fn unchecked_matches_checked<T: BEl>() {
     let a = make_vec::<T>(&mut rng, batch * m * k, 1.0);
     let b = make_vec::<T>(&mut rng, batch * k * n, 1.0);
     let c0 = make_vec::<T>(&mut rng, batch * m * n, 1.0);
-    let bias_row = make_vec::<T>(&mut rng, m, 2.0); // ONE shared per-row bias (length m)
+    let bias_row = make_vec::<T>(&mut rng, m, 2.0); // 1 bias shared across the whole batch
     let alpha = T::of(0.9);
     let beta = T::of(0.7);
     let (a_bs, b_bs, c_bs) = ((m * k) as isize, (k * n) as isize, (m * n) as isize);
@@ -232,8 +232,8 @@ fn unchecked_matches_checked<T: BEl>() {
     let mut c_pool = c0.clone();
     let mut c_ws = c0.clone();
     let mut ws = Workspace::new();
-    // SAFETY: valid in-bounds contiguously-packed col-major elements; the batch C regions are
-    // pairwise disjoint and alias neither A/B nor the (per-row, length-m) shared bias
+    // SAFETY: valid in-bounds contiguously-packed col-major elements; the batch's C regions are
+    // pairwise disjoint and alias neither A nor B nor the per-row, length-m shared bias
     unsafe {
         gemm_batched_fused_unchecked(
             batch,
@@ -310,15 +310,15 @@ fn batched_fused_unchecked_matches_checked() {
     unchecked_matches_checked::<f64>();
 }
 
-// b. broadcast A (a_batch_stride = 0): PerCol bias + Relu, bitwise vs the gemm_fused loop
+// broadcast A (a_batch_stride == 0): PerCol bias plus ReLU, bitwise vs the gemm_fused loop
 
 fn broadcast_a<T: BEl>() {
     let (batch, m, k, n) = (6usize, 20usize, 12usize, 14usize);
     let mut rng = Rng::new(0x0AD_C0DE);
-    let a = make_vec::<T>(&mut rng, m * k, 1.0); // ONE element of A, shared across the batch
+    let a = make_vec::<T>(&mut rng, m * k, 1.0); // 1 A, reused for every batch element
     let b = make_vec::<T>(&mut rng, batch * k * n, 1.0);
     let c0 = make_vec::<T>(&mut rng, batch * m * n, 1.0);
-    let bias_col = make_vec::<T>(&mut rng, n, 2.0); // shared per-col bias (length n)
+    let bias_col = make_vec::<T>(&mut rng, n, 2.0); // 1 bias shared across the whole batch
     let alpha = T::of(1.0);
     let beta = T::of(0.5);
 
@@ -329,7 +329,7 @@ fn broadcast_a<T: BEl>() {
         gemm_fused_with(
             &mut ws,
             alpha,
-            MatRef::new(&a, m, k, 1, m as isize), // same A every element
+            MatRef::new(&a, m, k, 1, m as isize), // the loop reads the same A every iteration
             MatRef::new(&b[bo..bo + k * n], k, n, 1, k as isize),
             beta,
             MatMut::new(&mut c_ref[co..co + m * n], m, n, 1, m as isize),
@@ -344,7 +344,7 @@ fn broadcast_a<T: BEl>() {
         batch,
         alpha,
         MatRef::new(&a, m, k, 1, m as isize),
-        0, // broadcast A across the batch
+        0, // a_batch_stride == 0: reuse the same A for every batch element
         MatRef::new(&b, k, n, 1, k as isize),
         (k * n) as isize,
         beta,
@@ -371,7 +371,7 @@ fn batched_fused_broadcast_a() {
     broadcast_a::<f64>();
 }
 
-// c. identity (bias None + act None) delegates to plain gemm_batched, bitwise
+// identity (bias None, act None) delegates to plain gemm_batched, bitwise
 
 fn identity_delegates<T: BEl>() {
     let (batch, m, k, n) = (4usize, 24usize, 20usize, 18usize);
@@ -429,12 +429,13 @@ fn batched_fused_identity_delegates() {
     identity_delegates::<f64>();
 }
 
-// d. serial == parallel, bitwise (each element is element-serial under either schedule)
+// serial == parallel, bitwise, in the Serial-resolved small-work regime
 
-/// Serial == Rayon(4), bitwise. These tiny shapes sit far below the default `parallel_threshold`,
-/// so resolve_batch returns `BatchPlan::Serial` for both calls: this covers the **Serial-resolved
-/// small-work regime**, not the parallel arms (those are `batched_fused_batch_parallel_bitwise` /
-/// `batched_fused_seq_internal_bitwise`, which lower the threshold under a knob guard)
+/// Serial == Rayon(4), bitwise. `batch * elem_mnk` here sits far below the default
+/// `parallel_threshold`, so `resolve_batch` returns `BatchPlan::Serial` for both calls: this
+/// covers the small-work regime specifically, not the parallel arms (those are
+/// [`batched_fused_batch_parallel_bitwise`] / [`batched_fused_seq_internal_bitwise`], which lower
+/// the threshold under a knob guard)
 fn parallel_bitwise<T: BEl>() {
     let (batch, m, k, n) = (8usize, 12usize, 24usize, 9usize);
     let mut rng = Rng::new(0x5E71_A11E);
@@ -481,19 +482,17 @@ fn batched_fused_parallel_bitwise() {
     parallel_bitwise::<f64>();
 }
 
-// d2. BatchParallel arm: enough elements to fill the workers => BatchPlan::BatchParallel
+// the BatchParallel arm: enough elements to fill the workers, so resolve_batch picks it
 
 fn batch_parallel_bitwise<T: BEl>() {
-    // Under `parallel_threshold = 1` the cheap total-work gate passes for any non-empty batch, so
-    // resolve_batch reaches the core-count branch instead of the small-work Serial short-circuit
-    // Plan derivation (feature = "parallel", Rayon(4)): elem_mnk*batch = (13*9*11)*8 = 10296 >= 1
-    // (gate passes); budget = min(4, auto_threads); batch = 8 >= budget => BatchPlan::BatchParallel(
-    // budget). On any host with >= 2 usable cores this exercises the BatchParallel arm (its whole
-    // point); with only one usable core budget <= 1 short-circuits to Serial. Either way the 2
-    // assertions below are plan-independent: BatchParallel runs every element serially on one worker,
-    // so the batch is bit-identical to a Serial loop of gemm_fused and to the Serial batched call. A
-    // future policy change that broke this routing is caught by re-deriving the plan against this
-    // comment
+    // With parallel_threshold lowered to 1, the cheap total-work gate (elem_mnk * batch =
+    // (13*9*11)*8 = 10296 >= 1) passes, so resolve_batch reaches the core-count branch instead of
+    // its small-work Serial short-circuit. With Rayon(4), budget = min(4, auto_threads()); batch
+    // == 8 >= budget, so it picks BatchPlan::BatchParallel(budget) whenever budget > 1, which
+    // needs at least 2 usable cores (otherwise budget <= 1 and resolve_batch falls back to Serial
+    // itself). Either way the assertions below hold: BatchParallel still runs each element
+    // serially on 1 worker, so the batch stays bit-identical to a Serial gemm_fused loop and to
+    // the Serial batched call regardless of which arm actually ran
     let _guard = KnobGuard::with_parallel_threshold(1);
 
     let (batch, m, k, n) = (8usize, 13usize, 9usize, 11usize);
@@ -501,10 +500,10 @@ fn batch_parallel_bitwise<T: BEl>() {
     let a = make_vec::<T>(&mut rng, batch * m * k, 1.0); // col-major, contiguously packed
     let b = make_vec::<T>(&mut rng, batch * k * n, 1.0);
     let c0 = make_vec::<T>(&mut rng, batch * m * n, 1.0);
-    let bias_row = make_vec::<T>(&mut rng, m, 2.0); // ONE shared per-row bias
+    let bias_row = make_vec::<T>(&mut rng, m, 2.0); // 1 bias shared across the whole batch
     let (alpha, beta) = (T::of(1.1), T::of(0.7));
 
-    // Reference: a loop of Serial gemm_fused, one per element on its offset window
+    // reference: a loop of Serial gemm_fused, 1 call per element on its offset window
     let mut c_loop = c0.clone();
     let mut ws = Workspace::new();
     for bi in 0..batch {
@@ -541,7 +540,7 @@ fn batch_parallel_bitwise<T: BEl>() {
         c
     };
 
-    let c_par = run(Parallelism::Rayon(4)); // BatchParallel(budget) on >= 2 cores
+    let c_par = run(Parallelism::Rayon(4)); // BatchPlan::BatchParallel(budget) on >= 2 cores
     let c_ser = run(Parallelism::Serial); // BatchPlan::Serial
     for idx in 0..batch * m * n {
         assert_eq!(
@@ -565,24 +564,25 @@ fn batched_fused_batch_parallel_bitwise() {
     batch_parallel_bitwise::<f64>();
 }
 
-// d3. SequentialInternal arm (best-effort, platform-dependent coverage): few but large,
-//     L2-spilling elements split each element across the machine in turn
+// the SequentialInternal arm (best-effort, platform-dependent coverage): few but large,
+// L2-spilling elements each get split across the machine in turn
 
 fn seq_internal_bitwise() {
-    // Under `parallel_threshold = 1` the work gate passes. Plan derivation (feature = "parallel",
-    // Rayon(4)): budget = min(4, auto_threads); batch = 2. With >= 3 usable cores batch < budget, so
-    // resolve_batch reaches the residency split test. On x86 (private per-core L2) it splits when the
-    // element spills that L2: elem_bytes = (mk + kn + mn)*8 = 3*256*256*8 = 1.5 MiB > this Zen5's
-    // 1 MiB effective L2 => BatchPlan::SequentialInternal (each element gets the full engine
-    // parallelism in turn). On a host with a larger L2, on aarch64's share-based rule, or with < 3
-    // usable cores, the same shape may resolve BatchParallel instead: that changes only which arm is
-    // *covered*, never the result. SequentialInternal splits each element across workers, relying on
-    // that element's route being serial==parallel bit-identical, so the batch equals a Serial
-    // gemm_fused loop under either plan. The assertion is therefore plan-independent; only the
-    // coverage is platform-dependent
+    // With parallel_threshold lowered to 1 the work gate passes. With Rayon(4), budget =
+    // min(4, auto_threads()); batch == 2, so on a host with >= 3 usable cores budget > batch and
+    // resolve_batch reaches the residency split test rather than picking BatchParallel(batch)
+    // outright. On x86 (private per-core L2) that test splits once an element spills its L2 share:
+    // elem_bytes = (m*k + k*n + m*n)*8 = 3*256*256*8 = 1.5 MiB, sized to exceed the effective L2
+    // this test was tuned against, giving BatchPlan::SequentialInternal (each element gets the
+    // full engine parallelism in turn). On a host with a bigger L2 share, on aarch64's separate
+    // share-based rule, or with < 3 usable cores, the same shape may resolve BatchParallel
+    // instead; that only changes which arm gets *covered*, never the assertions below
+    // SequentialInternal splits each element across workers, relying on that element's route
+    // being serial == parallel bit-identical, so the batch equals the Serial gemm_fused loop
+    // under either plan
     let _guard = KnobGuard::with_parallel_threshold(1);
 
-    let (batch, m, k, n) = (2usize, 256usize, 256usize, 256usize); // 1.5 MiB f64 element
+    let (batch, m, k, n) = (2usize, 256usize, 256usize, 256usize); // each element is 1.5 MiB (f64)
     let mut rng = Rng::new(0x5E90_11A7);
     let a = make_vec::<f64>(&mut rng, batch * m * k, 1.0);
     let b = make_vec::<f64>(&mut rng, batch * k * n, 1.0);
@@ -626,7 +626,7 @@ fn seq_internal_bitwise() {
         c
     };
 
-    let c_par = run(Parallelism::Rayon(4)); // SequentialInternal on this Zen5
+    let c_par = run(Parallelism::Rayon(4)); // BatchPlan::SequentialInternal, on this test's target
     let c_ser = run(Parallelism::Serial); // BatchPlan::Serial
     for idx in 0..batch * m * n {
         assert_eq!(
@@ -647,12 +647,13 @@ fn batched_fused_seq_internal_bitwise() {
     seq_internal_bitwise();
 }
 
-// e. validation panics
+// validation panics
 
 mod validation {
     use super::*;
 
-    /// `batch` contiguously-packed column-major f32 buffers `(a, b, c)` of one element each
+    /// `batch` contiguously-packed column-major f32 elements for A, B, and C, each filled with a
+    /// constant (A/B ones, C zeros), the fixture the panic cases below start from
     fn base(batch: usize, m: usize, k: usize, n: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
         (
             vec![1.0f32; batch * m * k],
@@ -666,7 +667,7 @@ mod validation {
     fn bias_wrong_length() {
         let (batch, m, k, n) = (3usize, 4usize, 4usize, 4usize);
         let (a, b, mut c) = base(batch, m, k, n);
-        let bias = vec![0.0f32; m - 1]; // PerRow must be length m
+        let bias = vec![0.0f32; m - 1]; // PerRow needs length m, not m - 1
         gemm_batched_fused(
             batch,
             1.0,
@@ -690,9 +691,9 @@ mod validation {
         let a = vec![1.0f32; batch * m * k];
         let b = vec![1.0f32; batch * k * n];
         let mut buf = vec![0.0f32; batch * m * n];
-        // A correctly-sized (length m) PerRow bias aliasing C's backing slice. It is raw-derived
-        // (its lifetime is not tied to `buf`), so `&mut buf` still type-checks; the overlap check
-        // panics before any element is read or written, so no aliased access occurs
+        // A correctly-sized (length m) PerRow bias built from a raw pointer into buf, so it has
+        // no lifetime tied to `buf` and `&mut buf` below still type-checks despite the aliasing;
+        // the overlap check panics before any element is read or written
         let bias: &[f32] = unsafe { core::slice::from_raw_parts(buf.as_ptr(), m) };
         gemm_batched_fused(
             batch,
@@ -731,8 +732,9 @@ mod validation {
         );
     }
 
-    /// The inherited batched disjointness check must still fire through the shared validation
-    /// helper on the fused path (a valid bias so validation is actually reached)
+    /// The plain-`gemm_batched` disjointness check (the batch's C regions must not overlap) fires
+    /// through the fused path's shared validation too; the bias is valid-length so this test
+    /// actually reaches that check rather than the bias-length one
     #[test]
     #[should_panic(expected = "stay disjoint")]
     fn c_batch_stride_below_extent() {
@@ -748,7 +750,7 @@ mod validation {
             (k * n) as isize,
             0.0,
             MatMut::new(&mut c, m, n, 1, m as isize),
-            (m * n - 1) as isize, // < element extent m*n
+            (m * n - 1) as isize, // shorter than the m * n element extent: batches would overlap
             Some(Bias::PerRow(&bias)),
             Some(Activation::Relu),
             Parallelism::Serial,
@@ -756,11 +758,11 @@ mod validation {
     }
 }
 
-// f. batch == 0 is a no-op that neither touches C nor validates
+// batch == 0 is a no-op that neither touches C nor validates
 
-/// `batch == 0` returns immediately (before the identity check, the view/bias validation, and any
-/// element write), mirroring `gemm_batched_with`. A deliberately wrong-length bias must NOT panic,
-/// and the sentinel-filled C must be untouched
+/// `batch == 0` returns immediately, before the identity check, the view/bias validation, or any
+/// element write, mirroring plain `gemm_batched_with`'s own `batch == 0` short-circuit. A
+/// deliberately wrong-length bias must NOT panic, and the sentinel-filled C must be untouched
 #[test]
 fn batched_fused_batch_zero_noop() {
     let (m, k, n) = (4usize, 3usize, 2usize);
@@ -768,7 +770,7 @@ fn batched_fused_batch_zero_noop() {
     let b = vec![1.0f32; k * n];
     let mut c = vec![7.0f32; m * n];
     let before = c.clone();
-    let wrong_bias = vec![0.0f32; m + 3]; // wrong length on purpose, must not be validated
+    let wrong_bias = vec![0.0f32; m + 3]; // wrong on purpose: must never reach validation
     gemm_batched_fused(
         0,
         1.0,

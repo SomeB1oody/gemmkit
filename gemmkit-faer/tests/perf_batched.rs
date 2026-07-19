@@ -1,6 +1,5 @@
-//! faer batched throughput: `gemm_batched` (1 call over a slice of per-element view triples) vs the
-//! honest baseline of a naive loop of single adapter `gemm` calls, for many small GEMMs.
-//! `#[ignore]` benchmark (not a correctness gate); run with:
+//! `gemm_batched` throughput vs a naive loop of single `gemm` calls, over many small-to-medium GEMMs.
+//! `#[ignore]`d (a benchmark, not a correctness gate); run with:
 //!   cargo test -p gemmkit-faer --release --test perf_batched -- --ignored --nocapture
 #![cfg(not(miri))]
 
@@ -11,11 +10,11 @@ use gemmkit::Parallelism;
 
 use gemmkit_faer::{gemm, gemm_batched};
 
-/// Serializes the core-saturating bench so the default multi-threaded harness cannot run it
-/// concurrently with itself (which would make every GFLOP/s figure meaningless)
+/// Held for the duration of `perf_batched`, so no other test in this file that also locks it can
+/// run at the same time and corrupt every GFLOP/s figure
 static BENCH_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Deterministic column-major `Mat<f64>` fill (xorshift), values in `[-0.5, 0.5)`
+/// Column-major `Mat<f64>` fill from a `seed`-derived xorshift64 stream, values in `[-0.5, 0.5)`
 fn rand_mat(r: usize, c: usize, seed: u64) -> Mat<f64> {
     let mut s = seed.wrapping_add(0x9E3779B97F4A7C15) | 1;
     Mat::from_fn(r, c, |_, _| {
@@ -29,8 +28,9 @@ fn rand_mat(r: usize, c: usize, seed: u64) -> Mat<f64> {
 const REPS: usize = 9;
 const BATCH_SECS: f64 = 0.07;
 
-/// Robust median GFLOP/s over `REPS` auto-calibrated batches (copied from the core bench harness,
-/// which is not importable across crates). `flops` is the whole-batch `2*batch*m*k*n`
+/// Median GFLOP/s over `REPS` repetitions of an auto-calibrated iteration count (mirrors the core
+/// crate's bench harness, which a test crate cannot import). `flops` is the whole call's total
+/// float ops, e.g. `2*batch*m*k*n` for a batched GEMM
 fn measure<F: FnMut()>(flops: f64, mut f: F) -> f64 {
     for _ in 0..3 {
         f();
@@ -52,8 +52,8 @@ fn measure<F: FnMut()>(flops: f64, mut f: F) -> f64 {
     g[REPS / 2]
 }
 
-/// 1 row: `gemm_batched` vs a naive loop of `gemm`, over `batch` `mxk * kxn` products, for both
-/// Serial and auto (`Rayon(0)`) parallelism, as total GFLOP/s
+/// Prints 1 result row: `gemm_batched` vs a naive loop of `gemm`, over `batch` independent `m x k`
+/// by `k x n` products, as total GFLOP/s under both Serial and auto (`Rayon(0)`) parallelism
 fn bench(batch: usize, m: usize, k: usize, n: usize) {
     let a: Vec<Mat<f64>> = (0..batch).map(|e| rand_mat(m, k, 1 + e as u64)).collect();
     let b: Vec<Mat<f64>> = (0..batch)

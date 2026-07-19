@@ -1,20 +1,22 @@
-//! Pointer-array-batched GEMM over a slice of per-element matrix triples
+//! Batched GEMM over a slice of independently shaped `(&A, &B) -> &mut C` triples, dispatched
+//! through gemmkit's pointer-array batched engine
 use super::*;
 use crate::common::dims_strides;
 
-/// Batched `C_e <- alpha*A_e*B_e + beta*C_e` for each element `e`, 1 call, parallelized **across
-/// the batch** (whole GEMMs assigned to workers, each run serially and cache-hot). nalgebra has no
-/// rank-3 type, so the batch is a slice of per-element `(&A, &B)` inputs paired positionally with a
-/// slice of `&mut C` outputs; `alpha`/`beta`/`par` are shared by every element. Element shapes may
-/// differ (heterogeneous batch), as long as `A_e.cols == B_e.rows`, `A_e.rows == C_e.rows`, and
-/// `B_e.cols == C_e.cols`. Each `A`/`B`/`C` is read straight through its pointer/strides, so
-/// column-major (nalgebra's natural layout), row-major, and general-stride views all work without
-/// copying, exactly like [`gemm`]
+/// Runs `C_e <- alpha*A_e*B_e + beta*C_e` for every element `e` of a batch in 1 call, parallelized
+/// **across the batch**: whole per-element GEMMs are handed to workers, each running serially and
+/// staying cache-hot. nalgebra has no rank-3 array type, so the batch is expressed as a slice of
+/// per-element `(&A, &B)` inputs paired positionally with a slice of `&mut C` outputs, with
+/// `alpha`/`beta`/`par` shared by every element. Element shapes may differ (a heterogeneous batch
+/// is fine) as long as each obeys `A_e.cols == B_e.rows`, `A_e.rows == C_e.rows`, and
+/// `B_e.cols == C_e.cols`; each `A`/`B`/`C` is read through its own pointer/strides, so
+/// column-major, row-major, and general-stride views all work without copying, exactly as in
+/// [`gemm`]
 ///
-/// The `ab.len()` inputs and `c.len()` outputs must agree (the batch size). Each element
-/// re-dispatches through the full engine, so the result **reproduces** a loop of [`gemm`] calls and
-/// is **deterministic** across thread counts; each element runs wholly on one worker, so serial and
-/// parallel are additionally bit-identical
+/// `ab` and `c` must have the same length (the batch size). Because every element re-dispatches
+/// through the same engine [`gemm`] uses, the batched result **reproduces** a loop of [`gemm`]
+/// calls and is **deterministic** across thread counts; since each element also runs wholly on 1
+/// worker, serial and parallel runs are additionally bit-identical
 ///
 /// ```
 /// use nalgebra::DMatrix;
@@ -32,8 +34,8 @@ use crate::common::dims_strides;
 /// # Panics
 /// If the input and output counts disagree (`ab.len() != c.len()`), or if any element's dimensions
 /// disagree (`A.cols != B.rows`, `A.rows != C.rows`, `B.cols != C.cols`)
-// The `(&A, &B)` element type carries both operands' full storage generics; factoring it into an
-// alias would hide the same generics behind another name, not simplify them
+// `(&A, &B)` already carries both operands' full storage-generic lists; a type alias would just
+// rename that same complexity, not reduce it
 #[allow(clippy::type_complexity)]
 pub fn gemm_batched<T, R1, C1, S1, R2, C2, S2, RC, CC, SC>(
     alpha: T,
@@ -100,11 +102,11 @@ pub fn gemm_batched<T, R1, C1, S1, R2, C2, S2, RC, CC, SC>(
         })
         .collect();
 
-    // SAFETY: each element's dims are validated above and nalgebra guarantees its pointer/strides
-    // describe a valid in-bounds layout that addresses each (i,j) uniquely. The outputs are a
-    // `&mut [C]` of distinct exclusive borrows, so the batch's `C` regions are pairwise disjoint and
-    // none aliases any `&` A/B input (a shared and an exclusive borrow of the same storage cannot
-    // coexist) - the disjointness `gemm_batched_ptr_unchecked` requires holds by construction
+    // SAFETY: each element's dims are checked above, and nalgebra guarantees its pointer/strides
+    // describe a valid in-bounds layout addressing each (i,j) uniquely. `c.iter_mut()` hands out
+    // distinct exclusive borrows, so the batch's C regions are pairwise disjoint and none can alias
+    // an `&` A/B input (a shared and an exclusive borrow of the same storage can't coexist) - the
+    // disjointness gemm_batched_ptr_unchecked requires holds by construction, not by a runtime check
     unsafe {
         gemm_batched_ptr_unchecked(&problems, par);
     }

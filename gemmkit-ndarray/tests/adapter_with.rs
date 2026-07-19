@@ -1,8 +1,8 @@
-//! The workspace-reusing `_with` adapters: `gemm_with`, `gemm_batched_with`,
-//! `gemm_packed_b_with`, `gemm_packed_a_with`, `gemm_i8_with`, and `gemm_cplx_with` must each
-//! produce the same result as their allocating counterpart (already checked in `adapter.rs`),
-//! reusing one caller-owned [`Workspace`] across calls. This also drives the `Some(ws)` match arm
-//! of both `_common` helpers and, transitively, `gemmkit::gemm_unchecked_with`
+//! Every `_with` adapter (the caller-owned-[`Workspace`] twin of an allocating entry) must produce
+//! the same result as that allocating entry, already checked without a workspace in `adapter.rs`:
+//! plain gemm, batched, prepacked-operand, and (feature-gated) i8, complex, fused, batched-fused,
+//! i8-requant, and complex-fused. This also drives the `Some(ws)` match arm of every adapter's
+//! `_common` helper and, transitively, gemmkit's own `_unchecked_with` core entries
 
 use approx::assert_relative_eq;
 use ndarray::{Array2, Array3, Axis, ShapeBuilder};
@@ -116,7 +116,8 @@ fn gemm_packed_a_with_matches() {
     }
 }
 
-/// The `dot` convenience keeps working: a smoke check the shared imports resolve
+/// `dot` (no workspace involved) still matches ndarray's own `.dot()`, as a baseline for the
+/// `_with` twins in this file
 #[test]
 fn dot_still_matches_ndarray() {
     let a = rand2(12, 9, 71);
@@ -155,7 +156,8 @@ fn gemm_i8_with_matches_gemm_i8() {
     }
 }
 
-/// `gemm_cplx_with` reusing a workspace must equal `gemm_cplx` for both conjugation flags
+/// `gemm_cplx_with` reusing a workspace must equal `gemm_cplx` over all 4 conj_a/conj_b
+/// combinations
 #[cfg(feature = "complex")]
 #[test]
 fn gemm_cplx_with_matches_gemm_cplx() {
@@ -310,7 +312,7 @@ fn gemm_batched_fused_with_matches() {
 }
 
 /// `gemm_i8_requant_with` / `gemm_i8_requant_u8_with` reusing a workspace must equal the allocating
-/// entries
+/// entries, for both a per-tensor and a per-row scale
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 #[test]
 fn gemm_i8_requant_with_matches() {
@@ -333,7 +335,7 @@ fn gemm_i8_requant_with_matches() {
     let b = randi8(k, n, 0x2);
     let bias: Vec<i32> = (0..m).map(|i| 30 * i as i32 - 100).collect();
     let (scale, zp_i8, zp_u8) = (0.05f32, -7i32, 30i32);
-    // per-row (per-channel) scales, all finite and > 0, exercised through the `_with` twin too
+    // per-row (per-channel) scales, all finite and > 0
     let scales: Vec<f32> = (0..m).map(|i| 0.01 * (1 + i % 5) as f32).collect();
 
     let mut ws = Workspace::new();

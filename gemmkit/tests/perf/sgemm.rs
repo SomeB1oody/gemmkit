@@ -1,4 +1,5 @@
-//! f32 sgemm vs gemm crate / matrixmultiply, thread-scaling, per-call latency
+//! f32 sgemm vs the `gemm` crate / `matrixmultiply`, an equal-ISA variant of that same
+//! comparison, per-call latency at the parallel work gate, and a thread-scaling diagnostic
 
 use crate::harness::{BENCH_GUARD, fill, measure};
 // Driver-level imports are used only by the equal-ISA bench; gate them to its
@@ -13,8 +14,8 @@ use gemmkit::driver;
 use gemmkit::kernel::FloatGemm;
 use gemmkit::{MatMut, MatRef, Parallelism, gemm};
 
-// gemmkit best-ISA vs the `gemm` crate + `matrixmultiply`: external crates that do
-// not build for wasm, so this bench (and its `perf_sgemm` caller) is gated off wasm
+// gemmkit's best auto-selected ISA against the `gemm` crate and `matrixmultiply`: both are
+// dev-deps excluded from wasm builds, so this bench (and `perf_sgemm`, its caller) is too
 #[cfg(not(target_family = "wasm"))]
 fn bench_one(s: usize, parallel: bool) {
     let (m, k, n) = (s, s, s);
@@ -104,9 +105,12 @@ fn bench_one(s: usize, parallel: bool) {
     println!();
 }
 
-/// Equal-ISA comparison: gemmkit's native single-ISA path (forced via the
-/// driver) vs gemm's default (the same ISA on stable). Single-threaded,
-/// column-major
+/// gemmkit vs `gemm` with both pinned to the same single ISA, so the comparison isolates
+/// kernel/scheduling quality from any ISA-selection gap between the 2. Serial, column-major.
+/// gemmkit is driven directly through [`driver::run`] with the harness's `NativeTok`/tile
+/// (bypassing dispatch's own auto-select); `gemm`'s `Parallelism::None` already runs its own
+/// default (auto-selected) ISA, which on x86 matches gemmkit's forced token only because
+/// `gemm`'s AVX-512 path needs its `nightly` feature, not enabled here (see `harness.rs`)
 #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
 fn bench_native_equal_isa(s: usize) {
     let (m, k, n) = (s, s, s);
@@ -190,11 +194,12 @@ fn perf_sgemm() {
     }
 }
 
-/// Per-call latency probe for shapes at and just above the parallel work gate
-/// (`parallel_threshold`, default 48*48*256): a few-MFLOP product runs tens of microseconds,
-/// so the fixed per-call resolve cost (knob reads, core-count queries, worker-ramp math) is a
-/// visible fraction here and nowhere else. Serial is the control: its resolve path exits
-/// before any core-count query, so a resolve-cost change moves only the parallel rows
+/// Per-call latency at and just above the parallel work gate (`parallel_threshold`, default
+/// 48*48*256): a product this size takes only tens of microseconds, so the per-call resolve
+/// cost fixed overhead (reading tuning knobs, querying the core count, computing the worker
+/// ramp) is a real fraction of the total here, unlike at any larger size where it disappears
+/// into the noise. The serial arm is the control: its resolve path returns before ever
+/// querying the core count, so a change in resolve cost only ever moves the parallel rows
 #[cfg(not(target_family = "wasm"))]
 fn bench_call_latency(m: usize, k: usize, n: usize, par: Parallelism) {
     let a = fill(m * k, 1);
@@ -215,7 +220,8 @@ fn bench_call_latency(m: usize, k: usize, n: usize, par: Parallelism) {
     } else {
         "par"
     };
-    // Median microseconds per call, derived from the median throughput
+    // Derived from the median GFLOP/s rather than timed separately, so it shares the same
+    // calibrated batches instead of paying its own measurement noise
     let us = 2.0 * m as f64 * k as f64 * n as f64 / st.median / 1e3;
     println!(
         "  {m:>4}x{k:<4}x{n:<4} {mode}  {:7.1} GFLOP/s (±{:>2.0}%)  {us:7.2} us/call",
@@ -237,12 +243,15 @@ fn perf_call_latency() {
     }
 }
 
-// Parallel thread-scaling diagnostic (the mid-size-parallel gap)
+// Parallel thread-scaling diagnostic (locating where mid-size parallel throughput breaks down)
 
-/// The (MR, NR) tile the default `gemm()` dispatch uses on this target, used
-/// only to *estimate* the per-region job count (the parallel work granularity).
-/// Assumes the best available x86 ISA is AVX-512; if the box only has AVX2 the
-/// real tile is 16x6 and the printed job estimate is a lower bound
+/// A rough estimate of the (MR, NR) microtile the default `gemm()` dispatch would use on this
+/// target, for sizing the printed "jobs/region" estimate below (not for driving any call
+/// here). Assumes the best available x86 ISA is AVX-512; on an AVX2-only box the real tile is
+/// the smaller 16x6: `mc`'s cap scales directly with `mr` (`tuning::mc_reg_panels`), and the
+/// per-region job count divides directly by both `mr` and `nr`, so the smaller tile splits the
+/// same problem into more, finer jobs than this bigger assumed tile predicts, making the
+/// printed count a lower bound rather than the true figure there
 #[cfg(not(target_family = "wasm"))]
 fn native_default_tile() -> (usize, usize) {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -259,12 +268,13 @@ fn native_default_tile() -> (usize, usize) {
     }
 }
 
-/// Print gemmkit's parallel *self*-scaling (and gemm's, for reference) at a fixed
-/// size across thread counts, showing *where* scaling breaks: poor speedup
-/// already at 2-4 threads => per-call fork/join + atomics overhead dominates the
-/// tiny work; a plateau after 8-16 => memory bandwidth or job starvation (compare
-/// against the printed ~jobs/region). Throughput is the median of `REPS`
-/// calibrated batches; the spread column flags differences smaller than the noise
+/// Prints gemmkit's own parallel scaling (and `gemm`'s, for reference) at a fixed size across
+/// a thread-count ladder, to show *where* scaling stalls: a poor speedup already by 2-4
+/// threads points at per-call fork/join and atomic-cursor overhead dominating a small
+/// workload; a plateau only after 8-16 threads points instead at memory bandwidth or job
+/// starvation (compare the plateau point against the printed jobs/region estimate). Each
+/// figure is the median of `REPS` calibrated batches; the spread column exists so a
+/// difference smaller than the batch-to-batch noise is not mistaken for a real effect
 #[cfg(not(target_family = "wasm"))]
 fn bench_scaling(s: usize) {
     let (m, k, n) = (s, s, s);
@@ -317,8 +327,8 @@ fn bench_scaling(s: usize) {
         );
     });
 
-    // The t=1 row is the serial `base`/`gbase` already measured (Rayon(1) resolves
-    // to the same single-worker path), so reuse them instead of re-measuring
+    // Rayon(1) resolves to the same single-worker code path as Parallelism::Serial, so the
+    // t=1 row below is just this already-measured serial baseline, not a fresh measurement
     println!(
         "      1 | {:9.1}  1.0x 100% | {:5.0}% | {:8.1}  1.0x",
         base.median,
@@ -364,9 +374,10 @@ fn bench_scaling(s: usize) {
             );
         });
         let spd = sk.median / base.median.max(1e-9);
-        // Effective workers = what resolve() actually grants (capped by cores and
-        // the per-region job count), not the requested t, else eff% reads low
-        // where n_jobs throttles below t and masquerades as a bandwidth wall
+        // The efficiency denominator is what resolve() actually grants (capped by the core
+        // count and the per-region job count), not the raw requested `t`; using `t` itself
+        // would read artificially low wherever `n_jobs` throttles the grant below `t` and
+        // make that throttling look like a bandwidth wall instead of what it is
         let workers = t.min(avail).min(n_jobs).max(1);
         println!(
             "    {t:3} | {:9.1} {:4.1}x {:3.0}% | {:5.0}% | {:8.1} {:4.1}x",
@@ -379,10 +390,10 @@ fn bench_scaling(s: usize) {
         );
     }
 
-    // Auto row: the forced-t curve above never exercises the default `Rayon(0)`
-    // path production uses, so this is the only line that shows what the auto ramp
-    // actually selects and delivers. `auto_w` mirrors `resolve`'s auto branch
-    // (cbrt(mnk).div_ceil(stride), capped) for sizes above the serial gate
+    // The forced-t ladder above never exercises the auto Rayon(0) path production code
+    // actually takes, so this row is the only one that shows what the auto ramp picks and
+    // delivers on this shape. `auto_w` mirrors resolve()'s own auto-worker formula
+    // (cbrt(mnk).div_ceil(stride), capped by cores and jobs) purely for the printed estimate
     let auto_w = (((m * k * n) as f64).cbrt() as usize)
         .div_ceil(gemmkit::tuning::thread_dim_stride())
         .min(avail)

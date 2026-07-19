@@ -1,16 +1,15 @@
 //! # gemmkit
 //!
-//! A clean, extensible, high-performance GEMM (general matrix multiply) engine
-//! with **zero ndarray dependency**. It computes `C <- alpha*A*B + beta*C` over
-//! data-type-agnostic `&[T]` + stride views (or raw pointers), choosing the best
-//! available instruction set at runtime
+//! A GEMM (general matrix multiply) engine with no ndarray dependency. It computes
+//! `C <- alpha*A*B + beta*C` over data-type-agnostic `&[T]` + stride views (or raw
+//! pointers), picking the fastest instruction set the running CPU supports
 //!
 //! ## Quick start
 //!
 //! ```
 //! use gemmkit::{gemm, MatRef, MatMut, Parallelism};
 //!
-//! // 2x3 * 3x2 = 2x2, all row-major
+//! // 2x3 * 3x2 = 2x2, row-major
 //! let a = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0];
 //! let b = [7.0_f32, 8.0, 9.0, 10.0, 11.0, 12.0];
 //! let mut c = [0.0_f32; 4];
@@ -27,58 +26,58 @@
 //!
 //! ## Architecture in brief
 //!
-//! The variation points are isolated to traits: ISA -> [`simd::SimdOps`], element
-//! type -> [`scalar::Scalar`], operation family -> [`kernel::KernelFamily`]. One
-//! generic 5-loop [`driver`] and one generic float microkernel cover every
-//! `(type, ISA, tile)` combination with no macros and no `transmute`. See
-//! `ARCHITECTURE.md` for the full tour
+//! Every axis of variation lives behind a trait: the instruction set is
+//! [`simd::SimdOps`], the element type is [`scalar::Scalar`], the operation family
+//! is [`kernel::KernelFamily`]. One generic 5-loop [`driver`] and one generic
+//! microkernel cover every `(type, ISA, tile)` combination with no macros and no
+//! `transmute`. See `ARCHITECTURE.md` for the full tour
 //!
 //! ## Features
 //!
-//! * `std` (default): runtime cache/CPU-feature detection, the
-//!   `GEMMKIT_REQUIRE_ISA` and tuning env knobs, and the thread-local workspace
-//!   pool. **With `std` off the crate is `#![no_std]`**, needing only `core` + `alloc`
-//! * `parallel` (default, implies `std`): rayon multithreading. With it off
-//!   everything still compiles and runs single-threaded
+//! * `std` (default): runtime cache/CPU-feature detection, the `GEMMKIT_REQUIRE_ISA`
+//!   and tuning env knobs, and the thread-local workspace pool. With `std` off the
+//!   crate is `#![no_std]`, needing only `core` and `alloc`
+//! * `parallel` (default, implies `std`): rayon multithreading. With it off the
+//!   crate still compiles and runs, single-threaded
 //! * `complex`: complex GEMM over `c32`/`c64` with optional conjugation
 //!   ([`gemm_cplx`]); pulls in `num-complex`
-//! * `half`: `f16`/`bf16` mixed-precision GEMM (`f32` accumulate); pulls in `half`
+//! * `half`: `f16`/`bf16` mixed-precision GEMM, accumulating in `f32`; pulls in `half`
 //! * `int8`: `i8 -> i32` integer GEMM ([`gemm_i8`]); no extra dependency
-//! * `epilogue`: fused epilogues: bias/activation ([`gemm_fused`],
-//!   `gemm_batched_fused*`, the prepacked `gemm_packed_a_fused*` / `gemm_packed_b_fused*`,
-//!   and, with `complex`, `gemm_cplx_fused*`); a user-defined
-//!   per-element closure ([`gemm_map`], `f32`/`f64`); and, with
-//!   `int8`, requantized `i8`/`u8` output (`gemm_i8_requant*`); no extra dependency
+//! * `epilogue`: fused epilogues, bias/activation ([`gemm_fused`], `gemm_batched_fused*`,
+//!   the prepacked `gemm_packed_a_fused*` / `gemm_packed_b_fused*`, and, with `complex`,
+//!   `gemm_cplx_fused*`); a user-defined per-element closure ([`gemm_map`], `f32`/`f64`
+//!   only); and, with `int8`, requantized `i8`/`u8` output (`gemm_i8_requant*`); no
+//!   extra dependency
 //!
-//! These 3 element-type families are off by default, so a plain `f32`/`f64`
-//! build pays for none of their codegen or dependencies. The `epilogue` capability
-//! is likewise off by default, so a plain-GEMM build pays for none of its codegen
+//! `complex`, `half`, and `int8` are off by default, so a plain `f32`/`f64` build pays
+//! for none of their codegen or dependencies. `epilogue` is off by default too, so a
+//! plain-GEMM build pays for none of its codegen
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_docs)]
-#![allow(clippy::missing_safety_doc)] // safety documented at the module / contract level
+#![allow(clippy::missing_safety_doc)] // documented at the module/contract level, not per fn
 
-// Heap-backed packing needs `alloc` in both builds; keep it unconditional so
-// downstream `alloc::` imports resolve under `std` too, with no cfg noise
+// Some modules (batched/packed API buffers) need heap `Vec`s even in a no_std
+// build, so pull in `alloc` unconditionally rather than gating this on `std`
 extern crate alloc;
 
 // Cache topology detection and BLIS-model analytical blocking (layer L3)
 pub mod cache;
-// Generic 5-loop GEMM driver, generic over kernel family and ISA (layer L4)
+// Generic 5-loop GEMM driver, generic over the kernel family and the ISA (layer L4)
 pub mod driver;
 // Kernel families: the operation-family seam (layer L1)
 pub mod kernel;
-// Numeric scalar abstraction: identity constants and accumulator type (layer L0)
+// Numeric scalar abstraction: identity constants and the accumulator type (layer L0)
 pub mod scalar;
 // SIMD abstraction: ISA tokens and per-type vector ops (layer L0)
 pub mod simd;
-// Unified tuning surface: heuristic thresholds and their env/setter overrides
+// Tuning surface: heuristic thresholds with env-var and setter overrides
 pub mod tuning;
 
-// Public core API: safe slice/stride entry points and the raw unchecked engine (layer L8a)
+// Public API: safe slice/stride entry points plus the raw unchecked engine (layer L8a)
 mod api;
-// Runtime ISA dispatch: cached per-type feature detection (layer L7)
+// Runtime ISA dispatch, memoized per element type (layer L7)
 mod dispatch;
 // Packing primitives shared by every kernel family (layer L2)
 mod pack;
@@ -86,7 +85,7 @@ mod pack;
 mod parallel;
 // Special-case paths that bypass the driver for shapes it fits poorly (layer L6)
 mod special;
-// Packing-buffer workspace: thread-local pool plus explicit reuse
+// Packing-buffer workspace: a thread-local pool plus explicit reuse
 mod workspace;
 
 #[cfg(feature = "epilogue")]
@@ -144,14 +143,15 @@ pub use workspace::Workspace;
 #[doc(no_inline)]
 pub use cache::{CacheTopology, Machine, topology};
 
-/// Re-exported [`half`] narrow float types (`f16`, `bf16`), so callers need not
-/// depend on `half` directly. They accumulate in `f32` (their [`Scalar::Acc`])
+/// Re-exported [`half`] narrow float types (`f16`, `bf16`), so you do not need to
+/// depend on `half` directly to call the `half`-gated GEMM entry points. Both
+/// accumulate in `f32` (their [`Scalar::Acc`])
 #[cfg(feature = "half")]
 #[doc(no_inline)]
 pub use half::{bf16, f16};
 
-/// Re-exported [`num_complex::Complex`] (and the `c32`/`c64` aliases), so callers
-/// need not depend on `num-complex` directly. Used by [`gemm_cplx`]
+/// Re-exported [`num_complex::Complex`] (and the `c32`/`c64` aliases below), so you
+/// do not need to depend on `num-complex` directly. The element type for [`gemm_cplx`]
 #[cfg(feature = "complex")]
 #[doc(no_inline)]
 pub use num_complex::Complex;

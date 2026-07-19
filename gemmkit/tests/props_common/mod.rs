@@ -1,35 +1,42 @@
-//! Shared strategies, reference implementations, and accuracy gates for the
-//! property-based suite (props_api / props_packed / props_knobs)
+//! Shared proptest strategies, oracle references, and accuracy gates for the
+//! property-based test suite (props_api, props_packed, props_knobs)
 //!
-//! Included via `mod props_common;` from each top-level `tests/props_*.rs`, so it is
-//! only ever compiled inside an already `cfg(all(not(miri), not(target_family =
-//! "wasm")))`-gated crate root; it is never itself a test target. Each binary uses a
-//! different subset of these helpers, so the module is `#![allow(dead_code)]` (the
-//! classic `tests/common` pattern); everything else stays clippy-clean under
-//! `-D warnings`
+//! Pulled in via `mod props_common;` from each `tests/props_*.rs` crate root, all of which
+//! are gated `cfg(all(not(miri), not(target_family = "wasm")))`; this module is therefore
+//! never compiled under Miri or wasm, and is never itself a test target (cargo only builds
+//! top-level `tests/*.rs` and `tests/*/main.rs`). Each including binary uses a different
+//! subset of the helpers here, so `#![allow(dead_code)]` applies, same as every other
+//! `tests/*_common` module
 //!
-//! The proptest-free numeric oracle core (element traits, `rand_vec`, `Mat`, the f64
-//! `reference`, the complex `ref_cplx`, and the `8*k*EPS` / `16*k*EPS` accuracy gates) is
-//! single-sourced in `tests/oracle_common/mod.rs` and re-exported below; this module adds
-//! the proptest strategies and the property-suite-only helpers (full-range i8 fill, the
-//! wrapping-i32 i8 reference, `frob_norm`, and the bit-identity checks)
+//! The numeric oracle core (the `Elem`/`CElem` traits, `rand_vec`, `Mat`, the f64
+//! `reference`, the complex `ref_cplx`, and the `8*k*eps`/`16*k*eps` accuracy gates) lives
+//! once in `tests/oracle_common/mod.rs` and is re-exported below. What this module adds on
+//! top is the proptest strategies (dimension, layout, coefficient, parallelism) and the
+//! helpers only the property suite needs: the full-range i8 fill, the wrapping-i32 i8
+//! reference, `frob_norm`, and the bit-identity checks
 #![allow(dead_code)]
 
 use gemmkit::Parallelism;
 use proptest::prelude::*;
 
-// Re-exports the shared numeric oracle core (Mat, Elem, reference, accuracy gates)
+// File-backed at ../oracle_common/mod.rs; pub-used below for Mat, Elem, CElem, reference,
+// ref_cplx, rand_vec/rand_cplx, the accuracy gates, and fast_test (read by cases() below)
 #[path = "../oracle_common/mod.rs"]
 mod oracle_common;
 pub use oracle_common::*;
 
-/// Per-property case count with a `PROPTEST_CASES` override. `ProptestConfig::default()`
-/// already reads the env var, but an explicit `cases:` field clobbers it, so read it here
-/// and fall back to the tuned default. Every property block passes `cases(N)`
+/// Per-property case count, honoring a `PROPTEST_CASES` override. `ProptestConfig::default()`
+/// already resolves that variable into its own `cases` field, but every property block here
+/// overwrites that field explicitly with `cases(N)`, which discards whatever
+/// `..ProptestConfig::default()` would have produced; this re-reads the override directly so
+/// that precedence is not lost
 ///
-/// Precedence: an explicit `PROPTEST_CASES` always wins (the SDE CI jobs pin it to 16);
-/// else under `GEMMKIT_FAST_TEST` the count drops to `max(default/8, 8)` so the property
-/// binaries stay a meaningful sample without the full case budget; else the tuned default
+/// # Parameters
+/// - `default` - tuned case count to use absent any override
+///
+/// # Returns
+/// `u32` - `PROPTEST_CASES` if set and parseable (the Intel SDE CI jobs pin it to 16); else,
+///   under `GEMMKIT_FAST_TEST`, `max(default/8, 8)`; else `default`
 pub fn cases(default: u32) -> u32 {
     if let Some(n) = std::env::var("PROPTEST_CASES")
         .ok()
@@ -43,8 +50,9 @@ pub fn cases(default: u32) -> u32 {
     default
 }
 
-// layout / stride strategies (generalizes `build_view` in tests/correctness/common.rs;
-// the safe API accepts only non-negative strides - api.rs:107-128)
+// layout/stride strategies: PLayout generalizes the Layout enum in
+// tests/correctness/common.rs; the checked gemm/gemm_with API only accepts non-negative
+// strides, so no variant here ever produces one
 
 #[derive(Copy, Clone, Debug)]
 pub enum PLayout {
@@ -52,7 +60,7 @@ pub enum PLayout {
     Row { pad: usize },
     /// rs = 1, cs = rows + pad
     Col { pad: usize },
-    /// Both strides > 1: cs in 2..=4, rs = cols*cs + pad
+    /// General strides: cs drawn from 2..=4 so cs > 1, rs = cols*cs + pad
     General { cs: usize, pad: usize },
 }
 
@@ -64,7 +72,7 @@ pub fn layout() -> impl Strategy<Value = PLayout> {
     ]
 }
 
-/// The (rs, cs) an untyped `rows x cols` view takes under `l`
+/// (rs, cs) for a `rows x cols` view laid out as `l`
 fn strides_for(rows: usize, cols: usize, l: PLayout) -> (usize, usize) {
     match l {
         PLayout::Row { pad } => (cols + pad, 1),
@@ -73,9 +81,19 @@ fn strides_for(rows: usize, cols: usize, l: PLayout) -> (usize, usize) {
     }
 }
 
-/// Materialize a row-major logical matrix (`vals`, `rows x cols`) into a strided buffer
-/// presented in layout `l`; returns `(buf, rs, cs)`. Generic port of
-/// tests/correctness/common.rs `build_view` that also serves the i8 (i8/i32) element paths
+/// Materialize a row-major logical `rows x cols` matrix (`vals`) into a strided buffer laid
+/// out as `l`. Generic over `Copy` rather than [`Elem`], so it also serves the i8 element
+/// path ([`fill_i8`]/[`ref_i8_wrapping`]), not just the float `Elem` types
+///
+/// # Parameters
+/// - `vals` - source values in row-major order, length `rows*cols`
+/// - `rows` - logical row count
+/// - `cols` - logical column count
+/// - `zero` - fill value for the padding gaps `l` leaves unwritten
+/// - `l` - target stride layout
+///
+/// # Returns
+/// `(Vec<T>, isize, isize)` - the strided buffer, its row stride, and its column stride
 pub fn build_view_rowmajor<T: Copy>(
     vals: &[T],
     rows: usize,
@@ -98,15 +116,18 @@ pub fn build_view_rowmajor<T: Copy>(
     (buf, rs as isize, cs as isize)
 }
 
-/// Typed convenience wrapper for the float element path
+/// Wraps [`build_view_rowmajor`] for `Mat<T: Elem>`, zero-filling padding via `T::from_f64(0.0)`
 pub fn build_view<T: Elem>(m: &Mat<T>, l: PLayout) -> (Vec<T>, isize, isize) {
     build_view_rowmajor(&m.v, m.rows, m.cols, T::from_f64(0.0), l)
 }
 
-// dimension / coefficient / parallelism strategies
+// dimension, coefficient, and parallelism strategies
 
-/// Dimension distribution: edge-weighted around 0, 1, the AVX-512 f32 tile (MR=32,
-/// NR=12), the FMA/NEON tiles (6, 12, 16), and the tiny gate 64 (tuning.rs)
+/// Dimension distribution, weighted toward degenerate cases: heavy on 0 and 1, then
+/// boundary triples (V-1, V, V+1) around 12, 16, 32, 48, and the tiny-block shortcut gate 64
+/// (`TINY_BLOCK_DIM_DEFAULT` in tuning.rs); 12 and 32 are the AVX-512 f32 microkernel tile's
+/// NR/MR, 16 is the FMA/NEON f32 tile's MR. A few extra small values (2, 4, 5, 6, 24) and a
+/// broad 2..=96 tail round it out
 pub fn dim() -> impl Strategy<Value = usize> {
     prop_oneof![
         2 => Just(0usize),
@@ -117,10 +138,11 @@ pub fn dim() -> impl Strategy<Value = usize> {
     ]
 }
 
-/// Like [`dim`] but strictly positive (drops the `0` branch): for the packed paths a
-/// `0`-length row/col makes the C's `Col`/`Row` layout stride collapse to `0`, which the
-/// orientation guard (`|csc| >= |rsc|` / `<=`) correctly rejects - an empty packed C is
-/// not a meaningful test
+/// Like [`dim`] but never draws 0: in the packed-path tests, C is built through
+/// `PLayout::Col`/`PLayout::Row`, and a 0-length row/col there collapses that layout's
+/// stride to `pad`, which can trip the packed API's column-major-ish/row-major-ish
+/// (`|csc| >= |rsc|` / `|csc| <= |rsc|`) orientation guard on a shape that was never meant
+/// to probe that guard. Used for the `m`/`n` draws so a generated C always clears it
 pub fn pos_dim() -> impl Strategy<Value = usize> {
     prop_oneof![
         3 => Just(1usize),
@@ -130,7 +152,8 @@ pub fn pos_dim() -> impl Strategy<Value = usize> {
     ]
 }
 
-/// `k` with an extra tail across the default kc boundary (KC_DEFAULT = 512, tuning.rs:312)
+/// `k` like [`dim`] but with an extra tail straddling the default kc block boundary
+/// (`KC_DEFAULT` = 512 in tuning.rs): 200, 511, 512, 513
 pub fn kdim() -> impl Strategy<Value = usize> {
     prop_oneof![
         8 => dim(),
@@ -138,10 +161,10 @@ pub fn kdim() -> impl Strategy<Value = usize> {
     ]
 }
 
-/// `k` like [`kdim`] but strictly positive: a `k == 0` empty contraction makes the
-/// relative-Frobenius denominator `||A||*||B|| == 0`, so the accuracy gate is only
-/// well-defined for `k >= 1` (the `k == 0` overwrite case is covered separately, with
-/// `beta == 0`, where the exact result is `0`)
+/// `k` like [`kdim`] but never 0, so every draw genuinely exercises the A*B contraction: a
+/// `k == 0` draw collapses A*B to an empty sum and only tests beta-scaling of C, which the
+/// dedicated `k == 0` overwrite properties in props_api already cover (there, k is drawn
+/// from [`kdim`] with beta pinned to 0, so the reference result is exactly 0)
 pub fn kdim_pos() -> impl Strategy<Value = usize> {
     prop_oneof![
         3 => Just(1usize),
@@ -152,8 +175,10 @@ pub fn kdim_pos() -> impl Strategy<Value = usize> {
     ]
 }
 
-/// Alpha/beta special values (union of the `correctness_alpha_beta` combos in tests/correctness/common.rs; no
-/// NaN/Inf: those inputs have no documented contract)
+/// Alpha/beta value pool, overlapping the combos `correctness_alpha_beta` in
+/// tests/correctness/float.rs sweeps, plus a few extra edge values (-1, 0.5, a near-zero
+/// 1e-3); alpha and beta each draw independently from this same set. No NaN/Inf: those have
+/// no documented gemm contract
 pub fn coeff() -> impl Strategy<Value = f64> {
     proptest::sample::select(&[0.0f64, 1.0, -1.0, 0.5, -1.5, 2.0, 2.5, 1e-3][..])
 }
@@ -170,12 +195,13 @@ pub fn par() -> impl Strategy<Value = Parallelism> {
 
 // property-suite-only numeric helpers (the oracle core is re-exported above)
 
-/// Frobenius norm of a logical matrix (over its widened f64 values)
+/// Frobenius norm of `m`'s row-major values, computed in widened f64
 pub fn frob_norm<T: Elem>(m: &Mat<T>) -> f64 {
     m.v.iter().map(|x| x.to_f64().powi(2)).sum::<f64>().sqrt()
 }
 
-/// 2 strided outputs (same shape/strides) are bit-identical element-for-element
+/// `true` if `x` and `y` are the same length and equal element-for-element by native bit
+/// pattern (not IEEE `==`, so -0.0 and 0.0, or differing NaN payloads, compare unequal)
 pub fn bits_identical<T: Elem>(x: &[T], y: &[T]) -> bool {
     x.len() == y.len()
         && x.iter()
@@ -183,10 +209,11 @@ pub fn bits_identical<T: Elem>(x: &[T], y: &[T]) -> bool {
             .all(|(a, b)| a.to_bits_u64() == b.to_bits_u64())
 }
 
-// integer (i8 -> i32) helpers
+// integer (i8 -> i32) property-suite-only helpers
 
-/// Deterministic **full-range** i8 fill (unlike the range-limited tests/correctness/common.rs
-/// `rand_i8`, :2011-2022, this spans all of `i8` so accumulation wrap is exercised)
+/// Deterministic full-range i8 fill: unlike tests/correctness/common.rs's range-limited
+/// `rand_i8` ([-100, 100]), this spans all of i8 ([-128, 127]) so wrapping accumulation on
+/// overflow is actually exercised
 #[cfg(feature = "int8")]
 pub fn fill_i8(n: usize, seed: u64) -> Vec<i8> {
     let mut s = seed.wrapping_add(0x9E3779B97F4A7C15);
@@ -200,9 +227,11 @@ pub fn fill_i8(n: usize, seed: u64) -> Vec<i8> {
         .collect()
 }
 
-/// **Wrapping**-i32 GEMM reference (row-major operands). The documented i8 contract is
-/// two's-complement wrapping i32 arithmetic (`i8_wraps_on_overflow` in tests/correctness/int8.rs); wrapping add
-/// is associative, so the reference is order-independent and the kernel must match it exactly
+/// Row-major wrapping-i32 GEMM reference: matches the documented i8 contract of
+/// two's-complement wrapping i32 arithmetic (see `i8_wraps_on_overflow` in
+/// tests/correctness/int8.rs). Wrapping add is associative and commutative, so this
+/// reference is order-independent, and the kernel under test must match it exactly
+/// regardless of its own summation order
 #[cfg(feature = "int8")]
 #[allow(clippy::too_many_arguments)]
 pub fn ref_i8_wrapping(
@@ -233,7 +262,8 @@ pub fn ref_i8_wrapping(
 
 // complex (c32 / c64) property-suite-only helper (the oracle core is re-exported above)
 
-/// Column-major complex outputs bit-identical (real+imag native bits)
+/// `true` if `x` and `y` are the same length and equal element-for-element, real and
+/// imaginary parts each compared by native bit pattern (not IEEE `==`)
 #[cfg(feature = "complex")]
 pub fn cplx_bits_identical<T: CElem>(x: &[T], y: &[T]) -> bool {
     x.len() == y.len()

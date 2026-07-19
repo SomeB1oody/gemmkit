@@ -20,8 +20,6 @@ complex = ["gemmkit/complex"]
 int8 = ["gemmkit/int8"]
 epilogue = ["gemmkit/epilogue"]
 
-# docs.rs documents every feature-gated surface; --cfg docsrs turns on
-# doc_auto_cfg for per-item feature badges (never set in normal builds)
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]

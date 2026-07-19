@@ -1,18 +1,19 @@
-//! Fused-epilogue special-path suite: `gemm_fused` routes gemv (`m == 1` / `n == 1`), small-`m,n`,
-//! and small-`k` shapes through the **same** kernels plain `gemm` uses, fusing the epilogue into
-//! each route, so the fused result is bit-identical to `gemm`-then-map for those shapes too (the
-//! Phase-1 contract). Every comparison is **bitwise**; all shapes are platform-independent
-//! (self-computed references, LCG-style fills). The routes are also serial == parallel
-//! bit-identical, and the fusion preserves that
+//! Fused-epilogue special-path suite: `gemm_fused` routes a gemv shape (`m == 1` / `n == 1`), a
+//! small-`m,n` shape, or a small-`k` shape through the **same** kernel plain `gemm` would use for
+//! it, fusing the epilogue into that route instead of falling back to the general driver. So the
+//! fused result stays bit-identical to `gemm`-then-map for those shapes too. Every comparison is
+//! **bitwise**; all shapes and reference values are platform-independent (self-computed, filled
+//! by the deterministic xorshift `Rng`). The routes are also serial == parallel bit-identical,
+//! and fusion preserves that too
 
 use crate::common::*;
 use gemmkit::{Activation, Bias, MatMut, MatRef, Parallelism, Workspace, gemm, gemm_fused_with};
 
-/// Drive `gemm_fused` over an explicit A/B/C layout (arbitrary strides, so a route-selecting
-/// layout, e.g. a row-major A with a column-major B, can be forced) and assert bitwise equality
-/// with `gemm`-then-`ref_apply`, across the full bias x activation sweep and `beta in {0, 0.7}`.
-/// The reference reads back plain `gemm`'s output and maps it with the exact `FusedEpi` mirror
-/// ([`ref_apply`]), so any divergence in the route's store or its fused map is caught bit-for-bit
+/// Drive `gemm_fused_with` over an explicit A/B/C layout (arbitrary strides, so a
+/// route-selecting layout, e.g. a row-major A paired with a column-major B, can be forced) and
+/// assert bitwise equality against plain `gemm` followed by [`ref_apply`], across the full bias
+/// x activation sweep and `beta in {0, 0.7}`. Since `ref_apply` mirrors `FusedEpi::apply`'s exact
+/// arithmetic, any divergence in the route's store or its fused epilogue shows up bit-for-bit
 fn check_route<T: Flt>(
     rng: &mut Rng,
     m: usize,
@@ -101,15 +102,16 @@ fn check_route<T: Flt>(
 
 // a. gemv route (m == 1 / n == 1)
 
-/// The gemv route: both orientations of the vector, both C layouts, full bias x activation sweep.
-/// `min(m, n) == 1 <= gemv_threshold`, so these hit the dedicated gemv kernel, whose output is
-/// fused via a final in-place epilogue pass (in the *user* frame: gemv dispatches before
-/// orientation normalization)
+/// The gemv route: both orientations of the vector (a row vector and a column vector), both C
+/// layouts, full bias x activation sweep. `min(m, n) == 1` and stays under `gemv_threshold`'s
+/// default (effectively unbounded), so every case here hits the dedicated gemv kernel, whose
+/// output is fused by a final in-place epilogue pass run in the *user* frame: gemv dispatches
+/// before the orientation swap the other routes go through, so its bias axis never flips
 fn gemv_bitwise_for<T: Flt>() {
     let mut rng = Rng::new(0x9E_11_0C_A5);
     for &(m, k, n) in &[(1usize, 64usize, 300usize), (300usize, 64usize, 1usize)] {
-        let a = make::<T>(&mut rng, m, k); // col-major mxk
-        let b = make::<T>(&mut rng, k, n); // col-major kxn
+        let a = make::<T>(&mut rng, m, k); // col-major m x k
+        let b = make::<T>(&mut rng, k, n); // col-major k x n
         for layout in [Layout::Col, Layout::Row] {
             check_route::<T>(
                 &mut rng,
@@ -138,11 +140,12 @@ fn fused_gemv_bitwise() {
 
 // b. small-m,n horizontal route
 
-/// The small-`m,n` route: `(8, 2048, 8)` with a row-major A (`csa == 1`) and a column-major B
-/// (`rsb == 1`), so the horizontal `small_mn` gate is hit (both dims <= 16, `k` above
-/// `small_k_threshold`, `csa == 1 && rsb == 1`). Both C layouts (the row-major C exercises the
-/// orientation swap, which flips the bias axis and still routes to `small_mn` since the swapped
-/// `csa`/`rsb` stay unit-stride). Full bias x activation sweep, bitwise
+/// The small-`m,n` route: shape `(8, 2048, 8)` with a row-major A (`csa == 1`) and a
+/// column-major B (`rsb == 1`) clears the `small_mn` gate (both dims <= `small_mn_dim`, `k`
+/// above `small_k_threshold`, `csa == 1 && rsb == 1`). Both C layouts are driven: the row-major C
+/// triggers the orientation swap, which flips the bias axis but leaves the route unchanged,
+/// since the swap exchanges `csa` with `rsb` and both were already 1, so the swapped pair stays
+/// unit-stride and the `small_mn` gate still passes. Full bias x activation sweep, bitwise
 fn small_mn_bitwise_for<T: Flt>() {
     let mut rng = Rng::new(0x5A_11_3E_00);
     let (m, k, n) = (8usize, 2048usize, 8usize);
@@ -175,9 +178,11 @@ fn fused_small_mn_bitwise() {
 
 // c. small-k route
 
-/// The small-`k` route: `(200, 4, 160)` with a column-major A (`rsa == 1`, so the in-place route
-/// applies for a column-major C; the row-major-C swap makes the oriented `rsa != 1`, deferring to
-/// the driver: still fused, still bitwise). Both C layouts, full sweep, bitwise
+/// The small-`k` route: shape `(200, 4, 160)` with `k` below `small_k_threshold` and a
+/// column-major A (`rsa == 1`). For a column-major C (no orientation swap), `small_k::run_epi`
+/// takes its in-place fast path since the oriented `rsa == 1`; for a row-major C the swap flips
+/// the oriented `rsa` away from 1, so `small_k::run_epi` itself falls back to
+/// `driver::run_epilogue`, still fused and still bitwise. Both C layouts, full sweep, bitwise
 fn small_k_bitwise_for<T: Flt>() {
     let mut rng = Rng::new(0x5A_11_C4_00);
     let (m, k, n) = (200usize, 4usize, 160usize);
@@ -210,9 +215,12 @@ fn fused_small_k_bitwise() {
 
 // d. serial == parallel bit-identity through the fused special routes
 
-/// Run one fused config (PerRow bias + LeakyReLU, `beta = 0.7`) under `Serial` and `Rayon(4)` and
-/// assert the 2 output buffers agree bitwise. The special routes partition the output with no
-/// cross-thread reduction, and the fused epilogue is a per-range pass, so the 2 are bit-identical
+/// Run 1 fused config (`PerRow` bias, `LeakyRelu`, `beta = 0.7`) under `Serial` and `Rayon(4)`
+/// and assert the 2 output buffers agree bitwise. Each of gemv, small_mn, and small_k computes
+/// every output element's full `k`-reduction on a single worker, partitioning only the output
+/// range across threads, so there is no cross-thread reduction step for the worker count to
+/// perturb, and the fused epilogue is just a per-element pass over whatever a worker already
+/// produced
 fn par_eq<T: Flt>(
     rng: &mut Rng,
     m: usize,
@@ -321,9 +329,10 @@ fn fused_special_parallel_bitwise() {
 
 // e. NaN through the special routes: ReLU(NaN) == +0.0, bitwise vs gemm-then-map
 
-/// A NaN in the first depth column of every A row makes each output's `k`-reduction a NaN, which
-/// ReLU must map to `+0.0`, bit-for-bit, and equal to `gemm`-then-map. Exercises the gemv and
-/// small_mn routes (whose fused epilogue runs the scalar `apply`, matching `ref_apply`)
+/// A NaN in the 1st depth column of every A row makes each output's `k`-reduction a NaN, which
+/// ReLU must map to `+0.0`, bit-for-bit, and equal to `gemm`-then-map. Drives the gemv and
+/// small_mn routes, whose fused epilogue calls the scalar `apply` (never `apply_reg`), the same
+/// arithmetic `ref_apply` mirrors
 fn nan_route<T: Flt>(
     rng: &mut Rng,
     m: usize,

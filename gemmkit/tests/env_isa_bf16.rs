@@ -1,10 +1,9 @@
-//! `GEMMKIT_REQUIRE_ISA=avx512bf16` pin: forces the `vdpbf16ps` dot `Bf16DotGemm` so its
-//! multi-slice deep-k twin (`Bf16DotGemmF32`, `kc` rounded to `DEPTH_MULTIPLE = 2` so a k-pair
-//! never straddles a slice boundary) runs in an isolated process. The single test pins through
-//! [`env_isa_common::pin`] (single `set_var` under a `Once` before any dispatch; the shared write
-//! overrides an inherited pin, so the SDE BF16 CI job still exercises this route). The multi-slice
-//! dot must be byte-for-byte the single depth panel for `beta in {0, 1}`. Skips gracefully when the
-//! host lacks `avx512bf16`
+//! `GEMMKIT_REQUIRE_ISA=avx512bf16` pin: forces the `vdpbf16ps` dot kernel `Bf16DotGemm`, so its
+//! multi-slice deep-k twin `Bf16DotGemmF32` gets exercised (`kc` rounded up to `DEPTH_MULTIPLE =
+//! 2` there, so a k-pair never straddles a slice boundary). Pins through [`env_isa_common::pin`]
+//! (a single `set_var` under a `Once`, before any dispatch; the shared write also overrides an
+//! inherited pin). The multi-slice route must be byte-for-byte the single depth panel for
+//! `beta in {0, 1}`. Skips when the host lacks `avx512bf16`
 #![cfg(all(
     feature = "half",
     feature = "std",
@@ -12,7 +11,7 @@
     not(miri)
 ))]
 
-// Shared single-set_var pin helper (Once before any dispatch; this test pins `avx512bf16`)
+// Shared GEMMKIT_REQUIRE_ISA pin helper; this binary's only test pins `avx512bf16` with it
 mod env_isa_common;
 
 use gemmkit::{MatMut, MatRef, Parallelism, bf16, gemm, tuning};
@@ -38,8 +37,8 @@ fn deep_k_bf16_dot_under_avx512bf16_pin() {
     }
     let restore = tuning::deep_kc_bytes();
 
-    // Odd `k` too, so a slice boundary and the final tail both fall on odd depth: the
-    // DEPTH_MULTIPLE rounding must keep interior slices even and pad only the final tail
+    // 4097 is odd, so both a slice boundary and the final tail land on odd depth: the
+    // DEPTH_MULTIPLE rounding must keep every interior slice even and pad only the tail
     for &k in &[4096usize, 4097] {
         let (m, n) = (40usize, 50);
         let a = fill(m * k, 0x1);

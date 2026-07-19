@@ -1,25 +1,27 @@
-//! `GEMMKIT_REQUIRE_ISA=wasm` cross-arch pin. `wasm` is the accepted alias for `simd128`; this
-//! binary drives the parse arm for that alias plus every dtype's `simd128`-on-non-wasm panic arm.
-//! Its own single-test binary so the one `set_var` runs before any dispatch. This binary only
-//! builds/runs on native (non-wasm) targets, where the `simd128` pin is always unsatisfiable, so
-//! every dtype ladder must panic. Each ladder is a distinct `OnceLock`, and a panicking init leaves
-//! it uninitialized, so one process sweeps all supported dtypes
+//! `GEMMKIT_REQUIRE_ISA=wasm` cross-architecture pin
+//!
+//! `wasm` is the accepted alias for `simd128`, so this exercises both that alias's parse arm and
+//! every dtype's "not wasm32 with +simd128" panic arm. Only builds/runs on native (non-wasm)
+//! targets, where the pin is always unsatisfiable, so every dtype ladder must panic. Its own
+//! single-test binary so the one `set_var` below runs before any dispatch. Each dtype's dispatch
+//! memoizes into its own `OnceLock`, and a panicking initializer leaves that lock unset, so 1
+//! process can drive every dtype's ladder to completion even though each one panics identically
 #![cfg(all(feature = "std", not(target_family = "wasm"), not(miri)))]
 
-// per-dtype tiny-GEMM entries shared by the ISA pin binaries
+// Tiny 2x2 GEMM entry point per dtype, shared by the cross-arch ISA pin binaries
 mod isa_dtypes;
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 #[test]
 fn wasm_pin_sweeps_every_dtype_ladder() {
-    // Set the pin exactly once, before any dispatch. SAFETY: this is the only test in this binary,
-    // so no other thread reads the environment concurrently with this write
+    // SAFETY: the only test in this binary, so no other thread reads the environment
+    // concurrently with this write
     unsafe {
         std::env::set_var("GEMMKIT_REQUIRE_ISA", "wasm");
     }
-    // Silence the intentional pin panics only while sweeping, then restore the hook so an
-    // assertion failure below still prints its diagnostics
+    // Suppress the expected panics' default output while sweeping, then restore the hook so a
+    // genuine assertion failure below still prints its diagnostics
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
     let results: Vec<(&str, bool)> = isa_dtypes::dtype_cases()
@@ -28,8 +30,7 @@ fn wasm_pin_sweeps_every_dtype_ladder() {
         .collect();
     std::panic::set_hook(prev);
 
-    // This binary runs only on native targets, where `simd128` is never available: every ladder
-    // must panic on its "not wasm32 with +simd128" arm
+    // Native target: simd128 is never available, so every ladder must have panicked
     for (name, panicked) in results {
         assert!(
             panicked,

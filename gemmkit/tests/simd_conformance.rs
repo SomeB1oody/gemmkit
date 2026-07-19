@@ -1,25 +1,27 @@
 //! L0 SIMD-vocabulary conformance: every ISA token's [`SimdOps`] primitives, the homogeneous
-//! [`KernelSimd`] `L == A` blanket, and the portable default `fma_bvec` must agree with a scalar
-//! reference for each supported element type. The product kernels only ever call a subset of these
-//! per token (loadu/storeu + mul_add + zero/splat, plus the dot seam), so the integer
-//! `reduce_sum`/`fnma`, the blanket widen seam, and the lane-FMA fallback are otherwise untouched by
-//! any driver run: this sweep exercises them directly
+//! [`KernelSimd`] `L == A` blanket impl, and the portable default `fma_bvec` must all agree
+//! with a plain scalar computation, for every element type the token supports. A product
+//! kernel only ever calls a subset of these primitives per token (loadu/storeu + mul_add +
+//! zero/splat, plus the dot seam), so this is the only place the integer `reduce_sum`/`fnma`,
+//! the mixed-precision widen seam, and the lane-FMA fallback are exercised at all
 //!
-//! Tokens are constructed directly (bypassing dispatch) and each is guarded behind the matching
-//! runtime feature probe, so the suite runs whatever the host supports and silently skips the rest;
-//! it is independent of `GEMMKIT_REQUIRE_ISA`. All arithmetic is compared against a plain scalar
-//! reference computed here: no platform-specific constants. Runs on wasm too (no proptest dep) so
-//! the compile-time `simd128` token is conformance-tested; the scalar token covers any host
+//! Each token is constructed directly here, bypassing dispatch, and guarded behind its own
+//! runtime feature probe, so the suite silently runs whatever subset the host actually
+//! supports; it does not read `GEMMKIT_REQUIRE_ISA`. Every check compares against a scalar
+//! reference computed in this file, never a platform-specific constant, so the same test runs
+//! on wasm too (no proptest dependency there), which is how the compile-time `simd128` token
+//! gets conformance-tested; the scalar token itself covers any host
 #![cfg(not(miri))]
-// The lane loops index parallel scratch buffers by lane and print the lane in failure messages;
-// an explicit index is clearer than an enumerate here
+// The lane loops index parallel scratch buffers by lane and print the lane on failure; an
+// explicit index reads clearer here than an enumerate
 #![allow(clippy::needless_range_loop)]
 
 use gemmkit::simd::{KernelSimd, ScalarTok, SimdOps};
 
-/// Generate a conformance check for one floating element type: every `SimdOps<$t>` primitive plus
-/// the `KernelSimd<$t,$t,$t,$t>` blanket, validated lane-by-lane against a scalar reference at a
-/// per-type tolerance (mul_add/fnma fuse a single rounding, so the match is not bitwise)
+/// Generates a conformance check for one floating element type: every `SimdOps<$t>`
+/// primitive plus the `KernelSimd<$t,$t,$t,$t>` blanket, validated lane-by-lane against a
+/// scalar reference at a per-type tolerance (mul_add/fnma fuse a single rounding step, so
+/// the comparison cannot be bitwise)
 macro_rules! float_conformance {
     ($name:ident, $t:ty, $tol:expr) => {
         fn $name<S>(simd: S, label: &str)
@@ -45,8 +47,9 @@ macro_rules! float_conformance {
                 );
             };
 
-            // SAFETY: guarded by the caller's feature probe; every access below stays within the
-            // 16-element buffers and inside this token's `vectorize` codegen context
+            // SAFETY: guarded by the caller's feature probe; every buffer access below stays
+            // within the 16-element arrays, and runs inside this token's `vectorize` codegen
+            // context so any intrinsic in the primitives below is actually feature-enabled
             unsafe {
                 simd.vectorize(|| {
                     let mut out = [0.0 as $t; 16];
@@ -96,7 +99,8 @@ macro_rules! float_conformance {
                         "{label} reduce_sum: got {got} want {want}"
                     );
 
-                    // KernelSimd<A,A,A,A> blanket: widen seam collapses to plain loadu/splat/storeu
+                    // KernelSimd<A,A,A,A> blanket: the widen seam collapses to plain
+                    // loadu/splat/storeu when every type parameter equals A
                     simd.storeu(
                         out.as_mut_ptr(),
                         <S as KernelSimd<$t, $t, $t, $t>>::load_lhs(simd, xs.as_ptr()),
@@ -146,10 +150,10 @@ macro_rules! float_conformance {
 float_conformance!(conform_f32, f32, 1e-4);
 float_conformance!(conform_f64, f64, 1e-12);
 
-/// Integer (`i32`) conformance: exact (wrapping) equality against a scalar reference for every
-/// `SimdOps<i32>` primitive plus the `KernelSimd<i32,i32,i32,i32>` blanket. The int kernel only
-/// uses zero/splat/add/mul_add + the dot seam, so load/loadu/store/fnma/reduce_sum are only
-/// directly exercised here
+/// Integer (`i32`) conformance: exact (wrapping) equality against a scalar reference for
+/// every `SimdOps<i32>` primitive plus the `KernelSimd<i32,i32,i32,i32>` blanket. The i8
+/// kernel only ever uses zero/splat/add/mul_add plus the dot seam, so load/loadu/store/
+/// fnma/reduce_sum are exercised only here
 #[cfg(feature = "int8")]
 fn conform_i32<S>(simd: S, label: &str)
 where
@@ -166,8 +170,8 @@ where
     let cs: [i32; 16] = core::array::from_fn(|i| i as i32 * 5 - 12);
     let bvals: [i32; 16] = core::array::from_fn(|i| i as i32 * 2 + 1);
 
-    // SAFETY: guarded by the caller's feature probe; accesses stay within the 16-element buffers
-    // and inside this token's `vectorize` context
+    // SAFETY: guarded by the caller's feature probe; accesses stay within the 16-element
+    // arrays and run inside this token's `vectorize` codegen context
     unsafe {
         simd.vectorize(|| {
             let mut out = [0i32; 16];
@@ -262,21 +266,22 @@ where
     }
 }
 
-/// Conformance for the deep-k twin seam `KernelSimd<N, N, f32, f32>` (the f32-output twin the
-/// `MixedGemmF32<N>` / `Bf16DotGemmF32` deep-k families drive on), for a narrow type `N`
-/// (`f16`/`bf16`). Two things are checked lane-by-lane against a scalar model:
+/// Conformance for the deep-k twin seam `KernelSimd<N, N, f32, f32>`, the f32-output twin
+/// the mixed and bf16-dot deep-k families switch to once their narrow single-panel micropanel
+/// outgrows the deep-k byte gate, for a narrow type `N` (`f16`/`bf16`). Checks 2 things
+/// lane-by-lane against a scalar model:
 ///
-/// 1 `load_out`/`store_out`: `Out == Acc == f32`, so the twin seam collapses to a plain f32
-///   `loadu`/`storeu`, a bit-preserving identity (the scalar model is the input bits themselves);
-///   swept over edge patterns (-0, NaN, +/-Inf) that a mangled load/store would corrupt
+/// 1 `load_out`/`store_out`: with `Out == Acc == f32` the twin seam collapses to a plain f32
+///    `loadu`/`storeu`, a bit-preserving identity (the scalar model is just the input bits),
+///    swept over edge patterns (-0, NaN, +/-Inf) a mangled load/store would corrupt
 /// 2 `load_lhs`/`splat_rhs`: the twin forwards these verbatim to the narrow seam
-///   `KernelSimd<N, N, f32, N>` (widen `N -> f32`), so each must be **bit-identical** to the narrow
-///   seam's own widen - the "identical bits for either Out" contract the driver's `twin_seed` /
-///   `mixed_accumulate` rely on
+///    `KernelSimd<N, N, f32, N>` (which widens `N -> f32`), so each must be **bit-identical**
+///    to the narrow seam's own widen - the "identical bits regardless of Out" contract the
+///    driver's twin-seed / mixed-accumulate logic depends on
 ///
-/// Requires both seams (`Out = f32` and `Out = N`), which every token that provides the narrow
-/// family provides. Platform-independent: the oracle is the scalar identity / the narrow seam
-/// itself, never a machine number
+/// Requires both seams (`Out = f32` and `Out = N`), which every token that ships the narrow
+/// family provides. Platform-independent: the oracle is the scalar identity or the narrow
+/// seam itself, never a machine-specific number
 #[cfg(feature = "half")]
 fn twin_seam_conformance<N, S>(simd: S, label: &str)
 where
@@ -329,7 +334,8 @@ where
                 );
             }
 
-            // load_lhs / splat_rhs: the twin forwards to the narrow seam, so the widen is identical
+            // load_lhs / splat_rhs: the twin forwards to the narrow seam, so the widen result
+            // must be identical
             let mut tw = [0.0f32; 16];
             let mut nr = [0.0f32; 16];
             simd.storeu(
@@ -393,8 +399,9 @@ fn x86_token_conformance() {
         eprintln!("skipping Fma conformance: avx2+fma not detected");
     }
 
-    // The Fma narrow seam widens f16 via F16C (`vcvtph2ps`), so the twin's widen-forward check needs
-    // f16c on top of avx2+fma; the plain-f32 load_out/store_out do not, but they ride the same probe
+    // The Fma narrow seam widens f16 through F16C (`vcvtph2ps`), so the twin's widen-forward
+    // check additionally needs f16c on top of avx2+fma; the plain-f32 load_out/store_out
+    // checks do not need it, but they ride the same probe for simplicity
     #[cfg(feature = "half")]
     if is_x86_feature_detected!("avx2")
         && is_x86_feature_detected!("fma")
@@ -436,7 +443,8 @@ fn x86_token_conformance() {
         use gemmkit::simd::Avx512Bf16;
         if is_x86_feature_detected!("avx512bf16") && is_x86_feature_detected!("avx512f") {
             conform_f32(Avx512Bf16, "avx512bf16/f32");
-            // Avx512Bf16 provides only the bf16 narrow seam (its `vdpbf16ps` dot), hence its twin
+            // Avx512Bf16 provides only the bf16 narrow seam (built on its `vdpbf16ps` dot),
+            // so it has no f16 twin to check here
             twin_seam_conformance::<gemmkit::bf16, _>(Avx512Bf16, "avx512bf16/bf16");
         } else {
             eprintln!("skipping Avx512Bf16 conformance: avx512bf16 not detected");
@@ -445,7 +453,7 @@ fn x86_token_conformance() {
 }
 
 /// Neon is baseline on aarch64 (no runtime probe needed) and is the only token that
-/// overrides `fma_bvec` / sets `LANE_FMA`, so this arm is the sole conformance check of
+/// overrides `fma_bvec` and sets `LANE_FMA`, so this is the sole conformance check of
 /// that seam
 #[cfg(target_arch = "aarch64")]
 #[test]
@@ -462,8 +470,8 @@ fn neon_token_conformance() {
     }
 }
 
-/// Simd128 is a compile-time token (`+simd128`, no runtime probe) and deviates from the
-/// FMA tokens (`mul_add` emulated as `mul + add`), so it needs its own conformance arm
+/// Simd128 is a compile-time token (`+simd128`, no runtime probe) that deviates from the
+/// FMA tokens by emulating `mul_add` as `mul` + `add`, so it needs its own conformance arm
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 #[test]
 fn simd128_token_conformance() {

@@ -11,7 +11,7 @@ use ndarray::{Array3, Axis};
 use gemmkit::Parallelism;
 use gemmkit_ndarray::{gemm, gemm_batched};
 
-/// Serializes the core-saturating bench so the default multi-threaded harness cannot run it
+/// Serializes the core-saturating bench so the default multi-threaded test harness cannot run it
 /// concurrently with itself (which would make every GFLOP/s figure meaningless)
 static BENCH_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

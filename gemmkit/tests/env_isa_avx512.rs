@@ -1,22 +1,23 @@
-//! `GEMMKIT_REQUIRE_ISA=avx512` pin: forces the plain (widen) AVX-512 kernels the auto path never
-//! takes on this VNNI/BF16 box, so their memoized-dispatch-only code lives in an isolated process.
-//! Every test here wants the same `avx512` pin and funnels through [`env_isa_common::pin`], which
-//! does the single `set_var` under a `Once` before any dispatch (see that module for the soundness
-//! argument); the shared write overrides an inherited `GEMMKIT_REQUIRE_ISA` so the SDE/pinned CI
-//! jobs still exercise these routes. The tests are otherwise independent: they touch different knobs
-//! (rhs-pack threshold, deep-kc gate) and different dtypes, and each asserts a self-contained
-//! parity that is invariant to the others' knob state. Every test skips gracefully when the host
-//! lacks `avx512f` (the pin would otherwise assert in `select_*`)
+//! `GEMMKIT_REQUIRE_ISA=avx512` pin: forces the plain (widen) AVX-512 kernels, which auto-selection
+//! skips in favor of VNNI/BF16 on a host that reports those extensions, so this is the only place
+//! their dispatch code actually runs
+//!
+//! Every test wants the same `avx512` pin, so all funnel through [`env_isa_common::pin`] (a single
+//! `set_var` under a `Once`, before any dispatch; see that module for why the shared write is
+//! sound). The tests are otherwise independent, each touching a different knob (RHS-pack
+//! threshold, deep-kc gate) and dtype, so none depends on another's knob state. Every test skips
+//! when the host lacks `avx512f`, since forcing the pin there would abort in `select_*` instead of
+//! testing anything
 #![cfg(all(
     feature = "std",
     any(target_arch = "x86", target_arch = "x86_64"),
     not(miri)
 ))]
 
-// Shared single-set_var pin helper (Once before any dispatch; all tests here pin `avx512`)
+// Shared GEMMKIT_REQUIRE_ISA pin helper; every test here pins `avx512` with it
 #[cfg(any(feature = "int8", feature = "half"))]
 mod env_isa_common;
-// Shared prepacked-i8 bit-parity check driven by the ISA pin binaries
+// Shared prepacked-vs-plain i8 bit-parity check, run under whichever ISA is pinned
 #[cfg(feature = "int8")]
 mod i8_packed_common;
 
@@ -25,12 +26,11 @@ use gemmkit::{MatMut, MatRef, Parallelism, tuning};
 #[cfg(feature = "half")]
 use gemmkit::{bf16, f16, gemm};
 
-// `IntGemm::pack_rhs`: the widen (non-VNNI) i8 kernel's RHS packer. On this AVX-512-VNNI box the
-// auto i8 path always picks the `vpdpbusd` dot kernel (which packs via `IntGemmVnni::pack_rhs`), so
-// the widen packer is only reachable when the plain AVX-512 kernel is forced. Pinning `avx512`
-// memoizes `select_i8` to the widen kernel, and lowering the RHS-pack threshold to `1` makes a
-// small `m` still trigger packing, more robust than the `m > 2048` default since it forces the
-// widen packer directly and keeps the matrix tiny/fast.
+// IntGemm::pack_rhs is the widen (non-VNNI) i8 kernel's RHS packer. On a VNNI-capable host
+// auto-selection always picks the vpdpbusd dot kernel instead, which packs through
+// IntGemmVnni::pack_rhs, so the widen packer only runs once avx512 is forced. Also lowers the
+// RHS-pack threshold from its 2048 default to 1, so a small m still triggers packing without
+// needing a large (and slower) matrix
 
 #[cfg(feature = "int8")]
 #[test]
@@ -40,11 +40,11 @@ fn widen_i8_pack_rhs_under_avx512_pin() {
         eprintln!("skipping: host does not report avx512f");
         return;
     }
-    // Force RHS packing for the widen kernel even at small `m` (`pack_b = m > threshold`)
+    // Below this shape's m, so pack_b (= m > threshold) is true regardless of shape size
     tuning::set_rhs_pack_threshold(1);
 
-    // Driver path (k > small_k gate, m,n > small_mn gate), so RHS packing runs through
-    // `IntGemm::pack_rhs`. Values stay in range so the wrapping semantics never fire
+    // Clears both the small_k and small_mn gates, landing on the general driver where RHS
+    // packing runs. Values stay well inside i8 range, so wrapping never actually triggers
     let (m, k, n) = (96usize, 64usize, 64usize);
     let a: Vec<i8> = (0..m * k).map(|i| ((i % 17) as i32 - 8) as i8).collect();
     let b: Vec<i8> = (0..k * n).map(|i| ((i % 13) as i32 - 6) as i8).collect();
@@ -61,7 +61,7 @@ fn widen_i8_pack_rhs_under_avx512_pin() {
         Parallelism::Serial,
     );
 
-    // Naive wrapping-i32 reference
+    // Reference: naive wrapping-i32 triple loop
     let mut expect = vec![0i32; m * n];
     for i in 0..m {
         for j in 0..n {
@@ -80,9 +80,7 @@ fn widen_i8_pack_rhs_under_avx512_pin() {
     );
 }
 
-// Forces the **widen** AVX-512 integer kernel (plain-panel RHS prepack, `DEPTH_MULTIPLE = 1`), the
-// path an auto VNNI box never takes, and checks `gemm_i8_packed_b` is bit-identical to plain
-// `gemm_i8` across the shared shape/layout/alpha-beta/thread sweep
+// The widen kernel's plain-panel RHS prepack (DEPTH_MULTIPLE = 1) must match plain gemm_i8
 
 #[cfg(feature = "int8")]
 #[test]
@@ -95,11 +93,10 @@ fn avx512_pin_i8_packed_matches_plain() {
     i8_packed_common::check();
 }
 
-// Deep-k narrow-twin parity under the forced widen `MixedGemm` (for both `f16` and `bf16` - the
-// bf16 `vdpbf16ps` dot path is only picked when `avx512bf16` is present and unforced). Pinning
-// `avx512` memoizes the widen twin `MixedGemmF32` for `bf16`, which the auto-selecting
-// `tests/deep_k_narrow.rs` never reaches on an AVX-512-BF16 box. The deep-k route must be
-// byte-for-byte the single depth panel for `beta in {0, 1}`, and serial == parallel
+// Under this pin both f16 and bf16 dispatch to the widen MixedGemm family (bf16's own
+// vdpbf16ps dot path only gets picked when avx512bf16 is present and unforced), so pinning
+// avx512 is what makes the widen deep-k twin MixedGemmF32<bf16> reachable at all: on an
+// AVX-512-BF16 host, tests/deep_k_narrow.rs's auto-selection never lands on it
 
 #[cfg(feature = "half")]
 fn fill<N: gemmkit::NarrowFloat>(n: usize, seed: u64) -> Vec<N> {
@@ -114,15 +111,15 @@ fn fill<N: gemmkit::NarrowFloat>(n: usize, seed: u64) -> Vec<N> {
         .collect()
 }
 
-/// Deep-k (gate `1`) vs single panel (gate `MAX`) must be bit-identical for `beta in {0, 1}` on a
-/// full+edge-tile shape; also serial == parallel for the deep-k route
+/// The deep-k route (gate `1`) must be byte-for-byte the single depth panel (gate `MAX`) for
+/// `beta in {0, 1}` on a shape mixing full and edge tiles, and serial must equal parallel
 #[cfg(feature = "half")]
 fn check<N: gemmkit::NarrowFloat + gemmkit::GemmScalar + Copy>(label: &str) {
     let (m, n, k) = (40usize, 50, 4096);
     let a: Vec<N> = fill(m * k, 0x1);
     let b: Vec<N> = fill(k * n, 0x2);
     let c0: Vec<N> = fill(m * n, 0x3);
-    // beta == 0 and beta == 1 (accumulate arm) are the bit-identity cases
+    // Only beta == 0 (overwrite) and beta == 1 (accumulate) are bit-identity cases
     for &beta in &[0.0f32, 1.0] {
         let run = |engage: bool, par| -> Vec<u16> {
             tuning::set_deep_kc_bytes(if engage { 1 } else { usize::MAX });
@@ -135,7 +132,7 @@ fn check<N: gemmkit::NarrowFloat + gemmkit::GemmScalar + Copy>(label: &str) {
                 MatMut::from_col_major(&mut c, m, n),
                 par,
             );
-            // SAFETY: N is f16/bf16, 2-byte transparent-over-u16
+            // SAFETY: N is f16 or bf16, both 2-byte transparent-over-u16
             c.iter()
                 .map(|v| unsafe { core::mem::transmute_copy::<N, u16>(v) })
                 .collect()

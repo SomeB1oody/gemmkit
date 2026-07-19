@@ -1,13 +1,14 @@
-//! Complex GEMM (c32/c64, conj variants)
+//! Complex GEMM (c32/c64): conj variants, workspace reuse, negative strides, and a
+//! gemm-crate cross-check
 
 use crate::common::*;
 use gemmkit::{MatMut, MatRef, Parallelism, Workspace};
 
-/// Complex counterpart of [`beta_zero_does_not_read_c`]: the SoA complex kernel's
-/// `Zero` branch must overwrite C without reading it. `ref_cplx` has no beta==0 guard
-/// (it always multiplies `beta * C0`), so the reference is built from a *zeroed* C
-/// while the kernel is fed a NaN-seeded C: a spurious read would surface as a
-/// non-finite output
+/// Complex twin of `float.rs`'s `beta_zero_does_not_read_c`: the SoA complex kernel's
+/// `Zero` branch must overwrite C without ever reading it. `ref_cplx` has no explicit
+/// beta==0 skip (it always evaluates `beta*C0`), and `0*NaN == NaN` in IEEE754, so the
+/// reference needs a genuinely zeroed C0 even with beta==0; the kernel under test is
+/// instead fed a NaN-seeded C, so a spurious read of it surfaces as a non-finite output
 #[cfg(feature = "complex")]
 #[test]
 fn beta_zero_does_not_read_c_complex() {
@@ -43,8 +44,9 @@ fn beta_zero_does_not_read_c_complex() {
     check::<gemmkit::c64>();
 }
 
-/// Complex counterpart: `gemm_cplx_with` (the only complex workspace-reuse entry) had
-/// no test at all. Must match `gemm_cplx` bit-for-bit, including conjugated cases
+/// `gemm_cplx_with` (the workspace-reuse counterpart of `gemm_cplx`) must match it
+/// bit-for-bit, including every conj combination, and stay correct on a 2nd call that
+/// reuses the same warmed-up `Workspace`
 #[cfg(feature = "complex")]
 #[test]
 fn workspace_reuse_matches_allocating_complex() {
@@ -95,6 +97,8 @@ fn workspace_reuse_matches_allocating_complex() {
     check::<gemmkit::c64>();
 }
 
+/// c32/c64 across a shape spread and every conj combination, column-major throughout,
+/// against the f64 `ref_cplx` oracle
 #[cfg(feature = "complex")]
 #[test]
 fn correctness_complex() {
@@ -113,7 +117,6 @@ fn correctness_complex() {
                 let (alpha, beta) = (T::of(1.1, -0.3), T::of(0.5, 0.7));
                 let cref = ref_cplx(&a, &b, &c0, m, k, n, alpha, beta, ca, cb);
                 let mut c = c0.clone();
-                // All column-major
                 gemmkit::gemm_cplx(
                     alpha,
                     MatRef::from_col_major(&a, m, k),
@@ -132,9 +135,10 @@ fn correctness_complex() {
     check::<gemmkit::c64>();
 }
 
-/// `alpha == 0` is the scale-only path: `C <- beta*C0`, with `A*B` (and any conj)
-/// skipped. It is the only way to reach the complex `scale_c_float` monomorphization,
-/// previously unexercised. `conj_a = true` is set on purpose and must be ignored
+/// `alpha == 0` routes through `execute_complex`'s degenerate path (`C <- beta*C0`,
+/// `A*B` never computed), the only way this suite reaches the complex `scale_c_float`
+/// call. `conj_a = true` is set on purpose: with no `A*B` term there is nothing to
+/// conjugate, so it must have no effect on the result
 #[cfg(feature = "complex")]
 #[test]
 fn correctness_complex_alpha_zero() {
@@ -149,7 +153,7 @@ fn correctness_complex_alpha_zero() {
             gemmkit::gemm_cplx(
                 alpha,
                 MatRef::from_col_major(&a, m, k),
-                true, // conj A on purpose: alpha==0 skips A*B, so it must have no effect
+                true, // must be a no-op: alpha==0 means A is never touched
                 MatRef::from_col_major(&b, k, n),
                 false,
                 beta,
@@ -163,9 +167,10 @@ fn correctness_complex_alpha_zero() {
     check::<gemmkit::c64>();
 }
 
-/// Complex serial == parallel bit-identity across thread counts: complex add isn't
-/// associative either, so the same thread-independent-blocking caveat as
-/// `parallel_equals_serial_bit_identical` applies
+/// Serial and parallel c32 runs stay bit-identical across thread counts, for every
+/// conj combination: float add isn't associative on the real/imaginary parts either,
+/// so this holds because blocking is thread-independent (same caveat as `float.rs`'s
+/// `parallel_equals_serial_bit_identical`), not because bitwise equality is promised
 #[cfg(feature = "complex")]
 #[test]
 fn parallel_equals_serial_complex() {
@@ -212,10 +217,11 @@ fn parallel_equals_serial_complex() {
     }
 }
 
-/// The raw `gemm_cplx_unchecked` entry (added for the ndarray adapter): exercise it
-/// with a **negative-row-stride** A view + conj, against the row-reversed reference.
-/// The safe `MatRef` surface can't express reversed strides, so this raw path is what
-/// arbitrary-stride callers (the ndarray adapter) rely on
+/// The raw `gemm_cplx_unchecked` entry: the safe `MatRef`/`MatMut` surface cannot
+/// express a negative stride, but arbitrary-stride callers (the `gemmkit-ndarray`
+/// adapter) rely on this one being able to, so drive it directly with a
+/// negative-row-stride A view and every conj combination, against a row-reversed
+/// reference
 #[cfg(feature = "complex")]
 #[test]
 fn cplx_unchecked_negative_strides() {
@@ -228,7 +234,7 @@ fn cplx_unchecked_negative_strides() {
             gemmkit::Complex::new(1.1f32, -0.3),
             gemmkit::Complex::new(0.5f32, 0.7),
         );
-        // Row-reversed copy of the (column-major) A, for the reference
+        // Row-reversed copy of A (column-major), matching what the negative stride below reads
         let mut a_rev = a.clone();
         for p in 0..k {
             for i in 0..m {
@@ -237,7 +243,7 @@ fn cplx_unchecked_negative_strides() {
         }
         let cref = ref_cplx(&a_rev, &b, &c0, m, k, n, alpha, beta, ca, cb);
         let mut c = c0.clone();
-        // A: base at physical row m-1, row stride -1 (col-major col stride m); B/C col-major
+        // A: base at the last physical row, row stride -1, col stride m (col-major); B/C col-major
         unsafe {
             gemmkit::gemm_cplx_unchecked(
                 m,
@@ -270,10 +276,10 @@ fn cplx_unchecked_negative_strides() {
     }
 }
 
-/// Cross-check complex (c32) against the `gemm` crate (which has native c32 and
-/// `conj_lhs`/`conj_rhs` flags); `gemm::c32 == num_complex::Complex32 == gemmkit::c32`,
-/// so the comparison is direct. Gated out of Miri and wasm (the `gemm` dev-dep is
-/// `cfg(all(not(miri), not(wasm)))`)
+/// Cross-check c32 against the `gemm` crate's native complex support and its
+/// `conj_lhs`/`conj_rhs` flags: `gemm::c32 == num_complex::Complex<f32> == gemmkit::c32`,
+/// so both sides run on the same bits. Gated the same as the `gemm` dev-dependency
+/// itself (`cfg(all(not(miri), not(target_family = "wasm")))`)
 #[test]
 #[cfg(all(not(miri), not(target_family = "wasm"), feature = "complex"))]
 fn complex_matches_gemm_crate() {
@@ -294,7 +300,7 @@ fn complex_matches_gemm_crate() {
                 MatMut::from_col_major(&mut c_kit, m, n),
                 Parallelism::Serial,
             );
-            // gemm crate: dst = alpha*dst + beta*op(lhs)*op(rhs); alpha=0, beta=1
+            // gemm's formula is dst <- alpha*dst + beta*op(lhs)*op(rhs): alpha=0, beta=1 below
             unsafe {
                 gemm::gemm(
                     m,
@@ -312,13 +318,13 @@ fn complex_matches_gemm_crate() {
                     1,
                     gemmkit::Complex::new(0.0f32, 0.0),
                     gemmkit::Complex::new(1.0f32, 0.0),
-                    false, // conj_dst
+                    false, // conj_dst: C is never conjugated
                     ca,    // conj_lhs
                     cb,    // conj_rhs
                     gemm::Parallelism::None,
                 );
             }
-            // Both column-major; build a row-major (f64,f64) reference from c_gemm
+            // c_gemm is column-major; assert_cplx_accurate wants a row-major (f64,f64) reference
             let mut cref = vec![(0.0f64, 0.0f64); m * n];
             for i in 0..m {
                 for j in 0..n {
@@ -338,14 +344,15 @@ fn complex_matches_gemm_crate() {
     }
 }
 
-/// Exact conjugation check. On small-integer inputs every product and sum is exactly
-/// representable in `f32`, so the FMA kernel and a scalar `num_complex` reference must
-/// agree *exactly* (value equality, not the L2 tolerance the other complex tests use)
+/// Exact conjugation check: inputs are small integers, so every intermediate product
+/// and sum stays exactly representable in `f32`. Whichever kernel the runtime dispatch
+/// picks must then agree with a scalar `num_complex` reference by value equality, not
+/// just the L2 tolerance the other complex tests use
 #[cfg(feature = "complex")]
 #[test]
 fn correctness_complex_conj_bit_exact() {
     use gemmkit::Complex;
-    // Deterministic small integers in [-3, 3] (exactly representable; exact arithmetic)
+    // Deterministic small integers in [-3, 3]: every product/sum below stays exact
     let cval = |seed: u64, i: usize| -> Complex<f32> {
         let r = (seed.wrapping_mul(2654435761).wrapping_add(i as u64) % 7) as i64 - 3;
         let m = (seed.wrapping_mul(40503).wrapping_add(i as u64 * 3) % 7) as i64 - 3;
@@ -358,7 +365,7 @@ fn correctness_complex_conj_bit_exact() {
         let c0: Vec<Complex<f32>> = (0..m * n).map(|i| cval(0x33, i)).collect();
         let (alpha, beta) = (Complex::new(2.0f32, 1.0), Complex::new(1.0f32, -1.0));
         for &(ca, cb) in &[(false, false), (true, false), (false, true), (true, true)] {
-            // Column-major scalar reference, exact in f32
+            // Scalar column-major reference, exact in f32
             let mut expect = c0.clone();
             for i in 0..m {
                 for j in 0..n {

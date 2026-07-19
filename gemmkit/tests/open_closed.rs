@@ -1,22 +1,21 @@
-//! Architecture acceptance (section 7.3, strongest claim): a *2nd* `KernelFamily`
-//! can be declared using only gemmkit's **public** API and driven by the same
-//! generic `driver::run`, with **no change** to `driver.rs` or `pack.rs`. The
-//! mere fact that this external file compiles and produces correct results is
-//! the proof that the operation-family seam is open for extension
+//! Proof that the `KernelFamily` seam is open for extension: this file defines a 2nd,
+//! independently written family using only gemmkit's public API, and drives it through the
+//! unchanged `driver::run` generic. That this file compiles at all, from outside the crate, and
+//! produces a correct result, is the test: no `driver.rs` or `pack.rs` change is needed to add a
+//! family
 
 use gemmkit::kernel::{AlphaStatus, BetaStatus, KernelFamily};
 use gemmkit::scalar::Scalar;
 use gemmkit::simd::{ScalarTok, SimdOps};
 use gemmkit::{Parallelism, Workspace, driver};
 
-/// A deliberately naive, independently-implemented float GEMM family. It shares
-/// nothing with the built-in `FloatGemm` except the public trait it satisfies:
-/// its own micropanel packing and a plain scalar microkernel
+/// A deliberately naive `f32` GEMM family, sharing nothing with any built-in family beyond the
+/// [`KernelFamily`] trait: its own micropanel packing and a plain scalar microkernel
 #[derive(Copy, Clone)]
 struct NaiveFloat;
 
-/// Re-implement micropanel-major packing using only public items (the crate's
-/// internal `pack` helper is not visible here, exactly the third-party case)
+/// Micropanel-major packing, reimplemented from scratch: the crate's internal packing helpers are
+/// not visible from outside the crate, exactly the situation a 3rd-party family would be in
 unsafe fn pack_panels(
     mut d: *mut f32,
     src: *const f32,
@@ -139,12 +138,13 @@ fn reference(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f64> {
 #[test]
 fn second_kernel_family_drives_unchanged() {
     let (m, k, n) = (40usize, 33, 28);
-    // Row-major logical inputs
+    // Logical row-major matrices, fed to the f64 reference as-is
     let a: Vec<f32> = (0..m * k).map(|x| (x % 17) as f32 * 0.1 - 0.5).collect();
     let b: Vec<f32> = (0..k * n).map(|x| (x % 13) as f32 * 0.2 - 0.7).collect();
     let cref = reference(&a, &b, m, k, n);
 
-    // Present everything column-major so the driver needs no orientation
+    // driver::run takes raw pointers and strides directly, with no orientation logic of its
+    // own, so this test picks column-major as its own fixed convention for A/B/C
     let to_col = |v: &[f32], r: usize, c: usize| {
         let mut o = vec![0.0f32; r * c];
         for i in 0..r {

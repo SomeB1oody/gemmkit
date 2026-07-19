@@ -1,16 +1,16 @@
-//! Fused-epilogue (bias/activation) GEMM entries
+//! Fused bias/activation GEMM entries
 use super::*;
 #[cfg(feature = "epilogue")]
 use crate::common::lower_bias;
 use crate::common::ref_parts;
 
-/// `C <- act(alpha*A*B + beta*C + bias)` in 1 fused pass (the faer adapter over gemmkit's
-/// [`gemmkit::gemm_fused`]). The optional [`Bias`] is [`Bias::PerRow`] (length `A.rows`) or
-/// [`Bias::PerCol`] (length `B.cols`) and the optional [`Activation`] is applied last;
-/// `bias == None && act == None` is exactly [`gemm`]. `T` is `f32`/`f64` (plus `f16`/`bf16` under
-/// `half`, whose epilogue applies in `f32` before the single narrowing). Like [`gemm`], it reads the
-/// pointer/strides directly and forwards to gemmkit's raw engine, so transposed, sub-matrix, and
-/// reversed (negative-stride) views all work without copying
+/// `C <- act(alpha*A*B + beta*C + bias)` in 1 fused pass, the faer adapter over gemmkit's
+/// [`gemmkit::gemm_fused`]. The optional [`Bias`] is [`Bias::PerRow`] (length `A.rows`) or
+/// [`Bias::PerCol`] (length `B.cols`), added before the optional [`Activation`], which runs last;
+/// `bias == None && act == None` behaves exactly like [`gemm`]. `T` is `f32`/`f64`, plus `f16`/`bf16`
+/// under `half` (whose epilogue runs in `f32`, narrowing to the output type only once, after the
+/// activation). Like [`gemm`], it reads the pointer/strides directly and forwards to gemmkit's raw
+/// engine, so transposed, sub-matrix, and reversed (negative-stride) views all work without copying
 ///
 /// # Panics
 /// If the inner dimensions disagree, or on a bias/activation the adapter rejects (a `PerRow`/`PerCol`
@@ -30,7 +30,7 @@ pub fn gemm_fused<T: FusedScalar>(
     gemm_fused_common(None, alpha, a, b, beta, c, bias, act, par);
 }
 
-/// Like [`gemm_fused`] but reuses a caller-owned [`Workspace`]
+/// [`gemm_fused`], threading a caller-owned [`Workspace`] through instead of the thread-local pool
 ///
 /// # Panics
 /// Same conditions as [`gemm_fused`]
@@ -72,17 +72,17 @@ fn gemm_fused_common<T: FusedScalar>(
     let (rsc, csc) = (c.row_stride(), c.col_stride());
     let cp = c.as_ptr_mut();
 
-    // Fused-epilogue validation, replicating gemmkit's checked entry (byte-identical wording): the
-    // bias length matches its axis and does not overlap C (raw pointer math, C is never
-    // referenced), and a LeakyRelu slope is finite
+    // Bias/activation validation, matching gemmkit's checked entry (same panic wording): the bias
+    // length matches its axis and doesn't overlap C, and a LeakyRelu slope is finite
     let (bias_ptr, bias_dim, has_bias) = lower_bias(bias, m, n, cp, &[(cm, rsc), (cn, csc)]);
     if let Some(Activation::LeakyRelu(s)) = &act {
         assert!(T::finite(*s), "gemmkit: LeakyRelu slope must be finite");
     }
 
-    // SAFETY: dims validated; faer guarantees the pointer + element-unit `isize` strides describe a
-    // valid in-bounds layout (negative for a reversed view, which the raw engine handles) and `c` (a
-    // `MatMut` exclusive borrow) can't alias `a`/`b`; the bias was validated disjoint from C above
+    // SAFETY: dims validated above; faer guarantees the pointer + element-unit `isize` strides
+    // describe a valid in-bounds layout (negative for a reversed view, which the raw engine
+    // handles), `c` (a `MatMut` exclusive borrow) can't alias `a`/`b`, and the bias was validated
+    // disjoint from C above
     unsafe {
         match ws {
             Some(ws) => gemm_fused_unchecked_with(

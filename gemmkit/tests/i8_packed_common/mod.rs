@@ -1,10 +1,12 @@
-//! Shared prepacked-i8 bit-parity check, driven by the per-ISA pin binaries (`env_isa_avx512`,
-//! `env_isa_vnni`, `env_isa_scalar`). Each binary pins `GEMMKIT_REQUIRE_ISA` once (its own process,
-//! so the pin runs before any dispatch) then calls [`check`], which asserts `gemm_i8_packed_b` is
-//! **bit-identical** to a plain `gemm_i8` across a shape / layout / alpha-beta / thread-count
-//! sweep. `k` not a multiple of 4 (the VNNI depth pad) and `n` not a multiple of the panel width
-//! are both included, so the pinned widen kernel and the pinned VNNI dot kernel each exercise
-//! their own prepacked micropanel layout
+//! Shared prepacked-i8 bit-parity check, used by the per-ISA pin binaries (`env_isa_avx512`,
+//! `env_isa_vnni`, `env_isa_scalar`)
+//!
+//! Each binary pins `GEMMKIT_REQUIRE_ISA` once, in its own process, before any dispatch runs,
+//! then calls [`check`], which asserts `gemm_i8_packed_b` reproduces plain `gemm_i8`
+//! **bit-identical** across a shape/layout/alpha-beta/thread-count sweep. The shape list mixes
+//! in a `k` that is not a multiple of 4 and an `n` that is not a multiple of a kernel's panel
+//! width, so the VNNI pin's depth-padding and the widen pin's panel-padding each get exercised
+//! at their own edge
 #![allow(dead_code)]
 
 use gemmkit::{MatMut, MatRef, Parallelism};
@@ -21,20 +23,21 @@ fn rand_i8(n: usize, seed: u64) -> Vec<i8> {
         .collect()
 }
 
-/// Assert `gemm_i8_packed_b` reproduces a plain `gemm_i8` bit-for-bit under the currently pinned
-/// ISA. Integer accumulation is exact, so the equality is hard for every shape/layout/thread count
+/// Assert `gemm_i8_packed_b` reproduces plain `gemm_i8` bit-for-bit under whichever ISA the
+/// calling binary pinned. Wrapping i32 accumulation is associative, so an exact match, not a
+/// tolerance, is the right bar across every shape/layout/alpha-beta/thread count below
 pub fn check() {
     for (m, k, n) in [
         (200usize, 130, 175),
         (65, 64, 64),
-        (64, 65, 100), // k not a multiple of 4, n not a multiple of nr
+        (64, 65, 100), // k not a multiple of 4, n not a multiple of a panel width
         (33, 17, 19),
         (256, 257, 129),
-        (8, 1024, 96), // small m, long k: the fixed-weight inference shape
+        (8, 1024, 96), // small m, long k: the fixed-weights inference shape
         (2, 1023, 12),
     ] {
         let a = rand_i8(m * k, 0x51 + (m * 7 + n) as u64);
-        let b_rm = rand_i8(k * n, 0x62 + (n * 3 + k) as u64); // logical k x n stored row-major
+        let b_rm = rand_i8(k * n, 0x62 + (n * 3 + k) as u64); // logical k x n, row-major
         let mut b_cm = vec![0i8; k * n];
         for i in 0..k {
             for j in 0..n {

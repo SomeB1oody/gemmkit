@@ -1,14 +1,18 @@
-//! Small-m,n horizontal (inner-product) route benches
+//! Small-`m,n`, long-`k` shapes: the horizontal inner-product route against the small-`k`
+//! route and the register-tiling driver, its pack tier for layouts that miss the route's
+//! unit-stride predicate, and the f16/bf16/i8 twins of the same comparison
 
 use crate::harness::{BENCH_GUARD, fill, measure};
 use gemmkit::{MatMut, MatRef, Parallelism, gemm};
 
-// small-matrix horizontal (inner-product) route: perf_small_mn
+// Small-matrix horizontal (inner-product) route: perf_small_mn
 
-/// Force the horizontal / small_k / driver route for a `gemm` call by pinning the 2 gates,
-/// run `f`, then restore. `small_mn_dim = MAX` + `small_k_threshold = 0` sends every small-m,n
-/// shape to the horizontal path (its gate needs `k > small_k_threshold`, so drop the latter to
-/// 0); `small_mn_dim = 0` + `small_k_threshold = MAX` forces small_k; both `0` forces the driver
+/// Runs `f` with the horizontal / small-`k` / driver route forced via the 2 gates that
+/// together decide it, then restores both. `small_mn_dim = MAX` plus `small_k_threshold = 0`
+/// routes every small-`m,n` shape to the horizontal path (it also needs `k` above the small-k
+/// floor, so dropping that floor to 0 clears it unconditionally); `small_mn_dim = 0` plus
+/// `small_k_threshold = MAX` forces the small-k route instead; `0` for both forces the
+/// general driver
 #[cfg(not(target_family = "wasm"))]
 fn with_route<R>(small_mn: usize, small_k: usize, f: impl FnOnce() -> R) -> R {
     let (pm, pk) = (
@@ -23,9 +27,10 @@ fn with_route<R>(small_mn: usize, small_k: usize, f: impl FnOnce() -> R) -> R {
     r
 }
 
-/// `gemm`-crate / `matrixmultiply` GFLOP/s for a small-`m,n` f32 `C = A*B` in the horizontal
-/// path's target layout (`row_major_a` ? row-major A : col-major A; col-major B; col-major C).
-/// Native-only. Returns `(gemm, Option<mm>)`; mm is serial-only
+/// `gemm`-crate / `matrixmultiply` GFLOP/s for a small-`m,n` f32 `C = A*B`, laid out the way
+/// the horizontal route's fast path wants it (`row_major_a` selects row-major vs column-major
+/// A; B and C are always column-major). Native-only. Returns `(gemm, Option<matrixmultiply>)`;
+/// the latter is `None` on the parallel arm, since `matrixmultiply` is only compared serially
 #[cfg(not(target_family = "wasm"))]
 fn extern_gflops_small(
     m: usize,
@@ -95,11 +100,11 @@ fn extern_gflops_small(
     (g.median, mm)
 }
 
-/// One `perf_small_mn` row: the horizontal path vs the small_k route vs the register-tiling
-/// driver on a small-`m,n` / long-`k` shape, plus the `gemm`-crate and `matrixmultiply`
-/// baselines: all GFLOP/s, back-to-back over the same buffers so drift cancels. `row_major_a`
-/// selects the horizontal path's contiguous-`k` fast-path layout (row-major A, col-major B) vs
-/// col-major A (its strided fallback)
+/// 1 `perf_small_mn` row: the horizontal path, the small-`k` route, and the register-tiling
+/// driver, forced in turn on the same buffers, plus the `gemm`-crate and `matrixmultiply`
+/// baselines, all reported as GFLOP/s so drift across the back-to-back runs cancels.
+/// `row_major_a` selects the horizontal route's contiguous-`k` fast-path layout (row-major A,
+/// column-major B) versus column-major A, its strided fallback
 #[cfg(not(target_family = "wasm"))]
 fn bench_small_mn(m: usize, n: usize, k: usize, row_major_a: bool, par: Parallelism) {
     let a = fill(m * k, 1);
@@ -145,12 +150,14 @@ fn bench_small_mn(m: usize, n: usize, k: usize, row_major_a: bool, par: Parallel
     );
 }
 
-/// Layout-coverage probe: the horizontal path requires `csa == 1 && rsb == 1` (row-major A,
-/// col-major B) after orientation, so an all-row-major or all-col-major small-`m,n` shape misses
-/// that predicate. At default settings (`small_mn_pack_min_k`) a long-`k` miss now takes the pack
-/// tier instead of falling to the driver / small_k, so this measures how close the pack tier's
-/// `all_rm`/`all_cm` rate lands to the eligible layout's horizontal rate (the ceiling), the residual
-/// gap being the `~1/m`/`~1/n` copy tax the pack tier could not amortize away
+/// Layout-coverage probe: the horizontal route's zero-copy gate needs `csa == 1 && rsb == 1`
+/// (column-major-along-`k` A rows and column-major-along-`k` B columns, i.e. row-major A
+/// with column-major B), so an all-row-major or all-col-major small-`m,n` shape misses it.
+/// At the shipped defaults, a long-`k` miss like that no longer falls all the way back to the
+/// driver / small-k route: it takes the pack tier instead (copy just the failing operand into
+/// `k`-contiguous scratch, then run the same horizontal kernel). This measures how close that
+/// recovery gets to the zero-copy horizontal rate (the ceiling neither ineligible layout can
+/// beat), the remaining gap being the pack tier's own `~1/m` or `~1/n` amortized copy cost
 #[cfg(not(target_family = "wasm"))]
 fn bench_small_mn_layouts(m: usize, n: usize, k: usize, par: Parallelism) {
     let a = fill(m * k, 1);
@@ -169,7 +176,8 @@ fn bench_small_mn_layouts(m: usize, n: usize, k: usize, par: Parallelism) {
             );
         })
     });
-    // All-row-major: B fails `rsb == 1`, so at defaults it takes the pack tier, not small_k / driver
+    // All-row-major: B fails rsb == 1, so at defaults it takes the pack tier (pack B), not
+    // the small_k route or the driver
     let all_rm = measure(m, k, n, || {
         gemm(
             1.0,
@@ -180,7 +188,7 @@ fn bench_small_mn_layouts(m: usize, n: usize, k: usize, par: Parallelism) {
             par,
         );
     });
-    // All-col-major: A fails `csa == 1` post-swap
+    // All-col-major: A fails csa == 1 (pack tier packs A instead)
     let all_cm = measure(m, k, n, || {
         gemm(
             1.0,
@@ -206,19 +214,21 @@ fn bench_small_mn_layouts(m: usize, n: usize, k: usize, par: Parallelism) {
     );
 }
 
-/// Pack-tier crossover probe: for an **ineligible** (all-col-major, so A fails `csa == 1`) small
-/// shape, compare the new packed-horizontal route (pack A into `k`-contiguous scratch, then the
-/// horizontal dot) against the current fallback (the register-tiling driver) and the small_k route
-/// across `k`. This is what sets `small_mn_pack_min_k`: the packed route must beat the driver at
-/// (and above) the gate. `packed` forces the pack tier (`small_mn_dim = MAX`, `pack_min_k = 0`,
-/// `small_k = 0`); `driver` forces the driver (`small_mn_dim = 0`, `small_k = 0`); `small_k` forces
-/// the in-place small_k route (`small_mn_dim = 0`, `small_k = MAX`). The `xd` ratio is packed/driver
+/// Pack-tier crossover probe: for an **ineligible**, all-col-major shape (A fails
+/// `csa == 1`), compares the pack tier (copy A into `k`-contiguous scratch, then the
+/// horizontal dot) against the register-tiling driver and the small-k route across a `k`
+/// sweep. This is the data behind `small_mn_pack_min_k`: the shipped gate must sit at (or
+/// past) the `k` where `packed` first overtakes `driver`, never before it. `packed` forces
+/// the pack tier by pairing `small_mn_dim = MAX` with `pack_min_k = 0` (clearing the pack
+/// tier's own `k` gate so every measured `k` takes it) and `small_k = 0`; `driver` and
+/// `small_k` force the other 2 routes the same way [`with_route`] always does. The printed
+/// `xd` ratio is packed/driver
 #[cfg(not(target_family = "wasm"))]
 fn bench_small_mn_pack_crossover(m: usize, n: usize, k: usize, par: Parallelism) {
     let a = fill(m * k, 1);
     let b = fill(k * n, 2);
     let mut c = vec![0.0f32; m * n];
-    // All-col-major: A fails `csa == 1` post-orientation, so it takes the pack tier when enabled
+    // All-col-major: A fails csa == 1 post-orientation, so it takes the pack tier when enabled
     let mut run = || {
         measure(m, k, n, || {
             gemm(
@@ -231,8 +241,6 @@ fn bench_small_mn_pack_crossover(m: usize, n: usize, k: usize, par: Parallelism)
             );
         })
     };
-    // pack tier: small_mn_dim = MAX + small_k = 0 route small-m,n here; pack_min_k = 0 clears the
-    // pack-tier k gate for every measured k
     let pmnk = gemmkit::tuning::small_mn_pack_min_k();
     gemmkit::tuning::set_small_mn_pack_min_k(0);
     let packed = with_route(usize::MAX, 0, &mut run);
@@ -253,14 +261,14 @@ fn bench_small_mn_pack_crossover(m: usize, n: usize, k: usize, par: Parallelism)
     );
 }
 
-/// Small-`m,n` pack-tier probe, two views of the same tier. View 1 (`bench_small_mn_layouts`, at
-/// shipped defaults): how close the pack tier's ineligible-layout rate (`all_rm` = pack-B,
-/// `all_cm` = pack-A) lands to the eligible horizontal rate (the ceiling), the residual gap being
-/// the copy tax. View 2 (`bench_small_mn_pack_crossover`, forced routes): the packed-horizontal
-/// route vs the driver / small_k swept across `k` for ineligible (all-col-major) shapes, which is
-/// what sets `small_mn_pack_min_k` (the gate sits where `packed` overtakes the driver). Both live
-/// in one probe because they measure the same tier from opposite ends: recovery-at-default and the
-/// crossover that fixes the gate
+/// Small-`m,n` pack-tier coverage, from 2 angles on the same tier. View 1
+/// ([`bench_small_mn_layouts`], shipped defaults): how close the pack tier's recovery on an
+/// ineligible layout lands to the eligible horizontal ceiling. View 2
+/// ([`bench_small_mn_pack_crossover`], every route forced in turn): where the pack tier
+/// itself first beats the driver as `k` grows, for an ineligible shape, which is what
+/// `small_mn_pack_min_k` is calibrated against. 1 test, since both views are needed together
+/// to make the case for wherever the gate ends up: recovery at the shipped default, and the
+/// crossover data that justifies it
 #[cfg(not(target_family = "wasm"))]
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
@@ -286,10 +294,11 @@ fn perf_small_mn_pack() {
     }
 }
 
-/// `perf_small_mn` row for **f16** (f32-accumulate mixed horizontal kernel): the horizontal path
-/// vs the register-tiling driver, plus the `gemm` crate (same f16-in-f32-acc convention), all
-/// GFLOP/s in the fast-path layout (row-major A, col-major B). Confirms the widen-load horizontal
-/// path beats the driver's padded microtile the same way f32 does
+/// `perf_small_mn` row for **f16** (the f32-accumulate mixed horizontal kernel): the
+/// horizontal route against the register-tiling driver, plus the `gemm` crate (same
+/// f16-in-f32-accumulate convention), in the fast-path layout (row-major A, column-major B).
+/// Confirms the widen-load horizontal path beats the driver's padded microtile the same way
+/// it does for f32
 #[cfg(all(feature = "half", not(target_family = "wasm")))]
 fn bench_small_mn_f16(m: usize, n: usize, k: usize, par: Parallelism) {
     use gemmkit::f16;
@@ -354,10 +363,11 @@ fn bench_small_mn_f16(m: usize, n: usize, k: usize, par: Parallelism) {
     );
 }
 
-/// `perf_small_mn` row for **bf16**. On x86 the driver takes the `vdpbf16ps` VNNI dot path while
-/// the horizontal route widens bf16->f32 like f16 does, so the `xh` ratio measures the widen
-/// route against the VNNI driver (a different, faster kernel than the f16 widen driver). No
-/// `gemm`-crate bf16 support, so it is horiz-vs-driver only
+/// `perf_small_mn` row for **bf16**. On x86 the driver auto-selects the `vdpbf16ps` dot
+/// kernel, while the horizontal route still widens bf16 to f32 the same way it does for f16,
+/// so the printed `xh` ratio here compares the widen route against a different, faster driver
+/// kernel than the f16 row above does. No `gemm`-crate bf16 support to compare against, so
+/// this is horizontal-vs-driver only
 #[cfg(all(feature = "half", not(target_family = "wasm")))]
 fn bench_small_mn_bf16(m: usize, n: usize, k: usize, par: Parallelism) {
     use gemmkit::bf16;
@@ -392,12 +402,14 @@ fn bench_small_mn_bf16(m: usize, n: usize, k: usize, par: Parallelism) {
     );
 }
 
-/// `perf_small_mn` row for **i8 -> i32** (widen horizontal dot vs the register-tiling driver). On
-/// this box the driver is the `vpdpbusd` VNNI dot kernel serial (the widen kernel small-parallel),
-/// so the `xh` ratio measures the widen horizontal route against whichever driver kernel is picked.
-/// The horizontal path widens `i8 -> i32` on load and reduces in `i32`; no `gemm`-crate i8 baseline
-/// (0.18 lacks it), so it is horiz-vs-small_k-vs-driver only. Fast-path layout: row-major A,
-/// col-major B, col-major C32
+/// `perf_small_mn` row for **i8 -> i32** (the widen horizontal dot against the register-tiling
+/// driver). On a VNNI-capable box the driver here is `vpdpbusd` in the serial arm; every
+/// parallel row's `m*n*k` stays well under the `i8_vnni_min_par_mnk` gate, so the parallel arm
+/// always falls back to the plain widen kernel instead. The printed `xh` ratio therefore
+/// compares against whichever of the 2 the driver picked for that row. The horizontal path
+/// itself always widens `i8 -> i32` on load and reduces in `i32`, with no `gemm`-crate i8
+/// baseline to compare against (0.18 has none). Fast-path layout: row-major A, column-major B,
+/// column-major C (i32)
 #[cfg(all(feature = "int8", not(target_family = "wasm")))]
 fn bench_small_mn_i8(m: usize, n: usize, k: usize, par: Parallelism) {
     let a: Vec<i8> = (0..m * k).map(|i| (i % 17) as i8 - 8).collect();
@@ -433,9 +445,10 @@ fn bench_small_mn_i8(m: usize, n: usize, k: usize, par: Parallelism) {
 }
 
 /// Small-matrix horizontal (inner-product) route: small `m,n`, long `k`. Sweeps the output
-/// dimensions against the contraction, forcing each of the 3 gemmkit routes (horizontal /
-/// small_k / driver) plus the `gemm`-crate and `matrixmultiply` baselines. The crossover (where
-/// the driver catches up as `m,n` grow) is visible in the `xh` (driver-over-horizontal) ratio
+/// dimensions against the contraction depth, forcing each of gemmkit's 3 routes (horizontal /
+/// small-k / driver) in turn, plus the `gemm`-crate and `matrixmultiply` baselines. The
+/// crossover where the driver catches up to the horizontal route as `m,n` grow shows up
+/// directly in the `xh` (driver-over-horizontal) ratio
 #[cfg(not(target_family = "wasm"))]
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
@@ -457,9 +470,9 @@ fn perf_small_mn() {
             }
         }
     }
-    // The route needs A rows / B cols unit-stride along `k`; a col-major A (strided along `k`)
-    // would force a scalar dot that loses to the driver's packed microkernel, so the dispatch
-    // gate excludes it and those shapes stay on the driver
+    // The route needs A's rows and B's columns unit-stride along k; a column-major A (strided
+    // along k) would force a scalar dot that loses to the driver's packed microkernel, so the
+    // dispatch gate excludes it and those shapes stay on the driver instead
 
     #[cfg(feature = "int8")]
     {

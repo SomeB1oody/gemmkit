@@ -1,8 +1,11 @@
-//! Integer GEMM (i8 -> i32)
+//! Integer GEMM (i8 -> i32): exact-reference correctness, the `small_mn` route,
+//! overflow wrapping, workspace reuse, parallel bit-identity, and negative strides
 
 use crate::common::*;
 use gemmkit::Parallelism;
 
+/// A shape and alpha/beta spread on row-major A, col-major B, row-major C, checked
+/// against the exact `ref_i8` reference
 #[cfg(feature = "int8")]
 #[test]
 fn correctness_i8() {
@@ -24,7 +27,7 @@ fn correctness_i8() {
             let c0: Vec<i32> = (0..m * n).map(|x| (x as i32 % 7) - 3).collect();
             let cref = ref_i8(&a, &b, &c0, m, k, n, alpha, beta);
 
-            // Row-major A, column-major B, row-major C32
+            // Transpose B into column-major, pairing row-major A with col-major B
             let bcol: Vec<i8> = {
                 let mut v = vec![0i8; k * n];
                 for i in 0..k {
@@ -48,23 +51,24 @@ fn correctness_i8() {
     }
 }
 
-/// The `small_mn` horizontal i8 route (both `m, n` small, long `k`, A rows / B cols unit-stride
-/// along `k`) must be **bit-exact** vs the register-tiling driver: `i32` is a ring, so the single
-/// fixed-order widen dot and the driver's panel-split accumulation land on the same wrapping `i32`.
-/// Straddle the default `small_mn_dim` gate (`m, n` in `1..=17`, so `17` in either axis spills to
-/// the driver), tail-sized `k` (`small_k_threshold + 1`, not a multiple of the tile), every
-/// alpha/beta sign, and serial + parallel. For each shape BOTH the eligible layout (row-major A +
-/// col-major B, which the orientation swap re-orients into `small_mn`'s unit-stride operands) and
-/// an ineligible layout (row-major B, whose post-swap A columns are strided along `k`, so the gate
-/// rejects it and the driver runs) are checked against the exact `i64` reference. No tuning-knob
-/// flip, so the route is selected by the real dispatch and it cannot perturb concurrent tests
+/// The `small_mn` horizontal i8 route (small `m`/`n`, unit-stride operands along `k`) must
+/// land on the same wrapping `i32` bits as the general register-tiling driver: wrapping i32
+/// addition is associative, so a single fixed-order widen dot and the driver's panel-split
+/// accumulation are guaranteed to agree regardless of which sums which first. `m`/`n` straddle
+/// the default `small_mn_dim` gate (16, so 17 on either axis spills to the driver), `k` is tail
+/// sized (`small_k_threshold + 1`, not a multiple of the SIMD lane width), and every
+/// alpha/beta sign and both `Parallelism` variants are covered. Each shape runs both the
+/// eligible layout (row-major A, col-major B: the orientation swap lands both operands
+/// unit-stride along `k`, the small_mn gate's `csa == 1 && rsb == 1` condition) and an
+/// ineligible one (row-major B, which the swap leaves strided along `k`, so the gate rejects
+/// it and the driver runs instead), both checked against the exact `i64` reference. No
+/// tuning-knob override: the route comes from the real dispatch, so this is safe to run
+/// alongside other tests
 #[cfg(feature = "int8")]
 #[test]
 fn i8_small_mn_matches_reference() {
     use gemmkit::{MatMut, MatRef};
     let kt = gemmkit::tuning::small_k_threshold();
-    // Straddle `small_mn_dim` (16): tail sizes (not multiples of the 4x4 register tile) drive the
-    // edge-cell dot, `1` the degenerate single row/col, `17` the spill to the driver
     let dims: &[usize] = if fast_test() {
         &[1, 3, 4, 7, 16, 17]
     } else {
@@ -80,7 +84,7 @@ fn i8_small_mn_matches_reference() {
             for &k in ks {
                 let a = rand_i8(m * k, 0x510 + (m * 131 + n * 7) as u64);
                 let b = rand_i8(k * n, 0x620 + (n * 17 + k * 3) as u64);
-                // Column-major B (rsb=1, csb=k): the eligible-layout twin of the row-major B
+                // Column-major B (rsb=1): the small_mn-eligible twin of the row-major b below
                 let bcol: Vec<i8> = {
                     let mut v = vec![0i8; k * n];
                     for p in 0..k {
@@ -94,8 +98,7 @@ fn i8_small_mn_matches_reference() {
                     let c0: Vec<i32> = (0..m * n).map(|x| (x as i32 % 7) - 3).collect();
                     let cref = ref_i8(&a, &b, &c0, m, k, n, alpha, beta);
                     for par in [Parallelism::Serial, Parallelism::Rayon(4)] {
-                        // Eligible: row-major A + col-major B + row-major C => `small_mn` for
-                        // m,n <= 16 (m or n == 17 spills to the driver); both must equal the ref
+                        // Eligible layout: takes the small_mn route (when m,n <= 16)
                         let mut c_h = c0.clone();
                         gemmkit::gemm_i8(
                             alpha,
@@ -109,7 +112,7 @@ fn i8_small_mn_matches_reference() {
                             c_h, cref,
                             "i8 small_mn (eligible) {m}x{k}x{n} alpha={alpha} beta={beta} {par:?}"
                         );
-                        // Ineligible: row-major B => the driver route on the same math
+                        // Ineligible layout: falls through to the general driver instead
                         let mut c_d = c0.clone();
                         gemmkit::gemm_i8(
                             alpha,
@@ -130,8 +133,8 @@ fn i8_small_mn_matches_reference() {
     }
 }
 
-/// `gemm_i8_unchecked_with` (raw pointers + a caller-owned `Workspace`) must equal `gemm_i8`.
-/// It is the FFI/adapter-facing signature and the missing `_with` sibling for the reuse-workspace path
+/// `gemm_i8_unchecked_with` (raw pointers, no bounds/alias checks, reusing a caller-owned
+/// `Workspace`) must produce the same output as the checked `gemm_i8`
 #[cfg(feature = "int8")]
 #[test]
 fn i8_unchecked_with_matches_gemm_i8() {
@@ -144,7 +147,7 @@ fn i8_unchecked_with_matches_gemm_i8() {
             let c0: Vec<i32> = (0..m * n).map(|x| (x as i32 % 7) - 3).collect();
             let cref = ref_i8(&a, &b, &c0, m, k, n, alpha, beta);
 
-            // Column-major B for the row-major-A / col-major-B / row-major-C layout
+            // Transpose B into column-major, pairing row-major A with col-major B
             let bcol: Vec<i8> = {
                 let mut v = vec![0i8; k * n];
                 for i in 0..k {
@@ -155,8 +158,8 @@ fn i8_unchecked_with_matches_gemm_i8() {
                 v
             };
             let mut c = c0.clone();
-            // SAFETY: A row-major (rsa=k, csa=1), B col-major (rsb=1, csb=k), C row-major
-            // (rsc=n, csc=1); all in bounds, distinct buffers, C doesn't alias A/B
+            // SAFETY: a/bcol/c are 3 distinct, correctly sized buffers, so every stride/extent
+            // implied by (rsa,csa)/(rsb,csb)/(rsc,csc) stays in bounds and C aliases neither operand
             unsafe {
                 gemm_i8_unchecked_with(
                     &mut ws,
@@ -185,16 +188,18 @@ fn i8_unchecked_with_matches_gemm_i8() {
     }
 }
 
-/// The documented i8 contract is *wrapping* i32 arithmetic on overflow. Every other
-/// i8 test keeps values in range so the wrap never fires; force it here with a large
-/// `alpha` and check against a wrapping-i32 reference (not the range-checked `ref_i8`)
+/// `gemm_i8` is documented to wrap on i32 overflow, but every other i8 test keeps values
+/// small enough that the wrap never fires; force it here with a large `alpha` and check
+/// against a `wrapping_mul`/`wrapping_add` reference, not the range-checked `ref_i8`
+/// (which panics on overflow)
 #[cfg(feature = "int8")]
 #[test]
 fn i8_wraps_on_overflow() {
     use gemmkit::{MatMut, MatRef};
-    // 2x2x2, all 127s: each dot = 127*127 + 127*127 = 32258 (fits i32). A large `alpha`
-    // then overflows the i32 epilogue; 2x2 stays on the general kernel drain (not the
-    // gemv path), exercising the scalar `wrapping_mul`/`wrapping_add`
+    // 2x2, k=2, all 127s: each dot is 127*127 + 127*127 = 32258, itself in range; alpha
+    // then overflows i32 when scaling it. k is below small_k_threshold, so this runs
+    // through special::small_k rather than the packing driver, exercising its wrapping
+    // epilogue instead
     let a = [127i8; 4];
     let b = [127i8; 4];
     let c0 = [1_000_000i32, -2_000_000, 3_000_000, -4_000_000];
@@ -225,11 +230,10 @@ fn i8_wraps_on_overflow() {
     );
 }
 
-/// Integer serial == parallel **bit-identity** (integer accumulation is exact, so
-/// any thread count must produce identical i32 output). Unlike the float
-/// `parallel_equals_serial_*` tests, this is *order-independent* (wrapping i32 add is
-/// associative), so it stays a hard guarantee even if blocking ever becomes
-/// parallelism-dependent; it does not carry their thread-independent-blocking caveat
+/// Serial and parallel i8 runs land on identical i32 bits for every thread count.
+/// Unlike the float `parallel_equals_serial_*` tests, this is a hard guarantee, not one
+/// that happens to hold under the current blocking: wrapping i32 addition is associative,
+/// so any reduction order lands on the same result
 #[cfg(feature = "int8")]
 #[test]
 fn parallel_equals_serial_i8() {
@@ -264,40 +268,41 @@ fn parallel_equals_serial_i8() {
     }
 }
 
-/// Negative strides for the integer path via [`gemmkit::gemm_i8_unchecked`] (the
-/// heterogeneous escape hatch: the homogeneous `gemm_unchecked` can't serve
-/// `i8 -> i32`). Reversed-row A, compared to the row-reversed exact reference
+/// `gemm_i8_unchecked` accepts a negative stride, unlike the homogeneous
+/// `gemm_unchecked`, which cannot serve `i8 -> i32` at all. Point A's base at its last
+/// physical row and walk backwards; output row `i` then holds the product for A's
+/// physical row `m-1-i`, checked against the exact reference indexed the same way
 #[cfg(feature = "int8")]
 #[test]
 fn i8_negative_strides_unchecked() {
     let (m, k, n) = (12usize, 9, 7);
-    let a = rand_i8(m * k, 5); // row-major m x k
-    let b = rand_i8(k * n, 6); // row-major k x n
+    let a = rand_i8(m * k, 5);
+    let b = rand_i8(k * n, 6);
     let c0 = vec![0i32; m * n];
     let cref = ref_i8(&a, &b, &c0, m, k, n, 1, 0);
 
     let mut c = vec![0i32; m * n];
     unsafe {
-        let a_last = a.as_ptr().add((m - 1) * k); // base = last row
+        let a_last = a.as_ptr().add((m - 1) * k);
         gemmkit::gemm_i8_unchecked(
             m,
             k,
             n,
             1,
             a_last,
-            -(k as isize), // reversed rows of A
+            -(k as isize),
             1,
             b.as_ptr(),
-            n as isize, // row-major B
+            n as isize,
             1,
             0,
             c.as_mut_ptr(),
-            n as isize, // row-major C
+            n as isize,
             1,
             Parallelism::Serial,
         );
     }
-    // Computed C[i,j] = sum_k A[m-1-i,k]*B[k,j]; compare to the reversed reference
+    // C[i,j] holds sum_k A[m-1-i,k]*B[k,j]; index the reference the same way
     for i in 0..m {
         for j in 0..n {
             assert_eq!(

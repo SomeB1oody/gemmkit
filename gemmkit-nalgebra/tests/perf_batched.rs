@@ -1,6 +1,6 @@
-//! nalgebra batched throughput: `gemm_batched` (1 call over a slice of per-element matrix triples)
-//! vs the honest baseline of a naive loop of single adapter `gemm` calls, for many small GEMMs.
-//! `#[ignore]` benchmark (not a correctness gate); run with:
+//! Throughput comparison for `gemm_batched`: 1 call over a slice of per-element matrix triples vs
+//! a naive loop of individual `gemm` calls, across a few small-to-mid batch shapes. An `#[ignore]`
+//! benchmark, not a correctness gate; run with:
 //!   cargo test -p gemmkit-nalgebra --release --test perf_batched -- --ignored --nocapture
 #![cfg(not(miri))]
 
@@ -11,11 +11,11 @@ use nalgebra::DMatrix;
 
 use gemmkit_nalgebra::{gemm, gemm_batched};
 
-/// Serializes the core-saturating bench so the default multi-threaded harness cannot run it
-/// concurrently with itself (which would make every GFLOP/s figure meaningless)
+/// Held for the duration of the benchmark, so no other test in this binary that also locks it can
+/// run at the same time and skew the GFLOP/s numbers
 static BENCH_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Deterministic column-major `DMatrix<f64>` fill (xorshift), values in `[-0.5, 0.5)`
+/// Xorshift64 fill for a column-major `DMatrix<f64>`, values uniform in `[-0.5, 0.5)`
 fn rand_mat(r: usize, c: usize, seed: u64) -> DMatrix<f64> {
     let mut s = seed.wrapping_add(0x9E3779B97F4A7C15) | 1;
     DMatrix::from_fn(r, c, |_, _| {
@@ -29,8 +29,9 @@ fn rand_mat(r: usize, c: usize, seed: u64) -> DMatrix<f64> {
 const REPS: usize = 9;
 const BATCH_SECS: f64 = 0.07;
 
-/// Robust median GFLOP/s over `REPS` auto-calibrated batches (copied from the core bench harness,
-/// which is not importable across crates). `flops` is the whole-batch `2*batch*m*k*n`
+/// Median GFLOP/s over `REPS` runs, with `iters` auto-calibrated to hit `BATCH_SECS` per rep (the
+/// same measurement scheme as the core crate's bench harness, duplicated here since it isn't
+/// importable across crates). `flops` is the whole-batch `2*batch*m*k*n`
 fn measure<F: FnMut()>(flops: f64, mut f: F) -> f64 {
     for _ in 0..3 {
         f();
@@ -52,8 +53,8 @@ fn measure<F: FnMut()>(flops: f64, mut f: F) -> f64 {
     g[REPS / 2]
 }
 
-/// 1 row: `gemm_batched` vs a naive loop of `gemm`, over `batch` `mxk * kxn` products, for both
-/// Serial and auto (`Rayon(0)`) parallelism, as total GFLOP/s
+/// 1 line of `gemm_batched` vs a naive loop of `gemm`, over `batch` `m x k * k x n` products, under
+/// both Serial and auto (`Rayon(0)`) parallelism, as total GFLOP/s
 fn bench(batch: usize, m: usize, k: usize, n: usize) {
     let a: Vec<DMatrix<f64>> = (0..batch).map(|e| rand_mat(m, k, 1 + e as u64)).collect();
     let b: Vec<DMatrix<f64>> = (0..batch)

@@ -1,33 +1,33 @@
-//! Small-matrix horizontal (inner-product) path: both output dimensions small, long `k`
+//! Small-`m,n` horizontal route: `C[i,j] = alpha*sum_k(A[i,k]*B[k,j]) + beta*C[i,j]`,
+//! computed as a grid of dot products rather than through the register-tiling driver
 //!
-//! When `m` and `n` are both far below the microtile but the contraction `k` is long, the
-//! register-tiling driver is the wrong tool: it packs A/B into micropanels and pads the tiny
-//! row/col tiles up to a full `MR x NR` microtile, so it computes (and reads) mostly padding.
-//! This route instead computes each output as a horizontal dot
-//! `C[i,j] = alpha*<A[i,:], B[:,j]> + beta*C[i,j]`, streaming SIMD along the contraction and
-//! reading A/B **in place** when both stream contiguously along `k`: no blocking or orientation
-//! machinery. It is [`crate::special::gemv`]'s `dot_rows` generalized from a vector to a small
-//! `m x n` grid
+//! The driver's microkernel is built around a fixed `MR x NR` microtile: when `m` and `n`
+//! are both far smaller than that tile, the driver still packs full micropanels and
+//! computes a whole padded microtile, so most of the work done is on padding that never
+//! reaches the real output. This route instead treats each `C[i,j]` as a single horizontal
+//! dot product over `k`, computed with a SIMD `mul_add` sweep plus an ascending scalar
+//! tail (the same primitive [`gemv`](crate::special::gemv) uses per row, generalized here
+//! to an `m x n` grid of rows/columns)
 //!
-//! The kernel needs both operands unit-stride along `k`: A rows (`csa == 1`, row-major A) and B
-//! columns (`rsb == 1`, column-major B). The 2 most common layouts each miss exactly one side
-//! (all-row-major A/B fails `rsb`, all-col-major fails `csa`), so [`prepack_operands`] copies
-//! **only the failing operand** once into a flat `k`-contiguous scratch (A: `m` rows each
-//! `k`-contiguous; B: `n` cols each `k`-contiguous) and the same kernel then runs over the packed
-//! pointer with unit strides. The copy is `m*k` (or `n*k`) reads against the `m*n*k` dot, a
-//! `~1/n` (or `~1/m`) tax the horizontal win dwarfs, so a strided layout still beats falling to
-//! the driver's padded microtile. When both operands already stream unit-stride the pre-pack is a
-//! no-op and the route reads A/B in place exactly as before (the zero-copy fast path). The output
-//! is register-blocked into `MT x NT` tiles: each cell holds one
-//! accumulator live across the whole `k`-sweep, so a full tile keeps `MT*NT` independent FMA
-//! chains in flight (hiding the reduction latency) while loading each A-row and B-column once per
-//! tile
+//! The dot kernel needs both operands unit-stride along `k`: A's rows (`csa == 1`) and B's
+//! columns (`rsb == 1`). Of the 2 common dense layouts, only one operand ever fails this at
+//! a time (all-row-major fails `rsb`, all-column-major fails `csa`), so [`prepack_operands`]
+//! copies just the failing operand into a flat `k`-contiguous scratch buffer and the same
+//! kernel then runs over it with unit strides; when both operands already qualify, the
+//! pre-pack is a no-op and every pointer passes through unchanged. The `m*k` (or `n*k`)
+//! copy cost is small next to the `m*n*k` dot work it unlocks, so this still beats falling
+//! back to the driver's padded microtile
 //!
-//! Each output element is a single fixed-order reduction (a `reduce_sum` with fixed lane order
-//! plus an ascending scalar `k`-tail) computed wholly by one worker: the output-tile partition
-//! touches disjoint C tiles and adds no cross-thread reduction, so the result is **reproducible**
-//! and bit-identical to the serial run for any worker count. The tile grid is decided once from
-//! the shape, independent of the worker count
+//! Output is tiled `MT x NT` at a time: a full tile keeps `MT*NT` accumulators live across
+//! the whole `k`-sweep (each A-row and B-column loaded once per depth step, shared across
+//! the tile's cells), with an edge tile (where `m`/`n` is not a multiple of the register
+//! tile) falling back to one dot per cell
+//!
+//! Every output cell is one fixed-order reduction (SIMD `reduce_sum` in the token's lane
+//! order, plus an ascending scalar tail) computed entirely by a single worker: splitting
+//! output tiles across workers adds no cross-thread reduction, so results are bit-identical
+//! to the serial run at any worker count. The tile grid itself does not depend on the
+//! worker count
 
 use crate::kernel::FloatGemm;
 #[cfg(feature = "half")]
@@ -42,30 +42,24 @@ use crate::simd::KernelSimd;
 use crate::simd::SimdOps;
 use crate::workspace::Workspace;
 
-/// Output register-block tile: `MT` rows x `NT` columns of accumulators. A full tile keeps
-/// `MT*NT` independent FMA chains live across the `k`-sweep (enough to saturate the FMA pipes)
-/// while its A-rows and B-columns are each loaded once per depth step: an arithmetic intensity
-/// of `MT*NT / (MT+NT)` MACs per vector load, which keeps the operand stream off the critical
-/// path when A/B spill L1 into L2. Calibrated on Zen5 (AVX-512): `4x4` = 16 accumulators + 4
-/// A-vectors + 1 B-vector = 21 of 32 `zmm`. A 16-vector ISA (x86 FMA / wasm) would spill this
-/// tile and wants a smaller one; NEON's 32 vectors do not
-///
-/// Confirmed on M4 (NEON): `4x4` is optimal there too. Enlarging the accumulator block
-/// regresses sharply: `4x6`/`6x4`/`5x5` (29-31 `MT*NT+MT+1` live vectors) all peak at
-/// 44-62 GFLOP/s vs `4x4`'s ~120, because LLVM spills the larger accumulator array on NEON.
-/// `4x4` is the same low-register-pressure regime (21 of 32, ~11 spare for the wide OoO
-/// window's rename headroom) the production NEON microkernel uses
+/// Output register-tile shape: `MT` rows by `NT` columns of live accumulators per pass over
+/// `k`. `4x4` was chosen so the tile's accumulators plus its 1 live A-row-vector-per-row and
+/// 1 B-column-vector fit comfortably inside the ISA's vector register file: on Zen5
+/// (AVX-512, 32 `zmm`) that is 16 + 4 + 1 = 21 registers, well under the 32 available.
+/// Measured on M4 (NEON, also 32 vector registers): larger tiles (`4x6`/`6x4`/`5x5`, 29-31
+/// live vectors) regress sharply, from ~120 GFLOP/s down to 44-62, because the larger
+/// accumulator array no longer fits and LLVM starts spilling it. `4x4` stays in the same
+/// low-register-pressure regime the production NEON microkernel targets
 const MT: usize = 4;
 const NT: usize = 4;
 
-/// Shared output-tile sweep for the small-`m,n` horizontal routes ([`run_epi`] and its mixed
-/// sibling [`run_mixed_epi`]): compute the `MT x NT` tile grid, cap the worker count with the
-/// bandwidth model (`bytes`, the per-type traffic, passed in so each caller keeps its own
-/// `sizeof`), take the `n_threads <= 1` serial fast path, else sweep the flat tiles through a
-/// shared [`JobCursor`]. `body(q_start, q_end)` computes the flat-tile range `[q_start, q_end)`
-/// with the caller's own tile kernels. The grid and the output partition are identical for every
-/// caller and add no cross-worker reduction, so the result is bit-identical to the serial run for
-/// any worker count
+/// Common output-tile sweep shared by every small-`m,n` entry point ([`run_epi`],
+/// [`run_mixed_epi`], [`run_int`]): builds the `MT x NT` tile grid, caps the worker count
+/// with the bandwidth model from the caller-supplied byte count, and either runs `body`
+/// serially over the whole grid or hands out flat-tile ranges to workers through a shared
+/// [`JobCursor`]. `body(q_start, q_end)` computes tiles `[q_start, q_end)` using whichever
+/// per-type tile kernels the caller closed over. Because every tile is a self-contained
+/// reduction, this partition never changes the result: bit-identical for any worker count
 fn tile_sweep(
     m: usize,
     n: usize,
@@ -83,9 +77,8 @@ fn tile_sweep(
         return;
     }
 
-    // Output-partitioned parallel sweep: workers pull disjoint flat-tile ranges from a
-    // shared cursor. No cross-worker reduction, so no barrier and no perturbation of the
-    // per-element summation order
+    // Each worker claims disjoint flat-tile ranges; every tile is a complete k-reduction
+    // owned by one worker, so no barrier or cross-worker combine step is needed
     let cur = JobCursor::new(n_tiles, parallel::job_grain(n_tiles, n_threads));
     parallel::for_each_worker(n_threads, |_tid| {
         while let Some((s, e)) = cur.next_chunk() {
@@ -94,18 +87,21 @@ fn tile_sweep(
     });
 }
 
-/// Line stride (in elements) for a packed `k`-contiguous buffer: `k` rounded up to an **odd** number
-/// of 64-byte cache lines. The packed buffer holds up to `small_mn_dim` (<= 16) lines that the
-/// horizontal kernel re-reads once per output tile; the natural stride `k` makes every line start
-/// alias to the same L1 set whenever `k*sizeof` is a multiple of the set span (any power-of-2 `k`),
-/// so 16 lines over an 8-way set thrash and the re-reads collapse (measured: a `16x16` all-col-major
-/// GEMM drops ~3x below the driver at `k >= 1024`). An odd cache-line count is coprime to the 64
-/// L1 sets, so the `l`-th line maps to set `l*odd (mod 64)`: 16 distinct sets, no aliasing. The
-/// pad past `k` is never read (the dot reads exactly `k` per line)
+/// Line stride, in elements, for a packed `k`-contiguous scratch buffer: `k`
+/// rounded up to an odd number of 64-byte cache lines
+///
+/// A stride of exactly `k` would make every packed line start at the same offset modulo
+/// the cache-line size whenever `k*sizeof(T)` is a multiple of the L1 set span, so with up
+/// to `small_mn_dim` (16) lines all landing on the same handful of L1 sets, the tile
+/// kernel's repeated re-reads of those lines thrash the cache (measured: a `16x16`
+/// all-column-major GEMM this route packs drops roughly 3x below the driver once `k >=
+/// 1024`). Rounding the line count up to an odd number makes it coprime with the (typically
+/// power-of-two) L1 set count, so consecutive lines land on distinct sets instead. Padding
+/// past `k` is allocated but never read
 #[inline]
 fn packed_line_stride<T>(k: usize) -> usize {
-    // Elements per 64-byte cache line (1 if the element is wider than a line, which never happens
-    // for the f32/f64/f16/bf16/i8 packed here, but keeps the divisor safe)
+    // Elements per 64-byte cache line; `.max(1)` keeps this a valid divisor even for a
+    // (currently nonexistent) element type wider than one line
     let lane = (64 / core::mem::size_of::<T>().max(1)).max(1);
     let lines = k.div_ceil(lane).max(1);
     let odd_lines = if lines.is_multiple_of(2) {
@@ -116,17 +112,19 @@ fn packed_line_stride<T>(k: usize) -> usize {
     odd_lines * lane
 }
 
-/// Copy one strided operand into a flat `k`-contiguous scratch: `dst[l*dst_stride + t] =
-/// src[l*lead + t*depth]` for `l in 0..lead`, `t in 0..k`, so each of the `lead` lines (A rows /
-/// B cols) lands as `k` contiguous elements the horizontal kernel then streams with unit stride
-/// (`dst_stride` is [`packed_line_stride`], `>= k`, breaking cache-set aliasing between lines). The
-/// operand that fails its unit-stride-along-`k` predicate has `k` as its *strided* axis, so `lead`
-/// (rows for A, cols for B) is the source's contiguous axis in the 2 common misses (all-col-major A:
-/// `lead = rsa = 1`; all-row-major B: `lead = csb = 1`): the inner loop walks it unit-stride while
-/// `t` is stripped in `pack_transpose_tile` blocks so the scattered `dst` writes stay cache-resident,
-/// turning what a naive per-`t` walk would make a strided gather into contiguous bursts. A pure
-/// reordered copy: the packed values are the source values in the same per-line order, so the dot
-/// reads identical numbers in identical order
+/// Copy one strided operand into a flat, `k`-contiguous scratch layout: for each of the
+/// `lead` lines (A rows or B columns), `dst[l*dst_stride + t] = src[l*lead_stride +
+/// t*depth_stride]` for `t in 0..k`. `dst_stride` is [`packed_line_stride`] so consecutive
+/// lines never alias the same L1 set
+///
+/// The operand being packed here is exactly the one whose `k` axis is strided in memory
+/// (`depth_stride != 1`), so its `lead` axis (rows for A, columns for B) is the one that is
+/// contiguous in `src`. The loop walks depth `t` in [`crate::tuning::pack_transpose_tile`]
+/// strips and `lead` inside each strip, so both the `src` reads (unit-stride along `lead`)
+/// and the scattered `dst` writes to `lead` distinct lines stay within a small working set
+/// instead of a full stride-`k` gather. This is a pure reordering copy: the values landing
+/// in `dst` are the same values in the same per-line order, so the dot afterward reads
+/// identical numbers in identical order
 ///
 /// # Safety
 /// `src` valid for the `lead x k` region at `lead`/`depth`; `dst` valid for `lead*dst_stride` writes
@@ -146,8 +144,7 @@ unsafe fn pack_k_contiguous<T: Copy>(
         while t0 < k {
             let te = core::cmp::min(t0 + tile, k);
             for t in t0..te {
-                // Depth line `t` of the source; the inner sweep over `lead` reads it along the
-                // contiguous axis (unit-stride for the common col-major-A / row-major-B misses)
+                // Depth line `t`; the inner sweep over `lead` then reads it unit-stride
                 let col = src.offset(t as isize * depth_stride);
                 for l in 0..lead {
                     *dst.add(l * dst_stride + t) = *col.offset(l as isize * lead_stride);
@@ -158,21 +155,22 @@ unsafe fn pack_k_contiguous<T: Copy>(
     }
 }
 
-/// Pre-pack the operand(s) that miss the unit-stride-along-`k` predicate into `ws`, returning the
-/// (possibly repointed) `(a, rsa, csa, b, rsb, csb)` the horizontal kernel then consumes with
-/// `csa == 1 && rsb == 1`. Shared by the float / mixed / int routes (one helper, no drift): the
-/// element type `T` is the only thing that varies, and the copy is type-generic. When both operands
-/// already stream unit-stride (the zero-copy fast path) this returns the inputs untouched and never
-/// carves the workspace, so an eligible-layout call is byte-for-byte the pre-pack-free route
+/// Pre-pack whichever of `A`/`B` fails the unit-stride-along-`k` predicate into `ws`,
+/// returning the (possibly repointed) `(a, rsa, csa, b, rsb, csb)` for the caller to feed
+/// the horizontal kernel, which then always sees `csa == 1 && rsb == 1`. One generic-over-`T`
+/// helper shared by the float, mixed, and integer routes so the pack logic cannot drift
+/// between them. When both operands already qualify, this returns the inputs untouched
+/// without touching `ws` at all, so an already-eligible call is identical to the
+/// pre-pack-free path
 ///
-/// `A` packs to `m` rows each `k`-contiguous (`rsa = stride`, `csa = 1`); `B` to `n` cols each
-/// `k`-contiguous (`rsb = 1`, `csb = stride`), where `stride` is [`packed_line_stride`] (`>= k`, the
-/// pad past `k` unread). `Workspace::regions` carries the same fail-closed element->byte overflow
-/// guard as the driver's own pack sizing
+/// A packs to `m` rows, each `k` contiguous elements (new `rsa` = [`packed_line_stride`],
+/// `csa = 1`); B packs to `n` columns, each `k` contiguous elements (`rsb = 1`, new `csb` =
+/// [`packed_line_stride`]). `Workspace::regions` applies the same fail-closed
+/// element-to-byte overflow guard the driver's own pack sizing uses
 ///
 /// # Safety
-/// `a`/`b` valid for the `m x k` / `k x n` regions at their strides; the returned pointers are
-/// valid only while `ws`'s `&mut` borrow lives (the caller consumes them before releasing it)
+/// `a`/`b` valid for the `m x k` / `k x n` regions at their strides; the returned pointers
+/// are valid only while `ws`'s `&mut` borrow lives (the caller must consume them before it ends)
 #[allow(clippy::too_many_arguments)]
 unsafe fn prepack_operands<T: Copy>(
     ws: &mut Workspace,
@@ -188,29 +186,27 @@ unsafe fn prepack_operands<T: Copy>(
 ) -> (*const T, isize, isize, *const T, isize, isize) {
     let pack_a = csa != 1;
     let pack_b = rsb != 1;
-    // Zero-copy fast path: both operands already stream unit-stride along `k`, so read in place
+    // Both operands already stream unit-stride along k: nothing to do
     if !pack_a && !pack_b {
         return (a, rsa, csa, b, rsb, csb);
     }
-    // Padded line stride (>= k) that breaks L1 set aliasing between the packed lines
     let stride = packed_line_stride::<T>(k);
     unsafe {
-        // Carve only the region(s) needed: A needs `m*stride`, B needs `n*stride`. `regions`
-        // fail-closes if either element->byte product overflows (a degenerate stride reaching here)
+        // Carve out only the region(s) actually needed
         let a_elems = if pack_a { m.saturating_mul(stride) } else { 0 };
         let b_elems = if pack_b { n.saturating_mul(stride) } else { 0 };
         let r = ws.regions::<T>(a_elems, 1, b_elems);
         let (mut a, mut rsa, mut csa) = (a, rsa, csa);
         let (mut b, mut rsb, mut csb) = (b, rsb, csb);
         if pack_a {
-            // A[i, :] -> dst[i*stride + t]: rows are the `lead` axis, `k` the depth (strided in src)
+            // A[i, :] -> dst[i*stride + t]: rows are the lead axis, k the (strided) depth
             pack_k_contiguous::<T>(r.a_base, a, m, k, stride, rsa, csa);
             a = r.a_base;
             rsa = stride as isize;
             csa = 1;
         }
         if pack_b {
-            // B[:, j] -> dst[j*stride + t]: cols are the `lead` axis, `k` the depth (strided in src)
+            // B[:, j] -> dst[j*stride + t]: cols are the lead axis, k the (strided) depth
             pack_k_contiguous::<T>(r.b_base, b, n, k, stride, csb, rsb);
             b = r.b_base;
             rsb = 1;
@@ -220,15 +216,9 @@ unsafe fn prepack_operands<T: Copy>(
     }
 }
 
-/// Dispatch a small-`m,n` horizontal GEMM, partitioning the `MT x NT` output tiles across up to
-/// `par`-many workers. Like the other special paths this shape is memory-bound (the operands
-/// stream from cache), so the worker count comes from the bandwidth model, not the compute ramp.
-/// Each output tile is computed wholly by one worker over the full `k`, so the split adds no
-/// cross-thread reduction and the result is bit-identical to the serial run
-///
-/// The zero-cost [`Identity`] forwarder over [`run_epi`]: with `E = Identity` the epilogue guard
-/// const-folds to the raw store, so this route is byte-for-byte unchanged from the pre-epilogue
-/// path and the public signature is preserved for every existing caller
+/// Small-`m,n` horizontal GEMM, plain (non-fused) output. Thin [`Identity`] wrapper over
+/// [`run_epi`]: with `E = Identity` the epilogue hook const-folds to the raw store, so this
+/// is exactly the code this route ran before the epilogue mechanism existed
 ///
 /// # Safety
 /// Pointers must be valid for the regions implied by the strides/sizes; `c` must not alias
@@ -257,8 +247,7 @@ pub unsafe fn run<T, S>(
     T: Float<Acc = T>,
     S: SimdOps<T>,
 {
-    // SAFETY: forwarded to `run_epi` with the zero-cost `Identity` epilogue: the raw store this
-    // route always did (`E::IS_IDENTITY` folds the per-cell hook away)
+    // SAFETY: forwards to `run_epi` with `Identity`, which const-folds to the raw store
     unsafe {
         run_epi::<T, S, Identity>(
             simd, m, k, n, par, ws, alpha, a, rsa, csa, b, rsb, csb, beta, c, rsc, csc, &Identity,
@@ -266,13 +255,11 @@ pub unsafe fn run<T, S>(
     }
 }
 
-/// Small-`m,n` horizontal GEMM applying the fused [`Epilogue`] `E` to each output element as its
-/// single store happens, instead of materializing the raw product and mapping it afterward.
-/// [`run`] is exactly this with `E = Identity`; a non-identity `E` changes only the per-cell
-/// store, so the tiling / partition / read pattern is identical and the fused result equals this
-/// route's plain output followed by the same scalar map. Each cell is one complete `k`-reduction,
-/// so the epilogue fires exactly once per element (`row`/`col` are oriented-frame coordinates;
-/// dispatch flips the bias axis on an orientation swap before calling)
+/// Small-`m,n` horizontal GEMM with a fused [`Epilogue`] `E` applied at each cell's single
+/// store. Each cell is one complete `k`-reduction, so the epilogue fires exactly once per
+/// element; a non-identity `E` changes only that store, leaving the tiling and partition
+/// identical to plain [`run`] (`row`/`col` passed to `epi` are oriented-frame coordinates -
+/// dispatch already flipped the bias axis on an orientation swap before calling in)
 ///
 /// # Safety
 /// As [`run`], plus `epi`'s interior pointers must be valid for the (oriented) problem's `m`/`n`
@@ -301,13 +288,10 @@ pub unsafe fn run_epi<T, S, E>(
     S: SimdOps<T>,
     E: Epilogue<FloatGemm<T>>,
 {
-    // `E: Copy` (an `Epilogue` supertrait): copy it out of the borrow so the `move` worker
-    // closure captures it by value
+    // Epilogue is Copy; move a value copy into the worker closure below
     let epi = *epi;
     unsafe {
-        // Pre-pack whichever operand misses the unit-stride-along-`k` predicate into `ws` (a
-        // no-op that touches no scratch when both already stream unit-stride), so the kernel
-        // below always runs with `csa == 1 && rsb == 1`
+        // No-op when both operands already stream unit-stride along k
         let (a, rsa, csa, b, rsb, csb) =
             prepack_operands::<T>(ws, m, k, n, a, rsa, csa, b, rsb, csb);
         debug_assert!(
@@ -316,7 +300,8 @@ pub unsafe fn run_epi<T, S, E>(
         );
         let n_row_tiles = m.div_ceil(MT);
 
-        // Bandwidth-capped worker count: min traffic is A read once, B once, C written once
+        // Bandwidth-capped worker count: minimum traffic is A read once, B read once, C
+        // written once
         let sizeof = core::mem::size_of::<T>();
         let bytes = m
             .saturating_mul(k)
@@ -328,8 +313,8 @@ pub unsafe fn run_epi<T, S, E>(
         let b = Ptr(b as *mut T);
         let c = Ptr(c);
 
-        // Column-tile-outer flat iteration (`jt` outer): a worker's consecutive tiles share a C
-        // column block, so a column-major C is stored down contiguous columns
+        // Column-tile-outer flat order: a worker's consecutive tiles share a C column
+        // block, giving contiguous stores for a column-major C
         let body = move |q_start: usize, q_end: usize| {
             let (a, b, c, epi) = (a, b, c, epi);
             let a = a.0 as *const T;
@@ -348,7 +333,7 @@ pub unsafe fn run_epi<T, S, E>(
                             simd, k, i0, j0, alpha, a, rsa, b, csb, beta, c, rsc, csc, &epi,
                         );
                     } else {
-                        // Edge tile (`m`/`n` not a multiple of the tile): one SIMD dot per cell
+                        // Edge tile (m or n not a multiple of MT/NT): one dot per cell
                         for cc in 0..nj {
                             for ir in 0..mi {
                                 cell_dot::<T, S, E>(
@@ -378,15 +363,16 @@ pub unsafe fn run_epi<T, S, E>(
     }
 }
 
-/// Compute a full `MT x NT` tile at output origin `(i0, j0)` from the contiguous-along-`k`
-/// layout (`csa == 1`, `rsb == 1`): hold `MT*NT` accumulators in registers across the whole
-/// `k`-sweep, loading each A-row and B-column once per depth step, then one `reduce_sum` +
-/// ascending scalar tail + `beta` epilogue per cell. The fused [`Epilogue`] `E` is applied to the
-/// final value at each cell's single store, exactly once (`E::IS_IDENTITY` const-folds it away)
+/// Compute a full `MT x NT` output tile at origin `(i0, j0)`. Holds `MT*NT` accumulators
+/// live across the entire `k`-sweep, loading each of the tile's `MT` A-rows and `NT`
+/// B-columns once per depth step (both contiguous: `csa == 1`, `rsb == 1`) and feeding them
+/// into every accumulator that needs them, then finishing each cell with `reduce_sum` plus
+/// an ascending scalar tail and the `beta` combine. The fused [`Epilogue`] `E` is applied at
+/// each cell's single store; `E::IS_IDENTITY` const-folds that branch away entirely
 ///
 /// # Safety
-/// `a`/`b`/`c` valid for the tile's reads/writes; `csa == 1` and `rsb == 1` (unit-stride along
-/// `k`); the tile is fully in-bounds (`i0 + MT <= m`, `j0 + NT <= n`). Run inside `S::vectorize`
+/// `a`/`b`/`c` valid for the tile's reads/writes; `csa == 1` and `rsb == 1` (unit-stride
+/// along `k`); the tile is fully in-bounds (`i0 + MT <= m`, `j0 + NT <= n`). Run inside `S::vectorize`
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 unsafe fn full_tile<T, S, E, const MT: usize, const NT: usize>(
@@ -411,7 +397,6 @@ unsafe fn full_tile<T, S, E, const MT: usize, const NT: usize>(
 {
     unsafe {
         let lanes = <S as SimdOps<T>>::LANES;
-        // A[i0+r, :] and B[:, j0+cc] are each contiguous over `k` (unit-stride)
         let rows: [*const T; MT] = core::array::from_fn(|r| a.offset((i0 + r) as isize * rsa));
         let cols: [*const T; NT] = core::array::from_fn(|cc| b.offset((j0 + cc) as isize * csb));
 
@@ -444,7 +429,7 @@ unsafe fn full_tile<T, S, E, const MT: usize, const NT: usize>(
                     beta * *cp
                 };
                 let out = alpha.mul_add(dot, ov);
-                // Fused transform at the oriented-frame coordinate, applied once at the store
+                // Applied once, at the single store for this cell
                 *cp = if E::IS_IDENTITY {
                     out
                 } else {
@@ -455,11 +440,11 @@ unsafe fn full_tile<T, S, E, const MT: usize, const NT: usize>(
     }
 }
 
-/// Compute one output element `C[i,j] = alpha*<A[i,:], B[:,j]> + beta*C[i,j]` as a
-/// single-accumulator SIMD dot over the contiguous A-row / B-column (`csa == 1`, `rsb == 1`) plus
-/// an ascending scalar `k`-tail. The edge-tile path (`m`/`n` not a multiple of the register
-/// tile); `beta` folded into the epilogue, then the fused [`Epilogue`] `E` applied once at the
-/// store (`E::IS_IDENTITY` const-folds it away)
+/// Compute one output cell `C[i,j] = alpha*sum_k(A[i,k]*B[k,j]) + beta*C[i,j]` as a
+/// single-accumulator SIMD dot over the contiguous A-row / B-column, plus an ascending
+/// scalar `k`-tail. Used for the edge tile, where `m`/`n` is not a multiple of `MT`/`NT`.
+/// The fused [`Epilogue`] `E` is applied once, at the store (`E::IS_IDENTITY` const-folds
+/// that branch away entirely)
 ///
 /// # Safety
 /// `a`/`b`/`c` valid for the element's reads/writes; `csa == 1` and `rsb == 1`. Run inside
@@ -487,8 +472,8 @@ unsafe fn cell_dot<T, S, E>(
     E: Epilogue<FloatGemm<T>>,
 {
     unsafe {
-        let row = a.offset(i as isize * rsa); // A[i, :] contiguous (csa == 1)
-        let col = b.offset(j as isize * csb); // B[:, j] contiguous (rsb == 1)
+        let row = a.offset(i as isize * rsa); // A[i, :], contiguous since csa == 1
+        let col = b.offset(j as isize * csb); // B[:, j], contiguous since rsb == 1
         let dot = super::dot_contiguous::<T, S>(simd, k, row, col);
         let cp = c.offset(i as isize * rsc + j as isize * csc);
         let ov = if beta == T::ZERO {
@@ -499,7 +484,6 @@ unsafe fn cell_dot<T, S, E>(
             beta * *cp
         };
         let out = alpha.mul_add(dot, ov);
-        // Fused transform at the oriented-frame coordinate, applied once at the store
         *cp = if E::IS_IDENTITY {
             out
         } else {
@@ -508,14 +492,15 @@ unsafe fn cell_dot<T, S, E>(
     }
 }
 
-/// Mixed-precision (`f16`/`bf16` inputs, `f32` accumulate) sibling of [`run`]: same `MT x NT`
-/// tiling and output partition, but each A-row / B-col is **widen-loaded** `N -> f32`
-/// ([`KernelSimd::load_lhs`]), accumulated in `f32`, and rounded to the narrow output once in the
-/// per-cell epilogue. `alpha`/`beta` arrive already widened to `f32`. Same reproducibility as [`run`]
+/// Mixed-precision (`f16`/`bf16` in, `f32` accumulate) sibling of [`run`]: same `MT x NT`
+/// tiling and output partition, but each A-row / B-column load widens `N -> f32`
+/// ([`KernelSimd::load_lhs`]) before accumulating, and each cell narrows back to `N` once,
+/// in the epilogue slot. `alpha`/`beta` are passed in already widened to `f32`. Same
+/// reproducibility guarantee as [`run`]
 ///
-/// The zero-cost [`Identity`] forwarder over [`run_mixed_epi`]: with `E = Identity` the per-cell
-/// epilogue guard const-folds to the raw narrowing store, so this route is byte-for-byte unchanged
-/// from the pre-epilogue path and the public signature is preserved for every existing caller
+/// Thin [`Identity`] wrapper over [`run_mixed_epi`]: with `E = Identity` the per-cell hook
+/// const-folds to the raw narrowing store, so this is exactly the code this route ran
+/// before the epilogue mechanism existed
 ///
 /// # Safety
 /// As [`run`] (A rows / B cols unit-stride along `k`, `c` not aliasing `a`/`b`, CPU supports `S`)
@@ -543,8 +528,8 @@ pub unsafe fn run_mixed<N, S>(
     N: NarrowFloat,
     S: KernelSimd<N, N, f32, N>,
 {
-    // SAFETY: forwarded to `run_mixed_epi` with the zero-cost `Identity` epilogue: the raw
-    // narrowing store this route always did (`E::IS_IDENTITY` folds the per-cell hook away)
+    // SAFETY: forwards to `run_mixed_epi` with `Identity`, which const-folds to the raw
+    // narrowing store
     unsafe {
         run_mixed_epi::<N, S, Identity>(
             simd, m, k, n, par, ws, alpha, a, rsa, csa, b, rsb, csb, beta, c, rsc, csc, &Identity,
@@ -552,14 +537,14 @@ pub unsafe fn run_mixed<N, S>(
     }
 }
 
-/// Mixed-precision small-`m,n` horizontal GEMM applying the fused [`Epilogue`] `E` (over the
-/// [`MixedGemm`] family) to each output element at its single narrowing store, instead of
-/// materializing the raw product and mapping it afterward. [`run_mixed`] is exactly this with
-/// `E = Identity`; a non-identity `E` changes only the per-cell store, so the tiling / partition /
-/// read pattern is identical. The epilogue applies to the `f32` cell value **before** the single
-/// narrowing (matching the driver-path mixed semantics), so it is more precise than a separate map
-/// (`row`/`col` are oriented-frame coordinates; dispatch flips the bias axis on an orientation
-/// swap before calling)
+/// Mixed-precision small-`m,n` horizontal GEMM with a fused [`Epilogue`] `E` (over the
+/// [`MixedGemm`] family) applied to each cell's `f32` accumulated value, right before that
+/// value is narrowed to `N` at its single store. [`run_mixed`] is exactly this with `E =
+/// Identity`. Applying `E` before the narrowing (rather than narrowing first and mapping
+/// after) matches the driver's mixed-precision epilogue semantics and is more precise than
+/// narrowing first, since it avoids rounding to `N` before the epilogue's own math runs
+/// (`row`/`col` are oriented-frame coordinates - dispatch already flipped the bias axis on
+/// an orientation swap before calling in)
 ///
 /// # Safety
 /// As [`run_mixed`], plus `epi`'s interior pointers must be valid for the (oriented) `m`/`n`
@@ -589,13 +574,11 @@ pub unsafe fn run_mixed_epi<N, S, E>(
     S: KernelSimd<N, N, f32, N>,
     E: Epilogue<MixedGemm<N>>,
 {
-    // `E: Copy` (an `Epilogue` supertrait): copy it out of the borrow so the `move` worker
-    // closure captures it by value
+    // Epilogue is Copy; move a value copy into the worker closure below
     let epi = *epi;
     unsafe {
-        // Pre-pack the operand missing the unit-stride-along-`k` predicate into `ws` (a no-op
-        // when both already stream unit-stride); the narrow operands pack as-is (`N` bytes), the
-        // kernel widens on load exactly as before
+        // No-op when both operands already stream unit-stride along k; the narrow (N-byte)
+        // operand is packed as-is, still widened on load same as before
         let (a, rsa, csa, b, rsb, csb) =
             prepack_operands::<N>(ws, m, k, n, a, rsa, csa, b, rsb, csb);
         debug_assert!(
@@ -604,7 +587,7 @@ pub unsafe fn run_mixed_epi<N, S, E>(
         );
         let n_row_tiles = m.div_ceil(MT);
 
-        // Bandwidth-capped worker count: A read once, B once, C written once (narrow bytes)
+        // Bandwidth-capped worker count, counted in narrow-type bytes
         let sizeof = core::mem::size_of::<N>();
         let bytes = m
             .saturating_mul(k)
@@ -663,10 +646,11 @@ pub unsafe fn run_mixed_epi<N, S, E>(
     }
 }
 
-/// Mixed sibling of [`full_tile`] (see [`run_mixed_epi`]). The `f32` scalar tail and epilogue use
-/// plain `a*b + c` (not the fused intrinsic) so the route stays reproducible; the fused
-/// [`Epilogue`] `E` is applied to the `f32` cell value at each cell's single narrowing store,
-/// exactly once (`E::IS_IDENTITY` const-folds it away to a raw narrowing store)
+/// Mixed-precision sibling of [`full_tile`] (see [`run_mixed_epi`]): accumulates in `f32`
+/// via widened `N -> f32` loads, using plain (non-fused) `a*b + c` for the scalar tail and
+/// combine so this route's rounding matches the reference scalar path exactly. The fused
+/// [`Epilogue`] `E` runs on the `f32` cell value at its single narrowing store
+/// (`E::IS_IDENTITY` const-folds that branch away to a raw narrowing store)
 ///
 /// # Safety
 /// As [`full_tile`], with `N`/`f32` operands
@@ -728,7 +712,7 @@ unsafe fn full_tile_mixed<N, S, E, const MT: usize, const NT: usize>(
                     beta * (*cp).widen()
                 };
                 let out = alpha * dot + ov;
-                // Fused transform on the `f32` cell value, before the single narrowing
+                // E runs on the f32 value, before the single narrowing to N
                 *cp = if E::IS_IDENTITY {
                     N::narrow(out)
                 } else {
@@ -739,9 +723,9 @@ unsafe fn full_tile_mixed<N, S, E, const MT: usize, const NT: usize>(
     }
 }
 
-/// Mixed sibling of [`cell_dot`] (edge-tile path; see [`run_mixed_epi`]): an `f32` widen-load dot,
-/// with the fused [`Epilogue`] `E` applied to the `f32` cell value before it is rounded to `N`
-/// once (`E::IS_IDENTITY` const-folds to a raw narrowing store)
+/// Mixed-precision sibling of [`cell_dot`] (edge-tile path; see [`run_mixed_epi`]): an `f32`
+/// widen-load dot, with the fused [`Epilogue`] `E` applied to the accumulated `f32` value
+/// before it is narrowed to `N` once (`E::IS_IDENTITY` const-folds to a raw narrowing store)
 ///
 /// # Safety
 /// As [`cell_dot`], with `N`/`f32` operands
@@ -792,7 +776,6 @@ unsafe fn cell_dot_mixed<N, S, E>(
             beta * (*cp).widen()
         };
         let out = alpha * dot + ov;
-        // Fused transform on the `f32` cell value, before the single narrowing
         *cp = if E::IS_IDENTITY {
             N::narrow(out)
         } else {
@@ -801,16 +784,17 @@ unsafe fn cell_dot_mixed<N, S, E>(
     }
 }
 
-/// Integer (`i8` inputs, `i32` accumulate) sibling of [`run`]: same `MT x NT` tiling and output
-/// partition, but each A-row / B-col is **widen-loaded** `i8 -> i32` ([`KernelSimd::load_lhs`],
-/// the same seam the `IntGemm` microkernel uses) and accumulated in `i32`. `alpha`/`beta`/`C` are
-/// all `i32`, combined `C <- alpha*<A[i,:], B[:,j]> + beta*C[i,j]` in wrapping `i32`
+/// Integer (`i8` in, `i32` accumulate) sibling of [`run`]: same `MT x NT` tiling and output
+/// partition, but each A-row / B-column load widens `i8 -> i32` ([`KernelSimd::load_lhs`],
+/// the same seam the `IntGemm` microkernel uses), and `alpha`/`beta`/`C` are all `i32`,
+/// combined as `C <- alpha*dot + beta*C` in wrapping `i32` arithmetic
 ///
-/// Bit-identical to the register-tiling driver route (`IntGemm`, or the `IntGemmVnni` dot kernel
-/// this route bypasses): `i32` is a ring, so wrapping add is fully associative and wrapping mul
-/// distributes over it, so the driver's panel-split accumulation and this single fixed-order dot
-/// land on the same `i32`. No epilogue variant exists (the `i8 -> i32` `IntTask` path never fuses;
-/// the fused requantizing families keep their own dedicated route). Same reproducibility as [`run`]
+/// Because wrapping `i32` addition is associative and wrapping multiplication distributes
+/// over it, this route's single fixed-order dot lands on the same result the driver's
+/// panel-split accumulation produces, regardless of how either splits the sum: bit-identical
+/// to both the `IntGemm` driver route and the `IntGemmVnni` dot kernel this route bypasses.
+/// No epilogue variant exists here (the plain `i8 -> i32` path never fuses; requantizing
+/// families keep their own dedicated route). Same reproducibility guarantee as [`run`]
 ///
 /// # Safety
 /// As [`run`] (A rows / B cols unit-stride along `k`, `c` not aliasing `a`/`b`, CPU supports `S`)
@@ -838,9 +822,8 @@ pub unsafe fn run_int<S>(
     S: KernelSimd<i8, i8, i32, i32>,
 {
     unsafe {
-        // Pre-pack the operand missing the unit-stride-along-`k` predicate into `ws` (a no-op
-        // when both already stream unit-stride); `i8` packs as-is, the kernel widens on load. The
-        // pack is a pure reorder, so bit-exactness vs the driver (wrapping i32) is unaffected
+        // No-op when both operands already stream unit-stride along k; i8 packs as-is
+        // (byte copy). A pure reorder cannot change a wrapping-i32 result
         let (a, rsa, csa, b, rsb, csb) =
             prepack_operands::<i8>(ws, m, k, n, a, rsa, csa, b, rsb, csb);
         debug_assert!(
@@ -849,7 +832,7 @@ pub unsafe fn run_int<S>(
         );
         let n_row_tiles = m.div_ceil(MT);
 
-        // Bandwidth-capped worker count: A / B read once as `i8`, C written once as `i32`
+        // Bandwidth-capped worker count: A/B read once as i8, C written once as i32
         let bytes = m
             .saturating_mul(k)
             .saturating_add(k.saturating_mul(n))
@@ -909,11 +892,11 @@ pub unsafe fn run_int<S>(
     }
 }
 
-/// Integer sibling of [`full_tile`] (see [`run_int`]): hold `MT*NT` `i32` accumulators live across
-/// the `k`-sweep, widen-loading each A-row and B-column `i8 -> i32` once per depth step, then one
-/// `reduce_sum` + ascending scalar `k`-tail + wrapping `alpha`/`beta` combine per cell. The
-/// `load_lhs` / `mul_add` / `reduce_sum` are the `i32`-accumulator seams (wrapping arithmetic), so
-/// the per-cell result matches the `IntGemm` driver's exactly
+/// Integer sibling of [`full_tile`] (see [`run_int`]): holds `MT*NT` `i32` accumulators live
+/// across the `k`-sweep, widen-loading each A-row / B-column `i8 -> i32` once per depth
+/// step, then finishing each cell with `reduce_sum`, an ascending scalar tail, and a
+/// wrapping `alpha`/`beta` combine. Uses the same `load_lhs` / `mul_add` / `reduce_sum`
+/// `i32`-accumulator seams the `IntGemm` driver kernel uses, so the 2 match bit-for-bit
 ///
 /// # Safety
 /// As [`full_tile`], with `i8` inputs / `i32` accumulator and output
@@ -945,8 +928,9 @@ unsafe fn full_tile_int<S, const MT: usize, const NT: usize>(
         let mut acc: [[<S as SimdOps<i32>>::Reg; MT]; NT] = [[simd.zero(); MT]; NT];
         let mut kk = 0;
         while kk + lanes <= k {
-            // UFCS: a widen token also carries the requant `KernelSimd<i8,i8,i32,{i8,u8}>` impls,
-            // so the bare `load_lhs` would be ambiguous (see `kernel::int::i32_accumulate`)
+            // Fully-qualified call: an i8 widen token also implements the requantizing
+            // `KernelSimd<i8,i8,i32,{i8,u8}>` variants, so a bare `load_lhs` would be
+            // ambiguous between them (see `kernel::int::i32_accumulate`)
             let av: [<S as SimdOps<i32>>::Reg; MT] = core::array::from_fn(|r| {
                 <S as KernelSimd<i8, i8, i32, i32>>::load_lhs(simd, rows[r].add(kk))
             });
@@ -982,8 +966,9 @@ unsafe fn full_tile_int<S, const MT: usize, const NT: usize>(
     }
 }
 
-/// Integer sibling of [`cell_dot`] (edge-tile path; see [`run_int`]): an `i8 -> i32` widen-load
-/// single-accumulator dot plus ascending scalar tail, `beta`/`alpha` folded in wrapping `i32`
+/// Integer sibling of [`cell_dot`] (edge-tile path; see [`run_int`]): a single-accumulator
+/// `i8 -> i32` widen-load dot plus an ascending scalar tail, with `alpha`/`beta` folded in
+/// using wrapping `i32` arithmetic
 ///
 /// # Safety
 /// As [`cell_dot`], with `i8` inputs / `i32` accumulator and output

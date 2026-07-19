@@ -1,4 +1,6 @@
-//! f16 / i8 / c32 element-type throughput benches
+//! Per-element-type throughput (f16, bf16, i8, c32) against whichever external baseline
+//! actually supports that type: the `gemm` crate has f16 and c32, but neither bf16 nor i8, so
+//! those 2 report gemmkit-only figures
 
 #[cfg(feature = "half")]
 use crate::harness::fill;
@@ -9,8 +11,9 @@ use gemmkit::gemm;
 #[cfg(any(feature = "half", feature = "complex"))]
 use gemmkit::{MatMut, MatRef};
 
-/// f16 GEMM throughput: gemmkit (f32-accumulate mixed kernel) vs the `gemm` crate
-/// (same f16-in-f32-acc convention), reported as a ratio. f16 FLOPs counted like f32
+/// f16 GEMM throughput: gemmkit's mixed kernel (f16 in, f32 accumulate, rounded back to f16 on
+/// store) against the `gemm` crate's f16 support, which uses the same f16-in-f32-accumulate
+/// convention. Flops are counted the same way as f32 (`2*m*k*n`) for both
 #[cfg(all(feature = "half", not(target_family = "wasm")))]
 fn bench_f16(s: usize, parallel: bool) {
     use gemmkit::f16;
@@ -88,13 +91,18 @@ fn perf_f16() {
     }
 }
 
-/// Deep-contraction probe for the narrow-output single-slice rule: an `OUT_IS_ACC = false`
-/// family runs the whole contraction as one depth panel (`kc = k`, the single-rounding
-/// contract), so at large `k` its micropanels outgrow L1/L2 where the homogeneous f32 driver
-/// re-blocks at the cache-model `kc`. The f32 column is the control: if f16/bf16 efficiency
-/// (relative to its own shallow-`k` row) falls off materially faster than f32's, the
-/// single-slice rule is leaving cache locality on the table; if the falloff tracks f32's,
-/// the deep panels are prefetch-covered and a multi-slice restructure has nothing to win
+/// f32 vs f16 vs bf16 GFLOP/s across a `k` sweep at fixed, small `m = n = 512`, all serial.
+/// f32 always runs the driver's ordinary cache-blocked path, re-blocking at the analytic `kc`
+/// regardless of how large `k` gets. f16/bf16 instead start out on the narrow-output
+/// single-slice route (`OUT_IS_ACC = false`: the entire contraction as 1 depth panel, so the
+/// narrow result rounds only once at the end), which on this target auto-switches itself to
+/// an `f32`-output multi-slice twin (re-blocked at the same analytic `kc` f32 uses) once the
+/// resulting RHS micropanel (`nr * k * sizeof(N)`) outgrows the deep-contraction engage gate.
+/// On AVX-512 (`nr = 12`, gate = half the detected L2) that crossover sits around `k ~
+/// 21800`, so the last 2 points below (32768, 65536) are already running the multi-slice
+/// twin, not the single-slice route the first 3 exercise. The sweep is therefore really 2
+/// questions in 1: does single-slice throughput hold up cleanly all the way to its own
+/// hand-off point, and is the hand-off itself smooth rather than a visible step
 #[cfg(all(feature = "half", not(target_family = "wasm")))]
 fn bench_narrow_k_sweep(m: usize, k: usize, n: usize) {
     use gemmkit::{bf16, f16};
@@ -159,11 +167,13 @@ fn perf_narrow_k_sweep() {
     }
 }
 
-/// bf16 -> f32 GEMM throughput (no `gemm`-crate baseline: it lacks bf16 in 0.18). On an
-/// AVX-512-BF16 box the driver takes the `vdpbf16ps` dot kernel, whose LHS/RHS packs run
-/// through `pack_kgroup_panels`; row-major A + col-major B is the contiguous (`depth == 1`)
-/// pack layout for both operands, so this exercises the fast pack path. bf16 FLOPs counted
-/// like f32. Mirrors `bench_f16` but reports gemmkit throughput only (no crate baseline)
+/// bf16-in, f32-accumulate GEMM throughput: no baseline here since the `gemm` crate (0.18) has
+/// no bf16 support to compare against. On an AVX-512-BF16 box the driver auto-selects the
+/// `vdpbf16ps` dot kernel, whose LHS/RHS packs both go through `pack_kgroup_panels`;
+/// row-major A (contiguous rows) plus col-major B (contiguous columns) is the layout where
+/// both operands hit that packer's fast, straight-copy path rather than its strided one, so
+/// this exercises the kernel at its best. Flops counted the same way as f32. A gemmkit-only
+/// sibling of [`bench_f16`]: same shape, no crate comparison to print
 #[cfg(all(feature = "half", not(target_family = "wasm")))]
 fn bench_bf16(s: usize, parallel: bool) {
     use gemmkit::bf16;
@@ -209,8 +219,11 @@ fn perf_bf16() {
     }
 }
 
-/// i8 -> i32 GEMM throughput (no `gemm`-crate baseline: it lacks i8 in 0.18). Just
-/// confirms the widen-and-multiply kernel is SIMD-accelerated, not scalar-bound
+/// i8-in, i32-accumulate GEMM throughput: no baseline here either (0.18 has no i8 support).
+/// On a VNNI-capable box `gemm_i8`'s auto-select mostly runs the `vpdpbusd` dot kernel here
+/// (every serial call, and every parallel call whose `m*n*k` clears `i8_vnni_min_par_mnk`);
+/// only a small parallel problem falls back to the plain widen-and-multiply kernel. Either
+/// way this just confirms i8 throughput is SIMD-accelerated rather than scalar-bound
 #[cfg(all(feature = "int8", not(target_family = "wasm")))]
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
@@ -249,9 +262,10 @@ fn perf_i8() {
     }
 }
 
-/// Complex (c32) GEMM throughput: gemmkit (`gemm_cplx`, no conj) vs the `gemm` crate
-/// (native c32). Complex FLOPs counted as 4x the real count (a complex mul-add is
-/// ~4 real mul + 4 real add), the convention both report
+/// Complex (c32) GEMM throughput: gemmkit's [`gemmkit::gemm_cplx`] (no conjugation on either
+/// operand) against the `gemm` crate's native c32 support. A complex multiply-add is
+/// conventionally counted as 4 real flops (4 real multiplies + 4 real adds), so both sides
+/// scale their raw `2*m*k*n` timing by that factor rather than reporting the real-valued count
 #[cfg(all(feature = "complex", not(target_family = "wasm")))]
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
@@ -286,7 +300,8 @@ fn perf_complex() {
             } else {
                 gemm::Parallelism::None
             };
-            // 4x for the complex flop convention
+            // Unused: the reported figures below come straight from `measure`'s own count,
+            // rescaled by 2x (see the comment at the print site)
             let cflop = |secs: f64| 4.0 * 2.0 * (m * k * n) as f64 / secs / 1e9;
             let sk = measure(m, k, n, || {
                 gemmkit::gemm_cplx(
@@ -323,7 +338,8 @@ fn perf_complex() {
                     gp,
                 );
             });
-            // `measure` already divides by 2*m*n*k; rescale to the complex flop count
+            // measure() already assumes 2*m*n*k flops; a complex mul-add is 4x that, so
+            // doubling its GFLOP/s figure (not calling the unused cflop() above) gets there
             let (kit, gem) = (sk.median * 2.0, sg.median * 2.0);
             let mode = if par { "par" } else { "ser" };
             println!(

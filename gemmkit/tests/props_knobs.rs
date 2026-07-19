@@ -1,11 +1,13 @@
-//! Property-based tests that mutate the process-global tuning knobs. The only
-//! knob-mutating binary: knob state is a per-process `AtomicUsize`, so a separate test
-//! binary is a separate process and cannot race `tests/tuning.rs`/`tests/env.rs`.
-//! Within this binary the harness runs tests concurrently, so every property holds
-//! [`KNOB_LOCK`] for its whole body (mirrors tests/tuning.rs:16-22) and captures/restores
-//! every knob it may touch via a per-case RAII [`KnobGuard`] that survives proptest's
-//! internal `catch_unwind`. Properties never assert on absolute defaults - only on
-//! outputs under knob settings they set themselves. See props_common for shared bars
+//! Property tests over gemmkit's tuning knobs (`tuning::set_*`): every knob assignment
+//! must still produce a correct, deterministic result, and every route a knob can steer a
+//! problem onto (packed, gemv, small-mn, small-k, i8 VNNI) must agree with the general
+//! driver regardless of which knob toggled it. Each knob is a process-global `AtomicUsize`,
+//! so mutating one from a different test binary (a separate process) cannot interfere with
+//! this one - but the harness runs the properties inside this binary concurrently, and they
+//! all touch the same globals. [`KNOB_LOCK`] serializes every property here, and a per-case
+//! [`KnobGuard`] captures and restores every knob so a shrink replay or an early panic never
+//! leaks a mutated value into the next case. See props_common for the shared strategies,
+//! oracle, and accuracy gates
 #![cfg(all(not(miri), not(target_family = "wasm")))]
 
 // Shared proptest strategies, oracle references, and accuracy gates
@@ -17,24 +19,27 @@ use gemmkit::{
 use props_common::*;
 use proptest::prelude::*;
 
-// isolation: shared lock + per-case knob capture/restore
+// Shared lock plus per-case knob capture/restore
 
-/// Serializes every test in this binary that mutates a knob (mirrors tests/tuning.rs:16-22).
-/// Poison-recovery: a panicking case must not cascade into spurious failures
+/// Serializes every property in this binary that mutates a knob (the same pattern
+/// tests/tuning.rs uses for its own knob-touching tests), so no 2 cases can interleave their
+/// `set_*` calls. Recovers a poisoned lock so one panicking case cannot cascade into
+/// spurious failures elsewhere
 static KNOB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn knob_guard() -> std::sync::MutexGuard<'static, ()> {
     KNOB_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Captures the current value of every knob and restores it on `Drop` - including during
-/// proptest's per-case unwind and shrink replays (it is a `Drop` impl). Getters resolve
-/// env->cache->default and return the *raw* stored value (so restoring via the setter is a
-/// faithful round-trip) for every knob except `thread_dim_stride`, whose getter maps raw `0`
-/// to the core-derived auto value; that one is restored to its shipped default `0`
-/// (THREAD_DIM_STRIDE_DEFAULT, tuning.rs:213) instead. The `.max(1)`-clamping getters
-/// (parallel_oversample/kc/mc_reg_panels/packed_oversample/pack_transpose_tile) restore an
-/// idempotently-clamped value - semantically identical
+/// Captures the current value of every knob and restores it on `Drop`, including through
+/// proptest's per-case unwind and shrink replays (restoring in `Drop` is what makes that
+/// safe). Each knob's getter resolves env -> cache -> default and returns the raw stored
+/// value, so feeding it back through the matching setter is a faithful round-trip, with one
+/// exception: `thread_dim_stride`'s getter maps a raw `0` to the core-derived auto value
+/// rather than returning it, so its `KNOBS` entry restores through [`thread_dim_stride_restore`]
+/// instead. The knobs whose getters clamp their result to `.max(1)` (`parallel_oversample`,
+/// `kc`, `mc_reg_panels`, `packed_oversample`, `pack_transpose_tile`) restore an
+/// already-clamped value, which is semantically identical to the original
 struct KnobGuard {
     restore: Vec<(fn(usize), usize)>,
 }
@@ -43,8 +48,8 @@ impl KnobGuard {
         #[allow(unused_mut)]
         let mut restore: Vec<(fn(usize), usize)> =
             KNOBS.iter().map(|&(_, set, get)| (set, get())).collect();
-        // i8 VNNI stays a separate cfg'd append: it is captured/restored but deliberately
-        // excluded from the swept `KNOBS` table (int8/f32-inert; exercised by P20)
+        // Captured/restored like every other knob, but kept out of the swept KNOBS table
+        // (int8-only; exercised separately by P20)
         #[cfg(feature = "int8")]
         restore.push((
             tuning::set_i8_vnni_min_par_mnk,
@@ -61,24 +66,25 @@ impl Drop for KnobGuard {
     }
 }
 
-/// `thread_dim_stride`'s getter maps a raw stored `0` to the core-derived auto value, so it
-/// does not round-trip; its `KNOBS` capture entry restores the shipped default `0`
-/// (THREAD_DIM_STRIDE_DEFAULT, tuning.rs:213) instead (see `KnobGuard`)
+/// Restore value for `thread_dim_stride`: its getter maps a raw stored `0` to the
+/// core-derived auto value instead of returning it verbatim, so capturing the getter's
+/// output would not round-trip through the setter. Used in its `KNOBS` entry in place of
+/// the real getter; `0` is the knob's own shipped default (auto), so this always restores it
 fn thread_dim_stride_restore() -> usize {
     0
 }
 
-/// One swept knob: its canonical `GEMMKIT_*` env name, its setter, and the capture fn that reads
-/// the value the setter round-trips to. The name backs the `knobs_table_covers_every_knob` sync
-/// test against `tuning::knob_env_names`; the two fns drive the sweep/restore
+/// One swept knob: its canonical `GEMMKIT_*` env name, its setter, and the getter that reads
+/// back the value the setter round-trips to. The name backs `knobs_table_covers_every_knob`
+/// against `tuning::knob_env_names`; the 2 fns drive the sweep and the restore
 type Knob = (&'static str, fn(usize), fn() -> usize);
 
-/// The 23 general-path knobs P16 sweeps (i8 VNNI is int8/f32-inert, exercised by P20), each
-/// paired with the capture fn that reads the value its setter round-trips to. Order-independent:
-/// each is set to an independently-drawn value. Both `KnobGuard::capture` (restore side) and
-/// `apply_knobs` (sweep side) drive this single table, so their lengths (and hence
-/// [`KNOB_COUNT`]) can never drift apart. The leading env name is asserted to cover
-/// [`tuning::knob_env_names`] by `knobs_table_covers_every_knob`
+/// The 23 general-path knobs this suite sweeps: every entry in `tuning::knob_env_names`
+/// except i8 VNNI, which is int8/f32-inert and exercised separately by P20. Order-independent:
+/// each entry is set to an independently-drawn value per case. Both `KnobGuard::capture`
+/// (restore side) and `apply_knobs` (sweep side) iterate this one table, so their lengths -
+/// and hence [`KNOB_COUNT`] - can never drift apart. `knobs_table_covers_every_knob` asserts
+/// the leading env names cover [`tuning::knob_env_names`] exactly
 const KNOBS: &[Knob] = &[
     (
         "GEMMKIT_PARALLEL_THRESHOLD",
@@ -190,23 +196,24 @@ const KNOBS: &[Knob] = &[
 ];
 const KNOB_COUNT: usize = KNOBS.len();
 
+/// Set every knob in [`KNOBS`] to its paired value from `vals`
 fn apply_knobs(vals: &[usize]) {
     for (&(_, set, _), &v) in KNOBS.iter().zip(vals) {
         set(v);
     }
 }
 
-// P16c registry sync: the KNOBS table (plus the cfg-gated i8 VNNI knob it deliberately omits) must
-// exactly cover tuning::knob_env_names(), gemmkit's canonical knob registry. A knob added to
-// gemmkit but not to KNOBS silently loses its metamorphic coverage; this catches that at test time
+// KNOBS (plus the cfg-gated i8 VNNI knob it deliberately excludes) must exactly cover
+// tuning::knob_env_names, the crate's canonical registry: catches a knob added upstream
+// that never got mirrored here, which would silently lose its coverage
 #[test]
 fn knobs_table_covers_every_knob() {
     use std::collections::BTreeSet;
     let canonical: BTreeSet<&str> = tuning::knob_env_names().iter().copied().collect();
     let mut swept: BTreeSet<&str> = KNOBS.iter().map(|&(name, _, _)| name).collect();
     assert_eq!(swept.len(), KNOBS.len(), "KNOBS has a duplicate env name");
-    // i8 VNNI is captured/restored (KnobGuard) but excluded from the swept KNOBS table (exercised
-    // by P20); it is the one knob legitimately not in KNOBS, so add it to match the canonical set
+    // The one knob legitimately absent from KNOBS: captured/restored by KnobGuard but swept
+    // separately by P20, so add it back before comparing against the canonical set
     if cfg!(feature = "int8") {
         swept.insert("GEMMKIT_I8_VNNI_MIN_PAR_MNK");
     }
@@ -216,9 +223,9 @@ fn knobs_table_covers_every_knob() {
     );
 }
 
-/// Value pool that lands on the small multipliers (1-3 forces deep multi-block driver
-/// paths on tiny inputs) and the saturating-arithmetic extremes (`usize::MAX` re-covers
-/// the `blocking()`/`m_iter*mr` saturating-mul class; tests/tuning.rs:43-59, 731-752)
+/// Value pool weighted toward small multipliers (1-3, which force deep multi-block driver
+/// paths even on tiny inputs) plus a few huge extremes (`usize::MAX` among them, to hit the
+/// saturating-arithmetic branches a knob-derived multiply can take)
 fn knob_val() -> impl Strategy<Value = usize> {
     prop_oneof![
         3 => proptest::sample::select(&[0usize, 1, 2, 3, 5, 8][..]),
@@ -258,9 +265,10 @@ fn run_gemm(
     c
 }
 
-// P16 metamorphic knob sweep: any assignment keeps every path correct (frob vs
-// ref64) and deterministic under a fixed config (run-twice BIT). No comparison across
-// different assignments (knobs change blocking hence summation order)
+// P16 metamorphic knob sweep: any single assignment of all 23 knobs keeps every path
+// correct (frob vs the f64 reference) and deterministic under a fixed config (run twice,
+// compare bit-for-bit). No comparison across 2 different assignments: different knobs
+// change the blocking, hence the summation order
 
 proptest! {
     #![proptest_config(ProptestConfig { cases: cases(80), ..ProptestConfig::default() })]
@@ -286,7 +294,7 @@ proptest! {
         let (alpha, beta) = (al as f32, be as f32);
         let cref = reference(&a, &b, &c0, al, be);
 
-        // (i) plain gemm, serial and Rayon(0): determinism (run twice) + frob
+        // (i) plain gemm, serial and Rayon(0): determinism (run twice) + frob accuracy
         for par in [Parallelism::Serial, Parallelism::Rayon(0)] {
             let c1 = run_gemm(m, k, n, &abuf, rsa, csa, &bbuf, rsb, csb, &cbase, rsc, csc, alpha, beta, par);
             let c2 = run_gemm(m, k, n, &abuf, rsa, csa, &bbuf, rsb, csb, &cbase, rsc, csc, alpha, beta, par);
@@ -294,8 +302,8 @@ proptest! {
             assert_accurate(&c1, rsc, csc, m, n, &cref, &a, &b, k, be.abs() * frob_norm(&c0), "knob gemm");
         }
 
-        // (ii) prepack_rhs + gemm_packed_b (column-major-ish C): exercises the
-        // tiny_block_dim().saturating_add(1) prepack sentinel under the same assignment
+        // (ii) prepack_rhs + gemm_packed_b (column-major-ish C): also exercises the
+        // tiny-branch prepack sentinel (tiny_block_dim() + 1) under the same assignment
         {
             let packed = prepack_rhs(MatRef::new(&bbuf, k, n, rsb, csb));
             let mut pk1 = cbase.clone();
@@ -308,7 +316,8 @@ proptest! {
             assert_accurate(&pk1, rsc, csc, m, n, &cref, &a, &b, k, be.abs() * frob_norm(&c0), "knob packed_b");
         }
 
-        // (iii) batched (3 contiguous col-major elements): each element frob + determinism
+        // (iii) batched (3 contiguous col-major elements): each element checked for frob
+        // accuracy and determinism
         {
             let batch = 3usize;
             let (ea, eb, ec) = (m * k, k * n, m * n);
@@ -354,9 +363,10 @@ fn col_major_to_rowmajor(v: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     out
 }
 
-// P16b prepack under one knob assignment, consume under a *different* one: the
-// prepack geometry is baked at pack time and consumed verbatim, so the result must
-// still be correct (directly tests the sentinel/geometry decoupling)
+// P16b: prepack under one knob assignment, then consume under a different one. The
+// prepack geometry is baked in at pack time and read back verbatim by the consumer, so the
+// result must still be correct regardless of what the knobs did in between - this directly
+// tests that decoupling
 
 proptest! {
     #![proptest_config(ProptestConfig { cases: cases(64), ..ProptestConfig::default() })]
@@ -396,8 +406,9 @@ proptest! {
     }
 }
 
-// P17 gemv routing: dedicated gemv path (threshold on) vs the general driver
-// (threshold 0) both stay accurate. Routes differ => tolerance, not bitwise
+// P17 gemv routing: the dedicated gemv path (threshold on) and the general driver
+// (threshold 0) must both stay accurate. The 2 routes differ, so only a tolerance
+// comparison applies, not bitwise
 
 proptest! {
     #![proptest_config(ProptestConfig { cases: cases(64), ..ProptestConfig::default() })]
@@ -429,9 +440,9 @@ proptest! {
     }
 }
 
-// P18 small-m,n horizontal route (row-major A + col-major B, k > small_k) vs the
-// driver, both accurate. small_k_threshold pinned to 16 in-guard so the k-gate is
-// deterministic regardless of the arch-split default / ambient env
+// P18 small-m,n horizontal route (row-major A + column-major B, k above the small-k
+// threshold) vs the general driver, both accurate. small_k_threshold is pinned to 16 inside
+// the guard so the k-gate is deterministic regardless of the arch-split default or ambient env
 
 proptest! {
     #![proptest_config(ProptestConfig { cases: cases(64), ..ProptestConfig::default() })]
@@ -445,9 +456,9 @@ proptest! {
         let _restore = KnobGuard::capture();
         tuning::set_small_k_threshold(16); // deterministic k-gate: every generated k (>=17) clears it
 
-        // Row-major A (csa == 1) + column-major B (rsb == 1) + column-major C: the layout the
-        // horizontal route requires (see dispatch::small_mn_eligible); C col-major keeps
-        // orient_transpose from swapping it away
+        // Row-major A (csa == 1) + column-major B (rsb == 1) + column-major C: the layout
+        // small_mn_eligible requires; keeping C column-major also stops orient_transpose
+        // from swapping the operands away from that layout
         let a = Mat::<f32>::rand(m, k, seed);
         let b = Mat::<f32>::rand(k, n, seed ^ 0xB);
         let c0 = Mat::<f32>::rand(m, n, seed ^ 0xC);
@@ -465,8 +476,8 @@ proptest! {
     }
 }
 
-// P19 small-k route vs the driver, both accurate. small_mn_dim pinned to 0 in-guard
-// so the small-mn gate can't flip mid-property as small_k_threshold is toggled
+// P19 small-k route vs the general driver, both accurate. small_mn_dim is pinned to 0
+// inside the guard so the small-mn gate cannot also flip while small_k_threshold is toggled
 
 proptest! {
     #![proptest_config(ProptestConfig { cases: cases(64), ..ProptestConfig::default() })]
@@ -498,9 +509,10 @@ proptest! {
     }
 }
 
-// P20 i8 VNNI gate (x86 + int8 only; the knob is inert elsewhere, tuning.rs:330-340):
-// VNNI (gate 0) and widen (gate MAX) must both equal the wrapping-i32 reference exactly
-// and be bit-identical to each other (the 2 kernels are documented bit-exact)
+// P20 i8 VNNI gate (x86 + int8 only; the knob only affects the VNNI auto-select path, so
+// it is a no-op on any other target/type): the VNNI kernel (gate 0) and the widen fallback
+// (gate usize::MAX) must both equal the wrapping-i32 reference exactly and be bit-identical
+// to each other, since both compute the exact same wrapping i32 arithmetic
 
 #[cfg(all(feature = "int8", any(target_arch = "x86", target_arch = "x86_64")))]
 proptest! {
@@ -518,7 +530,7 @@ proptest! {
         let c0 = vec![0i32; m * n];
         let cref = ref_i8_wrapping(&a, &b, &c0, m, k, n, 1, 0);
 
-        // Column-major operands (like tests/tuning.rs's i8_vnni_min_par_mnk_route_correct)
+        // Column-major operands, matching the layout tests/tuning.rs's own VNNI-gate test uses
         let acol = {
             let mut v = vec![0i8; m * k];
             for i in 0..m { for p in 0..k { v[p * m + i] = a[i * k + p]; } }
@@ -555,10 +567,11 @@ proptest! {
     }
 }
 
-// P21 mixed (f16) small-m,n horizontal route, parallel tail: the mixed route only ever ran
-// serial in the coverage runs. Pinning the gemv/bandwidth floor to 1 lets a small `k` still fork
-// under Rayon(2); the route reduces each output within one worker, so serial and parallel must be
-// bit-identical. beta == 1 also exercises the epilogue's accumulate arm
+// P21 mixed (f16) small-m,n horizontal route, forced onto a parallel tail: the mixed route
+// has otherwise only ever run serial in coverage. Pinning the gemv/bandwidth byte floor to 1
+// lets even this small k fork under Rayon(2); the route reduces each output within a single
+// worker with no cross-thread combine, so serial and parallel must be bit-identical
+// beta == 1 additionally exercises the epilogue's accumulate arm
 
 #[cfg(feature = "half")]
 #[test]
@@ -567,16 +580,17 @@ fn prop_small_mn_mixed_parallel_bit_identical() {
 
     let _lock = knob_guard();
     let _restore = KnobGuard::capture();
-    // Route to the mixed small_mn path and force its bandwidth-capped worker count above 1:
-    // small_mn_dim >= m,n; small_k_threshold < k; and a byte floor of 1 clears resolve_bandwidth
+    // Route onto the mixed small_mn path and force its worker count above 1: small_mn_dim
+    // must cover m,n; small_k_threshold must be below k; and a byte floor of 1 clears the
+    // gemv/gevv bandwidth gate that would otherwise keep this shape serial
     tuning::set_small_mn_dim(16);
     tuning::set_small_k_threshold(16);
     tuning::set_gemv_parallel_bytes(1);
 
     let (m, n, k) = (16usize, 16usize, 64usize);
-    // Row-major A (csa == 1) + column-major B (rsb == 1) + column-major C - the layout the
-    // horizontal route requires (dispatch.rs mixed gate), and col-major C keeps orient_transpose
-    // from swapping it away
+    // Row-major A (csa == 1) + column-major B (rsb == 1) + column-major C: the layout the
+    // mixed dispatch gate requires; column-major C also keeps orient_transpose from
+    // swapping the operands away from it
     let a: Vec<f16> = (0..m * k)
         .map(|i| f16::from_f32((i % 23) as f32 * 0.03 - 0.3))
         .collect();

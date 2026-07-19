@@ -1,7 +1,7 @@
 //! Strided-batched ndarray adapter (`gemm_batched` / `dot_batched`, batch on axis 0): the 3-D
 //! `Array3` form must reproduce a per-element loop of `dot` / `gemm`, read general-stride and
-//! permuted-axes 3-D views straight through without copying, stay serial==parallel reproducible,
-//! and (under `epilogue`) match a loop of `gemm_fused` for one shared bias/activation bit-for-bit
+//! permuted-axes 3-D views straight through without copying, and (under `epilogue`) match a loop of
+//! `gemm_fused` for one shared bias/activation bit-for-bit
 
 use approx::assert_relative_eq;
 use ndarray::{Array3, Axis};
@@ -78,8 +78,8 @@ fn gemm_batched_permuted_axes_view() {
     }
 }
 
-/// `gemm_batched_fused` (one shared `PerRow` bias + `ReLU`) is **bit-identical** to a loop of
-/// [`gemm_fused`] calls, one per batch element: gemmkit's batched-fused headline property
+/// `gemm_batched_fused` (one shared `PerRow` bias + `ReLU`) is bit-identical to a loop of
+/// [`gemm_fused`] calls, one per batch element
 #[cfg(feature = "epilogue")]
 #[test]
 fn batched_fused_matches_loop_of_gemm_fused() {

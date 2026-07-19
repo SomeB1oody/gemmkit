@@ -1,29 +1,31 @@
-//! gemv: matrix*vector (`n == 1` or `m == 1`)
+//! gemv: matrix*vector product, dispatched for `n == 1` or `m == 1` shapes
 //!
-//! gemv is memory-bound, so the arithmetic is trivial; the whole game is minimizing
-//! DRAM traffic. Both `m == 1` and `n == 1` reduce to one core routine by viewing the
-//! matrix (transposed for `m == 1`) as `rows x k` times a `k`-vector. Correct for every
-//! layout; vectorized for the contiguous ones
+//! A gemv touches `O(m*k)` bytes to do `O(m*k)` flops, so it is memory-bound: the arithmetic is
+//! trivial and the whole design question is minimizing DRAM traffic. Both `n == 1` and `m == 1`
+//! reduce to the same core routine by treating the matrix (transposed for `m == 1`) as a
+//! `rows x k` block times a `k`-vector; every stride combination is handled correctly, and the
+//! contiguous ones get a vectorized path
 //!
-//! The column-major (axpy) shape has 2 bit-identical strategies that differ only in
-//! memory traffic (both do the same ascending-`k` fused accumulation per output element):
+//! For a column-major matrix (the axpy shape) there are 2 strategies that produce the same
+//! result and differ only in memory traffic, since both fuse the accumulation for a given output
+//! element in the same ascending-`k` order:
 //!
-//! * **Register-blocked output**: block the rows into panels a few SIMD registers wide
-//!   and sweep all `k` columns per panel, holding the output panel in registers. The
-//!   matrix and the output are each read exactly once. Chosen when the output can't stay
-//!   resident in the last-level cache across the `k`-sweep, so the plain form's per-column
-//!   re-reads of the output would otherwise hit DRAM
-//! * **Plain axpy**: column-outer, re-reading the output each column. Fine when the
-//!   output stays cache-resident, and its perfectly contiguous single-stream matrix read
-//!   is what large `k` prefers
+//! * Register-blocked output: hold a few-SIMD-register-wide panel of output rows in registers
+//!   across the whole `k`-sweep, so the matrix and the output panel are each read exactly once.
+//!   Used once the output is too large to stay resident in the last-level cache across that
+//!   sweep, where the alternative's per-column output re-read would otherwise reach DRAM
+//! * Plain axpy: column-outer, re-reading and re-writing the output panel every few columns
+//!   instead of holding it in registers. Cheaper when the output stays cache-resident, and its
+//!   single contiguous matrix stream is what a large `k` wants
 //!
-//! Each output element is computed in a single pass over `k` by one worker, so the result
-//! is **reproducible** and bit-identical regardless of the worker count: the output-row
-//! partitioning ([`run_typed`]) never splits an element's reduction
+//! Every output element is reduced over the full `k` by exactly 1 worker, so splitting the output
+//! rows across workers changes nothing about how any single element is computed: the result is
+//! reproducible, and in fact bit-identical, at any worker count
 //!
-//! The mixed-precision (`f16`/`bf16` inputs, `f32` accumulate) twin [`run_mixed`] lives in the
-//! lower half of this module: the same partition and reproducibility, but each load is widened to
-//! `f32` through the `KernelSimd` seam and the result rounded to the narrow type once at the store
+//! The mixed-precision twin (`f16`/`bf16` in, `f32` accumulate), [`run_mixed`], sits in the lower
+//! half of this file: same row partition and same reproducibility guarantee, but every load
+//! widens through the `KernelSimd` seam to `f32` and the narrow result is rounded back exactly
+//! once, at the store
 
 use crate::kernel::FloatGemm;
 use crate::kernel::epilogue::{Epilogue, Identity};
@@ -35,20 +37,21 @@ use crate::scalar::NarrowFloat;
 use crate::simd::KernelSimd;
 use crate::simd::SimdOps;
 
-/// Output row panels register-blocked at once, in SIMD registers: `MB_REG` accumulator
-/// registers plus one broadcast RHS register stay well within the vector file on every
-/// ISA, while giving the matrix read a wide contiguous burst per column. Also the row
-/// partitioning grain, so worker boundaries land on panel edges and the SIMD/scalar
-/// split of every row is partition-independent (so serial == parallel bit-for-bit)
+/// Row-panel width, in SIMD registers, for the axpy register-blocking strategy: `MB_REG`
+/// accumulator registers plus 1 broadcast register for the scaled RHS element stay well inside
+/// the vector file on every ISA, while a `MB_REG`-wide panel gives the matrix read a wide
+/// contiguous burst per column. Doubles as the row-partitioning grain, so worker boundaries fall
+/// on panel edges and every row lands in the same wide-panel/single-register/scalar tier no
+/// matter how the rows are split, keeping serial and parallel bit-for-bit identical
 const MB_REG: usize = 8;
 
-/// Shared output-row partition sweep for the gemv core routines (the float [`core_epi`] and the
-/// mixed [`core_mixed`]): the `n_threads <= 1` serial fast path runs `body(0, rows)` directly; else
-/// workers pull disjoint panel ranges from a shared [`JobCursor`] and run `body(row_start, row_end)`
-/// on their rows only. `block` is the partition grain (a multiple of `lanes`, so each row's
-/// SIMD/scalar split is partition-independent and the split reproduces the serial result
-/// bit-for-bit). No cross-worker reduction, so no barrier and no perturbation of the per-element
-/// summation order
+/// Output-row partition shared by both gemv cores ([`core_epi`] and [`core_mixed`]): with
+/// `n_threads <= 1` this just calls `body(0, rows)` on the caller; otherwise workers draw disjoint
+/// panel ranges from a [`JobCursor`] and each calls `body(row_start, row_end)` on its own range
+/// only. `block` should be a multiple of `lanes` (the axpy/dot tier boundaries), so a row's
+/// SIMD-vs-scalar treatment never depends on where the partition happened to cut, and no worker
+/// ever reduces another worker's rows, so there is nothing to synchronize once every `body` call
+/// returns
 #[inline]
 fn row_sweep(
     rows: usize,
@@ -71,20 +74,20 @@ fn row_sweep(
     });
 }
 
-/// Dispatch a gemv shape to the core routine, partitioning the output rows across up to
-/// `par`-many workers. gemv is memory-bandwidth-bound, so the worker count is capped by a
-/// bandwidth model ([`Parallelism::resolve_bandwidth`]), not the compute ramp: past the
-/// few cores that saturate DRAM, more workers stop helping. Each output row is computed by
-/// one worker over the full `k`, so the split adds no cross-thread reduction and the result
-/// stays bit-identical to the serial run
+/// Entry point for a gemv shape: dispatches to the core routine, partitioning the output rows
+/// across up to `par` workers. Since gemv is bandwidth-bound rather than compute-bound, the
+/// worker count comes from a bandwidth model ([`Parallelism::resolve_bandwidth`]) instead of the
+/// usual compute ramp: past however many cores saturate DRAM, adding workers stops helping.
+/// Every output row is reduced over the full `k` by 1 worker, so the split never crosses a
+/// reduction boundary and the result is unchanged from the serial run
 ///
-/// The zero-cost [`Identity`] forwarder over [`run_typed_epi`]: with `E = Identity` the fused
-/// pass const-folds away, so this route is byte-for-byte unchanged and the public signature is
-/// preserved for every existing caller
+/// Calls [`run_typed_epi`] with the zero-cost [`Identity`] epilogue: `E::IS_IDENTITY` folds the
+/// fused-epilogue pass away entirely, so this stays the plain, epilogue-free route while sharing
+/// its implementation with the fused entry point
 ///
 /// # Safety
-/// Pointers must be valid for the regions implied by the strides/sizes; `c` must
-/// not alias `a`/`b`. Must be called only when the CPU supports `S`'s features
+/// Pointers must be valid for the regions their strides and sizes imply; `c` must not alias
+/// `a`/`b`. The CPU must support `S`'s target features
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn run_typed<T, S>(
     simd: S,
@@ -107,8 +110,8 @@ pub unsafe fn run_typed<T, S>(
     T: Float<Acc = T>,
     S: SimdOps<T>,
 {
-    // SAFETY: forwarded to `run_typed_epi` with the zero-cost `Identity` epilogue: the exact
-    // bits this route always stored (`E::IS_IDENTITY` folds the final sweep away)
+    // SAFETY: `Identity` is the zero-cost epilogue, so this reproduces exactly what the route
+    // stored before `run_typed_epi` existed (`E::IS_IDENTITY` folds the epilogue sweep away)
     unsafe {
         run_typed_epi::<T, S, Identity>(
             simd, m, k, n, par, alpha, a, rsa, csa, b, rsb, csb, beta, c, rsc, csc, &Identity,
@@ -116,10 +119,10 @@ pub unsafe fn run_typed<T, S>(
     }
 }
 
-/// gemv applying the fused [`Epilogue`] `E` to its output. gemv is dispatched **before**
-/// orientation normalization, so `epi`'s coordinates are the **user** frame (the caller passes
-/// the unflipped epilogue). The `n == 1` branch's output element `i` is `C[i, 0]` (`swap_rc =
-/// false`); the `m == 1` branch views `C^T`, so its element `i` is `C[0, i]` (`swap_rc = true`)
+/// gemv entry point with a fused [`Epilogue`] `E` applied to the output. gemv is dispatched
+/// before orientation normalization runs, so `epi` still speaks the caller's original, unflipped
+/// coordinate frame. In the `n == 1` branch output element `i` is `C[i, 0]` (`swap_rc = false`);
+/// the `m == 1` branch instead views `C^T`, where element `i` is `C[0, i]` (`swap_rc = true`)
 ///
 /// # Safety
 /// As [`run_typed`], plus `epi`'s interior pointers must be valid for the problem's `m`/`n`
@@ -149,16 +152,15 @@ pub unsafe fn run_typed_epi<T, S, E>(
 {
     unsafe {
         if n == 1 {
-            // C (mx1) = beta*C + alpha*A*b, A = mxk, b = k-vector. Output element `i` is
+            // C (m x 1) = beta*C + alpha*A*b: A is m x k, b a k-vector, output element `i` is
             // `C[i, 0]`, so the epilogue reads coordinate `(i, 0)` (`swap_rc = false`)
             core_epi::<T, S, E>(
                 simd, m, k, par, alpha, a, rsa, csa, b, rsb, beta, c, rsc, false, epi,
             );
         } else {
-            // C (1xn) = beta*C + alpha*a*B. View B^T (nxk) times a (k-vector):
-            // B^T[j,k] = B[k,j] -> row stride csb, col stride rsb; out stride csc. The transposed
-            // view makes output element `i` map to `C[0, i]`, so the epilogue reads coordinate
-            // `(0, i)` (`swap_rc = true`)
+            // C (1 x n) = beta*C + alpha*a*B: view B^T (n x k) times the k-vector a, so
+            // B^T[j,k] = B[k,j] gives row stride csb, column stride rsb, output stride csc. Under
+            // that transpose output element `i` is `C[0, i]`, so `swap_rc = true`
             core_epi::<T, S, E>(
                 simd, n, k, par, alpha, b, csb, rsb, a, csa, beta, c, csc, true, epi,
             );
@@ -166,17 +168,17 @@ pub unsafe fn run_typed_epi<T, S, E>(
     }
 }
 
-/// `out[i] = beta*out[i] + alpha * sum_k(mat[i,k]*vec[k])` for `i in 0..rows`, split across
-/// bandwidth-capped workers over disjoint output-row panels, then a fused [`Epilogue`] `E`
-/// applied as a final in-place sweep over each worker's own range (see the pass below).
-/// `swap_rc` picks the epilogue coordinate for output element `i`: `(i, 0)` when `false`
-/// (the `n == 1` shape), `(0, i)` when `true` (the transposed `m == 1` view)
+/// `out[i] = beta*out[i] + alpha * sum_k(mat[i,k]*vec[k])` for `i in 0..rows`: partitions the
+/// rows across bandwidth-capped workers, picks a layout strategy once for the whole call, then,
+/// if `E` is not [`Identity`], sweeps each worker's own row range once more to apply the fused
+/// epilogue in place. `swap_rc` selects the epilogue coordinate for output element `i`: `(i, 0)`
+/// when `false` (the `n == 1` shape), `(0, i)` when `true` (the transposed `m == 1` view)
 ///
 /// # Safety
 /// `mat` valid for the `rows x k` region at `mat_rs`/`mat_cs`; `vec` valid for `k` reads at
-/// `vec_s`; `out` valid for `rows` writes at `out_s`, and for `rows` reads too when `beta !=
-/// 0`; `epi`'s interior pointers valid for the problem's `m`/`n`. Must be called only when the
-/// CPU supports `S`'s features
+/// `vec_s`; `out` valid for `rows` writes at `out_s`, and for `rows` reads too when `beta != 0`;
+/// `epi`'s interior pointers valid for the problem's `m`/`n`. The CPU must support `S`'s target
+/// features
 #[allow(clippy::too_many_arguments)]
 #[inline]
 unsafe fn core_epi<T, S, E>(
@@ -200,28 +202,26 @@ unsafe fn core_epi<T, S, E>(
     S: SimdOps<T>,
     E: Epilogue<FloatGemm<T>>,
 {
-    // `E: Copy` (an `Epilogue` supertrait): copy it out of the borrow so each `move` worker
-    // closure captures it by value
+    // `Epilogue: Copy`, so dereferencing hands each `move` worker closure below its own value
     let epi = *epi;
     unsafe {
         let lanes = <S as SimdOps<T>>::LANES;
         let sizeof = core::mem::size_of::<T>();
 
-        // Which shape, decided once (same for every worker, so every worker runs the same
-        // per-row arithmetic and the row partition is bit-identical to the serial sweep)
+        // Classify the layout once, up front, so every worker below runs the identical branch
+        // and no worker's tier choice can depend on which rows it happened to draw
         let axpy = mat_rs == 1 && out_s == 1;
         let output_block = axpy && output_register_block(rows, sizeof, k);
         let dot = !axpy && mat_cs == 1 && vec_s == 1;
 
-        // Bandwidth-capped worker count. `bytes_touched` is the minimum traffic (matrix
-        // read once, vector once, output written once); `rows` bounds the partition
+        // The minimum traffic this call must move: the matrix once, the vector once, the output
+        // once. `rows` caps the worker count so no worker can end up with 0 rows
         let bytes_touched = (rows.saturating_mul(k) + k + rows).saturating_mul(sizeof);
         let n_threads = par.resolve_bandwidth(bytes_touched, rows);
 
-        // Partition grain: register-blocked panels (`MB_REG*lanes`) for the axpy path so
-        // worker boundaries fall on panel edges; single SIMD rows otherwise. Either way a
-        // multiple of `lanes`, so each row's SIMD/scalar classification is the same in
-        // every partition and the split reproduces the serial result bit-for-bit
+        // Grain the partition on register-blocked panels (`MB_REG*lanes`) for the axpy path, so
+        // worker boundaries land on panel edges; plain SIMD rows otherwise. Both are multiples of
+        // `lanes`, so a row's SIMD-vs-scalar tier never shifts with how the rows are cut
         let block = if output_block { MB_REG * lanes } else { lanes }.max(1);
 
         let mat = Ptr(mat as *mut T);
@@ -233,8 +233,8 @@ unsafe fn core_epi<T, S, E>(
             let mat = mat.0 as *const T;
             let vec = vec.0 as *const T;
             let out = out.0;
-            // Run the sweep inside the ISA's `#[target_feature]` context so the SIMD
-            // primitives fold into feature-enabled codegen (as the driver does per tile)
+            // Stay inside the ISA's `#[target_feature]` token so every SIMD call below compiles
+            // to feature-enabled codegen, the same discipline the driver uses per tile
             simd.vectorize(|| {
                 if output_block {
                     axpy_regblocked::<T, S>(
@@ -254,17 +254,17 @@ unsafe fn core_epi<T, S, E>(
                         out, out_s,
                     );
                 }
-                // Fused epilogue: a final in-place sweep over this worker's own output range
-                // gemv fuses this way, not by threading `epi` into the 4 strategy kernels,
-                // because the output is one vector, tiny next to the matrix read that dominates
-                // this memory-bound path: one extra pass over `[row_start, row_end)` is
-                // negligible and keeps all 4 strategies byte-identical to the non-fused build
-                // And because the strategy first stores exactly the bits plain gemv would store,
-                // mapping the re-read value is bitwise-identical to gemm-then-map by construction
-                // Fires exactly once per element (each range is owned by one worker, swept after
-                // its full k-reduction). `E::IS_IDENTITY` const-folds the whole sweep away, so the
-                // non-fused instantiation is zero-cost. Kept inside `vectorize` so the epilogue
-                // runs in the token context (its `apply` uses scalar ops only)
+                // A 2nd, separate pass over `[row_start, row_end)` applies the epilogue in place,
+                // rather than threading `epi` into the 4 strategy kernels above: the output is 1
+                // vector, tiny next to the matrix read that dominates this memory-bound path, so
+                // the extra pass costs nothing and it keeps the 4 kernels themselves identical to
+                // the non-fused build. Since the strategy above already stored the exact bits
+                // plain gemv would, re-reading and mapping here matches gemm-then-map bit for
+                // bit. Each output element belongs to exactly 1 worker's range, so it is mapped
+                // exactly once, after its full `k`-reduction; `E::IS_IDENTITY` folds this whole
+                // block away for the non-fused instantiation. Staying inside `vectorize` keeps
+                // the epilogue in the same target-feature token, even though `apply` itself is
+                // scalar
                 if !E::IS_IDENTITY {
                     for i in row_start..row_end {
                         let op = out.offset(i as isize * out_s);
@@ -275,36 +275,37 @@ unsafe fn core_epi<T, S, E>(
             });
         };
 
-        // Output-partitioned sweep (see [`row_sweep`]): disjoint panel ranges, no cross-worker
-        // reduction, so serial == parallel bit-for-bit
+        // Disjoint row ranges, no cross-worker reduction (see [`row_sweep`]), so this matches the
+        // serial result regardless of `n_threads`
         row_sweep(rows, block, n_threads, body);
     }
 }
 
-/// Register-block the output for an axpy-shape gemv when *both* hold: the output
-/// (`rows*sizeof` bytes) is large enough that the plain column-outer form's per-column re-read of
-/// the output spills toward DRAM (the size gate is a fraction of L3, see
-/// [`crate::cache::gemv_regblock_engage_bytes`]); and `k` is small enough (`<= k_stream_max`) that
-/// the register-blocked form's `k` in-place matrix column-streams (one per depth step) stay within
-/// the hardware prefetcher's window. When the output stays cache-resident the plain form's re-reads
-/// are cheap and its single contiguous matrix stream wins; when `k` is large its many streams thrash
-/// the prefetcher
+/// Whether an axpy-shape gemv should use the register-blocked output strategy instead of the
+/// plain one: both conditions must hold. 1st, the output (`rows*sizeof` bytes) must be large
+/// enough that the plain form's per-column output re-read would spill out of the last-level cache
+/// (the byte gate, a fraction of L3, lives in [`crate::cache::gemv_regblock_engage_bytes`]).
+/// 2nd, `k` must be small enough (`<= k_stream_max`) that register-blocking's `k` concurrent
+/// matrix column-streams still fit the hardware prefetcher's window. Below the byte gate the
+/// output stays cache-resident, so the plain form's cheap re-reads and single contiguous matrix
+/// stream win outright; above the `k` gate, register-blocking's many streams start thrashing the
+/// prefetcher instead of helping
 #[inline]
 fn output_register_block(rows: usize, sizeof: usize, k: usize) -> bool {
     k <= crate::tuning::k_stream_max()
         && rows.saturating_mul(sizeof) > crate::cache::gemv_regblock_engage_bytes()
 }
 
-/// Register-blocked axpy over output rows `[s, e)`: the output panel is held in SIMD
-/// registers across all `k` columns, so the output is read/written once and the
-/// column-major matrix is read once. `beta` is folded into the accumulator init (`beta == 0`
-/// never reads the output). Bit-identical to [`axpy_plain`]: same ascending-`k` fused
-/// accumulation per element, same SIMD/scalar split by row (panels of `MB_REG*lanes`, then
-/// single SIMD rows, then a scalar remainder), so the 2 strategies are interchangeable
+/// Register-blocked axpy over output rows `[s, e)`: an output panel stays in SIMD registers
+/// across the whole `k`-sweep, so the column-major matrix and the output are each read once (the
+/// output written once too). Folding `beta` into the accumulator's initial value means `beta ==
+/// 0` never touches the existing output. Row for row this computes the same ascending-`k` fused
+/// accumulation, and applies the same wide-panel/single-register/scalar-remainder tiering, as
+/// [`axpy_plain`], so the 2 kernels are interchangeable and produce identical output
 ///
 /// # Safety
-/// `mat`/`vec` valid for the region implied by the strides; `out` valid for `[s, e)` writes
-/// and, when `beta != 0`, reads. Run inside `S`'s `vectorize` context
+/// `mat`/`vec` valid for the region the strides imply; `out` valid for `[s, e)` writes, and for
+/// `[s, e)` reads too when `beta != 0`. Must run inside `S`'s `vectorize` context
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 unsafe fn axpy_regblocked<T, S>(
@@ -328,10 +329,10 @@ unsafe fn axpy_regblocked<T, S>(
         let mb = MB_REG * lanes;
         let mut i = s;
 
-        // Wide panels: `MB_REG` accumulator registers, live across the whole k-sweep
+        // A wide panel of `MB_REG` accumulators, held in registers across the whole k-sweep
         while i + mb <= e {
             let mut acc = [simd.zero(); MB_REG];
-            // acc <- beta*out (beta == 0 leaves the zero init and never reads out)
+            // acc <- beta*out; beta == 0 skips the load, leaving the zero init untouched
             if beta == T::ONE {
                 for (r, a) in acc.iter_mut().enumerate() {
                     *a = simd.loadu(out.add(i + r * lanes));
@@ -355,8 +356,8 @@ unsafe fn axpy_regblocked<T, S>(
             i += mb;
         }
 
-        // Single-register SIMD rows, then the sub-lane scalar remainder: the same
-        // per-row classification the plain path uses, so both round identically
+        // Then single-SIMD-register rows, then a sub-lane scalar remainder: the same 2 tiers
+        // [`axpy_plain`] uses, so a row rounds the same way regardless of which path took it
         while i + lanes <= e {
             let mut acc = if beta == T::ONE {
                 simd.loadu(out.add(i))
@@ -392,9 +393,11 @@ unsafe fn axpy_regblocked<T, S>(
 }
 
 /// Plain column-outer axpy over output rows `[s, e)`: `out[i] = beta*out[i] + sum_k((alpha*vec[k])*
-/// mat[i,k])`, re-reading the output panel each column (cache-resident regime). `beta` is folded
-/// via a per-range pre-scale so the range is self-contained (workers scale only their own
-/// rows). Same fused accumulation and per-row SIMD/scalar split as [`axpy_regblocked`]
+/// mat[i,k])`, re-reading and re-writing the output panel every `KB` columns instead of holding it
+/// in registers for the whole `k`-sweep (the strategy for the cache-resident regime, where that
+/// periodic re-touch is cheap). `beta` is applied once, up front, as a pre-scale over the whole
+/// range, so each worker touches only its own rows. Produces the same ascending-`k` fused
+/// accumulation per row, and the same SIMD-vs-scalar row split, as [`axpy_regblocked`]
 ///
 /// # Safety
 /// As [`axpy_regblocked`]
@@ -418,7 +421,7 @@ unsafe fn axpy_plain<T, S>(
 {
     unsafe {
         let lanes = <S as SimdOps<T>>::LANES;
-        // Pre-scale this range's output by beta (beta == 0 overwrites without reading)
+        // Apply beta once, up front, over the whole range (beta == 0 overwrites without a read)
         for i in s..e {
             let op = out.add(i);
             if beta == T::ZERO {
@@ -427,10 +430,11 @@ unsafe fn axpy_plain<T, S>(
                 *op = beta * *op;
             }
         }
-        // Fold KB columns per output load/store: the output panel is touched once per KB-group
-        // instead of once per column, cutting its cache traffic (the axpy form's main cost once
-        // the matrix read is DRAM-bound) while keeping only KB concurrent matrix column-streams
-        // The fused steps run in ascending `k`, so this is bit-identical to the one-column form
+        // Group KB columns per output load/store instead of 1: the output panel is then touched
+        // once every KB columns rather than every column, which is this form's main cache cost
+        // once the matrix read itself is DRAM-bound, while keeping only KB matrix column-streams
+        // active at once. The KB steps still fuse in ascending-k order, so the result matches the
+        // 1-column-at-a-time form below bit for bit
         const KB: usize = 4;
         let mut kk = 0;
         while kk + KB <= k {
@@ -459,7 +463,7 @@ unsafe fn axpy_plain<T, S>(
             }
             kk += KB;
         }
-        // Remainder columns (`k % KB`): one column at a time
+        // The remaining `k % KB` columns, 1 at a time
         while kk < k {
             let scal = alpha * *vec.offset(kk as isize * vec_s);
             let sv = simd.splat(scal);
@@ -481,30 +485,29 @@ unsafe fn axpy_plain<T, S>(
     }
 }
 
-/// Output rows register-blocked in the dot path: `DOT_RB` rows are reduced side by side,
-/// each keeping its own accumulator, so `DOT_RB` independent FMA chains overlap across the
-/// shared k-sweep. A single row's reduction is one dependent `mul_add` chain, latency-bound
-/// (~4-cycle FMA latency on Zen5, so ~1 FMA per 4 cycles) rather than throughput-bound (2
-/// FMAs/cycle); running several rows' chains at once fills that latency shadow, and the
-/// vector `vec` is loaded once per depth step and shared by the whole group. Chosen at 4 by
-/// measurement, not by the latency*throughput product (which wants ~8): 4 chains already
-/// recover most of the stall, and each row adds a concurrent matrix read-stream, so 8
-/// over-subscribes the hardware prefetcher and grows the per-group load footprint. 4 wins on
-/// both cache-resident shapes and the DRAM-bound guard (where the extra memory-level
-/// parallelism from a few independent streams even pushes a single core past its naive
-/// single-stream rate); 8 pulls ahead only on the few-long-rows shape, where the stream count
-/// is small. Not a partition grain (the dot path partitions on single SIMD rows), so its
-/// value is free of the serial-vs-parallel reproducibility constraint that pins [`MB_REG`]
+/// Row-group width for the dot path's register blocking: `DOT_RB` output rows are reduced side by
+/// side, each keeping its own accumulator, so `DOT_RB` independent FMA chains overlap across the
+/// shared `k`-sweep, and `vec` is loaded once per depth step and shared by the whole group. A
+/// single row's reduction is 1 dependent `mul_add` chain and so is latency-bound (an FMA takes
+/// about 4 cycles on Zen5, only 1 in flight) well short of the 2 FMAs/cycle the hardware can
+/// retire; running several rows' chains together fills that latency gap. Set to 4 by
+/// measurement, not by the naive latency*throughput target of about 8: 4 chains already recover
+/// most of the stall, and every extra row opens another concurrent matrix read-stream, so 8
+/// over-subscribes the prefetcher and grows the per-group working set instead of helping
+/// further. 4 wins on both cache-resident shapes and under the DRAM-bound bandwidth cap (where
+/// the extra memory-level parallelism from a few streams even beats a single core's naive
+/// single-stream rate); only the rare few-rows/long-`k` shape favors 8. Not a partition grain:
+/// [`row_sweep`] still cuts the output into `lanes`-wide granules for this path, so, unlike
+/// [`MB_REG`], this value carries no serial-vs-parallel reproducibility constraint
 const DOT_RB: usize = 4;
 
-/// Dot-form over output rows `[s, e)` (row-major matrix): `out[i] = alpha*<mat[i,:], vec> +
-/// beta*out[i]`, one pass (matrix row read once, output once, vector kept in L1). `beta` folded
-/// into the per-row epilogue. Rows are register-blocked in groups of [`DOT_RB`] to keep several
-/// independent FMA chains in flight (the per-row reduction is latency-bound otherwise); the
-/// `< DOT_RB` tail falls through to the plain per-row form
+/// Dot-form sweep over output rows `[s, e)`, for a row-major matrix: `out[i] = alpha*<mat[i,:],
+/// vec> + beta*out[i]` in 1 pass (each matrix row read once, the output touched once, `vec` reused
+/// from L1 across every row). Rows are processed [`DOT_RB`] at a time so their FMA chains overlap;
+/// the trailing `< DOT_RB` rows fall back to the plain 1-row-at-a-time form
 ///
 /// # Safety
-/// As [`axpy_regblocked`], with `mat` rows contiguous over `k` and `vec` unit-stride
+/// As [`axpy_regblocked`], with `mat`'s rows contiguous over `k` and `vec` unit-stride
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 unsafe fn dot_rows<T, S>(
@@ -527,19 +530,19 @@ unsafe fn dot_rows<T, S>(
         let lanes = <S as SimdOps<T>>::LANES;
         let mut i = s;
 
-        // Register-blocked groups of DOT_RB rows: DOT_RB independent SIMD accumulators plus
-        // DOT_RB independent scalar-tail accumulators, so DOT_RB FMA chains overlap across the
-        // shared k-sweep. Every row runs exactly `dot_contiguous`'s order (single accumulator,
-        // ascending k in `lanes` steps with `mul_add(row, vec, acc)`, `reduce_sum`, then the
-        // ascending scalar tail), so interleaving the chains leaves each row bit-identical to
-        // the per-row `dot_contiguous` used by the tail below and by the small_mn edge cell
+        // DOT_RB rows at a time, each with its own SIMD accumulator (and its own scalar-tail
+        // accumulator once k % lanes != 0), so DOT_RB FMA chains run concurrently over the
+        // shared k-sweep. Every row still follows dot_contiguous's exact order: 1 accumulator,
+        // ascending k in lanes-sized steps via mul_add, then reduce_sum, then an ascending
+        // scalar tail, so interleaving the rows' chains leaves each row's result bit-identical to
+        // the per-row dot_contiguous used by the tail below (and by small_mn's edge cell)
         while i + DOT_RB <= e {
             let rows: [*const T; DOT_RB] =
                 core::array::from_fn(|r| mat.offset((i + r) as isize * mat_rs));
             let mut acc = [simd.zero(); DOT_RB];
             let mut kk = 0;
             while kk + lanes <= k {
-                // Load the shared vector once, feed every row's chain
+                // vec is shared: load it once per step and feed every row's chain
                 let v = simd.loadu(vec.add(kk));
                 for r in 0..DOT_RB {
                     acc[r] = simd.mul_add(simd.loadu(rows[r].add(kk)), v, acc[r]);
@@ -568,8 +571,7 @@ unsafe fn dot_rows<T, S>(
             i += DOT_RB;
         }
 
-        // Remaining `< DOT_RB` rows: the plain single-accumulator per-row form (unchanged),
-        // which is exactly the per-row arithmetic the blocked groups above reproduce
+        // The < DOT_RB tail: the plain per-row form the blocked groups above reproduce exactly
         while i < e {
             let row = mat.offset(i as isize * mat_rs);
             let dot = super::dot_contiguous::<T, S>(simd, k, row, vec);
@@ -587,8 +589,8 @@ unsafe fn dot_rows<T, S>(
     }
 }
 
-/// Fully general strided fallback over output rows `[s, e)` (neither operand contiguous):
-/// scalar dot per row, `beta` folded into the epilogue
+/// Fully strided fallback over output rows `[s, e)`, used when neither the matrix rows nor `vec`
+/// are contiguous: a scalar dot per row, with `beta` applied in the per-row epilogue
 ///
 /// # Safety
 /// As [`axpy_regblocked`], for arbitrary strides
@@ -632,22 +634,25 @@ unsafe fn strided_rows<T, S>(
     }
 }
 
-// Mixed-precision (f16 / bf16 inputs, f32 accumulate) gemv. The narrow twin of the float routines
-// above: same output-row partition and reproducibility, but each N load is widened to f32 through
-// the `KernelSimd<N, N, f32, N>` seam, the reduction runs in f32, and the result is rounded to N
-// exactly once at the store (the driver's `OUT_IS_ACC = false` single-rounding discipline, the same
-// one `small_mn::run_mixed` uses). Kept a separate family rather than generalizing the float code
-// over the widen seam so the float instantiation stays byte-identical (f32 is not a `NarrowFloat`,
-// so the widen/narrow scalar ops have no float form to fold to). i8/complex gemv are out of scope
+// Mixed-precision gemv (f16/bf16 operands, f32 accumulate): the narrow twin of the float routines
+// above. Same output-row partition and same reproducibility guarantee, but every N load widens to
+// f32 through the KernelSimd<N, N, f32, N> seam, the reduction runs in f32, and the result rounds
+// back to N exactly once at the store (the same single-rounding discipline small_mn::run_mixed
+// follows). Kept as its own family instead of generalizing the float code over a widen seam, so
+// the float instantiation stays byte-identical: f32 is not a NarrowFloat, so it has no
+// widen/narrow scalar ops for such a generalization to fold to. i8 and complex gemv are out of
+// scope here
 
-/// Mixed-precision sibling of [`run_typed`]: dispatch a gemv shape to the widen core, viewing the
-/// `m == 1` problem as the transposed `n x k` times a `k`-vector exactly as [`run_typed_epi`] does.
-/// `alpha`/`beta` arrive already widened to `f32`. No fused-epilogue sibling exists: the mixed fused
-/// entry deliberately keeps gemv on the general driver (see `dispatch/mixed.rs`'s
-/// `run_typed_mixed_fused`), so this route is plain-only
+/// Entry point for a mixed-precision gemv shape (`f16`/`bf16` operands, `f32` accumulate): the
+/// sibling of [`run_typed`], viewing the `m == 1` problem as a transposed `n x k` matrix times a
+/// `k`-vector exactly as [`run_typed_epi`] does. `alpha`/`beta` arrive already widened to `f32`.
+/// There is no fused-epilogue sibling here: the mixed fused path deliberately keeps gemv on the
+/// general driver instead (see `dispatch/mixed.rs`'s `run_typed_mixed_fused`), so this route stays
+/// plain-only
 ///
 /// # Safety
-/// As [`run_typed`], with `N` inputs / `f32` accumulator; `c` not aliasing `a`/`b`, CPU supports `S`
+/// As [`run_typed`], with `N` operands and an `f32` accumulator; `c` must not alias `a`/`b`, and
+/// the CPU must support `S`'s target features
 #[cfg(feature = "half")]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn run_mixed<N, S>(
@@ -673,29 +678,34 @@ pub unsafe fn run_mixed<N, S>(
 {
     unsafe {
         if n == 1 {
-            // C (mx1) = beta*C + alpha*A*b, A = mxk, b = k-vector (out element `i` is `C[i, 0]`)
+            // C (m x 1) = beta*C + alpha*A*b: A is m x k, b a k-vector, output element `i` is
+            // `C[i, 0]`
             core_mixed::<N, S>(simd, m, k, par, alpha, a, rsa, csa, b, rsb, beta, c, rsc);
         } else {
-            // C (1xn) = beta*C + alpha*a*B, viewed as B^T (nxk) times a (k-vector): B^T[j,k] =
-            // B[k,j] -> row stride csb, col stride rsb; out stride csc (out element `i` is `C[0, i]`)
+            // C (1 x n) = beta*C + alpha*a*B: view B^T (n x k) times a (k-vector), so
+            // B^T[j,k] = B[k,j] gives row stride csb, column stride rsb, output stride csc;
+            // output element `i` is `C[0, i]`
             core_mixed::<N, S>(simd, n, k, par, alpha, b, csb, rsb, a, csa, beta, c, csc);
         }
     }
 }
 
-/// Mixed-precision sibling of [`core_epi`] (no fused epilogue): `out[i] = narrow(beta*out[i] +
-/// alpha * sum_k(mat[i,k]*vec[k]))`, the reduction widened to `f32` and rounded to `N` once at the
-/// store. Splits the output rows across bandwidth-capped workers over disjoint panels ([`row_sweep`]),
-/// with the same 3 layout strategies as the float core: the dot form for a contiguous-`k` matrix row
-/// ([`dot_rows_mixed`]), the register-blocked axpy for a column-major matrix ([`axpy_mixed`]), and the
-/// fully strided fallback ([`strided_rows_mixed`]). Unlike the float axpy, the mixed axpy has no
-/// plain column-outer variant: that form re-reads/re-writes the output panel per depth group, which
-/// would round the narrow output once per group, so the mixed path always holds the panel in `f32`
-/// registers across the whole `k`-sweep (matrix read once, output written and rounded once)
+/// Mixed-precision sibling of [`core_epi`], without a fused epilogue: `out[i] =
+/// narrow(beta*out[i] + alpha * sum_k(mat[i,k]*vec[k]))`, the reduction run in `f32` and rounded
+/// to `N` exactly once at the store. Splits the output rows across bandwidth-capped workers over
+/// disjoint panels ([`row_sweep`]), picking from 3 layout strategies mirroring the float core's
+/// dot/axpy/strided split: the dot form for a contiguous-`k` matrix row ([`dot_rows_mixed`]), the
+/// register-blocked axpy for a column-major matrix ([`axpy_mixed`]), and the fully strided
+/// fallback ([`strided_rows_mixed`]). Unlike the float axpy, the mixed axpy has no plain
+/// column-outer variant: that form re-reads and re-writes the output panel every depth group,
+/// which would round the narrow output more than once, so the mixed path always keeps the panel
+/// in `f32` registers for the whole `k`-sweep instead (matrix read once, output written and
+/// rounded once)
 ///
 /// # Safety
-/// `mat` valid for the `rows x k` region at `mat_rs`/`mat_cs`; `vec` valid for `k` reads at `vec_s`;
-/// `out` valid for `rows` writes (and reads when `beta != 0`) at `out_s`. CPU supports `S`
+/// `mat` valid for the `rows x k` region at `mat_rs`/`mat_cs`; `vec` valid for `k` reads at
+/// `vec_s`; `out` valid for `rows` writes (and reads when `beta != 0`) at `out_s`. The CPU must
+/// support `S`'s target features
 #[cfg(feature = "half")]
 #[allow(clippy::too_many_arguments)]
 #[inline]
@@ -721,20 +731,20 @@ unsafe fn core_mixed<N, S>(
         let lanes = <S as SimdOps<f32>>::LANES;
         let sizeof = core::mem::size_of::<N>();
 
-        // Shape decided once (same for every worker, so the row partition is bit-identical to the
-        // serial sweep). The axpy form always register-blocks (see the doc), so unlike the float
-        // core there is no output-size gate here
+        // Classify the layout once, up front, so every worker runs the identical branch. The
+        // axpy form always register-blocks (see its own doc), so there is no output-size gate
+        // here the way there is in the float core
         let axpy = mat_rs == 1 && out_s == 1;
         let dot = !axpy && mat_cs == 1 && vec_s == 1;
 
-        // Bandwidth-capped worker count: min narrow traffic is the matrix read once, the vector
-        // once, the output once; `rows` bounds the partition
+        // The minimum narrow-element traffic: the matrix once, the vector once, the output once
+        // `rows` caps the worker count so no worker can end up with 0 rows
         let bytes_touched = (rows.saturating_mul(k) + k + rows).saturating_mul(sizeof);
         let n_threads = par.resolve_bandwidth(bytes_touched, rows);
 
-        // Partition grain: register-blocked panels (`MB_REG*lanes`) for the axpy path so worker
-        // boundaries fall on panel edges; single SIMD rows otherwise. A multiple of `lanes` either
-        // way, so each row's SIMD/scalar split is partition-independent (serial == parallel)
+        // Grain the partition on register-blocked panels (`MB_REG*lanes`) for the axpy path, so
+        // worker boundaries land on panel edges; plain SIMD rows otherwise. Both are multiples of
+        // `lanes`, so a row's SIMD-vs-scalar tier never shifts with how the rows are cut
         let block = if axpy { MB_REG * lanes } else { lanes }.max(1);
 
         let mat = Ptr(mat as *mut N);
@@ -746,7 +756,7 @@ unsafe fn core_mixed<N, S>(
             let mat = mat.0 as *const N;
             let vec = vec.0 as *const N;
             let out = out.0;
-            // Run the sweep inside the ISA's `#[target_feature]` context (as the float core does)
+            // Stay inside the ISA's `#[target_feature]` token, as the float core does
             simd.vectorize(|| {
                 if axpy {
                     axpy_mixed::<N, S>(
@@ -769,19 +779,21 @@ unsafe fn core_mixed<N, S>(
     }
 }
 
-/// Register-blocked mixed axpy over output rows `[s, e)` (column-major matrix, `mat_cs` depth
-/// stride): the output panel is held in `f32` accumulator registers across all `k` columns, so the
-/// narrow matrix and output are each read once and the output is rounded to `N` exactly once at the
-/// store. `beta` folds into the accumulator init (`beta == 0` never reads the output). Widens each
-/// `N` load to `f32` ([`KernelSimd::load_lhs`]/[`KernelSimd::load_out`]) and narrows on store
-/// ([`KernelSimd::store_out`]); the wide-panel/single-register/scalar-remainder split by row is the
-/// mixed twin of [`axpy_regblocked`], so a row's tier is partition-independent. The SIMD tiers use
-/// the fused `f32` `mul_add`; the sub-lane scalar remainder uses plain `f32` `a*b + c` (matching
-/// [`crate::special::small_mn`]'s mixed tail), a per-row choice, so it does not perturb determinism
+/// Register-blocked mixed axpy over output rows `[s, e)`, for a column-major matrix (depth stride
+/// `mat_cs`): an `f32` accumulator panel stays in registers across the whole `k`-sweep, so the
+/// narrow matrix and output are each read once and the output is rounded to `N` exactly once, at
+/// the store. Folding `beta` into the accumulator's initial value means `beta == 0` never touches
+/// the existing output. Every `N` load widens to `f32` ([`KernelSimd::load_lhs`] /
+/// [`KernelSimd::load_out`]) and the result narrows back on store ([`KernelSimd::store_out`]);
+/// the wide-panel/single-register/scalar-remainder row tiering is the mixed twin of
+/// [`axpy_regblocked`], so a row's tier never depends on the partition. The SIMD tiers use a
+/// fused `f32` `mul_add`; the sub-lane scalar remainder instead uses plain `f32` `a*b + c`
+/// (matching [`crate::special::small_mn`]'s mixed tail), a choice made per row, so it cannot
+/// differ between the serial and parallel sweeps
 ///
 /// # Safety
-/// `mat`/`vec` valid for the region implied by the strides; `out` valid for `[s, e)` writes and,
-/// when `beta != 0`, reads. Run inside `S`'s `vectorize` context
+/// `mat`/`vec` valid for the region the strides imply; `out` valid for `[s, e)` writes, and for
+/// `[s, e)` reads too when `beta != 0`. Must run inside `S`'s `vectorize` context
 #[cfg(feature = "half")]
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
@@ -806,10 +818,10 @@ unsafe fn axpy_mixed<N, S>(
         let mb = MB_REG * lanes;
         let mut i = s;
 
-        // Wide panels: `MB_REG` f32 accumulator registers, live across the whole k-sweep
+        // A wide panel of `MB_REG` f32 accumulators, held in registers across the whole k-sweep
         while i + mb <= e {
             let mut acc: [<S as SimdOps<f32>>::Reg; MB_REG] = [simd.zero(); MB_REG];
-            // acc <- beta*out (beta == 0 leaves the zero init and never reads out)
+            // acc <- beta*out; beta == 0 skips the load, leaving the zero init untouched
             if beta == 1.0 {
                 for (r, a) in acc.iter_mut().enumerate() {
                     *a = simd.load_out(out.add(i + r * lanes));
@@ -833,8 +845,8 @@ unsafe fn axpy_mixed<N, S>(
             i += mb;
         }
 
-        // Single-register SIMD rows, then the sub-lane scalar remainder: the same per-row
-        // classification the float path uses, so a row's tier is partition-independent
+        // Then single-SIMD-register rows, then a sub-lane scalar remainder: the same tiering the
+        // float path uses, so a row's tier never depends on the partition
         while i + lanes <= e {
             let mut acc = if beta == 1.0 {
                 simd.load_out(out.add(i))
@@ -873,16 +885,17 @@ unsafe fn axpy_mixed<N, S>(
     }
 }
 
-/// Dot-form mixed gemv over output rows `[s, e)` (row-major matrix, rows contiguous over `k`):
-/// `out[i] = narrow(alpha*<mat[i,:], vec> + beta*out[i])`, the reduction widened to `f32` and
-/// rounded once. Rows are register-blocked in groups of [`DOT_RB`] to keep several independent
-/// `f32` FMA chains in flight (the mixed twin of [`dot_rows`]); the vector is widen-loaded once per
-/// depth step and shared by the group. Each row is an independent single-`f32`-accumulator reduction
-/// bit-identical to [`dot_contiguous_mixed`] (the `< DOT_RB` tail's form), so the grouping does not
-/// affect a row's result and serial == parallel holds
+/// Dot-form mixed gemv over output rows `[s, e)`, for a row-major matrix (rows contiguous over
+/// `k`): `out[i] = narrow(alpha*<mat[i,:], vec> + beta*out[i])`, the reduction run in `f32` and
+/// rounded to `N` once. Rows are register-blocked in groups of [`DOT_RB`] to keep several
+/// independent `f32` FMA chains in flight, the mixed twin of [`dot_rows`]; `vec` is widen-loaded
+/// once per depth step and shared by the whole group. Each row is still its own independent
+/// `f32`-accumulator reduction, bit-identical to [`dot_contiguous_mixed`] (the form the
+/// `< DOT_RB` tail uses), so grouping the rows does not change any row's result, and the split
+/// matches the serial sweep
 ///
 /// # Safety
-/// As [`axpy_mixed`], with `mat` rows contiguous over `k` (`mat_cs == 1`) and `vec` unit-stride
+/// As [`axpy_mixed`], with `mat`'s rows contiguous over `k` (`mat_cs == 1`) and `vec` unit-stride
 #[cfg(feature = "half")]
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
@@ -906,17 +919,17 @@ unsafe fn dot_rows_mixed<N, S>(
         let lanes = <S as SimdOps<f32>>::LANES;
         let mut i = s;
 
-        // Register-blocked groups of DOT_RB rows: DOT_RB independent f32 accumulators, so DOT_RB
-        // FMA chains overlap across the shared k-sweep. Every row runs exactly
-        // `dot_contiguous_mixed`'s order, so interleaving the chains leaves each row bit-identical
-        // to the per-row tail below
+        // DOT_RB rows at a time, each with its own f32 accumulator, so DOT_RB FMA chains run
+        // concurrently over the shared k-sweep. Every row still follows dot_contiguous_mixed's
+        // exact order, so interleaving the rows' chains leaves each row's result bit-identical to
+        // the per-row tail below
         while i + DOT_RB <= e {
             let rows: [*const N; DOT_RB] =
                 core::array::from_fn(|r| mat.offset((i + r) as isize * mat_rs));
             let mut acc: [<S as SimdOps<f32>>::Reg; DOT_RB] = [simd.zero(); DOT_RB];
             let mut kk = 0;
             while kk + lanes <= k {
-                // Widen-load the shared vector once, feed every row's chain
+                // vec is shared: widen-load it once per step and feed every row's chain
                 let v = simd.load_lhs(vec.add(kk));
                 for r in 0..DOT_RB {
                     acc[r] = simd.mul_add(simd.load_lhs(rows[r].add(kk)), v, acc[r]);
@@ -945,8 +958,7 @@ unsafe fn dot_rows_mixed<N, S>(
             i += DOT_RB;
         }
 
-        // Remaining `< DOT_RB` rows: the plain single-accumulator per-row form the blocked groups
-        // above reproduce bit-for-bit
+        // The < DOT_RB tail: the plain per-row form the blocked groups above reproduce exactly
         while i < e {
             let row = mat.offset(i as isize * mat_rs);
             let dot = dot_contiguous_mixed::<N, S>(simd, k, row, vec);
@@ -964,14 +976,15 @@ unsafe fn dot_rows_mixed<N, S>(
     }
 }
 
-/// Widen-load horizontal dot of 2 unit-stride length-`k` narrow vectors, accumulated in `f32`: a
-/// SIMD widen `mul_add` sweep reduced by `reduce_sum` (fixed lane order) then an ascending scalar
-/// `f32` widen tail. The single fixed-order `f32` reduction the mixed dot path's register-blocked
-/// rows and its `< DOT_RB` tail share, so both round a row identically (the serial == parallel
-/// guarantee for the dot path). The mixed twin of [`crate::special::dot_contiguous`]
+/// Horizontal dot of 2 unit-stride length-`k` narrow vectors, widen-loaded and accumulated in
+/// `f32`: a SIMD widen `mul_add` sweep, reduced by `reduce_sum` in its fixed lane order, then an
+/// ascending scalar `f32` widen tail for the remainder. This is the 1 fixed-order reduction that
+/// [`dot_rows_mixed`]'s register-blocked groups and its `< DOT_RB` tail both go through, which is
+/// what lets a row round the same way no matter which of the 2 forms computed it. The mixed twin
+/// of [`crate::special::dot_contiguous`]
 ///
 /// # Safety
-/// `x`/`y` valid for `k` contiguous reads; run inside `S`'s `vectorize`
+/// `x`/`y` valid for `k` contiguous reads; must run inside `S`'s `vectorize` context
 #[cfg(feature = "half")]
 #[inline(always)]
 unsafe fn dot_contiguous_mixed<N, S>(simd: S, k: usize, x: *const N, y: *const N) -> f32
@@ -996,8 +1009,9 @@ where
     }
 }
 
-/// Fully general strided mixed fallback over output rows `[s, e)` (neither operand contiguous):
-/// scalar widen dot in `f32`, rounded to `N` once. `beta` folded before the narrowing
+/// Fully strided mixed fallback over output rows `[s, e)`, used when neither operand is
+/// contiguous: a scalar widen dot accumulated in `f32`, with `beta` applied before the single
+/// narrowing round to `N`
 ///
 /// # Safety
 /// As [`axpy_mixed`], for arbitrary strides
@@ -1042,26 +1056,26 @@ unsafe fn strided_rows_mixed<N, S>(
     }
 }
 
+// Correctness checks for the axpy and dot gemv kernels above
 #[cfg(test)]
 mod tests {
     use super::{DOT_RB, MB_REG};
     use crate::simd::{ScalarTok, SimdOps};
 
-    /// Generate a per-float-type checker for [`super::axpy_regblocked`]. It picks a row count
-    /// that spans all 3 regimes: a wide `MB_REG*lanes` register-blocked panel, one
-    /// single-register `lanes`-wide tail, and a sub-lane scalar remainder, and sweeps
-    /// `beta` in `{0, 1, other}` so every accumulator-init branch runs. The result is compared
-    /// against a straightforward column-major axpy reference at a per-type tolerance (the
-    /// kernel fuses `a*b + c`, so the match is not bitwise)
+    /// Builds a per-float-type checker for [`super::axpy_regblocked`]: a row count chosen to hit
+    /// all 3 tiers (1 wide `MB_REG*lanes` panel, 1 single-register `lanes`-wide row group, and a
+    /// sub-lane scalar remainder), swept over `beta` in `{0, 1, other}` so every accumulator-init
+    /// branch runs. Verified against a plain column-major axpy reference within a per-type
+    /// tolerance, not bitwise, since the kernel's `a*b + c` is a fused multiply-add
     macro_rules! axpy_regblock_check {
         ($fn:ident, $t:ty, $tol:expr) => {
             fn $fn<S: SimdOps<$t>>(simd: S, label: &str) {
                 let lanes = <S as SimdOps<$t>>::LANES;
-                // wide panel + one single-register row-group + a sub-lane scalar remainder
+                // 1 wide panel, 1 single-register row-group, and a sub-lane scalar remainder
                 let rows = MB_REG * lanes + lanes + lanes.saturating_sub(1);
                 let k = 37usize;
 
-                // Index arithmetic in u64 so the multipliers don't overflow a 32-bit usize
+                // u64 index arithmetic so the multipliers can't overflow a 32-bit usize
                 let mat: Vec<$t> = (0..rows * k)
                     .map(|i| (((i as u64 * 1103515245 + 12345) % 251) as $t) * 0.008 - 1.0)
                     .collect();
@@ -1078,7 +1092,7 @@ mod tests {
                     (1.1 as $t, 2.5 as $t),
                 ] {
                     let mut out = out0.clone();
-                    // Column-major matrix (`mat_cs == rows`), unit-stride vector and output
+                    // Column-major matrix (mat_cs == rows), unit-stride vector and output
                     unsafe {
                         simd.vectorize(|| {
                             super::axpy_regblocked::<$t, S>(
@@ -1121,9 +1135,9 @@ mod tests {
     axpy_regblock_check!(check_f32, f32, 1e-4);
     axpy_regblock_check!(check_f64, f64, 1e-10);
 
-    /// The scalar token (`LANES == 1`) always runs, covering the wide-panel and
-    /// single-register regimes platform-independently; the SIMD tokens (guarded by runtime
-    /// detection) additionally exercise the sub-lane scalar remainder
+    /// The scalar token (`LANES == 1`) runs unconditionally, covering the wide-panel and
+    /// single-register tiers on every platform; the runtime-detected SIMD tokens additionally
+    /// exercise the sub-lane scalar remainder
     #[test]
     fn axpy_regblocked_spans_all_regimes() {
         check_f32(ScalarTok, "scalar/f32");
@@ -1142,8 +1156,8 @@ mod tests {
             }
         }
 
-        // Neon is baseline on aarch64 (the platform whose gemv dispatch uses it), so it
-        // needs no runtime probe; its `LANES > 1` also exercises the sub-lane remainder
+        // Neon is baseline on aarch64, the platform whose gemv dispatch actually uses it, so no
+        // runtime probe is needed; its `LANES > 1` also exercises the sub-lane remainder
         #[cfg(target_arch = "aarch64")]
         {
             check_f32(crate::simd::Neon, "neon/f32");
@@ -1151,25 +1165,23 @@ mod tests {
         }
     }
 
-    /// Generate a per-float-type bit-identity checker for [`super::dot_rows`]. The
-    /// register-blocked dot path must produce output *bitwise identical* to a reference loop
-    /// that reduces each row with [`crate::special::dot_contiguous`] (the shared fixed-order
-    /// reduction gemv and small_mn depend on): interleaving independent rows' chains keeps
-    /// each row's single-accumulator ascending-`k` order intact, so the bits must match. The
-    /// row count spans 2 full `DOT_RB` groups plus a `< DOT_RB` remainder, `k` spans the SIMD
-    /// vector loop plus a sub-lane scalar tail, and `beta` sweeps `{0, 1, other}` so every
-    /// epilogue branch runs. Compared on raw bits (`to_bits`), not a tolerance
+    /// Builds a per-float-type bit-identity checker for [`super::dot_rows`]: its register-blocked
+    /// path must match a reference that reduces each row with [`crate::special::dot_contiguous`]
+    /// bit for bit, since interleaving independent rows' chains does not change any single row's
+    /// accumulator order. Row count spans 2 full `DOT_RB` groups plus a `< DOT_RB` remainder, `k`
+    /// spans the SIMD loop plus a sub-lane scalar tail, and `beta` sweeps `{0, 1, other}` so every
+    /// epilogue branch runs. Compared with `to_bits`, not a tolerance
     macro_rules! dot_rows_bit_identity_check {
         ($fn:ident, $t:ty) => {
             fn $fn<S: SimdOps<$t>>(simd: S, label: &str) {
                 let lanes = <S as SimdOps<$t>>::LANES;
-                // 2 full DOT_RB groups + a sub-group remainder
+                // 2 full DOT_RB groups plus a sub-group remainder
                 let rows = DOT_RB * 2 + 3;
-                // full SIMD vector loop + a sub-lane scalar tail
+                // A full SIMD vector loop plus a sub-lane scalar tail
                 let k = lanes * 5 + 3;
 
-                // Row-major matrix (`mat_rs == k`, rows contiguous over `k`), unit-stride
-                // vector and unit-stride output (the dot-path layout)
+                // Row-major matrix (mat_rs == k, rows contiguous over k), unit-stride vector
+                // and unit-stride output: the dot-path layout
                 let mat: Vec<$t> = (0..rows * k)
                     .map(|i| (((i as u64 * 1103515245 + 12345) % 251) as $t) * 0.008 - 1.0)
                     .collect();
@@ -1202,10 +1214,10 @@ mod tests {
                                 out.as_mut_ptr(),
                                 1,
                             );
-                            // Reference: the plain per-row `dot_contiguous` form the blocked
-                            // groups must reproduce bit-for-bit. The epilogue uses `alpha*dot +
-                            // ov`, matching `Float::mul_add` (plain mul-add, not a hardware
-                            // FMA), so any reordering in the blocked path would flip a bit here
+                            // Reference: the plain per-row dot_contiguous form the blocked
+                            // groups must reproduce exactly. `alpha*dot + ov` here matches
+                            // `Float::mul_add` (a plain multiply-add, not a hardware FMA), so any
+                            // reordering in the blocked path would flip a bit against this
                             for i in 0..rows {
                                 let row = mat.as_ptr().add(i * k);
                                 let dot = crate::special::dot_contiguous::<$t, S>(
@@ -1242,9 +1254,9 @@ mod tests {
     dot_rows_bit_identity_check!(dot_check_f32, f32);
     dot_rows_bit_identity_check!(dot_check_f64, f64);
 
-    /// The scalar token (`LANES == 1`) always runs, covering the register-blocked groups and
-    /// remainder platform-independently; the SIMD tokens (guarded by runtime detection)
-    /// additionally exercise the shared SIMD `mul_add` sweep and the sub-lane scalar tail
+    /// The scalar token (`LANES == 1`) runs unconditionally, covering the register-blocked
+    /// groups and the remainder on every platform; the runtime-detected SIMD tokens additionally
+    /// exercise the shared SIMD `mul_add` sweep and the sub-lane scalar tail
     #[test]
     fn dot_rows_bit_identical() {
         dot_check_f32(ScalarTok, "scalar/f32");

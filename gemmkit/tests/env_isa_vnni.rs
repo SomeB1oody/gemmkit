@@ -1,10 +1,15 @@
-//! `GEMMKIT_REQUIRE_ISA=avx512vnni` pin: forces the `vpdpbusd` i8 dot kernel (k-quad-interleaved
-//! RHS prepack, `DEPTH_MULTIPLE = 4`, `+128` LHS bias), disabling the small-parallel widen fallback
-//! so the VNNI prepack-and-consume path is pinned exactly. Both tests want the same `avx512vnni`
-//! pin and funnel through [`env_isa_common::pin`] (single `set_var` under a `Once` before any
-//! dispatch; the shared write overrides an inherited pin, so the SDE VNNI CI job still exercises
-//! these routes). Both skip gracefully when the host lacks `avx512f+bw+vnni` (the pin would
-//! otherwise assert in `select_i8`)
+//! `GEMMKIT_REQUIRE_ISA=avx512vnni` pin: forces the `vpdpbusd` i8 dot kernel (`IntGemmVnni`,
+//! `DEPTH_MULTIPLE = 4`, a `+128` LHS bias) instead of whatever `select_i8` would otherwise pick
+//! on this host. A forced pin also disables the small-parallel widen fallback that auto-selected
+//! VNNI can take (its mandatory RHS-pack barrier is skipped only when the choice is dynamic), so
+//! this exercises the VNNI kernel exactly, for every shape that reaches `select_i8` (the small_mn
+//! gate below is a separate, earlier reroute)
+//!
+//! Both tests want the same `avx512vnni` pin, so both go through [`env_isa_common::pin`] (a
+//! single `set_var` under a `Once`, before any dispatch; the shared write also overrides an
+//! inherited pin, so a CI job that already exports `GEMMKIT_REQUIRE_ISA` still exercises this
+//! route). Both skip when the host lacks `avx512f+bw+vnni`, since forcing the pin on such a host
+//! would abort in `select_i8` instead of testing anything
 #![cfg(all(
     feature = "std",
     feature = "int8",
@@ -12,22 +17,21 @@
     not(miri)
 ))]
 
-// Shared single-set_var pin helper (Once before any dispatch; both tests here pin `avx512vnni`)
+// Shared GEMMKIT_REQUIRE_ISA pin helper; both tests here pin `avx512vnni` with it
 mod env_isa_common;
-// Shared prepacked-i8 bit-parity check driven by the ISA pin binaries
+// Shared prepacked-vs-plain i8 bit-parity check, run under whichever ISA is pinned
 mod i8_packed_common;
 
 use gemmkit::{MatMut, MatRef, Parallelism};
 
-/// True iff the host reports the full `avx512f+bw+vnni` set the pin needs
+/// Whether the host reports the full `avx512f+bw+vnni` feature set the pin requires
 fn host_has_vnni() -> bool {
     is_x86_feature_detected!("avx512vnni")
         && is_x86_feature_detected!("avx512bw")
         && is_x86_feature_detected!("avx512f")
 }
 
-// Prepacked-i8 bit-parity: the `vpdpbusd` dot kernel's prepacked micropanel (`DEPTH_MULTIPLE = 4`,
-// `+128` bias) must be bit-identical to a plain `gemm_i8` across the shared sweep
+// The VNNI kernel's prepacked micropanel path must match plain gemm_i8 bit-for-bit
 
 #[test]
 fn avx512vnni_pin_i8_packed_matches_plain() {
@@ -39,7 +43,7 @@ fn avx512vnni_pin_i8_packed_matches_plain() {
     i8_packed_common::check();
 }
 
-/// Exact wrapping-`i32` GEMM reference (row-major A/B), matching the documented i8 contract
+/// Exact wrapping-i32 GEMM reference (row-major A/B), matching the documented i8 contract
 #[allow(clippy::too_many_arguments)]
 fn ref_i8(
     a: &[i8],
@@ -66,11 +70,10 @@ fn ref_i8(
     out
 }
 
-// Small-`m,n` horizontal-route pin: a forced ISA still allows the special paths (the `small_mn`
-// gate lives in `run_typed_int`, orthogonal to `select_i8`), so a tiny-`m,n` / long-`k` i8 shape
-// widens through the horizontal dot instead of the `vpdpbusd` driver. The horizontal route
-// (eligible layout) must stay bit-exact vs both the driver (ineligible layout) and the exact
-// `i32` reference
+// The small_mn eligibility gate lives in run_typed_int, ahead of and independent of select_i8,
+// so a forced ISA still lets a tiny-m,n / long-k shape reroute to the horizontal small_mn kernel
+// instead of the pinned VNNI driver. Checks that route (eligible A/B layout) against both the
+// pinned driver (ineligible layout, same math) and the exact i32 reference
 
 #[test]
 fn avx512vnni_pin_i8_small_mn_matches_driver() {
@@ -80,7 +83,7 @@ fn avx512vnni_pin_i8_small_mn_matches_driver() {
         return;
     }
     let kt = gemmkit::tuning::small_k_threshold();
-    // Small `m,n` (both <= small_mn_dim), long `k`, incl. single-row / single-col and a tail tile
+    // Small m,n (each <= small_mn_dim), long k; includes single-row/single-column shapes
     for &(m, n) in &[
         (4usize, 4usize),
         (8, 8),
@@ -96,7 +99,7 @@ fn avx512vnni_pin_i8_small_mn_matches_driver() {
             let b: Vec<i8> = (0..k * n)
                 .map(|i| ((i as i32 * 5 + 9) % 201 - 100) as i8)
                 .collect();
-            // Column-major B (rsb=1): the eligible-layout twin of the row-major B
+            // Column-major transpose of b (rsb=1), the small_mn-eligible layout
             let bcol: Vec<i8> = {
                 let mut v = vec![0i8; k * n];
                 for p in 0..k {
@@ -110,8 +113,7 @@ fn avx512vnni_pin_i8_small_mn_matches_driver() {
                 let c0: Vec<i32> = (0..m * n).map(|x| (x as i32 % 7) - 3).collect();
                 let cref = ref_i8(&a, &b, &c0, m, k, n, alpha, beta);
                 for par in [Parallelism::Serial, Parallelism::Rayon(4)] {
-                    // Eligible: row-major A + col-major B => the horizontal `small_mn` route even
-                    // under the VNNI pin (the gate is orthogonal to the forced ISA)
+                    // Eligible layout: takes the small_mn route despite the VNNI pin
                     let mut c_h = c0.clone();
                     gemmkit::gemm_i8(
                         alpha,
@@ -125,7 +127,7 @@ fn avx512vnni_pin_i8_small_mn_matches_driver() {
                         c_h, cref,
                         "vnni-pin i8 small_mn {m}x{k}x{n} alpha={alpha} beta={beta} {par:?}"
                     );
-                    // Ineligible: row-major B => the `vpdpbusd` driver on the same math
+                    // Ineligible layout: falls through to the pinned VNNI driver
                     let mut c_d = c0.clone();
                     gemmkit::gemm_i8(
                         alpha,

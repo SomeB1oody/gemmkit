@@ -1,16 +1,21 @@
-//! Prepacked-RHS/LHS reuse, prepack buffer setup cost, shared-LHS gate sweep
+//! Prepack-and-reuse throughput (RHS and LHS), the isolated cost of building a prepacked
+//! buffer, and a forced on/off sweep of the shared-LHS A-pack gate
 
 use crate::harness::{BENCH_GUARD, fill, measure};
 use gemmkit::{MatMut, MatRef, Parallelism, gemm};
 
-// Prepacked-RHS reuse
+// Prepacked-RHS reuse: perf_prepack
 
-/// Per-call throughput of a reused prepacked B (`gemm_packed_b`) vs plain `gemm`
-/// (which re-reads / re-packs B every call) for a fixed `(k, n)` B and a varying
-/// `m` (the activation batch). `b_row_major` is the strided case: plain gemm reads
-/// B with a large K-stride each call and, below `m > 2048`, never packs it, so the
-/// contiguous prepacked panel should win per call. `colB` is the control. The win
-/// is the per-call speedup (the one-time pack amortizes away over many calls)
+/// Per-call throughput of a reused prepacked B ([`gemmkit::gemm_packed_b`], packed once
+/// outside the timed closure) against plain [`gemm`] (which re-reads, and past
+/// `rhs_pack_threshold`, re-packs B on every call), for a fixed `(k, n)` B and varying
+/// activation batch `m`. `b_row_major` selects the strided case: row-major B has a
+/// non-unit depth stride, and for every `m` swept here (up to 2048, at or below the
+/// default 2048 packing threshold) plain `gemm` never crosses that threshold and so never
+/// packs it either, leaving it to re-read that stride on every call, which the prepacked
+/// contiguous panel should beat. `colB` is the already-contiguous control. Either way the
+/// reported number is the per-call speedup; the pack's own one-time cost is not counted
+/// against either arm and only amortizes across many calls the loop here does not model
 fn bench_prepack(k: usize, n: usize, m: usize, b_row_major: bool, par: Parallelism) {
     let a = fill(m * k, 1);
     let b = fill(k * n, 2);
@@ -73,11 +78,11 @@ fn perf_prepack() {
     }
 }
 
-// Prepack buffer setup cost (half-type dead zero-fill probe)
+// Prepack buffer setup cost (isolated, no compute)
 
-/// Median wall time of `reps` calls to `f`, in microseconds (after a short warmup).
-/// For timing an operation whose cost is not a GFLOP count (here, the prepack buffer
-/// setup), so the GFLOP/s-oriented `measure` does not apply
+/// Median wall time of `reps` calls to `f`, in microseconds, after a short warmup. For timing
+/// an operation that has no natural flop count (here, building a prepacked buffer), where the
+/// GFLOP/s-oriented [`measure`] does not apply
 #[cfg(feature = "half")]
 fn time_us<F: FnMut()>(reps: usize, mut f: F) -> f64 {
     use std::time::Instant;
@@ -94,12 +99,13 @@ fn time_us<F: FnMut()>(reps: usize, mut f: F) -> f64 {
     samples[reps / 2]
 }
 
-/// Isolated cost of the prepack buffer setup. `prepack_rhs` allocates `ceil(n/nr)*nr*k_pad`
-/// elements, then packs every one of them. For `f32` the zero-init specializes to
-/// `alloc_zeroed` (no write pass), but the `half` types (`f16`/`bf16`) lack std's `IsZero`
-/// specialization, so a plain `vec![ZERO; ..]` runs a dead `O(k*n)` write the pack immediately
-/// overwrites. This times prepack alone (no compute) so that dead pass is visible; `f32` is the
-/// control (its zero-init is already free, so its number must not move)
+/// Isolated cost of `prepack_rhs` alone, no compute, for `bf16`/`f16` against the `f32`
+/// control. The pack buffer is sized with `Vec::with_capacity` + `set_len` rather than a
+/// zero-initializing allocation, specifically so the `half` types are not left paying a dead
+/// `O(k*n)` write before the pack loop below overwrites every slot anyway; this is the
+/// regression guard for that choice. `f32`'s number should never move (its own path was
+/// already allocation-light), and `bf16`/`f16` should track it rather than showing any
+/// leftover zero-fill tax
 #[cfg(feature = "half")]
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
@@ -131,14 +137,16 @@ fn perf_prepack_alloc() {
     println!("  bf16 {t_bf:8.1} us   f16 {t_hf:8.1} us   f32 (control) {t_f:8.1} us");
 }
 
-// Prepacked-i8-RHS reuse
+// Prepacked-i8-RHS reuse: perf_prepack_i8
 
-/// Per-call throughput of a reused prepacked `i8` B (`gemm_i8_packed_b`) vs plain `gemm_i8`
-/// (which re-packs B every call - for the VNNI `vpdpbusd` kernel the k-quad-interleaved RHS pack
-/// is *mandatory* on every call, the quad layout can't be read in place) for a fixed `(k, n)` B
-/// and a small activation batch `m`. At small `m` the `O(k*n)` pack dominates the `O(m*k*n)`
-/// compute, so a reused prepacked panel should win per call (the one-time pack amortizes away over
-/// a stream of activation batches)
+/// Per-call throughput of a reused prepacked `i8` B ([`gemmkit::gemm_i8_packed_b`]) against
+/// plain [`gemmkit::gemm_i8`] (which re-packs B on every call), for a fixed `(k, n)` B and a
+/// small activation batch `m`. Plain `gemm_i8` has no unpacked-read option to fall back to
+/// here: whichever kernel this box auto-selects packs its RHS unconditionally (the VNNI
+/// `vpdpbusd` kernel's k-quad-interleaved layout in particular cannot be read in place at
+/// all), so every plain call pays a fresh `O(k*n)` pack. At the small `m` values below that
+/// pack cost dominates the `O(m*k*n)` compute, which is exactly where reusing 1 prepacked
+/// panel across a stream of activation batches should win per call
 #[cfg(all(feature = "int8", not(target_family = "wasm")))]
 fn bench_prepack_i8(k: usize, n: usize, m: usize, par: Parallelism) {
     let a: Vec<i8> = (0..m * k).map(|i| (i % 17) as i8 - 8).collect();
@@ -199,13 +207,15 @@ fn perf_prepack_i8() {
     }
 }
 
-/// Per-call throughput of a reused prepacked A (`gemm_packed_a`) vs plain `gemm`
-/// (which re-packs A every call) for a fixed `(m, k)` A and varying `n`. The
-/// packed-LHS path drives the product transposed, so C is row-major (its supported
-/// orientation) and A plays the transposed RHS. `a_col_major` is the strided case:
-/// after the transpose the driver reads A with a large K-stride (`= m`) and, below
-/// the pack gate (transposed `m = n > 2048`), never packs it, so the contiguous
-/// prepacked panel should win per call. Row-major A is the contiguous control
+/// Per-call throughput of a reused prepacked A ([`gemmkit::gemm_packed_a`]) against plain
+/// [`gemm`] (which re-packs A on every call), for a fixed `(m, k)` A and varying `n`. The
+/// packed-LHS path always drives the transposed product internally, so `C` must be row-major
+/// (`gemm_packed_a`'s supported orientation) with `A` playing the role of the transposed
+/// product's RHS. `a_col_major` is the strided case: with column-major `A`, the transposed
+/// product's depth-walk stride is `m`, and below the RHS-pack gate (here, once the swept `n`
+/// exceeds 2048) plain `gemm` leaves that stride unpacked, so the prepacked contiguous panel
+/// should win most clearly right past that crossover. Row-major `A` is the already-contiguous
+/// control
 fn bench_prepack_lhs(m: usize, k: usize, n: usize, a_col_major: bool, par: Parallelism) {
     let a = fill(m * k, 1);
     let b = fill(k * n, 2);
@@ -214,7 +224,7 @@ fn bench_prepack_lhs(m: usize, k: usize, n: usize, a_col_major: bool, par: Paral
     } else {
         (k as isize, 1)
     };
-    // Row-major C: the supported orientation for the prepacked-LHS path
+    // gemm_packed_a requires row-major-ish C: the orientation its transposed-product path supports
     let mut c = vec![0.0f32; m * n];
 
     let s_plain = measure(m, k, n, || {
@@ -271,15 +281,16 @@ fn perf_prepack_lhs() {
     }
 }
 
-// Shared-LHS A-pack gate calibration
+// Shared-LHS A-pack gate calibration: perf_shared_lhs
 
-/// Force the shared-LHS A-pack gate **on vs off back-to-back in one process** (via
-/// the runtime setter, so the same buffers/thread-pool are reused and machine drift
-/// cancels) and report the parallel throughput of each. The gate only changes
-/// behavior on the packed-A path: a row-major A (`rsa != 1`) always packs, so every
-/// size exercises the pre-pass; a column-major A packs only once its K-walk stride
-/// trips the TLB gate (large `m`), so its crossover sits higher. The `on % of off`
-/// column is the signal: above 100% the shared pre-pass wins, below it regresses
+/// Forces the shared-LHS A-pack gate on and then off, back-to-back in 1 process (via the
+/// runtime setter, so both runs reuse the same buffers/thread pool and machine drift
+/// cancels), and reports the parallel throughput of each. The gate only matters on the
+/// packed-A path: row-major `A` (non-unit row stride) always packs regardless of the gate, so
+/// every size here exercises the shared pre-pass either way; column-major `A` packs only once
+/// its depth-walk stride (`= m` elements, growing with `s`) trips the separate TLB-driven
+/// `lhs_pack_stride` gate, so its crossover sits at a larger `s`. The "on % of off" column is
+/// the signal: above 100% the shared pre-pass is winning, below it is a regression
 fn bench_shared_lhs(s: usize, row_major_a: bool) {
     let (m, k, n) = (s, s, s);
     let a = fill(m * k, 1);

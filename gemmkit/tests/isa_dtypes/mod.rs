@@ -1,9 +1,12 @@
-//! Shared tiny-GEMM entry points, one per element-type dispatch ladder, for the
-//! `GEMMKIT_REQUIRE_ISA` cross-arch pin binaries (`env_isa_neon`, `env_isa_wasm`). Each runs a
-//! 2x2 product through the public entry for its dtype; the pin binaries wrap them in
-//! `catch_unwind` to observe whether the pinned ISA's `select_*` ladder accepts or rejects the
-//! current target. Feature-gated dtypes are simply absent from `dtype_cases` when their feature
-//! is off. Lives in a subdirectory so cargo does not compile it as its own test binary
+//! Tiny 2x2 GEMM entry point per element-type dispatch ladder, shared by the
+//! `GEMMKIT_REQUIRE_ISA` cross-architecture pin binaries (`env_isa_neon`, `env_isa_wasm`)
+//!
+//! Each function below drives one dtype's public GEMM entry through a fixed 2x2 product; the
+//! pin binaries wrap them in `catch_unwind` to observe whether the pinned ISA's `select_*`
+//! ladder accepts the current target (returns normally) or rejects it (panics). A dtype whose
+//! feature is off is simply missing from [`dtype_cases`]. Lives in a subdirectory, reached with
+//! a plain `mod isa_dtypes;`, so cargo's default test-discovery does not also build it as its
+//! own top-level test binary
 
 use gemmkit::{MatMut, MatRef, Parallelism};
 
@@ -118,8 +121,8 @@ fn gemm_c64() {
     );
 }
 
-/// Every element-type dispatch ladder available under the active feature set, as
-/// `(name, entry)`. `f32`/`f64` are always present; the rest track their features
+/// Every element-type dispatch ladder available under the active feature set, paired with its
+/// entry point. `f32` and `f64` are unconditional; the rest are gated by their own feature
 pub fn dtype_cases() -> Vec<(&'static str, fn())> {
     vec![
         ("f32", gemm_f32 as fn()),

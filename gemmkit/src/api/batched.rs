@@ -1,4 +1,11 @@
-//! Strided- and pointer-array-batched GEMM entries
+//! Batched GEMM entries: many independent products in 1 call
+//!
+//! 2 batch forms: the strided form ([`gemm_batched`] and its fused/unchecked siblings), where
+//! every element shares 1 shape and strides and is spaced by a fixed `*_batch_stride`, and the
+//! pointer-array form ([`gemm_batched_slice`] / [`gemm_batched_ptr_unchecked`]), where each
+//! element carries its own shape and pointers. Both parallelize across the batch (whole GEMMs
+//! assigned to workers) rather than splitting an individual element, and both forward to the
+//! scheduling engine in `crate::special::batched`
 #[cfg(feature = "epilogue")]
 use super::fused::{Activation, Bias};
 use super::*;
@@ -9,11 +16,15 @@ use crate::dispatch::GemmProblem;
 use crate::kernel::epilogue::BiasDim;
 use alloc::vec::Vec;
 
-/// Bounds check for a **strided-batched** view: the `batch` element views (element `bi` based at
-/// slice offset `bi * batch_stride`) must all address inside `data`, including the last element.
-/// The batch stride must be non-negative for the safe API (like the element strides). Returns the
-/// element extent (highest offset + 1) so the caller can reuse it for the inter-element
-/// disjointness check
+/// Bounds-checks a strided-batched view: every element (element `bi` based at slice offset
+/// `bi * batch_stride`) must address inside `data`, including the last one. `batch_stride` must
+/// be non-negative when `batch > 1` (only element 0 exists otherwise, so the stride is moot).
+/// Returns the single element's extent (highest offset + 1) so the caller can reuse it, e.g.
+/// for a disjointness check
+///
+/// # Panics
+/// If the strides are negative or too large to address, if `batch_stride` is negative, or if
+/// the last element's view runs past `data`
 #[allow(clippy::too_many_arguments)]
 fn check_batched_view<T>(
     data: &[T],
@@ -31,7 +42,7 @@ fn check_batched_view<T>(
             "gemmkit: {name} view has negative strides or is too large to address; use the unchecked API"
         ),
     };
-    // Only element 0 exists when batch <= 1, so the batch stride is irrelevant there
+    // batch <= 1: only element 0 exists, so the stride is irrelevant
     let last_base = if batch <= 1 {
         0
     } else {
@@ -51,13 +62,15 @@ fn check_batched_view<T>(
     e
 }
 
-/// The shared checked-API validation for a strided-batched `(A, B, C)` trio (used by both the
-/// plain [`gemm_batched_with`] and the fused [`gemm_batched_fused_with`]): matching per-element
-/// inner dimensions, every element view (incl. the last) in bounds, each `C` element addressing
-/// uniquely, the `batch` `C` outputs pairwise disjoint, and `C` not overlapping `A`/`B`. Panics on
-/// any violation (messages match the wording tests assert on). Callers add any entry-specific
-/// checks (fused bias) after this returns. Assumes `batch >= 1`: the callers short-circuit
-/// `batch == 0` before validating (the views are unused)
+/// The shared checked-API validation for a strided-batched `(A, B, C)` trio, used by both plain
+/// [`gemm_batched_with`] and fused [`gemm_batched_fused_with`]: per-element inner dimensions
+/// agree, every element view (including the last) is in bounds, every `C` element addresses
+/// uniquely, the `batch` `C` outputs are pairwise disjoint, and `C` does not overlap `A`/`B`.
+/// Panics on any violation (the wording is what the tests assert on). Callers add any
+/// entry-specific checks (fused bias) after this returns
+///
+/// Assumes `batch >= 1`: callers short-circuit `batch == 0` before validating, since the views
+/// are unused there
 #[allow(clippy::too_many_arguments)]
 fn validate_batched_views<T>(
     batch: usize,
@@ -115,12 +128,12 @@ fn validate_batched_views<T>(
         "C",
     );
 
-    // Each C element must address every (i,j) uniquely (a self-aliasing element would race in
-    // parallel), and, since the batch writes them concurrently, the elements must not overlap
-    // each other. Disjointness is enforced conservatively: the batch stride must clear 1
-    // element's whole extent (sufficient, and simpler than a per-offset overlap test; it can
-    // reject an exotic layout that threads later elements through a strided element's internal
-    // gaps, but never accepts a real overlap). (`c_batch_stride >= 0` here: `check_batched_view`.)
+    // C must address each (i,j) uniquely (self-aliasing would race under concurrent writes),
+    // and the batch elements must not overlap each other either. Disjointness is enforced
+    // conservatively: the batch stride must clear 1 whole element extent, which is simpler than
+    // a per-offset overlap test and never accepts a real overlap (it can only reject some
+    // exotic layout that threads a later element through this one's internal gaps). The cast
+    // below is sound because check_batched_view already rejected a negative c_batch_stride
     if self_aliases(c.rows, c.cols, c.rs, c.cs) {
         panic!(
             "gemmkit: batched C element aliases itself (strides {},{} map distinct elements to \
@@ -135,8 +148,8 @@ fn validate_batched_views<T>(
         );
     }
 
-    // C must not alias A or B (it is written). The whole-slice check is defensive: safe Rust's
-    // borrow checker already forbids overlapping &mut/& slices
+    // C must not alias A or B; the borrow checker already forbids this in safe Rust, so the
+    // check below is defensive
     let cp = c.data.as_ptr();
     let cl = c.data.len();
     if overlaps(cp, cl, a.data.as_ptr(), a.data.len())
@@ -146,26 +159,25 @@ fn validate_batched_views<T>(
     }
 }
 
-/// Strided-batched GEMM: `C_b <- alpha*A_b*B_b + beta*C_b` for `b in 0..batch`, 1 call,
-/// parallelized **across the batch**. All elements share the single-element shape and strides of
-/// `a`/`b`/`c`; consecutive elements are `*_batch_stride` apart in their slices (`A_b` at
-/// `a.data + b*a_batch_stride`, etc.). A `*_batch_stride` of `0` broadcasts 1 operand across the
-/// whole batch (valid for the read-only `A`/`B`, never for `C`). Uses the thread-local workspace
-/// pool
+/// Strided-batched GEMM: `C_b <- alpha*A_b*B_b + beta*C_b` for `b in 0..batch`, in 1 call,
+/// parallelized across the batch rather than within each element. Every element shares the
+/// single-element shape and strides of `a`/`b`/`c`; element `b` is based at
+/// `a.data + b*a_batch_stride` (likewise for `b`/`c`). A `*_batch_stride` of `0` broadcasts 1
+/// operand across the whole batch, valid for the read-only `A`/`B` but never for `C`. Uses the
+/// thread-local workspace pool
 ///
-/// Each element re-dispatches through the full engine, so the result **reproduces** a loop of
-/// [`gemm`] calls and is **deterministic** across thread counts (reproducible under a fixed
-/// config, the library's determinism contract). The serial and batch-parallel schedules run each
-/// element serially, so they are additionally bit-identical across thread counts; the
-/// few-but-large schedule runs each element through the parallel engine and so inherits its
-/// per-element serial==parallel behavior
+/// Every element re-dispatches through the full engine, so the batch reproduces a loop of
+/// [`gemm`] calls and stays reproducible across thread counts. The serial and batch-parallel
+/// schedules run each element on a single worker, so those 2 are additionally bit-identical
+/// across thread counts; the few-but-large schedule instead runs an element through the
+/// parallel engine and inherits that route's own serial == parallel behavior
 ///
 /// # Panics
 /// If the per-element dimensions disagree (`A.cols != B.rows`, `A.rows != C.rows`,
-/// `B.cols != C.cols`); if any element view (including the last, `b == batch-1`) addresses outside
-/// its slice; if a batch stride is negative; if the `batch` output regions overlap each other
-/// (`C` batch stride below the element extent) or a `C` element aliases itself; or if `C`'s
-/// storage overlaps `A`'s or `B`'s
+/// `B.cols != C.cols`); if any element view (including the last, `b == batch - 1`) addresses
+/// outside its slice; if a batch stride is negative; if the `batch` output regions overlap each
+/// other (`C` batch stride below the element extent) or a `C` element aliases itself; or if
+/// `C`'s storage overlaps `A`'s or `B`'s
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_batched<T: GemmScalar>(
     batch: usize,
@@ -197,9 +209,9 @@ pub fn gemm_batched<T: GemmScalar>(
 }
 
 /// Like [`gemm_batched`] but reuses a caller-owned [`Workspace`]. The serial and few-but-large
-/// schedules pack through `ws`; the batch-parallel schedule instead packs through each worker's
-/// own persistent per-thread batched pool (a single shared `ws` cannot back concurrent packing),
-/// which is reused across calls the same way `ws` is
+/// schedules pack through `ws`; the batch-parallel schedule instead has each worker pack
+/// through its own thread-local pool, since 1 `Workspace` cannot back concurrent packing from
+/// several threads, reused across calls exactly like a caller-owned `ws`
 ///
 /// # Panics
 /// Same conditions as [`gemm_batched`]
@@ -217,7 +229,7 @@ pub fn gemm_batched_with<T: GemmScalar>(
     c_batch_stride: isize,
     par: Parallelism,
 ) {
-    // A zero-length batch is a pure no-op: nothing to validate (the views are unused)
+    // batch == 0: nothing to run, so skip validating the (unused) views
     if batch == 0 {
         return;
     }
@@ -232,9 +244,8 @@ pub fn gemm_batched_with<T: GemmScalar>(
         c_batch_stride,
     );
 
-    // SAFETY: validated above, per-element shapes agree, every element view (incl. the last) is
-    // in bounds, the C outputs are pairwise disjoint and address uniquely, and C does not alias
-    // A/B
+    // SAFETY: validate_batched_views has confirmed the shapes, bounds, disjointness, and
+    // non-aliasing above
     unsafe {
         gemm_batched_unchecked_with(
             ws,
@@ -261,34 +272,27 @@ pub fn gemm_batched_with<T: GemmScalar>(
     }
 }
 
-/// Strided-batched GEMM with a **fused epilogue** applied to every element:
-/// `C_b <- act(alpha*A_b*B_b + beta*C_b + bias)` for `b in 0..batch`, 1 call, parallelized
-/// **across the batch**. **1** bias vector and **1** activation are shared by every batch
-/// element (the batched-linear-layer case: the same layer applied to a batch of inputs). All
-/// elements share the single-element shape and strides of `a`/`b`/`c`; consecutive elements are
-/// `*_batch_stride` apart in their slices, and a `*_batch_stride` of `0` broadcasts 1 operand
-/// across the whole batch (valid for the read-only `A`/`B`, never for `C`). Uses the thread-local
-/// workspace pool. `bias == None && act == None` delegates to plain [`gemm_batched`]
+/// Strided-batched GEMM with a fused epilogue shared by every element:
+/// `C_b <- act(alpha*A_b*B_b + beta*C_b + bias)` for `b in 0..batch`, in 1 call, parallelized
+/// across the batch. 1 bias vector and 1 activation apply to every element (the
+/// batched-linear-layer case: 1 layer applied to a batch of inputs). Shape, stride, and
+/// broadcast conventions match [`gemm_batched`]. Uses the thread-local workspace pool;
+/// `bias == None && act == None` takes the plain [`gemm_batched`] path
 ///
-/// The headline property: the result is **bit-identical to a loop of [`gemm_fused`] calls**, 1
-/// per element, with the same shared bias/activation, because each element re-dispatches through
-/// the full fused engine. So for `f32`/`f64` every element equals `gemm()`-then-map bit-for-bit for
-/// every shape, and for `f16`/`bf16` the epilogue applies in `f32` **before** the single narrowing
-/// (more precise than a separate narrow map). Elements are independent, so the batch is
-/// **reproducible** across thread counts; the serial and batch-parallel schedules run each element
-/// serially, so they are additionally bit-identical across thread counts (the few-but-large
-/// schedule runs each element through the parallel engine and inherits its per-element behavior)
-///
-/// `T: FusedScalar`: `f32`/`f64` and, under the `half` feature, `f16`/`bf16`. There is no
-/// `unchecked` variant this round; an FFI caller can loop [`gemm_fused_unchecked`]
+/// Each element re-dispatches through the full fused engine, so element `b`'s output is
+/// bit-identical to a standalone [`gemm_fused`] call on that element with the same bias and
+/// activation. For `f32`/`f64` that means bit-identical to `gemm()` followed by the same
+/// scalar map, for every shape; for `f16`/`bf16` the epilogue applies in `f32` before the
+/// single narrowing (more precise than a separate narrow map, so not bitwise-equal to
+/// `gemm`-then-map there). Elements are independent, so the batch stays reproducible across
+/// thread counts, with the same serial / batch-parallel bit-identical guarantee as
+/// [`gemm_batched`]
 ///
 /// # Panics
-/// The [`gemm_batched`] conditions (per-element dimensions disagree; any element view out of
-/// bounds; a negative batch stride; the `batch` `C` regions overlap or a `C` element aliases
-/// itself; or `C` overlaps `A`/`B`), plus the fused conditions: a `PerRow` bias whose length is not
-/// the element `A.rows` (or a `PerCol` bias not the element `B.cols`); the bias is 1 shared
-/// vector sized for a single element; a bias slice overlapping `C`'s storage; or a non-finite
-/// `LeakyRelu` slope
+/// The [`gemm_batched`] conditions, plus: a `PerRow` bias whose length is not the element
+/// `A.rows` (or a `PerCol` bias not the element `B.cols`), since the bias is 1 shared vector
+/// sized for a single element, not `batch*axis`; a bias slice overlapping `C`'s storage; or a
+/// non-finite `LeakyRelu` slope
 #[cfg(feature = "epilogue")]
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_batched_fused<T: FusedScalar>(
@@ -324,9 +328,9 @@ pub fn gemm_batched_fused<T: FusedScalar>(
     });
 }
 
-/// Like [`gemm_batched_fused`] but reuses a caller-owned [`Workspace`] (the same pooling as
-/// [`gemm_batched_with`]: the serial / few-but-large schedules pack through `ws`, the batch-parallel
-/// schedule through each worker's own persistent per-thread pool)
+/// Like [`gemm_batched_fused`] but reuses a caller-owned [`Workspace`] (the same split as
+/// [`gemm_batched_with`]: serial and few-but-large schedules pack through `ws`, batch-parallel
+/// through each worker's own thread-local pool)
 ///
 /// # Panics
 /// Same conditions as [`gemm_batched_fused`]
@@ -347,14 +351,13 @@ pub fn gemm_batched_fused_with<T: FusedScalar>(
     act: Option<Activation<T>>,
     par: Parallelism,
 ) {
-    // A zero-length batch is a pure no-op: nothing to validate (the views and bias are unused),
-    // mirroring `gemm_batched_with`
+    // batch == 0: nothing to run, so skip validating the (unused) views and bias
     if batch == 0 {
         return;
     }
 
-    // The identity-fused case delegates to plain batched gemm so the zero-cost path is guaranteed
-    // (and it runs the plain validation), mirroring `gemm_fused_with`
+    // No bias or activation: delegate to plain gemm_batched so no fused kernel is instantiated,
+    // and both paths share 1 set of validation panics
     if bias.is_none() && act.is_none() {
         gemm_batched_with(
             ws,
@@ -382,9 +385,8 @@ pub fn gemm_batched_fused_with<T: FusedScalar>(
         c_batch_stride,
     );
 
-    // Fused-epilogue validation: the bias is ONE shared vector sized for a single element (its
-    // length matches the element axis, not `batch*axis`) and must not overlap C. The overlap test
-    // uses C's WHOLE backing slice, so it is conservative across every batch element
+    // The bias is 1 shared vector sized for a single element (its length matches the element
+    // axis, not batch*axis) and must not overlap C's whole backing slice
     validate_bias(&bias, a.rows, b.cols, &c);
     if let Some(Activation::LeakyRelu(s)) = &act {
         assert!(T::finite(*s), "gemmkit: LeakyRelu slope must be finite");
@@ -392,10 +394,8 @@ pub fn gemm_batched_fused_with<T: FusedScalar>(
 
     let epi = to_fused_epi(bias, act);
 
-    // SAFETY: validated above, per-element shapes agree, every element view (incl. the last) is in
-    // bounds, the C outputs are pairwise disjoint and address uniquely, C does not alias A/B, the
-    // bias slice matches its element axis and does not overlap C, and the slope is finite. The bias
-    // pointer (borrowed for this call) stays valid for the whole `run_fused` frame
+    // SAFETY: validate_batched_views and validate_bias confirmed shapes, bounds, disjointness,
+    // non-aliasing, and a finite slope above; the bias borrow outlives this run_fused call
     unsafe {
         crate::special::batched::run_fused(
             batch,
@@ -424,21 +424,23 @@ pub fn gemm_batched_fused_with<T: FusedScalar>(
 }
 
 /// The raw strided-batched fused engine: `C_e <- act(alpha*A_e*B_e + beta*C_e + bias)` for
-/// `e in 0..batch` over pointers and `isize` strides, with **no** bounds/alias/shape checks, the
-/// raw-parts form of [`gemm_batched_fused`] (mirroring [`gemm_batched_unchecked`]'s shape plus the
-/// shared bias/activation of [`gemm_fused_unchecked`]). Element `e` is based at `a + e*a_batch_stride`
-/// / `b + e*b_batch_stride` / `c + e*c_batch_stride`, all sharing the single-element shape `(m, k, n)`
-/// and element strides; the **1** `bias` (`(ptr, dim)` pair enabled by `has_bias`) and **1** `act`
-/// are shared by every element. Uses the thread-local workspace pool
+/// `e in 0..batch`, over pointers and `isize` strides, with no bounds, alias, or shape checks:
+/// the raw-parts form of [`gemm_batched_fused`], combining [`gemm_batched_unchecked`]'s
+/// per-element shape with the shared bias/activation of [`gemm_fused_unchecked`]. Element `e`
+/// is based at `a + e*a_batch_stride` / `b + e*b_batch_stride` / `c + e*c_batch_stride`, all
+/// sharing the single-element shape `(m, k, n)` and element strides; the 1 `bias` (a
+/// `(ptr, dim)` pair, read only when `has_bias`) and 1 `act` apply to every element. Uses the
+/// thread-local workspace pool
 ///
 /// # Safety
-/// For every element `e in 0..batch`: `a`/`b` are valid for reads and `c` for read+write over every
-/// `(i, j)` implied by `(m, k, n)` and the element strides at the batch-strided base; the `batch` `C`
-/// regions are pairwise disjoint and none aliases any `A`/`B`; and when `beta == 0`, `c` need not be
-/// initialized. A batch stride may be `0` (broadcast) only for the read-only `A`/`B`, never `C`. When
-/// `has_bias`, `bias` is a single shared vector valid for reads of `m` (`PerRow`) or `n` (`PerCol`)
-/// elements, sized for 1 element, not `batch*axis`, and disjoint from every `C` element; a
-/// non-finite `LeakyRelu` slope is the caller's responsibility (the checked API rejects it)
+/// For every element `e in 0..batch`: `a`/`b` are valid for reads and `c` for read+write over
+/// every `(i, j)` implied by `(m, k, n)` and the element strides at the batch-strided base; the
+/// `batch` `C` regions are pairwise disjoint and none aliases any `A`/`B`; and when `beta == 0`,
+/// `c` need not be initialized. A batch stride may be `0` (broadcast) only for the read-only
+/// `A`/`B`, never `C`. When `has_bias`, `bias` is a single shared vector, valid for reads of `m`
+/// (`PerRow`) or `n` (`PerCol`) elements, sized for 1 element rather than `batch*axis`, and
+/// disjoint from every `C` element; a non-finite `LeakyRelu` slope is the caller's
+/// responsibility (the checked API rejects it)
 #[cfg(feature = "epilogue")]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn gemm_batched_fused_unchecked<T: FusedScalar>(
@@ -466,7 +468,7 @@ pub unsafe fn gemm_batched_fused_unchecked<T: FusedScalar>(
     act: Option<Activation<T>>,
     par: Parallelism,
 ) {
-    // SAFETY: preconditions forwarded to the caller (see this fn's # Safety)
+    // SAFETY: preconditions satisfied by the caller, per # Safety above
     unsafe {
         workspace::with_thread_pool(|ws| {
             gemm_batched_fused_unchecked_with(
@@ -532,9 +534,7 @@ pub unsafe fn gemm_batched_fused_unchecked_with<T: FusedScalar>(
     par: Parallelism,
 ) {
     let epi = to_fused_epi_raw(bias, bias_dim, has_bias, act);
-    // SAFETY: the caller guarantees per-element pointer validity, pairwise-disjoint `C` regions that
-    // don't alias `A`/`B`, a valid disjoint shared bias when `has_bias`, and that `beta == 0` may
-    // leave `C` uninitialized (see # Safety)
+    // SAFETY: preconditions satisfied by the caller, per # Safety above
     unsafe {
         crate::special::batched::run_fused(
             batch,
@@ -562,18 +562,19 @@ pub unsafe fn gemm_batched_fused_unchecked_with<T: FusedScalar>(
     }
 }
 
-/// The raw strided-batched engine: [`gemm_batched`] over pointers and `isize` strides, with **no**
-/// bounds/alias/shape checks. Element `e` is based at `a + e*a_batch_stride` / `b + e*b_batch_stride`
-/// / `c + e*c_batch_stride`, all sharing the single-element shape `(m, k, n)` and element strides.
-/// The raw counterpart of [`gemm_batched`], for adapters (e.g. an ndarray `Array3`, batch on axis 0)
-/// and FFI callers that supply their own valid pointers / arbitrary strides. Uses the thread-local
-/// workspace pool
+/// The raw strided-batched engine: [`gemm_batched`] over pointers and `isize` strides, with no
+/// bounds, alias, or shape checks. Element `e` is based at `a + e*a_batch_stride` /
+/// `b + e*b_batch_stride` / `c + e*c_batch_stride`, all sharing the single-element shape
+/// `(m, k, n)` and element strides. Adapter crates (e.g. an ndarray `Array3` batched on axis 0)
+/// and FFI callers that supply their own pointers or arbitrary strides use this path. Uses the
+/// thread-local workspace pool
 ///
 /// # Safety
-/// For every element `e in 0..batch`: `a`/`b` are valid for reads and `c` for read+write over every
-/// `(i, j)` implied by `(m, k, n)` and the element strides at the batch-strided base; the `batch`
-/// `C` regions are pairwise disjoint and none aliases any `A`/`B`; and when `beta == 0`, `c` need not
-/// be initialized. A batch stride may be `0` (broadcast) only for the read-only `A`/`B`, never `C`
+/// For every element `e in 0..batch`: `a`/`b` are valid for reads and `c` for read+write over
+/// every `(i, j)` implied by `(m, k, n)` and the element strides at the batch-strided base; the
+/// `batch` `C` regions are pairwise disjoint and none aliases any `A`/`B`; and when `beta == 0`,
+/// `c` need not be initialized. A batch stride may be `0` (broadcast) only for the read-only
+/// `A`/`B`, never `C`
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn gemm_batched_unchecked<T: GemmScalar>(
     batch: usize,
@@ -596,7 +597,7 @@ pub unsafe fn gemm_batched_unchecked<T: GemmScalar>(
     c_batch_stride: isize,
     par: Parallelism,
 ) {
-    // SAFETY: preconditions forwarded to the caller (see this fn's # Safety)
+    // SAFETY: preconditions satisfied by the caller, per # Safety above
     unsafe {
         workspace::with_thread_pool(|ws| {
             gemm_batched_unchecked_with(
@@ -652,8 +653,8 @@ pub unsafe fn gemm_batched_unchecked_with<T: GemmScalar>(
     c_batch_stride: isize,
     par: Parallelism,
 ) {
-    // SAFETY: the caller guarantees per-element pointer validity, pairwise-disjoint `C` regions that
-    // don't alias `A`/`B`, and that `beta == 0` may leave `C` uninitialized (see # Safety)
+    // SAFETY: caller guarantees valid, pairwise-disjoint, non-aliasing C regions per element,
+    // and that beta == 0 may leave C uninitialized
     unsafe {
         crate::special::batched::run(
             batch,
@@ -680,12 +681,13 @@ pub unsafe fn gemm_batched_unchecked_with<T: GemmScalar>(
     }
 }
 
-/// Run a **pointer-array batched** GEMM: every element in `problems` is an independent product with
-/// its own shape and pointers ([`GemmProblem`]), parallelized across the batch (whole GEMMs assigned
-/// to workers, each run serially and cache-hot). The raw counterpart of [`gemm_batched_slice`], for
-/// callers (FFI, adapters) that validate their own inputs and may use arbitrary pointers / negative
-/// strides. Deterministic across thread counts (each element runs wholly on 1 worker), and it
-/// takes the `problems` slice as-is, no per-call allocation
+/// Runs a pointer-array batched GEMM: every element in `problems` is an independent product
+/// with its own shape and pointers ([`GemmProblem`]), parallelized across the batch (whole
+/// GEMMs assigned to workers, each run serially and cache-hot). The raw counterpart of
+/// [`gemm_batched_slice`], for callers (FFI, adapters) that validate their own inputs and may
+/// use arbitrary pointers or negative strides. Deterministic across thread counts, since each
+/// element runs wholly on 1 worker, and takes the `problems` slice as-is with no per-call
+/// allocation
 ///
 /// # Safety
 /// For each problem: `a`/`b` valid for reads and `c` for read+write over the shape/strides; when
@@ -695,14 +697,14 @@ pub unsafe fn gemm_batched_ptr_unchecked<T: GemmScalar>(
     problems: &[GemmProblem<T>],
     par: Parallelism,
 ) {
-    // SAFETY: the caller guarantees each problem's pointers are valid and the outputs are pairwise
+    // SAFETY: caller guarantees each problem's pointers are valid and the outputs are pairwise
     // disjoint and don't alias inputs
     unsafe {
         workspace::with_thread_pool(|ws| crate::special::batched::run_ptr(problems, par, ws));
     }
 }
 
-/// One element of a checked pointer-array batched GEMM ([`gemm_batched_slice`]):
+/// 1 element of a checked pointer-array batched GEMM ([`gemm_batched_slice`]):
 /// `C <- alpha*A*B + beta*C` over safe views
 pub struct BatchProblem<'a, T> {
     /// Product scale
@@ -713,15 +715,16 @@ pub struct BatchProblem<'a, T> {
     pub b: MatRef<'a, T>,
     /// Accumulator scale
     pub beta: T,
-    /// Output view (a distinct `&mut` per element, so the batch's outputs are disjoint)
+    /// Output view: a distinct `&mut` borrow per element, so the batch's outputs can't overlap
     pub c: MatMut<'a, T>,
 }
 
-/// Run a **checked pointer-array batched** GEMM: `problems[i].c <- alpha*A*B + beta*C` for each
-/// element, each an independent product over safe views, parallelized across the batch. The safe
-/// counterpart of [`gemm_batched_ptr_unchecked`]: because every `c` is a distinct `MatMut`, the
-/// outputs are pairwise disjoint and don't alias the inputs *by construction*, so validation only
-/// covers per-element shape agreement and in-bounds strides. Deterministic across thread counts
+/// Runs a checked pointer-array batched GEMM: `problems[i].c <- alpha*A*B + beta*C` for each
+/// element, each an independent product over safe views, parallelized across the batch. The
+/// safe counterpart of [`gemm_batched_ptr_unchecked`]: because every `c` is a distinct
+/// `MatMut`, the outputs are pairwise disjoint and can't alias the inputs by construction (the
+/// borrow checker already forbids 2 overlapping `&mut` borrows), so validation only covers
+/// per-element shape agreement and in-bounds strides. Deterministic across thread counts
 ///
 /// # Panics
 /// If any element's dimensions disagree (`A.cols != B.rows`, `A.rows != C.rows`, `B.cols != C.cols`),
@@ -774,7 +777,7 @@ pub fn gemm_batched_slice<T: GemmScalar>(problems: &mut [BatchProblem<'_, T>], p
             }
         })
         .collect();
-    // SAFETY: each element validated above; the outputs are pairwise disjoint and don't alias the
-    // inputs by construction (distinct `&mut` C vs `&` A/B), so the parallel writes are race-free
+    // SAFETY: shapes validated above; distinct &mut C borrows vs & A/B mean the outputs are
+    // pairwise disjoint and alias nothing, by construction, so the parallel writes are race-free
     workspace::with_thread_pool(|ws| unsafe { crate::special::batched::run_ptr(&raw, par, ws) });
 }

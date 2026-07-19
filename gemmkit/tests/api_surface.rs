@@ -1,11 +1,12 @@
-//! Public API surface that the driver never touches on its own: the [`MatRef`]/[`MatMut`]
-//! dimension accessors, the [`Workspace`] `with_capacity`/`Default` constructors, and the raw
-//! `gemm_unchecked_with` entry (a caller-owned workspace over raw pointers)
+//! Coverage for public API surface that a correctness sweep would not otherwise reach: the
+//! [`MatRef`]/[`MatMut`] shape accessors, the [`Workspace`] constructors, and the raw
+//! `gemm_unchecked_with` entry point over a caller-owned workspace
 #![cfg(all(not(miri), not(target_family = "wasm")))]
 
 use gemmkit::{MatMut, MatRef, Parallelism, Workspace, gemm, gemm_unchecked_with};
 
-/// `MatRef`/`MatMut` expose their shape through `rows()`/`cols()`
+/// `rows()`/`cols()` report the logical shape passed to a view's constructor, regardless of
+/// which constructor built it or what strides it carries
 #[test]
 fn matref_matmut_accessors() {
     let data = [0.0f32; 12];
@@ -13,7 +14,7 @@ fn matref_matmut_accessors() {
     assert_eq!(r.rows(), 3);
     assert_eq!(r.cols(), 4);
 
-    // Explicit strides + column-major constructor report the same logical shape
+    // MatRef::new takes explicit strides; the shape it reports is independent of them
     let r2 = MatRef::new(&data, 4, 3, 1, 4);
     assert_eq!((r2.rows(), r2.cols()), (4, 3));
 
@@ -27,9 +28,8 @@ fn matref_matmut_accessors() {
     assert_eq!((m2.rows(), m2.cols()), (2, 3));
 }
 
-/// `Workspace::default()` equals `Workspace::new()` (both empty), and a `with_capacity`-primed
-/// workspace produces the same result as a fresh one when threaded through the raw
-/// `gemm_unchecked_with` entry, covering both constructors and the raw workspace path
+/// An empty `Workspace` (`default()`, `new()`, or `with_capacity(0)`) and a pre-sized one both
+/// drive `gemm_unchecked_with` to the same result as the safe, allocating `gemm` entry
 #[test]
 fn workspace_constructors_and_unchecked_with() {
     let (m, k, n) = (48usize, 40, 32);
@@ -38,7 +38,7 @@ fn workspace_constructors_and_unchecked_with() {
     let c0: Vec<f32> = (0..m * n).map(|i| (i % 7) as f32 * 0.05).collect();
     let (alpha, beta) = (1.25f32, -0.5);
 
-    // Reference through the safe, allocating entry
+    // Reference result via the safe entry (pool-allocated workspace)
     let mut c_ref = c0.clone();
     gemm(
         alpha,
@@ -49,16 +49,16 @@ fn workspace_constructors_and_unchecked_with() {
         Parallelism::Serial,
     );
 
-    // `default()` is an empty workspace; `with_capacity(0)` must also be empty (no alloc)
+    // default() and with_capacity(0) both construct empty; with_capacity(0) must not itself allocate
     let mut ws_default = Workspace::default();
     let _ws_zero = Workspace::with_capacity(0);
-    // Pre-sized workspace: avoids the first-call growth, must give an identical result
+    // Primed above what this shape needs, so the run below never grows it
     let mut ws_cap = Workspace::with_capacity(1 << 20);
 
     for ws in [&mut ws_default, &mut ws_cap] {
         let mut c = c0.clone();
-        // SAFETY: shapes/strides describe valid in-bounds row-major layouts and C aliases neither
-        // A nor B (distinct Vecs)
+        // SAFETY: row-major strides are in bounds for m/k/n, and C (its own Vec) aliases
+        // neither A nor B
         unsafe {
             gemm_unchecked_with(
                 ws,

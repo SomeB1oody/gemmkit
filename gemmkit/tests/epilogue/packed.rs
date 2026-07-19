@@ -1,15 +1,18 @@
-//! Prepacked-operand fused-epilogue tests: the core `packed-fused == packed-then-map` oracle for
-//! both `gemm_packed_b_fused` (RHS prepacked, column-major-ish C) and `gemm_packed_a_fused` (LHS
-//! prepacked, row-major-ish C), the degenerate cases (`alpha == 0` / `k == 0`), handle reuse across
-//! plain + fused calls, the no-swap orientation panics, the checked/allocating twin equivalence,
-//! and the narrow (`f16`/`bf16`) pre-narrow contract
+//! Tests for the prepacked-operand fused entries `gemm_packed_b_fused` (RHS prepacked, requires
+//! column-major-ish C) and `gemm_packed_a_fused` (LHS prepacked, requires row-major-ish C):
+//! `packed-fused == packed-then-map` over the general shape sweep, the degenerate cases
+//! (`alpha == 0` / `k == 0`), reusing one prepacked handle across plain and fused calls, the
+//! no-swap orientation panics, the checked/allocating vs `_unchecked`/`_with` equivalence, and
+//! (submodule [`narrow`]) the narrow `f16`/`bf16` pre-narrow contract
 //!
-//! For `f32`/`f64` every comparison against the plain packed entry then the same scalar map is
-//! **bitwise**: the epilogue is store-side only, riding the *same* prepacked kernel `gemm_packed_*`
-//! runs (identical blocking / packing / scheduling), applied to the very register the plain store
-//! would write. The narrow path applies the epilogue in `f32` before the single narrowing, so it is
-//! locked against an `f32` single-rounding reference (a per-element gate for the general shape, and
-//! a bitwise `k == 1` case), not the 2-rounding narrow gemm-then-map
+//! For `f32`/`f64` every comparison against the plain packed entry followed by the same scalar
+//! map is bitwise: the fused epilogue only changes the store at the end of the *same* prepacked
+//! kernel `gemm_packed_*` already runs (identical blocking, packing, and scheduling), applying to
+//! the exact register or scratch value the plain store would otherwise have written. The narrow
+//! path instead applies the epilogue in `f32` before its single narrowing, so it is locked against
+//! an `f32` single-rounding reference: a per-element tolerance gate over the general shape, and a
+//! bitwise check at `k == 1` where the accumulator is a single exact product; not the 2-rounding
+//! `narrow-gemm-then-map` a naive oracle would use
 
 use crate::common::*;
 use gemmkit::{
@@ -18,13 +21,13 @@ use gemmkit::{
     prepack_lhs, prepack_rhs,
 };
 
-// column-major-ish C layouts for the RHS-packed path (|csc| >= |rsc|)
+// C layouts `gemm_packed_b_fused` accepts: column-major-ish (|csc| >= |rsc|)
 #[derive(Copy, Clone)]
 enum ColC {
-    /// Contiguous column-major (rsc = 1, csc = m)
+    /// Contiguous column-major: `rsc = 1, csc = m`
     Col,
-    /// Column-major with a padded column stride (rsc = 1, csc = m + 3): a strided C forcing the
-    /// scratch path at tile edges
+    /// Column-major with a gap after each column (`rsc = 1, csc = m + 3`): a strided C that
+    /// forces the scratch path at tile edges
     ColPadded,
 }
 fn col_c_strides(layout: ColC, m: usize, n: usize) -> (isize, isize, usize) {
@@ -34,12 +37,12 @@ fn col_c_strides(layout: ColC, m: usize, n: usize) -> (isize, isize, usize) {
     }
 }
 
-// row-major-ish C layouts for the LHS-packed path (|csc| <= |rsc|)
+// C layouts `gemm_packed_a_fused` accepts: row-major-ish (|csc| <= |rsc|)
 #[derive(Copy, Clone)]
 enum RowC {
-    /// Contiguous row-major (rsc = n, csc = 1)
+    /// Contiguous row-major: `rsc = n, csc = 1`
     Row,
-    /// Row-major with a padded row stride (rsc = n + 3, csc = 1): a strided C
+    /// Row-major with a gap after each row (`rsc = n + 3, csc = 1`): a strided C
     RowPadded,
 }
 fn row_c_strides(layout: RowC, m: usize, n: usize) -> (isize, isize, usize) {
@@ -49,8 +52,8 @@ fn row_c_strides(layout: RowC, m: usize, n: usize) -> (isize, isize, usize) {
     }
 }
 
-/// 1 RHS-packed fused case and its `gemm_packed_b`-then-map oracle; assert bitwise-equal C over
-/// the whole (possibly strided) output. The same prepacked handle drives both
+/// Runs one RHS-packed fused config and its `gemm_packed_b`-then-map oracle off the same
+/// prepacked handle, asserting the 2 outputs bitwise-equal over the whole (possibly strided) `C`
 #[allow(clippy::too_many_arguments)]
 fn check_packed_b_fused<T: Flt>(
     rng: &mut Rng,
@@ -62,13 +65,13 @@ fn check_packed_b_fused<T: Flt>(
     rsc: isize,
     csc: isize,
     clen: usize,
-    bias_kind: u8, // 0 none, 1 per-row, 2 per-col
+    bias_kind: u8, // 0 = none, 1 = per-row, 2 = per-col
     act: Option<Activation<T>>,
     par: Parallelism,
     tag: &str,
 ) {
-    let a = make::<T>(rng, m, k.max(1)); // col-major mxk (k.max(1) keeps a real buffer at k == 0)
-    let b = make::<T>(rng, k.max(1), n); // col-major kxn
+    let a = make::<T>(rng, m, k.max(1)); // col-major m x k; k.max(1) keeps a real buffer at k == 0
+    let b = make::<T>(rng, k.max(1), n); // col-major k x n
     let c0 = make::<T>(rng, clen, 1);
     let bias_row: Vec<T> = (0..m).map(|_| T::of(rng.unit() * 3.0)).collect();
     let bias_col: Vec<T> = (0..n).map(|_| T::of(rng.unit() * 3.0)).collect();
@@ -82,7 +85,7 @@ fn check_packed_b_fused<T: Flt>(
     let packed = prepack_rhs(bv);
     let av = MatRef::new(&a, m, k, 1, m as isize);
 
-    // fused
+    // The fused call under test
     let mut c_fused = c0.clone();
     let mut ws = Workspace::new();
     gemm_packed_b_fused_with(
@@ -97,7 +100,7 @@ fn check_packed_b_fused<T: Flt>(
         par,
     );
 
-    // oracle: plain packed (same handle) then the scalar map in the user frame
+    // The oracle: the same handle through plain gemm_packed_b, then the scalar map by hand
     let mut c_ref = c0.clone();
     gemm_packed_b(
         alpha,
@@ -131,8 +134,9 @@ fn check_packed_b_fused<T: Flt>(
     }
 }
 
-/// 1 LHS-packed fused case and its `gemm_packed_a`-then-map oracle; assert bitwise-equal. Exercises
-/// the user-frame bias axis through the packed-A transpose (a wrong flip diverges loudly)
+/// Runs one LHS-packed fused config and its `gemm_packed_a`-then-map oracle, asserting the 2
+/// bitwise-equal. Since the packed-A path drives the transposed product internally, a bias axis
+/// flipped the wrong way here would show up as a loud mismatch rather than staying silent
 #[allow(clippy::too_many_arguments)]
 fn check_packed_a_fused<T: Flt>(
     rng: &mut Rng,
@@ -149,8 +153,8 @@ fn check_packed_a_fused<T: Flt>(
     par: Parallelism,
     tag: &str,
 ) {
-    let a = make::<T>(rng, m, k.max(1)); // col-major mxk
-    let b = make::<T>(rng, k.max(1), n); // col-major kxn
+    let a = make::<T>(rng, m, k.max(1)); // col-major m x k
+    let b = make::<T>(rng, k.max(1), n); // col-major k x n
     let c0 = make::<T>(rng, clen, 1);
     let bias_row: Vec<T> = (0..m).map(|_| T::of(rng.unit() * 3.0)).collect();
     let bias_col: Vec<T> = (0..n).map(|_| T::of(rng.unit() * 3.0)).collect();
@@ -211,8 +215,8 @@ fn check_packed_a_fused<T: Flt>(
     }
 }
 
-// core oracle sweep: shapes (incl. non-tile-multiples), beta {0, 1, 0.7}, bias {none/row/col},
-// act {none/relu/leaky}, strided C
+// core oracle sweep: several shapes (including ones that are not multiples of the tile size),
+// beta in {0, 1, 0.7}, bias in {none, row, col}, act in {none, relu, leaky}, plain and padded C
 
 fn packed_b_matrix<T: Flt>(par: Parallelism) {
     let mut rng = Rng::new(0x9ACB_11B0);
@@ -222,10 +226,10 @@ fn packed_b_matrix<T: Flt>(par: Parallelism) {
         Some(Activation::Relu),
         Some(Activation::LeakyRelu(T::of(0.1))),
     ];
-    // Under GEMMKIT_FAST_TEST run the full coefficient/layout/bias/activation lattice on one
-    // representative shape (index 1, the smallest) and reduce the other 2 shapes to a single
-    // non-trivial combo each: every class stays covered, only the redundant per-shape
-    // cross-product is dropped. Off, `fast` is false and the sweep is byte-for-byte the full one
+    // Under GEMMKIT_FAST_TEST, only the smallest shape (index 1) runs the full lattice; the other
+    // 2 shapes each keep just 1 non-trivial combo, since every bias/act/layout class is already
+    // covered by the full-lattice shape and only the redundant per-shape cross-product shrinks
+    // With the env var unset, `fast` is false and this is byte-for-byte the unshrunk sweep
     let fast = fast_test();
     let full_lattice = 1usize;
     for (si, &(m, k, n)) in shapes.iter().enumerate() {
@@ -276,8 +280,7 @@ fn packed_a_matrix<T: Flt>(par: Parallelism) {
         Some(Activation::Relu),
         Some(Activation::LeakyRelu(T::of(0.1))),
     ];
-    // Same shrink policy as `packed_b_matrix`: full lattice on the smallest shape, one
-    // non-trivial combo on the others under GEMMKIT_FAST_TEST; byte-for-byte full when off
+    // Same GEMMKIT_FAST_TEST shrink policy as `packed_b_matrix`
     let fast = fast_test();
     let full_lattice = 1usize;
     for (si, &(m, k, n)) in shapes.iter().enumerate() {
@@ -336,15 +339,16 @@ fn packed_fused_eq_packed_then_map_parallel() {
     packed_a_matrix::<f64>(Parallelism::Rayon(8));
 }
 
-// degenerate cases: alpha == 0 (k > 0) and k == 0 => C <- act(beta*C + bias), via the same
-// packed-then-map oracle (plain packed also beta-scales in the degenerate)
+// degenerate cases where the A*B term vanishes (alpha == 0 with k > 0, or k == 0): the fused
+// entry falls back to C <- act(beta*C + bias) directly, checked against the same
+// check_packed_*_fused oracle (plain packed's beta*C, then the scalar map by hand)
 
 #[test]
 fn packed_fused_degenerate() {
     let mut rng = Rng::new(0xDE6E_9AC0);
     let (m, n) = (48usize, 40usize);
     for &(k, alpha) in &[(0usize, 1.0f32), (130usize, 0.0f32)] {
-        // RHS-packed, col-major C, per-row bias + ReLU
+        // RHS-packed, padded column-major C, per-row bias + ReLU
         let (rsc, csc, clen) = col_c_strides(ColC::ColPadded, m, n);
         check_packed_b_fused::<f32>(
             &mut rng,
@@ -376,7 +380,8 @@ fn packed_fused_degenerate() {
             Parallelism::Rayon(4),
             "b/degenerate",
         );
-        // LHS-packed, row-major C, per-row + per-col bias (exercises the flipped degenerate axis)
+        // LHS-packed, padded row-major C, per-row then per-col bias: exercises the degenerate
+        // path's bias-axis flip in both directions
         let (rsc, csc, clen) = row_c_strides(RowC::RowPadded, m, n);
         check_packed_a_fused::<f32>(
             &mut rng,
@@ -411,8 +416,9 @@ fn packed_fused_degenerate() {
     }
 }
 
-// 1 prepacked handle reused across multiple fused calls AND mixed plain + fused calls: each
-// result is independent (no shared mutable state; the epilogue is store-side only)
+// The same PackedRhs handle drives several fused calls and a plain call in a row: since the
+// buffer is read-only and the epilogue is store-side only, each call's output must be independent
+// of what ran before it
 
 #[test]
 fn packed_handle_reused_across_plain_and_fused() {
@@ -428,9 +434,9 @@ fn packed_handle_reused_across_plain_and_fused() {
 
     let av = MatRef::new(&a, m, k, 1, m as isize);
     let bv = MatRef::new(&b, k, n, 1, k as isize);
-    let packed = prepack_rhs(bv); // ONE handle, reused below
+    let packed = prepack_rhs(bv); // 1 handle, reused for every call below
 
-    // 3 products off the SAME handle: fused(PerRow+ReLU), plain, fused(PerCol+Leaky)
+    // 3 calls off that 1 handle: fused (PerRow bias + ReLU), plain, fused (PerCol bias + Leaky)
     let mut c_f1 = c0.clone();
     gemm_packed_b_fused(
         alpha,
@@ -463,7 +469,8 @@ fn packed_handle_reused_across_plain_and_fused() {
         par,
     );
 
-    // Independent oracles: each fused equals plain-then-its-own-map; plain is untouched by the fused
+    // Each fused result must equal the plain result mapped by its own bias/act, and the plain
+    // result itself must be unaffected by the fused calls sharing its handle
     for j in 0..n {
         for i in 0..m {
             let idx = i + j * m;
@@ -476,7 +483,8 @@ fn packed_handle_reused_across_plain_and_fused() {
     }
 }
 
-// no-swap orientation panics still fire for the fused entries, with the plain-packed wording
+// A prepacked operand cannot serve the orientation swap plain gemm would take, so the fused
+// entries reject the wrong-orientation C the same way the plain packed entries do
 
 #[test]
 #[should_panic(expected = "column-major-ish C")]
@@ -491,7 +499,7 @@ fn packed_b_fused_row_major_c_panics() {
         MatRef::from_col_major(&a, m, k),
         &packed,
         0.0,
-        MatMut::from_row_major(&mut c, m, n), // row-major C -> swap -> reject
+        MatMut::from_row_major(&mut c, m, n), // row-major C needs the A/B swap, so this panics
         None,
         Some(Activation::Relu),
         Parallelism::Serial,
@@ -511,14 +519,15 @@ fn packed_a_fused_col_major_c_panics() {
         &packed,
         MatRef::from_col_major(&b, k, n),
         0.0,
-        MatMut::from_col_major(&mut c, m, n), // column-major C -> reject
+        MatMut::from_col_major(&mut c, m, n), // column-major C would keep A as the true LHS: panics
         None,
         Some(Activation::Relu),
         Parallelism::Serial,
     );
 }
 
-// _with (caller-owned Workspace) vs the allocating entry: bit-identical
+// The _with entry (caller-owned Workspace) must produce the same bits as the allocating entry
+// that hands it a thread-local one internally
 
 #[test]
 fn packed_fused_with_matches_allocating() {
@@ -533,7 +542,7 @@ fn packed_fused_with_matches_allocating() {
     let av = MatRef::new(&a, m, k, 1, m as isize);
     let bv = MatRef::new(&b, k, n, 1, k as isize);
 
-    // RHS-packed
+    // gemm_packed_b_fused
     {
         let packed = prepack_rhs(bv);
         let mut c_alloc = c0.clone();
@@ -568,7 +577,7 @@ fn packed_fused_with_matches_allocating() {
             );
         }
     }
-    // LHS-packed (row-major C)
+    // gemm_packed_a_fused (row-major C, as that path requires)
     {
         let packed = prepack_lhs(av);
         let mut c_alloc = c0.clone();
@@ -605,9 +614,9 @@ fn packed_fused_with_matches_allocating() {
     }
 }
 
-// unchecked twin equivalence: the raw fused packed entries drive the same result as the checked
-// ones (the checked entry does not delegate to the unchecked one, so a Bias/Act translation drift
-// would go undetected)
+// The checked fused entries build their own Task/FusedEpi rather than delegating to the
+// `_unchecked` ones, so a Bias/Activation lowering drift between the 2 call paths would otherwise
+// go unnoticed; these tests drive both from the same inputs and compare the output bitwise
 
 #[test]
 fn packed_b_fused_unchecked_matches_checked() {
@@ -636,8 +645,9 @@ fn packed_b_fused_unchecked_matches_checked() {
     );
 
     let mut c_unchecked = c0.clone();
-    // SAFETY: valid in-bounds col-major A/C, C column-major (packed_b orientation), distinct
-    // buffers, per-col bias of length n
+    // SAFETY: a/c are valid in-bounds col-major buffers matching av/c_unchecked above, c is
+    // column-major (the orientation gemm_packed_b requires) and does not alias a, and bias_col
+    // has 1 entry per output column as BiasDim::PerCol requires
     unsafe {
         gemm_packed_b_fused_unchecked(
             alpha,
@@ -693,8 +703,9 @@ fn packed_a_fused_unchecked_matches_checked() {
     );
 
     let mut c_unchecked = c0.clone();
-    // SAFETY: valid in-bounds col-major B, row-major C (packed_a orientation), distinct buffers,
-    // per-row bias of length m (user frame; the entry flips the axis internally)
+    // SAFETY: b/c are valid in-bounds buffers matching bv/c_unchecked above, c is row-major (the
+    // orientation gemm_packed_a requires) and does not alias b, and bias_row has 1 entry per
+    // packed-A row (the user frame; the entry flips the axis internally before dispatch)
     unsafe {
         gemm_packed_a_fused_unchecked(
             alpha,
@@ -723,8 +734,9 @@ fn packed_a_fused_unchecked_matches_checked() {
     }
 }
 
-// narrow (f16/bf16) prepacked-fused: per-element gate vs an f64 reference, plus a k == 1 bitwise
-// case vs the f32 single-rounding reference (the pre-narrow contract)
+// Narrow (f16/bf16) prepacked-fused tests: a per-element gate against an f64 reference over a
+// general shape, plus a bitwise k == 1 case against the f32 single-rounding reference that pins
+// down the pre-narrow contract
 
 #[cfg(feature = "half")]
 mod narrow {
@@ -751,7 +763,7 @@ mod narrow {
         fn bits(self) -> u16 {
             self.to_bits()
         }
-        const EPS: f64 = 9.765625e-4; // 2^-10
+        const EPS: f64 = 9.765625e-4; // 2^-10: f16 has a 10-bit mantissa
         fn name() -> &'static str {
             "f16"
         }
@@ -766,7 +778,7 @@ mod narrow {
         fn bits(self) -> u16 {
             self.to_bits()
         }
-        const EPS: f64 = 7.8125e-3; // 2^-7
+        const EPS: f64 = 7.8125e-3; // 2^-7: bf16 has a 7-bit mantissa
         fn name() -> &'static str {
             "bf16"
         }
@@ -776,7 +788,8 @@ mod narrow {
         (0..m * n).map(|_| N::of(rng.unit())).collect()
     }
 
-    /// f64 reference `C <- relu-or-none(alpha*A*B + beta*C0 + bias_row[i])`, un-narrowed, [i + j*m]
+    /// f64 reference for `C <- relu-or-none(alpha*A*B + beta*C0 + bias_row[i])`, un-narrowed,
+    /// `out[i + j*m]` in logical (row, col) order
     #[allow(clippy::too_many_arguments)]
     fn reference_f64<N: Narrow>(
         m: usize,
@@ -816,7 +829,9 @@ mod narrow {
         out
     }
 
-    /// Per-element gate: `|got - r| <= (2*eps_N + 8*k*f32_eps)*(1 + |r|)` (the established mixed gate)
+    /// Per-element accuracy gate against the un-narrowed f64 reference `cref`: asserts
+    /// `|got - r| <= (2*eps_N + 8*k*f32_eps)*(1 + |r|)`, the same bound the mixed-suite gate uses
+    /// (the `f32`-accumulation error plus 1 narrowing ulp, scaled to stay meaningful near 0)
     #[allow(clippy::too_many_arguments)]
     fn assert_close<N: Narrow>(
         got: &[N],
@@ -856,7 +871,7 @@ mod narrow {
         let av = MatRef::new(&a, m, k, 1, m as isize);
         let bv = MatRef::new(&b, k, n, 1, k as isize);
 
-        // RHS-packed, col-major C
+        // gemm_packed_b_fused, column-major C
         {
             let packed = prepack_rhs(bv);
             let mut c = c0.clone();
@@ -875,7 +890,7 @@ mod narrow {
             );
             assert_close::<N>(&c, 1, m as isize, m, n, &cref, k, "b/gate");
         }
-        // LHS-packed, row-major C (bias flip path)
+        // gemm_packed_a_fused, row-major C (exercises the bias-axis flip)
         {
             let packed = prepack_lhs(av);
             let mut c = c0.clone();
@@ -902,15 +917,15 @@ mod narrow {
         gate::<gemmkit::bf16>();
     }
 
-    /// `k == 1`: the accumulator is a single exact `f32` product, so the fused output must equal the
-    /// **single-rounding** reference `narrow(act(alpha*a*b + beta*c0 + bias))` bitwise, for
-    /// `beta in {0, 1}` (the exact combine). This locks the pre-narrow semantics through the packed
-    /// fused store (the 2-rounding narrow-gemm-then-map would differ)
+    /// At `k = 1` the accumulator is a single exact `f32` product, so for `beta in {0, 1}` (an
+    /// exact combine on both sides) the fused output must equal the single-rounding reference
+    /// `narrow(act(alpha*a*b + beta*c0 + bias))` bitwise. This locks the pre-narrow semantic
+    /// through the packed fused store: the 2-rounding `narrow-gemm-then-map` would differ
     fn k1_bitwise<N: Narrow>() {
         let mut rng = Rng::new(0x9E27_ACB1);
         let (m, n) = (32usize, 24usize);
         let k = 1usize;
-        // Values in [1, 2) so the product carries sub-narrow bits a matching bias keeps significant
+        // [1, 2): the product carries sub-narrow bits that a comparable bias below keeps significant
         let a: Vec<N> = (0..m)
             .map(|_| N::of(1.0 + (rng.unit() + 1.0) * 0.5))
             .collect();
@@ -924,7 +939,7 @@ mod narrow {
         let alpha = N::of(1.0);
 
         for beta in [N::of(0.0), N::of(1.0)] {
-            // RHS-packed
+            // gemm_packed_b_fused
             let packed = prepack_rhs(bv);
             let mut c = c0.clone();
             gemm_packed_b_fused(
@@ -939,7 +954,7 @@ mod narrow {
             );
             for j in 0..n {
                 for i in 0..m {
-                    let ab = a[i].f32() * b[j].f32(); // exact single f32 product
+                    let ab = a[i].f32() * b[j].f32(); // k == 1: the single f32 product, exact
                     let base = if beta.f32() == 0.0 {
                         0.0
                     } else {
