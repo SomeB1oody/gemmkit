@@ -262,12 +262,121 @@ where
     }
 }
 
+/// Conformance for the deep-k twin seam `KernelSimd<N, N, f32, f32>` (the f32-output twin the
+/// `MixedGemmF32<N>` / `Bf16DotGemmF32` deep-k families drive on), for a narrow type `N`
+/// (`f16`/`bf16`). Two things are checked lane-by-lane against a scalar model:
+///
+/// 1 `load_out`/`store_out`: `Out == Acc == f32`, so the twin seam collapses to a plain f32
+///   `loadu`/`storeu`, a bit-preserving identity (the scalar model is the input bits themselves);
+///   swept over edge patterns (-0, NaN, +/-Inf) that a mangled load/store would corrupt
+/// 2 `load_lhs`/`splat_rhs`: the twin forwards these verbatim to the narrow seam
+///   `KernelSimd<N, N, f32, N>` (widen `N -> f32`), so each must be **bit-identical** to the narrow
+///   seam's own widen - the "identical bits for either Out" contract the driver's `twin_seed` /
+///   `mixed_accumulate` rely on
+///
+/// Requires both seams (`Out = f32` and `Out = N`), which every token that provides the narrow
+/// family provides. Platform-independent: the oracle is the scalar identity / the narrow seam
+/// itself, never a machine number
+#[cfg(feature = "half")]
+fn twin_seam_conformance<N, S>(simd: S, label: &str)
+where
+    N: gemmkit::NarrowFloat,
+    S: SimdOps<f32> + KernelSimd<N, N, f32, f32> + KernelSimd<N, N, f32, N>,
+{
+    let lanes = <S as SimdOps<f32>>::LANES;
+    assert!(
+        (1..=16).contains(&lanes),
+        "{label}: implausible LANES {lanes}"
+    );
+
+    // f32 payload the plain twin load/store must reproduce bit-for-bit, including edge patterns
+    let mut fs: [f32; 16] = core::array::from_fn(|i| (i as f32) * 0.5 - 2.0);
+    fs[0] = -0.0;
+    fs[1] = f32::NAN;
+    fs[2] = f32::INFINITY;
+    fs[3] = f32::NEG_INFINITY;
+    // Narrow inputs for the widen-forward equivalence check
+    let ns: [N; 16] = core::array::from_fn(|i| N::narrow((i as f32) * 0.25 - 1.0));
+
+    // SAFETY: guarded by the caller's feature probe; every access stays within the 16-element
+    // buffers and inside this token's `vectorize` codegen context
+    unsafe {
+        simd.vectorize(|| {
+            let mut out = [0.0f32; 16];
+
+            // load_out through the twin seam == a plain f32 loadu (bit-preserving)
+            simd.storeu(
+                out.as_mut_ptr(),
+                <S as KernelSimd<N, N, f32, f32>>::load_out(simd, fs.as_ptr()),
+            );
+            for l in 0..lanes {
+                assert_eq!(
+                    out[l].to_bits(),
+                    fs[l].to_bits(),
+                    "{label} twin load_out lane {l}"
+                );
+            }
+
+            // store_out through the twin seam == a plain f32 storeu (bit-preserving)
+            let v = simd.loadu(fs.as_ptr());
+            let mut out2 = [0.0f32; 16];
+            <S as KernelSimd<N, N, f32, f32>>::store_out(simd, out2.as_mut_ptr(), v);
+            for l in 0..lanes {
+                assert_eq!(
+                    out2[l].to_bits(),
+                    fs[l].to_bits(),
+                    "{label} twin store_out lane {l}"
+                );
+            }
+
+            // load_lhs / splat_rhs: the twin forwards to the narrow seam, so the widen is identical
+            let mut tw = [0.0f32; 16];
+            let mut nr = [0.0f32; 16];
+            simd.storeu(
+                tw.as_mut_ptr(),
+                <S as KernelSimd<N, N, f32, f32>>::load_lhs(simd, ns.as_ptr()),
+            );
+            simd.storeu(
+                nr.as_mut_ptr(),
+                <S as KernelSimd<N, N, f32, N>>::load_lhs(simd, ns.as_ptr()),
+            );
+            for l in 0..lanes {
+                assert_eq!(
+                    tw[l].to_bits(),
+                    nr[l].to_bits(),
+                    "{label} twin load_lhs != narrow lane {l}"
+                );
+            }
+            simd.storeu(
+                tw.as_mut_ptr(),
+                <S as KernelSimd<N, N, f32, f32>>::splat_rhs(simd, ns[1]),
+            );
+            simd.storeu(
+                nr.as_mut_ptr(),
+                <S as KernelSimd<N, N, f32, N>>::splat_rhs(simd, ns[1]),
+            );
+            for l in 0..lanes {
+                assert_eq!(
+                    tw[l].to_bits(),
+                    nr[l].to_bits(),
+                    "{label} twin splat_rhs != narrow lane {l}"
+                );
+            }
+        });
+    }
+}
+
 #[test]
 fn scalar_token_conformance() {
     conform_f32(ScalarTok, "scalar/f32");
     conform_f64(ScalarTok, "scalar/f64");
     #[cfg(feature = "int8")]
     conform_i32(ScalarTok, "scalar/i32");
+    #[cfg(feature = "half")]
+    {
+        twin_seam_conformance::<gemmkit::f16, _>(ScalarTok, "scalar/f16");
+        twin_seam_conformance::<gemmkit::bf16, _>(ScalarTok, "scalar/bf16");
+    }
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -284,11 +393,27 @@ fn x86_token_conformance() {
         eprintln!("skipping Fma conformance: avx2+fma not detected");
     }
 
+    // The Fma narrow seam widens f16 via F16C (`vcvtph2ps`), so the twin's widen-forward check needs
+    // f16c on top of avx2+fma; the plain-f32 load_out/store_out do not, but they ride the same probe
+    #[cfg(feature = "half")]
+    if is_x86_feature_detected!("avx2")
+        && is_x86_feature_detected!("fma")
+        && is_x86_feature_detected!("f16c")
+    {
+        twin_seam_conformance::<gemmkit::f16, _>(Fma, "fma/f16");
+        twin_seam_conformance::<gemmkit::bf16, _>(Fma, "fma/bf16");
+    }
+
     if is_x86_feature_detected!("avx512f") {
         conform_f32(Avx512, "avx512/f32");
         conform_f64(Avx512, "avx512/f64");
         #[cfg(feature = "int8")]
         conform_i32(Avx512, "avx512/i32");
+        #[cfg(feature = "half")]
+        {
+            twin_seam_conformance::<gemmkit::f16, _>(Avx512, "avx512/f16");
+            twin_seam_conformance::<gemmkit::bf16, _>(Avx512, "avx512/bf16");
+        }
     } else {
         eprintln!("skipping Avx512 conformance: avx512f not detected");
     }
@@ -311,6 +436,8 @@ fn x86_token_conformance() {
         use gemmkit::simd::Avx512Bf16;
         if is_x86_feature_detected!("avx512bf16") && is_x86_feature_detected!("avx512f") {
             conform_f32(Avx512Bf16, "avx512bf16/f32");
+            // Avx512Bf16 provides only the bf16 narrow seam (its `vdpbf16ps` dot), hence its twin
+            twin_seam_conformance::<gemmkit::bf16, _>(Avx512Bf16, "avx512bf16/bf16");
         } else {
             eprintln!("skipping Avx512Bf16 conformance: avx512bf16 not detected");
         }
@@ -328,6 +455,11 @@ fn neon_token_conformance() {
     conform_f64(Neon, "neon/f64");
     #[cfg(feature = "int8")]
     conform_i32(Neon, "neon/i32");
+    #[cfg(feature = "half")]
+    {
+        twin_seam_conformance::<gemmkit::f16, _>(Neon, "neon/f16");
+        twin_seam_conformance::<gemmkit::bf16, _>(Neon, "neon/bf16");
+    }
 }
 
 /// Simd128 is a compile-time token (`+simd128`, no runtime probe) and deviates from the
@@ -340,4 +472,9 @@ fn simd128_token_conformance() {
     conform_f64(Simd128, "simd128/f64");
     #[cfg(feature = "int8")]
     conform_i32(Simd128, "simd128/i32");
+    #[cfg(feature = "half")]
+    {
+        twin_seam_conformance::<gemmkit::f16, _>(Simd128, "simd128/f16");
+        twin_seam_conformance::<gemmkit::bf16, _>(Simd128, "simd128/bf16");
+    }
 }

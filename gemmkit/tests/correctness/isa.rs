@@ -273,6 +273,81 @@ fn miri_scalar_path() {
     }
 }
 
+/// Miri-reachable coverage of the optimization campaign's new unsafe, on the scalar engine. The CI
+/// filter matches this by the `miri_scalar_path` substring, so it runs under `cargo miri test` next
+/// to [`miri_scalar_path`]. Every case reaches its target path through the **natural** gates at
+/// Miri-sized shapes (no tuning-knob mutation, so this test stays safe to run concurrently with the
+/// rest of the correctness binary):
+///
+/// * the small-`m,n` horizontal PACK tier's `k`-contiguous scratch pack
+///   (`special::small_mn::pack_k_contiguous`), engaged when a small-`m,n`, long-`k` shape has an
+///   operand strided along `k`: an all-col-major shape packs A, an all-row-major shape packs B
+///   (`k = 20 > small_mn_pack_min_k`, `m = n = 8 <= small_mn_dim`, C col-major so no orientation
+///   swap). The uninit-free `f32` engine drains it, so a mis-sized or partial pack is a Miri UB
+/// * the `i8` prepack path (`prepack_rhs_i8` + `gemm_i8_packed_b`), a small packed-B round trip that
+///   must stay bit-identical to plain `gemm_i8` (exact `i32`)
+///
+/// The remaining campaign paths are already reached by [`miri_scalar_path`] and are not duplicated:
+/// `pack_panels`'s `lead == 1` tail straight-copy (its `driver_case` with `m = 5` packs a
+/// col-major-A tail panel), the driver's null-base `Regions` when nothing packs (its `driver_case`
+/// with `m = 8` reaches the all-in-place branch), and the prepack uninit `Vec::with_capacity` +
+/// `set_len` (its `f32` prepack round trips exercise the identical type-generic alloc)
+#[test]
+fn miri_scalar_path_campaign() {
+    // small_mn PACK tier: pack-A (all col-major) then pack-B (row-major A/B, col-major C). k above
+    // the default small_mn_pack_min_k, m/n within small_mn_dim, so both hit the pack tier
+    run_case::<f32>(
+        8,
+        20,
+        8,
+        Layout::Col,
+        Layout::Col,
+        Layout::Col,
+        1.3,
+        0.5,
+        Parallelism::Serial,
+    );
+    run_case::<f32>(
+        8,
+        20,
+        8,
+        Layout::Row,
+        Layout::Row,
+        Layout::Col,
+        1.0,
+        0.0,
+        Parallelism::Serial,
+    );
+    // i8 prepacked-RHS round trip on the scalar (widen) engine: bit-identical to plain gemm_i8
+    #[cfg(feature = "int8")]
+    {
+        let (m, k, n) = (8usize, 6, 6);
+        let a = rand_i8(m * k, 5);
+        let b = rand_i8(k * n, 6);
+        let c0: Vec<i32> = (0..m * n).map(|x| x as i32 % 3 - 1).collect();
+        let mut c_ref = c0.clone();
+        gemmkit::gemm_i8(
+            2,
+            MatRef::from_col_major(&a, m, k),
+            MatRef::from_col_major(&b, k, n),
+            -1,
+            MatMut::from_col_major(&mut c_ref, m, n),
+            Parallelism::Serial,
+        );
+        let packed = gemmkit::prepack_rhs_i8(MatRef::from_col_major(&b, k, n));
+        let mut c_pk = c0.clone();
+        gemmkit::gemm_i8_packed_b(
+            2,
+            MatRef::from_col_major(&a, m, k),
+            &packed,
+            -1,
+            MatMut::from_col_major(&mut c_pk, m, n),
+            Parallelism::Serial,
+        );
+        assert_eq!(c_ref, c_pk, "miri: i8 prepack != gemm_i8");
+    }
+}
+
 #[test]
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[cfg_attr(miri, ignore = "Miri cannot execute AVX intrinsics")]

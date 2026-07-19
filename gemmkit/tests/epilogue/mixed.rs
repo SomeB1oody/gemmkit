@@ -21,7 +21,19 @@
 use crate::common::Rng;
 use gemmkit::{
     Activation, Bias, MatMut, MatRef, NarrowFloat, Parallelism, Workspace, gemm, gemm_fused_with,
+    tuning,
 };
+
+/// Serializes the `GEMMKIT_DEEP_KC_BYTES`-mutating deep-k test ([`fused_mixed_deep_k`]) against the
+/// one other test in this binary that runs a plain narrow `gemm` at a twin-eligible shape and
+/// asserts an exact single-panel result ([`fused_mixed_identity_delegates`]). The knob is
+/// process-global and the harness runs these tests concurrently, so without a shared lock the deep-k
+/// test's `set(1)` could flip that plain gemm onto the f32-output twin mid-run (only tolerance-equal
+/// for a general `beta`) and break its bitwise assert. Poison-tolerant so one panic does not cascade
+static KNOB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+fn knob_guard() -> std::sync::MutexGuard<'static, ()> {
+    KNOB_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 // harness
 
@@ -601,6 +613,10 @@ fn identity_delegates<N: Narrow>() {
 
 #[test]
 fn fused_mixed_identity_delegates() {
+    // Holds KNOB_LOCK: this runs a plain narrow `gemm` at a twin-eligible shape (m=48,k=40) and
+    // asserts it equals the single-panel fused-identity result bitwise, which the deep-k test's
+    // `GEMMKIT_DEEP_KC_BYTES` mutation would break if it raced (see KNOB_LOCK)
+    let _g = knob_guard();
     identity_delegates::<gemmkit::f16>();
     identity_delegates::<gemmkit::bf16>();
 }
@@ -650,4 +666,136 @@ fn nan_relu<N: Narrow>() {
 fn fused_mixed_nan_relu() {
     nan_relu::<gemmkit::f16>();
     nan_relu::<gemmkit::bf16>();
+}
+
+// g. fused x deep-k interaction
+
+/// Past the deep-contraction engage gate (forced low via `GEMMKIT_DEEP_KC_BYTES = 1`), a plain narrow
+/// `gemm` re-blocks through the f32-output twin (`MixedGemmF32` / `Bf16DotGemmF32`), while `gemm_fused`
+/// deliberately stays single-panel (its dispatch has **no** deep-k branch, documented in
+/// `dispatch::mixed`). This locks that split: at the same deep `k`, the fused entry must still be
+/// accurate against the f64 oracle and reproduce serial==parallel bit-for-bit, and the plain path
+/// (now the twin) must too. Accuracy - not a bit compare vs plain-then-map - is the fused oracle here:
+/// the mixed epilogue applies pre-narrow, so fused is *more* precise than gemm-then-map (see the module
+/// doc), the same discipline as tests c/d
+fn deep_k<N: Narrow>() {
+    // General-driver shape: m,n past `small_mn_dim` and k past `small_k_threshold`, so no special
+    // route claims it. The plain path then reaches the deep-k engage gate; the fused path the driver
+    // k stays small for GEMMKIT_FAST_TEST (the forced gate engages the twin at any k > small_k)
+    let (m, k, n) = (48usize, 96usize, 40usize);
+    let mut rng = Rng::new(0xDEE9_CA5E);
+    let alpha = N::of(1.0);
+    let beta = N::of(0.7);
+    let a = make::<N>(&mut rng, m, k, 1.0);
+    let b = make::<N>(&mut rng, k, n, 1.0);
+    let c0 = make::<N>(&mut rng, m, n, 1.0);
+    let bias_row: Vec<N> = (0..m).map(|_| N::of(rng.unit() * 2.0)).collect();
+    let act = ActK::Leaky(0.25);
+
+    // Hold the lock for the whole knob window: `fused_mixed_identity_delegates` waits it out
+    let _g = knob_guard();
+    let restore = tuning::deep_kc_bytes();
+    tuning::set_deep_kc_bytes(1); // engage the twin for the plain path at any k > small_k
+
+    // FUSED at deep k: stays single-panel. Serial == parallel bitwise, and accurate vs the oracle
+    let run_fused = |par: Parallelism| -> Vec<N> {
+        let mut c = c0.clone();
+        let mut ws = Workspace::new();
+        gemm_fused_with(
+            &mut ws,
+            alpha,
+            MatRef::new(&a, m, k, 1, m as isize),
+            MatRef::new(&b, k, n, 1, k as isize),
+            beta,
+            MatMut::new(&mut c, m, n, 1, m as isize),
+            Some(Bias::PerRow(&bias_row)),
+            act.make::<N>(),
+            par,
+        );
+        c
+    };
+    let f_ser = run_fused(Parallelism::Serial);
+    let f_par = run_fused(Parallelism::Rayon(4));
+    for idx in 0..m * n {
+        assert_eq!(
+            f_ser[idx].bits(),
+            f_par[idx].bits(),
+            "{}: fused deep-k serial != parallel at {idx}",
+            N::name(),
+        );
+    }
+    let cref_f = reference_f64::<N>(
+        m,
+        k,
+        n,
+        alpha,
+        &a,
+        1,
+        m as isize,
+        &b,
+        1,
+        k as isize,
+        beta,
+        &c0,
+        1,
+        m as isize,
+        BiasK::Row,
+        &bias_row,
+        &[],
+        act,
+    );
+    assert_close::<N>(&f_ser, 1, m as isize, m, n, &cref_f, k, "fused-deep-k");
+
+    // PLAIN at deep k: re-blocks through the f32-output twin. Serial == parallel bitwise, accurate
+    let run_plain = |par: Parallelism| -> Vec<N> {
+        let mut c = c0.clone();
+        gemm(
+            alpha,
+            MatRef::new(&a, m, k, 1, m as isize),
+            MatRef::new(&b, k, n, 1, k as isize),
+            beta,
+            MatMut::new(&mut c, m, n, 1, m as isize),
+            par,
+        );
+        c
+    };
+    let p_ser = run_plain(Parallelism::Serial);
+    let p_par = run_plain(Parallelism::Rayon(4));
+    for idx in 0..m * n {
+        assert_eq!(
+            p_ser[idx].bits(),
+            p_par[idx].bits(),
+            "{}: plain deep-k twin serial != parallel at {idx}",
+            N::name(),
+        );
+    }
+    let cref_p = reference_f64::<N>(
+        m,
+        k,
+        n,
+        alpha,
+        &a,
+        1,
+        m as isize,
+        &b,
+        1,
+        k as isize,
+        beta,
+        &c0,
+        1,
+        m as isize,
+        BiasK::None,
+        &bias_row,
+        &[],
+        ActK::None,
+    );
+    assert_close::<N>(&p_ser, 1, m as isize, m, n, &cref_p, k, "plain-twin-deep-k");
+
+    tuning::set_deep_kc_bytes(restore);
+}
+
+#[test]
+fn fused_mixed_deep_k() {
+    deep_k::<gemmkit::f16>();
+    deep_k::<gemmkit::bf16>();
 }

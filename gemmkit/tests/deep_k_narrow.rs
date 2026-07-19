@@ -188,7 +188,11 @@ fn bit_identity_case<N: gemmkit::NarrowFloat + gemmkit::GemmScalar + Copy>(label
 
 /// General `beta` (neither 0 nor 1): the deep-k route is *not* required to be bitwise equal to the
 /// single panel (the single panel fuses `beta*C + AB` on full tiles but not on edge tiles), only
-/// accurate to a tight relative tolerance. Confirms the fallback contract holds
+/// accurate to a tight relative tolerance. Confirms the fallback contract holds. Swept over both a
+/// unit-stride C (`rsc == 1`, the twin's vectorized narrowing sweep) and a strided C (`rsc == 2`,
+/// the twin's scalar per-element narrowing sweep): the general-`beta` `BetaStatus::Other` arm of
+/// that scalar branch has no other coverage (the bit-identity case exercises the strided branch only
+/// for `beta in {0, 1}`)
 fn tolerance_case<N: gemmkit::NarrowFloat + gemmkit::GemmScalar + Copy>(
     label: &str,
     to: fn(u16) -> N,
@@ -199,49 +203,55 @@ fn tolerance_case<N: gemmkit::NarrowFloat + gemmkit::GemmScalar + Copy>(
     let (m, n, k) = (40usize, 50, 4096);
     let a: Vec<N> = fill(m * k, 0x2222);
     let b: Vec<N> = fill(k * n, 0x3333);
-    let c0: Vec<N> = fill(m * n, 0x4444);
     let (alpha, beta) = (N::narrow(0.75), N::narrow(2.5));
 
-    let single = run(
-        false,
-        m,
-        k,
-        n,
-        &a,
-        &b,
-        &c0,
-        1,
-        m as isize,
-        alpha,
-        beta,
-        Parallelism::Serial,
-    );
-    let deep = run(
-        true,
-        m,
-        k,
-        n,
-        &a,
-        &b,
-        &c0,
-        1,
-        m as isize,
-        alpha,
-        beta,
-        Parallelism::Serial,
-    );
+    // (rsc, csc): unit-stride C (vector sweep) then strided C (rsc = 2, the scalar sweep branch)
+    for &(rsc, csc) in &[(1isize, m as isize), (2isize, 2 * m as isize)] {
+        // C backing large enough for the strided view: max index (m-1)*rsc + (n-1)*csc
+        let cbacking = (m as isize * rsc.abs() + n as isize * csc.abs()) as usize + 8;
+        let c0: Vec<N> = fill(cbacking, 0x4444 ^ rsc as u64);
 
-    // Two roundings of the same math: they differ only where the single panel used an edge tile
-    // (unfused combine), by at most ~1 narrow ULP. Assert a tight relative Frobenius bound
-    let scale = max_abs(&single, to).max(1e-6);
-    let mut max_diff = 0.0f32;
-    for (&s, &d) in single.iter().zip(&deep) {
-        max_diff = max_diff.max((to(s).widen() - to(d).widen()).abs());
+        let single = run(
+            false,
+            m,
+            k,
+            n,
+            &a,
+            &b,
+            &c0,
+            rsc,
+            csc,
+            alpha,
+            beta,
+            Parallelism::Serial,
+        );
+        let deep = run(
+            true,
+            m,
+            k,
+            n,
+            &a,
+            &b,
+            &c0,
+            rsc,
+            csc,
+            alpha,
+            beta,
+            Parallelism::Serial,
+        );
+
+        // Two roundings of the same math: they differ only where the single panel used an edge tile
+        // (unfused combine), by at most ~1 narrow ULP. Assert a tight relative Frobenius bound
+        let scale = max_abs(&single, to).max(1e-6);
+        let mut max_diff = 0.0f32;
+        for (&s, &d) in single.iter().zip(&deep) {
+            max_diff = max_diff.max((to(s).widen() - to(d).widen()).abs());
+        }
+        assert!(
+            max_diff <= 0.05 * scale,
+            "{label}: deep-k must match the single panel within tolerance for general beta (rsc={rsc}, max_diff={max_diff}, scale={scale})"
+        );
     }
-    assert!(
-        max_diff <= 0.05 * scale,
-        "{label}: deep-k must match the single panel within tolerance for general beta (max_diff={max_diff}, scale={scale})"
-    );
 
     tuning::set_deep_kc_bytes(restore);
 }
