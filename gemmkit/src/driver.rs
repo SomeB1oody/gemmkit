@@ -507,13 +507,25 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize, E>(
         // while packing wins from the 4 MiB span of n = 2048 up. When this gate
         // does fire, the pack cost is shared once per row-block wherever the
         // `shared_a` pre-pass below is open
+        //
+        // The stride and span gates price the pack's COST; the reuse floor prices
+        // its BENEFIT. A pack pays off in proportion to the `n_nt_max` column
+        // tiles that re-read each packed panel, so a tall/skinny shape (huge span,
+        // few column tiles) amortizes an expensive pack over too few tiles and
+        // loses. Measured on the Zen5 9950X (f32, auto parallelism): in-place wins
+        // by 18-71% through n_nt = 86 (m = 4096-8192, k = 512-1024, skinny n)
+        // while deep-k squares from n_nt = 171 up (2048^3) still want the pack by
+        // 8%, with every n_nt in between a tie - hence the floor at 128; aarch64 flips
+        // the trade and floors at 4 instead (see `tuning::LHS_PACK_REUSE_DEFAULT`). A knob
+        // of `0` makes the conjunct vacuously true, dropping the floor
         let pack_stride = cache::lhs_pack_stride_bytes();
         let lhs_step_bytes = csa
             .unsigned_abs()
             .saturating_mul(core::mem::size_of::<Fam::Lhs>());
         let strided_lhs = rsa == 1
             && lhs_step_bytes >= pack_stride
-            && lhs_step_bytes.saturating_mul(kc.min(k)) >= cache::lhs_pack_span_bytes();
+            && lhs_step_bytes.saturating_mul(kc.min(k)) >= cache::lhs_pack_span_bytes()
+            && n_nt_max >= tuning::lhs_pack_reuse();
         let want_pack_lhs =
             reuse_cols > tuning::lhs_pack_threshold() || strided_lhs || Fam::FORCE_PACK_LHS;
 

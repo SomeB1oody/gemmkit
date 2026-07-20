@@ -885,12 +885,11 @@ fn main() {
             tuning::LHS_PACK_STRIDE_DEFAULT, // 0 = auto (page-derived)
             &[2048, 4096, 8192, MAX],
             &timing,
-            &[
-                (1024, 512, 512),
-                (1536, 384, 384),
-                (4096, 1024, 1024),
-                (8192, 512, 512),
-            ],
+            // Square col-major shapes: the reuse floor now vetoes the force-pack on the
+            // tall/skinny shapes stride was first probed on (too few column tiles), so every
+            // stride candidate measured identical there. Probe the same square trio the span
+            // sweep uses, where the stride gate still governs the pack decision
+            &[(1024, 1024, 1024), (2048, 2048, 2048), (4096, 4096, 4096)],
             par,
             false,
         )
@@ -907,6 +906,26 @@ fn main() {
             // span gate controls (the 9950X measured it between the 2 MiB walk of
             // n = 1024 and the 4 MiB walk of n = 2048)
             &[(1024, 1024, 1024), (2048, 2048, 2048), (4096, 4096, 4096)],
+            par,
+            false,
+        )
+    );
+    knob!(
+        "GEMMKIT_LHS_PACK_REUSE",
+        sweep_sgemm(
+            "GEMMKIT_LHS_PACK_REUSE",
+            tuning::set_lhs_pack_reuse,
+            tuning::LHS_PACK_REUSE_DEFAULT,
+            &[0, 64, 256, MAX],
+            &timing,
+            // Tall/skinny shapes where the floor keeps A in place, plus a deep-k
+            // square that still wants the pack: both sides of the n_nt crossover
+            &[
+                (4096, 512, 512),
+                (4096, 512, 1024),
+                (8192, 512, 2048),
+                (2048, 2048, 2048),
+            ],
             par,
             false,
         )
@@ -1212,6 +1231,7 @@ const NEUTRALIZE: &[(Setter, usize)] = &[
     ),
     (tuning::set_lhs_pack_stride, tuning::LHS_PACK_STRIDE_DEFAULT),
     (tuning::set_lhs_pack_span, tuning::LHS_PACK_SPAN_DEFAULT),
+    (tuning::set_lhs_pack_reuse, tuning::LHS_PACK_REUSE_DEFAULT),
     (
         tuning::set_small_k_threshold,
         tuning::SMALL_K_THRESHOLD_DEFAULT,
@@ -1463,6 +1483,7 @@ const TUNED: &[&str] = &[
     "GEMMKIT_LHS_PACK_THRESHOLD",
     "GEMMKIT_LHS_PACK_STRIDE",
     "GEMMKIT_LHS_PACK_SPAN",
+    "GEMMKIT_LHS_PACK_REUSE",
     "GEMMKIT_GEMV_THRESHOLD",
     "GEMMKIT_SMALL_K_THRESHOLD",
     "GEMMKIT_SMALL_MN_DIM",
@@ -1507,7 +1528,7 @@ mod knob_coverage {
     #[test]
     fn sweep_table_covers_every_knob() {
         // gemmkit-tune enables the int8 feature but not wasm_threads (see Cargo.toml), so
-        // knob_env_names() is always the 23 base knobs plus I8_VNNI_MIN_PAR_MNK, 24 total; TUNED
+        // knob_env_names() is always the 25 base knobs plus I8_VNNI_MIN_PAR_MNK, 26 total; TUNED
         // and NEVER_TUNED must partition that set exactly
         let names: BTreeSet<&str> = gemmkit::tuning::knob_env_names().iter().copied().collect();
         let tuned: BTreeSet<&str> = TUNED.iter().copied().collect();

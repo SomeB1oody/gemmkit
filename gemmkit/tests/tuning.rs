@@ -136,7 +136,12 @@ fn lhs_packing_both_modes_correct() {
     // 1 = always pack a column-major A (both the stride and span gates pass at 1 byte);
     // MAX = never via stride (0 would mean "auto" - derive from the page size / the
     // 4 MiB span default - so it is not an extreme here). The span gate mirrors the
-    // stride value: the driver packs only when BOTH gates fire
+    // stride value: the driver packs only when BOTH gates fire. These shapes are small
+    // (few column tiles), so the reuse floor is dropped to 0 - otherwise the compiled
+    // default (4 on aarch64, 128 on non-aarch64) would veto the force-pack the
+    // stride+span gates are here to exercise
+    let prev_reuse = tuning::lhs_pack_reuse();
+    tuning::set_lhs_pack_reuse(0);
     for &stride in &[1usize, usize::MAX] {
         tuning::set_lhs_pack_stride(stride);
         tuning::set_lhs_pack_span(stride);
@@ -155,6 +160,7 @@ fn lhs_packing_both_modes_correct() {
             assert_close(&cc, &cref, &format!("stride={stride} {m}x{k}x{n}"));
         }
     }
+    tuning::set_lhs_pack_reuse(prev_reuse);
 }
 
 /// `parallel_oversample` is a live knob: 0 (clamped to 1), 1, and an adversarially

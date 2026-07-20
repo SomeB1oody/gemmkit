@@ -162,7 +162,7 @@ pub fn run_gemm(p: GemmPlan) {
 // fuzz_knobs
 
 /// Every `tuning::set_*` compiled under this crate's features (`std,parallel,complex,
-/// half,int8` on x86_64): the 24 general knobs plus `set_i8_vnni_min_par_mnk` (`int8`).
+/// half,int8` on x86_64): the 25 general knobs plus `set_i8_vnni_min_par_mnk` (`int8`).
 /// `set_wasm_threads` is wasm-only and so never compiled here
 pub(crate) const KNOB_SETTERS: &[(&str, fn(usize))] = &[
     ("parallel_threshold", tuning::set_parallel_threshold),
@@ -170,6 +170,7 @@ pub(crate) const KNOB_SETTERS: &[(&str, fn(usize))] = &[
     ("lhs_pack_threshold", tuning::set_lhs_pack_threshold),
     ("lhs_pack_stride", tuning::set_lhs_pack_stride),
     ("lhs_pack_span", tuning::set_lhs_pack_span),
+    ("lhs_pack_reuse", tuning::set_lhs_pack_reuse),
     ("gemv_threshold", tuning::set_gemv_threshold),
     ("small_k_threshold", tuning::set_small_k_threshold),
     ("small_mn_dim", tuning::set_small_mn_dim),
@@ -557,7 +558,7 @@ mod knob_sync {
     /// `KNOB_SETTERS` must exactly cover gemmkit's canonical knob registry
     /// (`tuning::knob_env_names`), so a knob added to gemmkit but not wired into
     /// `KNOB_SETTERS` fails this test. This crate builds gemmkit for `complex,half,int8`
-    /// on a native target, so the registry is the 24 general knobs plus i8_vnni_min_par_mnk
+    /// on a native target, so the registry is the 25 general knobs plus i8_vnni_min_par_mnk
     /// (no wasm_threads); an env name maps to its setter name by dropping the `GEMMKIT_`
     /// prefix and lowercasing
     #[test]

@@ -159,6 +159,20 @@ static LHS_PACK_STRIDE: Threshold =
 pub const LHS_PACK_SPAN_DEFAULT: usize = 0;
 static LHS_PACK_SPAN: Threshold = Threshold::new("GEMMKIT_LHS_PACK_SPAN", LHS_PACK_SPAN_DEFAULT);
 
+// Reuse floor companion to the stride+span gates above: those 2 price the pack's cost (a
+// page-scale depth stride over a wide address span), but a pack only pays off in proportion to
+// how many `nr`-wide column tiles re-read each packed A panel (`n_nt_max = nc.div_ceil(nr)`). A
+// tall, skinny shape (m >> n) has a huge span but few column tiles, so the stride+span gate
+// fires and amortizes an expensive pack over too little reuse. This floor holds the force-pack
+// back until at least this many column tiles reuse the panel: measured on the Zen5 9950X (f32,
+// auto parallelism), in-place beats the pack by 18-71% through n_nt = 86 (m = 4096-8192,
+// k = 512-1024, skinny n) while deep-k squares from n_nt = 171 up (2048^3) still want the pack
+// by 8%, with every n_nt in between a tie - hence the floor at 128
+/// Compiled default for [`lhs_pack_reuse`]: overridden by `GEMMKIT_LHS_PACK_REUSE` or
+/// [`set_lhs_pack_reuse`]; `0` drops the reuse floor (force-pack on the stride+span gate alone)
+pub const LHS_PACK_REUSE_DEFAULT: usize = 128;
+static LHS_PACK_REUSE: Threshold = Threshold::new("GEMMKIT_LHS_PACK_REUSE", LHS_PACK_REUSE_DEFAULT);
+
 // Cap on `min(m, n)` for taking the dedicated gemv (matrix*vector) path when the other dimension
 // is 1. The shape (m == 1 or n == 1) decides whether gemv is even a candidate; this only caps how
 // large the vector side may be before falling back to the general driver
@@ -438,17 +452,18 @@ static I8_VNNI_MIN_PAR_MNK: Threshold =
 // itself against this one, so a knob added above cannot silently escape their coverage. A static
 // cannot be iterated over without a macro (which this crate avoids), so this manual mirror is the
 // chosen tradeoff: every `Threshold` static declared above must have its env name appear here
-// The 24 knobs that exist in every build live in `KNOB_ENV_NAMES_BASE`; the 2 that are cfg-gated
+// The 25 knobs that exist in every build live in `KNOB_ENV_NAMES_BASE`; the 2 that are cfg-gated
 // (whose `Threshold` statics above carry the same cfg) are appended only when actually compiled
 // in - `I8_VNNI_MIN_PAR_MNK` under the `int8` feature and `WASM_THREADS` under
 // `wasm32 + wasm_threads`. Declaring a `Threshold` here without adding its name to one of these 2
 // lists is a small diff away from being caught: the consumer sync tests assert against the count
-const KNOB_ENV_NAMES_BASE: [&str; 24] = [
+const KNOB_ENV_NAMES_BASE: [&str; 25] = [
     "GEMMKIT_PARALLEL_THRESHOLD",
     "GEMMKIT_RHS_PACK_THRESHOLD",
     "GEMMKIT_LHS_PACK_THRESHOLD",
     "GEMMKIT_LHS_PACK_STRIDE",
     "GEMMKIT_LHS_PACK_SPAN",
+    "GEMMKIT_LHS_PACK_REUSE",
     "GEMMKIT_GEMV_THRESHOLD",
     "GEMMKIT_SMALL_K_THRESHOLD",
     "GEMMKIT_SMALL_MN_DIM",
@@ -563,6 +578,17 @@ pub fn lhs_pack_span() -> usize {
 /// Override the LHS-packing address-span gate, in bytes; `0` restores the auto value
 pub fn set_lhs_pack_span(v: usize) {
     LHS_PACK_SPAN.set(v);
+}
+
+/// Get the LHS-packing reuse floor for the strided-LHS force-pack: the stride+span gate only
+/// fires when at least this many `nr`-wide column tiles reuse each packed A panel; `0` drops
+/// the floor (force-pack on the stride+span gate alone)
+pub fn lhs_pack_reuse() -> usize {
+    LHS_PACK_REUSE.get()
+}
+/// Override the LHS-packing reuse floor; `0` drops the floor (force-pack on stride+span alone)
+pub fn set_lhs_pack_reuse(v: usize) {
+    LHS_PACK_REUSE.set(v);
 }
 
 /// Get the gemv special-path cap on `min(m, n)`
