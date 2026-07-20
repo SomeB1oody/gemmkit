@@ -14,6 +14,6 @@ name = "gemmkit-tune"
 path = "src/main.rs"
 
 [dependencies]
-gemmkit = { path = "../gemmkit", features = ["complex", "half", "int8"] }
+gemmkit = { path = "../gemmkit", version = "0.1.0", features = ["complex", "half", "int8"] }
 indicatif = "0.17"
 console = "0.15"
