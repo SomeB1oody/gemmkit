@@ -31,8 +31,9 @@ The knobs below are the full catalog across every feature and target configurati
 | --- | --- | --- | --- |
 | `GEMMKIT_RHS_PACK_THRESHOLD` | `set_rhs_pack_threshold` | 2048 | Pack the RHS macro-panel only when `m` (how many row blocks reuse it) exceeds this; below it, B is read in place. |
 | `GEMMKIT_LHS_PACK_THRESHOLD` | `set_lhs_pack_threshold` | 1024 (aarch64: 256) | Pack the LHS only when per-worker column reuse exceeds this. Packing is cheaper on aarch64, so it pays from lower reuse there. |
-| `GEMMKIT_LHS_PACK_STRIDE` | `set_lhs_pack_stride` | 0 (auto) | Byte gate: a column-major A whose `csa * sizeof(Lhs)` reaches this is packed to dodge a TLB- and cache-hostile strided read, independent of reuse. `0` derives it from the OS page size. |
-| `GEMMKIT_SHARED_LHS_MNK` | `set_shared_lhs_mnk` | 8e9 (aarch64: 5e7; 32-bit: disabled) | `m*n*k` gate for the shared-A pre-pass on the parallel packed path, which removes redundant per-worker packs at the cost of a fork-join barrier. |
+| `GEMMKIT_LHS_PACK_STRIDE` | `set_lhs_pack_stride` | 0 (auto) | Byte gate: a column-major A whose per-step depth stride `csa * sizeof(Lhs)` reaches this is packed to dodge a TLB- and cache-hostile strided read, independent of reuse. `0` derives it from the OS page size. ANDed with the span gate below. |
+| `GEMMKIT_LHS_PACK_SPAN` | `set_lhs_pack_span` | 0 (auto) | Address-span companion to the stride gate: the page-scale stride only force-packs a column-major A when the whole depth-slice walk (`csa * sizeof(Lhs) * kc`) also reaches this many bytes. A page-scale stride over a span that stays cache-resident re-walks warm lines and is faster in place than the pack it would pay for. `0` means auto (4 MiB). |
+| `GEMMKIT_SHARED_LHS_MNK` | `set_shared_lhs_mnk` | 8e9 (aarch64: 5e7; 32-bit: disabled) | `m*n*k` gate for the shared-A pre-pass on the parallel packed path, which removes redundant per-worker packs at the cost of a fork-join barrier. Independent of this gate, the pre-pass also opens from 16 workers up, where the per-worker redundancy always outweighs the barrier. |
 | `GEMMKIT_PACK_TRANSPOSE_TILE` | `set_pack_transpose_tile` | 16 | Strip length for the cache-blocked transpose used when a packed operand is strided, turning a per-element gather into blocked copies. Backs both the real and complex packers. |
 
 ### Special-path thresholds
@@ -54,7 +55,7 @@ The knobs below are the full catalog across every feature and target configurati
 | Env var | Setter | Default | Controls |
 | --- | --- | --- | --- |
 | `GEMMKIT_PARALLEL_OVERSAMPLE` | `set_parallel_oversample` | 8 | The parallel driver aims for this many work chunks per worker, drained from a shared cursor on demand. Higher is finer load balance with a smaller tail but more atomic claims; lower is coarser with less overhead. |
-| `GEMMKIT_THREAD_DIM_STRIDE` | `set_thread_dim_stride` | 0 (auto) | Auto worker-count ramp granularity: the auto path targets `cbrt(m*n*k)` divided by this many units of linear size per worker, so a problem ramps to full width instead of jumping to all cores. `0` derives the stride from the core count. |
+| `GEMMKIT_PAR_MNK_PER_WORKER` | `set_par_mnk_per_worker` | 2000000 (threaded wasm: 262144) | Auto worker-count granularity: the auto path targets `m*n*k` divided by this much work per worker (then capped by cores and jobs, floored at 1), so the count scales with total flops rather than linear size. A wasm worker costs far less to engage than a native thread, hence the lower wasm floor. `0` behaves as `1` (always full width). |
 | `GEMMKIT_PACKED_OVERSAMPLE` | `set_packed_oversample` | 2 | The packed-LHS path's split target (distinct from the general grain above): splitting harder re-packs A too often and regresses, so this optimum is lower. |
 
 ### Blocking caps

@@ -74,7 +74,7 @@ The file is a header comment followed by one `export` line per swept knob, follo
 
 export GEMMKIT_MC_REG_PANELS=8  # default (1.00x)
 export GEMMKIT_LHS_PACK_THRESHOLD=256  # tuned (1.07x)
-export GEMMKIT_THREAD_DIM_STRIDE=32  # tuned (1.03x)
+export GEMMKIT_PAR_MNK_PER_WORKER=4000000  # tuned (1.03x)
 
 # not swept on this host:
 #   GEMMKIT_PARALLEL_THRESHOLD: serial/parallel break-even is strongly shape-dependent ...

@@ -21,10 +21,13 @@ at runtime. Edition 2024, `rust-version` 1.89, licensed MIT OR Apache-2.0
   as the adapters.
 - **Reproducible, not bitwise, parallel results.** For a fixed input,
   environment, and configuration the output is identical regardless of the
-  worker count: blocking is thread-count independent and every output element
-  is reduced start-to-finish by one worker. Bitwise serial-vs-parallel
-  identity happens to hold on the driver paths today, but the promised
-  contract is reproducibility under a fixed config.
+  worker count: `kc` and the fixed depth-panel order set every element's
+  accumulation order and never depend on the thread count (`mc` may shrink
+  with the worker count for job depth, but it stays an `mr` multiple, so the
+  microtile set is unchanged), and every output element is reduced
+  start-to-finish by one worker. Bitwise serial-vs-parallel identity happens
+  to hold on the driver paths today, but the promised contract is
+  reproducibility under a fixed config.
 - **No macros, no `transmute` in the variation points.** ISA, element type,
   and operation family are traits; dispatch slots are typed function pointers
   in `OnceLock`s; tile geometry is a pair of const generics.
@@ -244,8 +247,11 @@ in L1 without self-eviction, `MC` so the A macro-panel fits L2 (one way
 reserved for B), `NC` so the B macro-panel fits L3 (with a panel-count cap on
 L3-less machines). A tiny-matrix shortcut skips the model for small shapes,
 and sizing uses the packed-input element size, so narrow types get deeper
-blocks. Blocking is deliberately independent of the thread count: that is the
-mechanism behind reproducible output. Parallelism instead feeds the packing
+blocks. `KC` and `NC` are deliberately independent of the thread count, and
+`MC`, though it may shrink with the worker count to keep the parallel job list
+deep enough, always stays an `MR` multiple - so the microtile set and every
+element's accumulation order are identical at any width, which is the
+mechanism behind reproducible output. Parallelism otherwise feeds the packing
 decisions: the LHS pack gate is per-worker column reuse, and the shared-A
 pre-pass engages only on the parallel packed path above a workload threshold.
 
@@ -301,11 +307,13 @@ giving zero heap allocation after the first sufficiently large call. Without
 `Parallelism` is `Serial` or `Rayon(n)` (`Rayon(0)` = auto). Resolution
 (`gemmkit/src/parallel.rs`) is workload-aware: below a total-work gate
 everything stays serial; an explicit count is honored (capped by cores and
-available jobs); the auto count ramps with the linear problem size,
-`cbrt(m*n*k)` divided by a core-count-derived stride, instead of jumping to
-all cores. Bandwidth-bound shapes (gemv/gevv) use a different rule: serial
-below an LLC-derived byte floor, then straight to a bandwidth cap, because a
-few workers is the worst point on a bandwidth scaling curve.
+available jobs); the auto count scales with the total work, one worker per
+`GEMMKIT_PAR_MNK_PER_WORKER` block of `m*n*k` (default 2_000_000), capped by
+cores and jobs and floored at 1. It is work-based rather than dimension-based
+because the measured optimum tracks total flops, not linear size. Bandwidth-
+bound shapes (gemv/gevv) use a different rule: serial below an LLC-derived
+byte floor, then straight to a bandwidth cap, because a few workers is the
+worst point on a bandwidth scaling curve.
 
 Work distribution is demand-driven: the driver flattens its inner work into a
 1-D job list and workers pull contiguous chunks from a shared lock-free
@@ -316,10 +324,14 @@ rayon is usable only under `wasm_threads` (targeting `wasm32-wasip1-threads`),
 which sizes a dedicated pool from the `GEMMKIT_WASM_THREADS` knob; without it,
 `parallel` degrades to the serial loop instead of trapping.
 
-The reproducibility contract, concretely: blocking and the job list are
-identical for every worker count, each output tile is computed whole by one
-worker over the full depth, and packed bytes do not depend on who packs them.
-Which worker computes a tile varies run to run; the result never does.
+The reproducibility contract, concretely: `kc`/`nc` and the fixed depth-panel
+order are identical for every worker count, so each output element accumulates
+in one fixed order. The flat job list may differ (a wide worker count can
+shrink `mc` to keep it deep enough), but `mc` stays an `mr` multiple, so the
+microtile set is unchanged and no result bit moves. Each output tile is
+computed whole by one worker over the full depth, and packed bytes do not
+depend on who packs them. Which worker computes a tile varies run to run; the
+result never does.
 
 ## Special paths
 
