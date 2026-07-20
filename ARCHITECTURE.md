@@ -260,7 +260,10 @@ Detection is best-effort with a fallback chain that cannot fail: CPUID on x86
 (`cache/sysctl.rs`) -> a static default calibrated on a Zen5 part. `#[cfg]`
 only ever picks the sniffing method, never the values; implausible reads are
 filtered out, and results are memoized once (with the OS page size) in
-`Machine`. `Level::shared_by` models per-worker contention for the data the
+`Machine`. Every backend reports each level as reachable from one core: on a
+multi-die part the L3 figure is the local complex's slice (32 MiB on a 2-CCD
+9950X), never the package total, which no single core experiences as one
+cache. `Level::shared_by` models per-worker contention for the data the
 driver actually places at each level, not raw hardware sharing: L1 and L3 are
 always 1, and only L2 uses the physical-core sharing degree.
 

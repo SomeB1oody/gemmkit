@@ -39,7 +39,12 @@ use std::sync::OnceLock;
 /// One cache level
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Level {
-    /// Total size in bytes, as reported by the backend, before dividing by `shared_by`
+    /// Size in bytes of the cache as reachable from one core, before dividing by
+    /// `shared_by`. Every backend must report the per-core-reachable slice, not a
+    /// package aggregate: on a multi-die part (a 2-CCD Ryzen) this is the one
+    /// complex's L3 a core can actually hit, since the other die's slice costs a
+    /// fabric round-trip close to DRAM and no single core ever experiences the
+    /// marketing total as one cache
     pub bytes: usize,
     /// Associativity (ways)
     pub assoc: usize,
@@ -222,7 +227,9 @@ pub(crate) fn lhs_pack_span_bytes() -> usize {
 /// overrides it verbatim; `0` (the default) derives it from the last-level cache. Centralized
 /// here (like [`lhs_pack_stride_bytes`]) as the one home for the `0 => auto` derivation
 ///
-/// * With an L3 (x86, Graviton): a quarter of the per-core L3 share ([`Level::effective_bytes`])
+/// * With an L3 (x86, Graviton): half of the per-core-reachable L3
+///   ([`Level::effective_bytes`]). Calibrated on the Zen5 9950X as a 16 MiB floor
+///   against its 32 MiB per-CCD slice
 /// * No L3 (Apple's shared cluster-L2): half the *full* shared L2, not `effective_bytes`,
 ///   which divides by the cluster size (`shared_by`) for the per-worker BLIS budget. For the
 ///   serial-vs-parallel gemv question, a single core streams from the whole cluster L2 but
@@ -236,7 +243,7 @@ pub(crate) fn gemv_parallel_floor_bytes() -> usize {
         0 => {
             let t = topology();
             match t.l3 {
-                Some(l3) => (l3.effective_bytes() / 4).max(1),
+                Some(l3) => (l3.effective_bytes() / 2).max(1),
                 None => (t.l2.bytes / 2).max(1),
             }
         }
@@ -249,14 +256,15 @@ pub(crate) fn gemv_parallel_floor_bytes() -> usize {
 /// column-outer form's per-column output re-reads spill toward DRAM. Register-blocking *loses*
 /// while the output is L3-resident (the extra matrix-stream prefetches thrash while the re-reads
 /// stay cheap) and *wins* once the output approaches leaving L3. Calibrated on Zen5, where it
-/// loses up to a ~16 MiB output and wins from ~32 MiB, i.e. around half the per-core L3 share.
+/// loses up to a ~16 MiB output and wins from ~32 MiB, i.e. the full per-core-reachable L3
+/// (the 9950X's 32 MiB per-CCD slice).
 /// No L3 (Apple): falls back to the L2 gate, pending on-device calibration. Sibling of
 /// [`gemv_parallel_floor_bytes`] as a cache-derived byte threshold; not gated on `parallel`
 /// since the serial gemv path uses it too
 pub(crate) fn gemv_regblock_engage_bytes() -> usize {
     let t = topology();
     match t.l3 {
-        Some(l3) => (l3.effective_bytes() / 2).max(1),
+        Some(l3) => l3.effective_bytes().max(1),
         None => t.l2.effective_bytes().max(1),
     }
 }

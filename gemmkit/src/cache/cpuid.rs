@@ -3,27 +3,27 @@
 //! Cache geometry comes straight from the CPUID instruction, so this works the
 //! same in a container or most VMs as on bare metal; only a hypervisor that
 //! masks the relevant leaves makes [`detect`] return `None`, in which case the
-//! caller falls through to the next backend. Intel exposes the deterministic
-//! cache leaf (CPUID.04h, walked sub-leaf by sub-leaf); AMD reports cache
-//! geometry through the legacy L1 (0x8000_0005) and L2/L3 (0x8000_0006) leaves
+//! caller falls through to the next backend. Both vendors expose a per-cache
+//! topology leaf (Intel CPUID.04h, AMD 0x8000_001D), walked sub-leaf by
+//! sub-leaf; it describes each cache as reachable from the executing core, so
+//! on a multi-die part (a 2-CCD Ryzen) the L3 figure is the one complex a core
+//! can actually hit, not the package total - the semantic every consumer wants
+//! (see [`super::Level::bytes`]). AMD parts or hypervisors without that leaf
+//! fall back to the legacy L1 (0x8000_0005) and L2/L3 (0x8000_0006) leaves,
+//! which only know a package-total L3 and a coarse associativity encoding
 
 use super::{CacheTopology, Level};
 use raw_cpuid::{Associativity, CacheType, CpuId, CpuIdReader};
 
-/// Best-effort cache topology from CPUID; `None` when the vendor string and both
-/// leaf families are unreadable
+/// Best-effort cache topology from CPUID; `None` when both leaf families are
+/// unreadable
 pub fn detect() -> Option<CacheTopology> {
     let cpuid = CpuId::new();
-    let vi = cpuid.get_vendor_info();
-    let vendor = vi.as_ref().map(|v| v.as_str()).unwrap_or("");
-
-    if vendor.contains("AMD") {
-        detect_amd(&cpuid)
-    } else {
-        // Non-AMD (including an unreadable vendor string): try the Intel leaf
-        // first, and fall back to the AMD leaves in case they still decode
-        detect_intel(&cpuid).or_else(|| detect_amd(&cpuid))
-    }
+    // The topology leaf first: raw-cpuid selects CPUID.04h or 0x8000_001D by
+    // vendor, and both report per-core-reachable caches. The legacy AMD leaves
+    // are only a fallback, at the cost of a package-total L3 figure on
+    // multi-CCD parts and a guessed associativity
+    detect_topology_leaf(&cpuid).or_else(|| detect_amd_legacy(&cpuid))
 }
 
 // Map raw_cpuid's associativity encoding to a plain way count
@@ -42,8 +42,11 @@ fn assoc_num(a: Associativity) -> usize {
 
 // AMD legacy leaves: the L1 (0x8000_0005) and L2/L3 (0x8000_0006) leaves must both
 // decode; L3 is reported inside the L2/L3 leaf and treated as absent below when its
-// size field reads 0, not by the leaf itself being unreadable
-fn detect_amd<R: CpuIdReader>(cpuid: &CpuId<R>) -> Option<CacheTopology> {
+// size field reads 0, not by the leaf itself being unreadable. Only reached when the
+// topology leaf is unavailable: the L3 size here is the package total, which
+// overstates what one core can hit on a multi-CCD part, and 16-way associativity is
+// not even encodable (it reads back as `Unknown`)
+fn detect_amd_legacy<R: CpuIdReader>(cpuid: &CpuId<R>) -> Option<CacheTopology> {
     let l1 = cpuid.get_l1_cache_and_tlb_info()?;
     let l23 = cpuid.get_l2_l3_cache_and_tlb_info()?;
 
@@ -74,11 +77,14 @@ fn detect_amd<R: CpuIdReader>(cpuid: &CpuId<R>) -> Option<CacheTopology> {
     Some(CacheTopology { l1d, l2, l3 })
 }
 
-// Intel deterministic leaf (CPUID.04h): the sub-leaf iterator stops on its own at
-// the Null terminator, so this just keeps the 1st Data-or-Unified entry seen at
-// each of levels 1-3. L3 is optional; L1d and L2 are not, so a topology missing
-// either comes back as None
-fn detect_intel<R: CpuIdReader>(cpuid: &CpuId<R>) -> Option<CacheTopology> {
+// The per-cache topology leaf (Intel CPUID.04h, AMD 0x8000_001D - raw-cpuid picks
+// by vendor): the sub-leaf iterator stops on its own at the Null terminator, so this
+// just keeps the 1st Data-or-Unified entry seen at each of levels 1-3. L3 is
+// optional; L1d and L2 are not, so a topology missing either comes back as None. That
+// None also covers `get_cache_parameters` itself returning None, which is what happens
+// on an AMD part whose 0x8000_001D is masked: raw-cpuid never falls back to the Intel
+// leaf for AMD, so the caller then tries the legacy leaves
+fn detect_topology_leaf<R: CpuIdReader>(cpuid: &CpuId<R>) -> Option<CacheTopology> {
     let params = cpuid.get_cache_parameters()?;
     let mut l1d = None;
     let mut l2 = None;
@@ -130,13 +136,13 @@ mod tests {
         }
     }
 
-    /// Feed `detect_intel` a mock leaf-04h walk (L1d 48 KiB/12-way, an L1 *instruction*
-    /// cache that the `Data | Unified` filter must skip, L2 1 MiB/8-way unified, L3
-    /// 32 MiB/16-way unified) and check the resulting sizes and way counts. `detect_intel`
-    /// is generic over the CPUID reader, so a mock exercises the Intel path on any host:
-    /// the dev box's own vendor is AMD, so `detect()` never takes this branch there
+    /// Feed `detect_topology_leaf` a mock leaf-04h walk (L1d 48 KiB/12-way, an L1
+    /// *instruction* cache that the `Data | Unified` filter must skip, L2 1 MiB/8-way
+    /// unified, L3 32 MiB/16-way unified) and check the resulting sizes and way counts.
+    /// `detect_topology_leaf` is generic over the CPUID reader, so a mock exercises the
+    /// Intel flavor of the leaf on any host, including the AMD dev box
     #[test]
-    fn detect_intel_from_canned_leaf04() {
+    fn detect_topology_leaf_from_canned_intel_leaf04() {
         let reader = |eax: u32, ecx: u32| -> CpuIdResult {
             match (eax, ecx) {
                 // Leaf 0: report a max basic leaf of 4 or higher, and spell out
@@ -168,7 +174,7 @@ mod tests {
             }
         };
         let cpuid = CpuId::with_cpuid_fn(reader);
-        let t = super::detect_intel(&cpuid).expect("canned Intel leaf-04h must detect");
+        let t = super::detect_topology_leaf(&cpuid).expect("canned Intel leaf-04h must detect");
 
         assert_eq!(t.l1d.bytes, 48 * 1024, "L1d size");
         assert_eq!(t.l1d.assoc, 12, "L1d ways");
@@ -181,14 +187,14 @@ mod tests {
         assert_eq!(l3.assoc, 16, "L3 ways");
     }
 
-    /// Feed `detect_amd` a mock AMD leaf pair whose associativity nibbles decode to
-    /// `DirectMapped` (L1d) and `FullyAssociative` (L2 and L3), encodings a real Zen
+    /// Feed `detect_amd_legacy` a mock AMD leaf pair whose associativity nibbles decode
+    /// to `DirectMapped` (L1d) and `FullyAssociative` (L2 and L3), encodings a real Zen
     /// part does not emit for those fields, and check that `assoc_num` folds them to
-    /// `1` and `64` respectively. The dev box's own L1d and L2 nibbles decode to
-    /// `NWay`, and its L3 nibble decodes to `Unknown` (the catch-all default), so
-    /// this test is what exercises the `DirectMapped` and `FullyAssociative` arms
+    /// `1` and `64` respectively. A real AMD host never reaches this path (the topology
+    /// leaf wins), so the mock is the only coverage for the legacy decode and for the
+    /// `DirectMapped` and `FullyAssociative` arms
     #[test]
-    fn detect_amd_exotic_associativities() {
+    fn detect_amd_legacy_exotic_associativities() {
         let reader = |eax: u32, _ecx: u32| -> CpuIdResult {
             match eax {
                 // Leaf 0: spell "AuthenticAMD" across ebx/edx/ecx (max basic leaf value,
@@ -233,7 +239,7 @@ mod tests {
             }
         };
         let cpuid = CpuId::with_cpuid_fn(reader);
-        let t = super::detect_amd(&cpuid).expect("canned AMD leaves must detect");
+        let t = super::detect_amd_legacy(&cpuid).expect("canned AMD leaves must detect");
 
         assert_eq!(t.l1d.bytes, 64 * 1024, "L1d size");
         assert_eq!(t.l1d.assoc, 1, "DirectMapped L1d folds to assoc 1");
@@ -242,5 +248,71 @@ mod tests {
         let l3 = t.l3.expect("L3 present");
         assert_eq!(l3.bytes, 16 * 512 * 1024, "L3 size (units of 512 KiB)");
         assert_eq!(l3.assoc, 64, "FullyAssociative L3 folds to assoc 64");
+    }
+
+    /// Feed `detect_topology_leaf` the AMD flavor of the leaf (0x8000_001D, selected by
+    /// raw-cpuid on an "AuthenticAMD" vendor with the extended max leaf high enough),
+    /// canned as the 9950X reports it: L3 32 MiB/16-way, the one-CCD slice a core can
+    /// hit. The mock also serves the legacy L2/L3 leaf with the 64 MiB package total,
+    /// so the asserts prove the topology leaf is the one being decoded - the exact
+    /// misread this backend used to ship (64 MiB, associativity guessed as 8, from the
+    /// legacy leaf) can never come back silently
+    #[test]
+    fn detect_topology_leaf_from_canned_amd_leaf1d() {
+        let reader = |eax: u32, ecx: u32| -> CpuIdResult {
+            match (eax, ecx) {
+                // Leaf 0: spell "AuthenticAMD" across ebx/edx/ecx
+                (0x0, _) => CpuIdResult {
+                    eax: 0x10,
+                    ebx: 0x6874_7541, // "Auth"
+                    ecx: 0x444d_4163, // "cAMD"
+                    edx: 0x6974_6e65, // "enti"
+                },
+                // Extended-function max leaf: must be >= 0x8000_001D so raw-cpuid
+                // routes get_cache_parameters to the AMD topology leaf
+                (0x8000_0000, _) => CpuIdResult {
+                    eax: 0x8000_0020,
+                    ebx: 0,
+                    ecx: 0,
+                    edx: 0,
+                },
+                // The legacy L2/L3 leaf, reporting the 64 MiB package-total L3
+                // (128 * 512 KiB): decoding this instead of the topology leaf below
+                // is exactly the regression the asserts rule out
+                (0x8000_0006, _) => CpuIdResult {
+                    eax: 0,
+                    ebx: 0,
+                    ecx: (1024 << 16) | (0x6 << 12) | 64,
+                    edx: (128 << 18) | (0x9 << 12) | 64,
+                },
+                // Topology leaf sub-leaves, 9950X geometry: L1d, L1i (skipped by the
+                // Data | Unified filter), L2, the per-CCD L3, then the Null terminator
+                (0x8000_001D, 0) => leaf04(1, 1, 64, 1, 12, 64), // Data, L1: 48 KiB
+                (0x8000_001D, 1) => leaf04(2, 1, 64, 1, 8, 64),  // Instruction, L1
+                (0x8000_001D, 2) => leaf04(3, 2, 64, 1, 16, 1024), // Unified, L2: 1 MiB
+                (0x8000_001D, 3) => leaf04(3, 3, 64, 1, 16, 32768), // Unified, L3: 32 MiB
+                _ => CpuIdResult {
+                    eax: 0,
+                    ebx: 0,
+                    ecx: 0,
+                    edx: 0,
+                },
+            }
+        };
+        let cpuid = CpuId::with_cpuid_fn(reader);
+        let t = super::detect_topology_leaf(&cpuid).expect("canned AMD leaf-1Dh must detect");
+
+        assert_eq!(t.l1d.bytes, 48 * 1024, "L1d size");
+        assert_eq!(t.l1d.assoc, 12, "L1d ways");
+        assert_eq!(t.l2.bytes, 1024 * 1024, "L2 size");
+        assert_eq!(t.l2.assoc, 16, "L2 ways");
+        let l3 = t.l3.expect("L3 present");
+        assert_eq!(
+            l3.bytes,
+            32 * 1024 * 1024,
+            "L3 is the per-CCD slice, not the total"
+        );
+        assert_eq!(l3.assoc, 16, "L3 ways read exactly, not guessed");
+        assert_eq!(l3.shared_by, 1, "L3 shared_by is fixed at 1");
     }
 }

@@ -284,7 +284,8 @@ unsafe fn core_epi<T, S, E>(
 /// Whether an axpy-shape gemv should use the register-blocked output strategy instead of the
 /// plain one: both conditions must hold. 1st, the output (`rows*sizeof` bytes) must be large
 /// enough that the plain form's per-column output re-read would spill out of the last-level cache
-/// (the byte gate, a fraction of L3, lives in [`crate::cache::gemv_regblock_engage_bytes`]).
+/// (the byte gate, the per-core-reachable L3, lives in
+/// [`crate::cache::gemv_regblock_engage_bytes`]).
 /// 2nd, `k` must be small enough (`<= k_stream_max`) that register-blocking's `k` concurrent
 /// matrix column-streams still fit the hardware prefetcher's window. Below the byte gate the
 /// output stays cache-resident, so the plain form's cheap re-reads and single contiguous matrix
