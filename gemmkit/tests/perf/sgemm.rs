@@ -268,6 +268,53 @@ fn native_default_tile() -> (usize, usize) {
     }
 }
 
+/// Mirrors `Parallelism::resolve`'s auto-worker choice for the printed "picks N workers"
+/// estimate: the work ramp (`mnk / par_mnk_per_worker`) snapped to a size-class pool tier when
+/// the tiers are active, stepping to full width past the full-width gate, then capped by the
+/// core and job counts. Platform-independent: the tiers are derived from `avail` and the live
+/// `pool_classes` knob, never a hard-coded width, so it tracks resolve on any machine
+#[cfg(not(target_family = "wasm"))]
+fn expected_auto_width(m: usize, k: usize, n: usize, avail: usize, n_jobs: usize) -> usize {
+    let mnk = m * k * n;
+    let want = mnk / gemmkit::tuning::par_mnk_per_worker().max(1);
+    // Active tier sizes ascending (width/2, width/4, width/8 as pool_classes, clamped to 3,
+    // selects), dropping any below 2 or not strictly below the full width: the same rule as
+    // parallel::class_sizes
+    let classes = gemmkit::tuning::pool_classes().min(3);
+    let mut tiers = [0usize; 3];
+    let mut n_tiers = 0;
+    if classes > 0 {
+        let mut div = 1usize << classes;
+        while div >= 2 {
+            let size = avail / div;
+            if size >= 2 && size < avail {
+                tiers[n_tiers] = size;
+                n_tiers += 1;
+            }
+            div /= 2;
+        }
+    }
+    let w = if n_tiers == 0 {
+        want
+    } else {
+        // 0 means auto: the same 110M gate parallel::FULL_WIDTH_MNK_AUTO uses
+        let full = match gemmkit::tuning::full_width_mnk() {
+            0 => 110_000_000,
+            v => v,
+        };
+        if mnk >= full {
+            avail
+        } else {
+            tiers[..n_tiers]
+                .iter()
+                .copied()
+                .find(|&t| want <= (3 * t) / 2)
+                .unwrap_or(tiers[n_tiers - 1])
+        }
+    };
+    w.min(avail).min(n_jobs).max(1)
+}
+
 /// Prints gemmkit's own parallel scaling (and `gemm`'s, for reference) at a fixed size across
 /// a thread-count ladder, to show *where* scaling stalls: a poor speedup already by 2-4
 /// threads points at per-call fork/join and atomic-cursor overhead dominating a small
@@ -392,12 +439,10 @@ fn bench_scaling(s: usize) {
 
     // The forced-t ladder above never exercises the auto Rayon(0) path production code
     // actually takes, so this row is the only one that shows what the auto ramp picks and
-    // delivers on this shape. `auto_w` mirrors resolve()'s own auto-worker formula
-    // (mnk / par_mnk_per_worker, capped by cores and jobs) purely for the printed estimate
-    let auto_w = ((m * k * n) / gemmkit::tuning::par_mnk_per_worker().max(1))
-        .min(avail)
-        .min(n_jobs)
-        .max(1);
+    // delivers on this shape. `auto_w` mirrors resolve()'s own auto-worker formula (the
+    // work ramp, snapped to a size-class pool tier and stepping to full width past the
+    // full-width gate, then capped by cores and jobs) purely for the printed estimate
+    let auto_w = expected_auto_width(m, k, n, avail, n_jobs);
     let sk = measure(m, k, n, || {
         gemm(
             1.0,

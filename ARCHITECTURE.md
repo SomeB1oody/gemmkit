@@ -315,6 +315,21 @@ bound shapes (gemv/gevv) use a different rule: serial below an LLC-derived
 byte floor, then straight to a bandwidth cap, because a few workers is the
 worst point on a bandwidth scaling curve.
 
+Rayon fork/join overhead scales with a pool's idle slack (threads minus
+engaged workers), so a small parallel GEMM forking into the full-width global
+pool pays for threads it never uses. On x86_64 gemmkit also keeps up to
+`GEMMKIT_POOL_CLASSES` (default 2, clamped to 3; 0 on other architectures
+pending on-device validation) private, persistent rayon pools at halving
+tiers of the machine width - e.g. 16 and 8 threads on a 32-thread part -
+built lazily on first use (about 12 microseconds per thread) and never
+rebuilt. The auto path snaps its worker count exactly onto a tier and stays
+on the physical-core tier until `m*n*k` clears `GEMMKIT_FULL_WIDTH_MNK`
+(default auto, 110_000_000 on the 9950X, where the physical-core tier beats
+full width through `448^3`); `MAX` pins auto to that tier unconditionally. A
+call already running inside a rayon pool is never redirected, and an
+explicit `Rayon(n)` keeps exactly `n` workers while merely picking the
+smallest fitting tier pool; threaded wasm's dedicated pool is unaffected.
+
 Work distribution is demand-driven: the driver flattens its inner work into a
 1-D job list and workers pull contiguous chunks from a shared lock-free
 `JobCursor`, so faster cores on heterogeneous parts absorb proportionally

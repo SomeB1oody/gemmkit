@@ -845,6 +845,38 @@ fn main() {
             false,
         )
     );
+    // Exact-fit size-class pool tiers: 0 (disabled), 1 (half width only), or 3 (adds eighth
+    // width). The probes span tier-8 territory (128^3), the 8/16 crossover (256^3), and the
+    // 16-vs-full-width regime (384^3)
+    knob!(
+        "GEMMKIT_POOL_CLASSES",
+        sweep_sgemm(
+            "GEMMKIT_POOL_CLASSES",
+            tuning::set_pool_classes,
+            tuning::POOL_CLASSES_DEFAULT,
+            &[0, 1, 3],
+            &timing,
+            &[(128, 128, 128), (256, 256, 256), (384, 384, 384)],
+            par,
+            false,
+        )
+    );
+    // Full-machine-width work gate: the m*n*k above which auto leaves the largest pool tier for
+    // the full machine width. MAX means never leave that tier. The probes bracket the measured
+    // 448^3/512^3 crossover, plus a larger 640^3 that full width should clearly win
+    knob!(
+        "GEMMKIT_FULL_WIDTH_MNK",
+        sweep_sgemm(
+            "GEMMKIT_FULL_WIDTH_MNK",
+            tuning::set_full_width_mnk,
+            tuning::FULL_WIDTH_MNK_DEFAULT,
+            &[64_000_000, 134_000_000, MAX],
+            &timing,
+            &[(448, 448, 448), (512, 512, 512), (640, 640, 640)],
+            par,
+            false,
+        )
+    );
 
     // Packing gates: pack/no-pack route crossovers, each probed near its crossover point
     knob!(
@@ -1221,6 +1253,8 @@ const NEUTRALIZE: &[(Setter, usize)] = &[
         tuning::set_par_mnk_per_worker,
         tuning::PAR_MNK_PER_WORKER_DEFAULT,
     ),
+    (tuning::set_pool_classes, tuning::POOL_CLASSES_DEFAULT),
+    (tuning::set_full_width_mnk, tuning::FULL_WIDTH_MNK_DEFAULT),
     (
         tuning::set_rhs_pack_threshold,
         tuning::RHS_PACK_THRESHOLD_DEFAULT,
@@ -1492,6 +1526,8 @@ const TUNED: &[&str] = &[
     "GEMMKIT_GEMV_THREAD_CAP",
     "GEMMKIT_PARALLEL_OVERSAMPLE",
     "GEMMKIT_PAR_MNK_PER_WORKER",
+    "GEMMKIT_POOL_CLASSES",
+    "GEMMKIT_FULL_WIDTH_MNK",
     "GEMMKIT_SHARED_LHS_MNK",
     "GEMMKIT_K_STREAM_MAX",
     "GEMMKIT_SEQ_INTERNAL_BYTES_PER_WORKER",
@@ -1528,7 +1564,7 @@ mod knob_coverage {
     #[test]
     fn sweep_table_covers_every_knob() {
         // gemmkit-tune enables the int8 feature but not wasm_threads (see Cargo.toml), so
-        // knob_env_names() is always the 25 base knobs plus I8_VNNI_MIN_PAR_MNK, 26 total; TUNED
+        // knob_env_names() is always the 27 base knobs plus I8_VNNI_MIN_PAR_MNK, 28 total; TUNED
         // and NEVER_TUNED must partition that set exactly
         let names: BTreeSet<&str> = gemmkit::tuning::knob_env_names().iter().copied().collect();
         let tuned: BTreeSet<&str> = TUNED.iter().copied().collect();

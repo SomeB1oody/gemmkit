@@ -288,6 +288,41 @@ pub const PAR_MNK_PER_WORKER_DEFAULT: usize = 262_144;
 static PAR_MNK_PER_WORKER: Threshold =
     Threshold::new("GEMMKIT_PAR_MNK_PER_WORKER", PAR_MNK_PER_WORKER_DEFAULT);
 
+// Number of exact-fit private rayon pool tiers, halving down from half the machine width: 1
+// tier is width/2, 2 adds width/4, 3 adds width/8. The auto worker count snaps to a tier so a
+// small parallel GEMM runs in a pool sized to it with no idle slack, since rayon's fork-join
+// tax scales with a pool's SLACK (its width minus the active workers), not just the worker
+// count. The tier pools are persistent (built once, reused warm), not rebuilt per call. `0`
+// disables the tiers and keeps the current ambient-pool behavior. The default is arch-split:
+// * x86 (Zen5): 2 tiers. Measured on the 9950X (32 HW threads, 16 physical cores), the width/4
+//   tier of 8 wins 96^3 through 288^3 by 2-3x, and the width/2 physical-core tier of 16 wins
+//   320^3 through 448^3, beating full SMT width by 7-11% by staying on the physical cores
+// * other targets: 0 (disabled). aarch64 is pending on-device validation; wasm has its own
+//   dedicated pool and never reaches this path
+/// Compiled default for [`pool_classes`]: overridden by `GEMMKIT_POOL_CLASSES` or
+/// [`set_pool_classes`]; `0` disables the private size-class pools (ambient-pool behavior).
+/// Clamped to at most 3 tiers at the consumer (see `crate::parallel::class_sizes`)
+#[cfg(target_arch = "x86_64")]
+pub const POOL_CLASSES_DEFAULT: usize = 2;
+/// The non-x86_64 default; see the x86_64 doc above for what this knob controls
+#[cfg(not(target_arch = "x86_64"))]
+pub const POOL_CLASSES_DEFAULT: usize = 0;
+static POOL_CLASSES: Threshold = Threshold::new("GEMMKIT_POOL_CLASSES", POOL_CLASSES_DEFAULT);
+
+// Work gate (`m*n*k`) at which the auto path leaves the largest private pool tier for the full
+// machine width. Below it a tier pool (the physical cores on x86, no SMT) wins; only the largest
+// problems pay for the full machine width. Calibrated on the Zen5 9950X between 448^3 (89.9M, where
+// the physical-core tier still wins by 7%) and 512^3 (134M, where full width wins by 5%). The
+// auto value is arch-split at the consumer: aarch64 (M4 Max, no SMT) crosses over an order of
+// magnitude earlier, between 224^3 and 256^3. Only consulted when pool tiers are active
+// (`pool_classes` above is non-zero)
+// the physical-core tier still wins by 7%) and 512^3 (134M, where full width wins by 5%). Only
+// consulted when pool tiers are active (`pool_classes` above is non-zero)
+/// Compiled default for [`full_width_mnk`]: overridden by `GEMMKIT_FULL_WIDTH_MNK` or
+/// [`set_full_width_mnk`]; `0` means auto (110_000_000; see `crate::parallel::FULL_WIDTH_MNK_AUTO`)
+pub const FULL_WIDTH_MNK_DEFAULT: usize = 0;
+static FULL_WIDTH_MNK: Threshold = Threshold::new("GEMMKIT_FULL_WIDTH_MNK", FULL_WIDTH_MNK_DEFAULT);
+
 // Worker count for a threaded wasm build (the `wasm_threads` feature). wasm has no
 // `available_parallelism`, so the deployer sets the parallel width here instead: it both caps
 // `auto_threads` and sizes gemmkit's own wasm rayon pool. An off-target build stays serial via
@@ -452,12 +487,12 @@ static I8_VNNI_MIN_PAR_MNK: Threshold =
 // itself against this one, so a knob added above cannot silently escape their coverage. A static
 // cannot be iterated over without a macro (which this crate avoids), so this manual mirror is the
 // chosen tradeoff: every `Threshold` static declared above must have its env name appear here
-// The 25 knobs that exist in every build live in `KNOB_ENV_NAMES_BASE`; the 2 that are cfg-gated
+// The 27 knobs that exist in every build live in `KNOB_ENV_NAMES_BASE`; the 2 that are cfg-gated
 // (whose `Threshold` statics above carry the same cfg) are appended only when actually compiled
 // in - `I8_VNNI_MIN_PAR_MNK` under the `int8` feature and `WASM_THREADS` under
 // `wasm32 + wasm_threads`. Declaring a `Threshold` here without adding its name to one of these 2
 // lists is a small diff away from being caught: the consumer sync tests assert against the count
-const KNOB_ENV_NAMES_BASE: [&str; 25] = [
+const KNOB_ENV_NAMES_BASE: [&str; 27] = [
     "GEMMKIT_PARALLEL_THRESHOLD",
     "GEMMKIT_RHS_PACK_THRESHOLD",
     "GEMMKIT_LHS_PACK_THRESHOLD",
@@ -472,6 +507,8 @@ const KNOB_ENV_NAMES_BASE: [&str; 25] = [
     "GEMMKIT_GEMV_THREAD_CAP",
     "GEMMKIT_PARALLEL_OVERSAMPLE",
     "GEMMKIT_PAR_MNK_PER_WORKER",
+    "GEMMKIT_POOL_CLASSES",
+    "GEMMKIT_FULL_WIDTH_MNK",
     "GEMMKIT_SHARED_LHS_MNK",
     "GEMMKIT_K_STREAM_MAX",
     "GEMMKIT_SEQ_INTERNAL_BYTES_PER_WORKER",
@@ -797,6 +834,28 @@ pub fn par_mnk_per_worker() -> usize {
 /// Override the auto worker-count ramp granularity (`0` behaves as `1`: always full width)
 pub fn set_par_mnk_per_worker(v: usize) {
     PAR_MNK_PER_WORKER.set(v);
+}
+
+/// Get the number of exact-fit private rayon pool tiers, halving from half the machine width
+/// (`0` disables the size-class pools, restoring the ambient-pool behavior). Clamped to at
+/// most 3 tiers at the consumer (see `crate::parallel::class_sizes`)
+pub fn pool_classes() -> usize {
+    POOL_CLASSES.get()
+}
+/// Override the number of exact-fit private rayon pool tiers (`0` disables them)
+pub fn set_pool_classes(v: usize) {
+    POOL_CLASSES.set(v);
+}
+
+/// Get the full-machine-width work gate (`m*n*k`): above it the auto path leaves the largest
+/// private pool tier for the full machine width. `0` means auto (110_000_000). Consulted only
+/// when the size-class pools are active (`pool_classes` is non-zero)
+pub fn full_width_mnk() -> usize {
+    FULL_WIDTH_MNK.get()
+}
+/// Override the full-machine-width work gate (`0` restores the 110_000_000 auto value)
+pub fn set_full_width_mnk(v: usize) {
+    FULL_WIDTH_MNK.set(v);
 }
 
 /// Get the worker count for a threaded wasm build (default 8; see `WASM_THREADS_DEFAULT`). Only

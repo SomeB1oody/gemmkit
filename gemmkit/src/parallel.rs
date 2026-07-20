@@ -72,6 +72,75 @@ fn wasm_pool() -> &'static rayon::ThreadPool {
     })
 }
 
+/// The auto value for `tuning::full_width_mnk` (a `0` knob): the `m*n*k` above which the auto
+/// path leaves the largest private pool tier for the full machine width. Calibrated on the Zen5
+/// 9950X between 448^3 (89.9M, where the physical-core tier still wins by 7%) and 512^3 (134M,
+/// where full SMT width wins by 5%)
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+const FULL_WIDTH_MNK_AUTO: usize = 110_000_000;
+
+/// The active exact-fit pool tier sizes, ascending, as a fixed `[size; 3]` array plus a length
+/// (no heap). Derived on every call so the `pool_classes` knob stays sweepable in-process (its
+/// getter is a cached atomic, cheap). `pool_classes` (clamped to 3) picks how many tiers halve
+/// down from half the machine width: 1 tier is width/2, 2 adds width/4, 3 adds width/8. Any tier
+/// below 2 workers, or not strictly below the full width, is dropped. An empty result (length 0)
+/// means the tiers are disabled or the machine is too narrow, and the caller uses the plain
+/// work-ramp width and the ambient pool
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+fn class_sizes() -> ([usize; 3], usize) {
+    let n = tuning::pool_classes().min(3);
+    let cores = auto_threads();
+    let mut out = [0usize; 3];
+    let mut count = 0;
+    if n == 0 {
+        return (out, 0);
+    }
+    // Ascending: the smallest tier divides the width by 2^n, up through 2^1 (half width)
+    let mut div = 1usize << n;
+    while div >= 2 {
+        let size = cores / div;
+        if size >= 2 && size < cores {
+            out[count] = size;
+            count += 1;
+        }
+        div /= 2;
+    }
+    (out, count)
+}
+
+/// The persistent exact-fit rayon pool for tier `size`, built lazily on first use, or `None`
+/// if it failed to build. There are at most 3 tier sizes (half, quarter, eighth of the machine
+/// width), each keyed to its own static `OnceLock` slot by halving level (width/2 -> 0,
+/// width/4 -> 1, width/8 -> 2), so a pool is built once and its warm threads are reused across
+/// calls rather than rebuilt per call (~12 us/thread to build, ~free to drop). A build failure
+/// caches `None` and the caller falls back to the ambient pool, so a perf feature never panics
+/// the process
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+fn class_pool(size: usize) -> Option<&'static rayon::ThreadPool> {
+    use std::sync::OnceLock;
+    static POOLS: [OnceLock<Option<rayon::ThreadPool>>; 3] =
+        [OnceLock::new(), OnceLock::new(), OnceLock::new()];
+    let cores = auto_threads();
+    // Map the tier size to its stable halving slot; the sizes class_sizes emits are always
+    // width/2, width/4, or width/8, so a given size maps to the same slot on every call
+    let slot = if size >= cores / 2 {
+        0
+    } else if size >= cores / 4 {
+        1
+    } else {
+        2
+    };
+    POOLS[slot]
+        .get_or_init(|| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(size)
+                .thread_name(|i| format!("gemmkit-pool-{i}"))
+                .build()
+                .ok()
+        })
+        .as_ref()
+}
+
 /// Whether rayon can spawn extra worker threads at runtime. `false` only for a wasm
 /// build that has not opted into threading (baseline `wasm32-wasip1` has no thread
 /// runtime), where `parallel` degrades to the serial loop instead of trapping. `true`
@@ -124,7 +193,43 @@ impl Parallelism {
                 // linear-dimension stride can fit
                 let cores = auto_threads();
                 let want = mnk / tuning::par_mnk_per_worker().max(1);
-                want.min(cores).min(n_jobs).max(1)
+                // With the exact-fit size-class pools active, snap the width to a pool tier
+                // instead of taking the raw ramp value: `for_each_worker` runs a tier-fitting
+                // width inside a same-width private pool, whose fork-join sees no idle slack
+                // Calibrated on the Zen5 9950X (32 HW threads, 16 physical cores): 96^3 through
+                // 288^3 want the width/4 tier of 8; 320^3 through 448^3 want the width/2
+                // physical-core tier of 16, which beats full SMT width by 7-11% by staying on the
+                // physical cores; only from ~110M `m*n*k` up does full width finally win. Below
+                // that gate the width never drops below the smallest tier - an exact-fit pool
+                // wakes whole either way, so a sub-tier width is pointless above the serial gate.
+                // The 3/2 tier margin is measured: 256^3 (want 8.4) is still fastest at 8, 288^3
+                // (want 11.9) ties, 320^3 (want 16.4) wants 16. Wasm keeps the plain ramp (its
+                // dedicated pool has no tiers), so this reduces to the old formula there
+                #[cfg(not(target_arch = "wasm32"))]
+                let w = {
+                    let (tiers, n_tiers) = class_sizes();
+                    if n_tiers == 0 {
+                        want
+                    } else {
+                        let full = match tuning::full_width_mnk() {
+                            0 => FULL_WIDTH_MNK_AUTO,
+                            v => v,
+                        };
+                        if mnk >= full {
+                            cores
+                        } else {
+                            let tiers = &tiers[..n_tiers];
+                            tiers
+                                .iter()
+                                .copied()
+                                .find(|&t| want <= (3 * t) / 2)
+                                .unwrap_or(tiers[n_tiers - 1])
+                        }
+                    }
+                };
+                #[cfg(target_arch = "wasm32")]
+                let w = want;
+                w.min(cores).min(n_jobs).max(1)
             }
         }
     }
@@ -454,8 +559,40 @@ where
     {
         wasm_pool().install(|| (0..n_threads).into_par_iter().for_each(f));
     }
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm_threads")))]
+    // Bare wasm reached here only via `target_feature = "atomics"` (no gemmkit pool): the
+    // ambient global pool, as before
+    #[cfg(all(target_arch = "wasm32", not(feature = "wasm_threads")))]
     {
+        (0..n_threads).into_par_iter().for_each(f);
+    }
+    // Native: route through an exact-fit private size-class pool when one fits, else the
+    // ambient global pool. rayon's fork-join tax scales with a pool's SLACK (its width minus
+    // the active workers), not the worker count: measured on the Zen5 9950X, 256^3 at w=8 runs
+    // 1978 GFLOP/s in an exact 8-wide pool vs 1152 in a 16-wide pool vs 820 in the default
+    // 32-wide global pool. The tier pools are persistent (built once at ~12 us/thread, reused
+    // warm), not a fresh exact-width pool per call, which would hop between pools and abandon
+    // warm threads
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // Already on some rayon pool's worker (a nested gemm, or the caller installed its own
+        // pool): run in the current pool rather than nesting into a private one
+        if rayon::current_thread_index().is_some() {
+            (0..n_threads).into_par_iter().for_each(f);
+            return;
+        }
+        // Smallest active tier that still holds all n_threads workers, installed so its
+        // fork-join sees no idle slack. A tier found but whose pool failed to build, or no
+        // fitting tier at all, falls through to the ambient global pool
+        let (tiers, n_tiers) = class_sizes();
+        for &size in &tiers[..n_tiers] {
+            if size >= n_threads {
+                if let Some(pool) = class_pool(size) {
+                    pool.install(|| (0..n_threads).into_par_iter().for_each(f));
+                    return;
+                }
+                break;
+            }
+        }
         (0..n_threads).into_par_iter().for_each(f);
     }
 }
@@ -577,5 +714,95 @@ mod tests {
                 }
             }
         }
+    }
+
+    // Serializes the size-class-pool knob tests below: they mutate the process-global
+    // `pool_classes` / `full_width_mnk` knobs, so 2 running concurrently in this binary could
+    // interleave their set/restore. Recovers a poisoned lock so 1 panic does not cascade
+    #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+    static POOL_KNOB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// With the size-class pools disabled (`pool_classes` = 0), the auto width reproduces the
+    /// legacy work-ramp formula exactly (`want.min(cores).min(n_jobs).max(1)`), so turning the
+    /// feature off is behavior-preserving. Derived from the live knobs, never a hard-coded width
+    #[test]
+    #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+    fn resolve_matches_legacy_formula_with_tiers_off() {
+        let _lock = POOL_KNOB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = crate::tuning::pool_classes();
+        crate::tuning::set_pool_classes(0);
+        let cores = auto_threads();
+        let per = crate::tuning::par_mnk_per_worker().max(1);
+        let gate = crate::tuning::parallel_threshold();
+        let n_jobs = 1_000_000usize;
+        // A spread of sizes straddling the gate and the whole ramp, plus a huge value
+        for &mnk in &[
+            gate,
+            gate * 2,
+            gate * 37,
+            per * (cores * 3 + 1),
+            usize::MAX / 4,
+        ] {
+            let want = mnk / per;
+            let expect = if mnk < gate {
+                1
+            } else {
+                want.min(cores).min(n_jobs).max(1)
+            };
+            assert_eq!(
+                Parallelism::Rayon(0).resolve(mnk, n_jobs),
+                expect,
+                "tiers-off mnk={mnk}"
+            );
+        }
+        crate::tuning::set_pool_classes(prev);
+    }
+
+    /// With tiers active, every auto width lands in {1, the active tier sizes, cores}: above the
+    /// serial gate the width snaps to a pool tier (never a sub-tier value) or, in the full-width
+    /// regime, to the full machine width. Trivially passes on a machine too narrow to form a tier
+    #[test]
+    #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+    fn resolve_auto_width_lands_on_a_tier_or_cores() {
+        let _lock = POOL_KNOB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cores = auto_threads();
+        if cores < 4 {
+            return; // too narrow to form any tier (width/2 would be < 2); nothing to assert
+        }
+        let prev_pc = crate::tuning::pool_classes();
+        let per = crate::tuning::par_mnk_per_worker().max(1);
+        let n_jobs = 1_000_000usize;
+        for &pc in &[1usize, 2, 3] {
+            crate::tuning::set_pool_classes(pc);
+            let (tiers, n_tiers) = class_sizes();
+            let mut allowed: Vec<usize> = vec![1usize, cores];
+            allowed.extend_from_slice(&tiers[..n_tiers]);
+            // Sweep the ramp from below the gate through the full-width regime (the top of the
+            // sweep clears the 110M auto full-width gate on any core count >= 4)
+            for want in 0..=(cores * 2 + 2) {
+                let mnk = (want * per).max(1);
+                let w = Parallelism::Rayon(0).resolve(mnk, n_jobs);
+                assert!(
+                    allowed.contains(&w),
+                    "pc={pc} want={want} mnk={mnk} -> width {w} not in {allowed:?}"
+                );
+            }
+        }
+        crate::tuning::set_pool_classes(prev_pc);
+    }
+
+    /// A huge `m*n*k` (well past the full-width gate) always routes to the full machine width,
+    /// whether or not the tiers are active
+    #[test]
+    #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+    fn resolve_huge_mnk_routes_to_full_width() {
+        let _lock = POOL_KNOB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = crate::tuning::pool_classes();
+        crate::tuning::set_pool_classes(2); // tiers active, so the full-width gate is exercised
+        let cores = auto_threads();
+        let n_jobs = 1_000_000usize;
+        let w = Parallelism::Rayon(0).resolve(usize::MAX / 4, n_jobs);
+        assert_eq!(w, cores.min(n_jobs).max(1), "huge mnk must take full width");
+        crate::tuning::set_pool_classes(prev);
     }
 }
