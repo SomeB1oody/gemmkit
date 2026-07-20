@@ -200,6 +200,22 @@ pub(crate) fn lhs_pack_stride_bytes() -> usize {
     }
 }
 
+/// The LHS-packing address-span gate in bytes: the stride gate above only force-packs when the
+/// whole depth-slice walk (`csa * sizeof * kc`) also reaches this much address range - a
+/// page-scale stride over a span that stays cache-resident re-walks warm lines and is faster in
+/// place than the pack it would otherwise pay for. The `GEMMKIT_LHS_PACK_SPAN` knob overrides it
+/// verbatim; `0` (the default) is a flat 4 MiB, calibrated on the Zen5 9950X (in place wins
+/// through a 2 MiB span at n = 1024, packing wins from the 4 MiB span at n = 2048) rather than
+/// derived from the detected topology, since the crossover tracks TLB reach as much as cache
+/// size. Centralized here (like [`lhs_pack_stride_bytes`]) as the one home for the `0 => auto`
+/// derivation
+pub(crate) fn lhs_pack_span_bytes() -> usize {
+    match crate::tuning::lhs_pack_span() {
+        0 => 4 << 20,
+        v => v,
+    }
+}
+
 /// The gemv/gevv parallelism byte floor: below this much touched data the problem is
 /// LLC-resident and one core already gets the full LLC bandwidth, so splitting only adds
 /// fork/join and shared-cache contention with no DRAM bandwidth to gain. `GEMMKIT_GEMV_PARALLEL_BYTES`

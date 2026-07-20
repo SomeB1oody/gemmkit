@@ -272,7 +272,7 @@ pub(crate) fn arb_par(u: &mut Unstructured) -> Result<Parallelism> {
 }
 
 pub(crate) fn arb_par_knobs(u: &mut Unstructured) -> Result<Parallelism> {
-    // Also exercises Rayon(0) (auto-detect), the only path where thread_dim_stride
+    // Also exercises Rayon(0) (auto-detect), the only path where par_mnk_per_worker
     // takes effect (parallel_threshold gates every Rayon variant); still Serial-weighted
     // for throughput
     Ok(*u.choose(&[

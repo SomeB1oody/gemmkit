@@ -33,17 +33,27 @@ impl Default for Parallelism {
     }
 }
 
+// Memoized: `available_parallelism` walks affinity AND cgroup-quota state on Linux,
+// measured at ~8 us per call on the reference Zen5 box - longer than half of an entire
+// 128^3 GEMM - and every `Rayon` resolve consults it, so recomputing per call taxed
+// exactly the small problems that can least afford it. The price of caching is that an
+// affinity change after the first parallel call is not observed; that is rare enough
+// (and recoverable via an explicit `Rayon(n)`) to be the right trade
 #[cfg(feature = "parallel")]
 fn auto_threads() -> usize {
-    match std::thread::available_parallelism() {
-        Ok(n) => n.get(),
-        // No `available_parallelism` on bare wasm; fall back to the wasm worker count
-        // tunable, reachable only when `RAYON_USABLE` gates the parallel path open
-        #[cfg(all(target_arch = "wasm32", feature = "wasm_threads"))]
-        Err(_) => crate::tuning::wasm_threads(),
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm_threads")))]
-        Err(_) => 1,
-    }
+    use std::sync::OnceLock;
+    static AUTO_THREADS: OnceLock<usize> = OnceLock::new();
+    *AUTO_THREADS.get_or_init(|| {
+        match std::thread::available_parallelism() {
+            Ok(n) => n.get(),
+            // No `available_parallelism` on bare wasm; fall back to the wasm worker count
+            // tunable, reachable only when `RAYON_USABLE` gates the parallel path open
+            #[cfg(all(target_arch = "wasm32", feature = "wasm_threads"))]
+            Err(_) => crate::tuning::wasm_threads(),
+            #[cfg(not(all(target_arch = "wasm32", feature = "wasm_threads")))]
+            Err(_) => 1,
+        }
+    })
 }
 
 /// A rayon pool sized by [`crate::tuning::wasm_threads`], since wasm has no
@@ -105,15 +115,15 @@ impl Parallelism {
                 if req != 0 {
                     return req.min(auto_threads()).min(n_jobs).max(1);
                 }
-                // Auto: ramp the worker count with the linear problem size, since
-                // contention grows with worker count too. The stride defaults to a
-                // core-count-derived value, overridable via `GEMMKIT_THREAD_DIM_STRIDE`
-                // `auto_threads` is sampled once and reused for both the stride and the
-                // cap below, since `available_parallelism` walks affinity/cgroup state
-                // on Linux and a 2nd call would be the priciest part of this path
+                // Auto: scale the worker count with the total work, one worker per
+                // `par_mnk_per_worker` block of `m*n*k` (default 2e6, the measured
+                // per-worker floor under which fork/join overhead eats the gain)
+                // Work-based rather than dimension-based: the measured optimum
+                // tracks total flops, not linear size (128^3 runs fastest serial
+                // while 384^3 already wants every hardware thread), a curve no
+                // linear-dimension stride can fit
                 let cores = auto_threads();
-                let dim = (mnk as f64).cbrt() as usize; // linear size, e.g. n for a square problem
-                let want = dim.div_ceil(tuning::thread_dim_stride_for(cores));
+                let want = mnk / tuning::par_mnk_per_worker().max(1);
                 want.min(cores).min(n_jobs).max(1)
             }
         }

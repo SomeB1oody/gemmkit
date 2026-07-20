@@ -12,15 +12,20 @@
 //! an equal static share. `beta` applies only on the 1st depth panel; later
 //! panels accumulate (`beta = 1`) into the same `C`
 //!
-//! Reproducibility: `mc`/`kc`/`nc` come from the problem size and the cache
-//! topology alone, never the thread count, and the `pc` panels are always visited
-//! in that same fixed order, so the sequence of partial sums written into `C` is
+//! Reproducibility: `kc`/`nc` come from the problem size and the cache topology
+//! alone, never the thread count, and the `pc` panels are always visited in that
+//! same fixed order, so the sequence of partial sums written into `C` is
 //! independent of how many workers ran or which one happened to drain which
-//! chunk. A fixed input and config therefore always produce the same output under
-//! any [`Parallelism`]. (Serial and parallel also happen to be bitwise-identical
-//! today, since both run the exact same kernel arithmetic in the exact same panel
-//! order - but the contract this driver actually promises is reproducibility
-//! under a fixed config, not bitwise serial/parallel identity.)
+//! chunk. `mc` MAY shrink with the worker count (the parallel job-depth floor
+//! below), but that cannot move a result bit: `mc` is always an `mr` multiple,
+//! so the microtile set - every `mr`-aligned row offset plus the one `m`-tail
+//! tile - is the same under any split, and each tile's accumulation order is
+//! shaped only by `kc` and the fixed `pc` order. A fixed input and config
+//! therefore always produce the same output under any [`Parallelism`]. (Serial
+//! and parallel also happen to be bitwise-identical today, since both run the
+//! exact same kernel arithmetic in the exact same panel order - but the contract
+//! this driver actually promises is reproducibility under a fixed config, not
+//! bitwise serial/parallel identity)
 
 use core::mem::MaybeUninit;
 
@@ -454,11 +459,34 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize, E>(
             "prepacked-RHS with DEPTH_MULTIPLE > 1 requires a single depth slice (kc >= k)"
         );
 
-        let n_mc = m.div_ceil(mc); // count of A/C row macro-blocks; fixed for the whole call
         let n_nt_max = nc.div_ceil(nr);
-        let n_jobs_max = n_mc * n_nt_max;
+        let n_jobs_max = m.div_ceil(mc) * n_nt_max;
         let mnk = m.saturating_mul(n).saturating_mul(k);
         let n_threads = par.resolve(mnk, n_jobs_max);
+
+        // Parallel job-depth floor: the flat job list must be several chunks deep
+        // per worker, or the run's tail degenerates into idle workers waiting on
+        // whoever drew the last chunks (measured on the Zen5 9950X: n = 512 at 32
+        // workers is +20% from splitting its 86 cache-model jobs to ~256). When
+        // the list is too shallow, shrink `mc` - jobs are `(row-block x column
+        // tile)`, so more row-blocks means proportionally more jobs. Shrinking
+        // `mc` is numerics-free: `mc` stays an `mr` multiple, so the microtile
+        // set (every `mr`-aligned row offset plus the one `m`-tail) is identical
+        // under any split, and `kc` - the only blocking dimension that shapes the
+        // per-tile accumulation order - is untouched. Serial and parallel
+        // therefore stay bitwise-identical even though `mc` now varies with the
+        // worker count; only the traversal grouping moves
+        const PAR_JOBS_PER_WORKER: usize = 8;
+        let mc = if n_threads > 1 && n_jobs_max < n_threads * PAR_JOBS_PER_WORKER {
+            let n_mc_target = (n_threads * PAR_JOBS_PER_WORKER)
+                .div_ceil(n_nt_max)
+                .min(m.div_ceil(mr));
+            mc.min(m.div_ceil(n_mc_target).next_multiple_of(mr).max(mr))
+        } else {
+            mc
+        };
+        let n_mc = m.div_ceil(mc); // count of A/C row macro-blocks; fixed for the whole call
+        let n_jobs_max = n_mc * n_nt_max;
 
         // Rough reuse estimate for the pack/no-pack decision below: if jobs split
         // evenly, each worker handles about `jobs_per_worker` column-tile jobs,
@@ -468,15 +496,24 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize, E>(
         let jobs_per_worker = n_jobs_max.div_ceil(n_threads.max(1));
         let reuse_cols = jobs_per_worker.min(n_nt_max) * nr;
         // A column-major A (`rsa == 1`) is read in place by walking K with stride
-        // `csa`; once `csa * sizeof(Lhs)` approaches a memory page, that walk
-        // starts thrashing the TLB badly enough that packing wins even at low
-        // reuse, so this gate fires independently of the reuse threshold below
+        // `csa`. That walk only turns TLB/cache-hostile when BOTH hold: the
+        // per-step stride is page-scale (`csa * sizeof(Lhs)` reaches the stride
+        // gate), AND the whole depth-slice walk spans more address range than
+        // stays resident under it (`stride * kc` reaches the span gate). A
+        // page-scale stride over a slice span that fits cache re-walks warm lines
+        // and is measurably FASTER in place than the packed copy it would
+        // otherwise pay for - on the Zen5 9950X at 32 workers, in-place beats the
+        // per-worker redundant pack by 1.5-2.7x at n = 512..1024 (2 MiB span),
+        // while packing wins from the 4 MiB span of n = 2048 up. When this gate
+        // does fire, the pack cost is shared once per row-block wherever the
+        // `shared_a` pre-pass below is open
         let pack_stride = cache::lhs_pack_stride_bytes();
+        let lhs_step_bytes = csa
+            .unsigned_abs()
+            .saturating_mul(core::mem::size_of::<Fam::Lhs>());
         let strided_lhs = rsa == 1
-            && csa
-                .unsigned_abs()
-                .saturating_mul(core::mem::size_of::<Fam::Lhs>())
-                >= pack_stride;
+            && lhs_step_bytes >= pack_stride
+            && lhs_step_bytes.saturating_mul(kc.min(k)) >= cache::lhs_pack_span_bytes();
         let want_pack_lhs =
             reuse_cols > tuning::lhs_pack_threshold() || strided_lhs || Fam::FORCE_PACK_LHS;
 
@@ -485,11 +522,20 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize, E>(
         // a region every worker then reads. Only worth it when A is actually going
         // to be packed (`rsa != 1 || want_pack_lhs`), there is real parallelism to
         // deduplicate across (`n_threads > 1`; serial keeps the simpler per-worker
-        // path), and the problem clears a size gate (the pre-pass adds a fork-join
-        // per depth slice, which only pays off at large sizes; see
-        // `tuning::shared_lhs_mnk`)
-        let shared_a =
-            n_threads > 1 && (rsa != 1 || want_pack_lhs) && mnk >= tuning::shared_lhs_mnk();
+        // path), and either the problem clears a size gate (the pre-pass adds a
+        // fork-join per depth slice, which the per-worker path only out-runs at
+        // small sizes; see `tuning::shared_lhs_mnk`) or the width makes per-worker
+        // redundancy the bigger cost regardless of size: each extra worker is
+        // another redundant copy of every A panel it touches, so from
+        // `SHARED_A_MIN_THREADS` up the dedup wins even below the size gate
+        // (measured on the Zen5 9950X, row-major f32: tie at 16 workers, +16-35%
+        // shared at 32, and +52% for the forced-pack bf16 dot layout; 16 also
+        // keeps aarch64 behavior unchanged - the M4's auto width tops out below
+        // it - pending on-device validation)
+        const SHARED_A_MIN_THREADS: usize = 16;
+        let shared_a = n_threads > 1
+            && (rsa != 1 || want_pack_lhs)
+            && (mnk >= tuning::shared_lhs_mnk() || n_threads >= SHARED_A_MIN_THREADS);
 
         // A prepacked RHS arrives whole, already in micropanel-major layout, so
         // the per-call B-pack region is skipped and compute reads straight from

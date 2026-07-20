@@ -34,10 +34,8 @@ fn knob_guard() -> std::sync::MutexGuard<'static, ()> {
 /// Captures the current value of every knob and restores it on `Drop`, including through
 /// proptest's per-case unwind and shrink replays (restoring in `Drop` is what makes that
 /// safe). Each knob's getter resolves env -> cache -> default and returns the raw stored
-/// value, so feeding it back through the matching setter is a faithful round-trip, with one
-/// exception: `thread_dim_stride`'s getter maps a raw `0` to the core-derived auto value
-/// rather than returning it, so its `KNOBS` entry restores through [`thread_dim_stride_restore`]
-/// instead. The knobs whose getters clamp their result to `.max(1)` (`parallel_oversample`,
+/// value, so feeding it back through the matching setter is a faithful round-trip.
+/// The knobs whose getters clamp their result to `.max(1)` (`parallel_oversample`,
 /// `kc`, `mc_reg_panels`, `packed_oversample`, `pack_transpose_tile`) restore an
 /// already-clamped value, which is semantically identical to the original
 struct KnobGuard {
@@ -66,20 +64,12 @@ impl Drop for KnobGuard {
     }
 }
 
-/// Restore value for `thread_dim_stride`: its getter maps a raw stored `0` to the
-/// core-derived auto value instead of returning it verbatim, so capturing the getter's
-/// output would not round-trip through the setter. Used in its `KNOBS` entry in place of
-/// the real getter; `0` is the knob's own shipped default (auto), so this always restores it
-fn thread_dim_stride_restore() -> usize {
-    0
-}
-
 /// One swept knob: its canonical `GEMMKIT_*` env name, its setter, and the getter that reads
 /// back the value the setter round-trips to. The name backs `knobs_table_covers_every_knob`
 /// against `tuning::knob_env_names`; the 2 fns drive the sweep and the restore
 type Knob = (&'static str, fn(usize), fn() -> usize);
 
-/// The 23 general-path knobs this suite sweeps: every entry in `tuning::knob_env_names`
+/// The 24 general-path knobs this suite sweeps: every entry in `tuning::knob_env_names`
 /// except i8 VNNI, which is int8/f32-inert and exercised separately by P20. Order-independent:
 /// each entry is set to an independently-drawn value per case. Both `KnobGuard::capture`
 /// (restore side) and `apply_knobs` (sweep side) iterate this one table, so their lengths -
@@ -105,6 +95,11 @@ const KNOBS: &[Knob] = &[
         "GEMMKIT_LHS_PACK_STRIDE",
         tuning::set_lhs_pack_stride,
         tuning::lhs_pack_stride,
+    ),
+    (
+        "GEMMKIT_LHS_PACK_SPAN",
+        tuning::set_lhs_pack_span,
+        tuning::lhs_pack_span,
     ),
     (
         "GEMMKIT_GEMV_THRESHOLD",
@@ -142,9 +137,9 @@ const KNOBS: &[Knob] = &[
         tuning::parallel_oversample,
     ),
     (
-        "GEMMKIT_THREAD_DIM_STRIDE",
-        tuning::set_thread_dim_stride,
-        thread_dim_stride_restore,
+        "GEMMKIT_PAR_MNK_PER_WORKER",
+        tuning::set_par_mnk_per_worker,
+        tuning::par_mnk_per_worker,
     ),
     (
         "GEMMKIT_SHARED_LHS_MNK",

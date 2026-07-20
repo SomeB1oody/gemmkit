@@ -393,9 +393,8 @@ fn bench_scaling(s: usize) {
     // The forced-t ladder above never exercises the auto Rayon(0) path production code
     // actually takes, so this row is the only one that shows what the auto ramp picks and
     // delivers on this shape. `auto_w` mirrors resolve()'s own auto-worker formula
-    // (cbrt(mnk).div_ceil(stride), capped by cores and jobs) purely for the printed estimate
-    let auto_w = (((m * k * n) as f64).cbrt() as usize)
-        .div_ceil(gemmkit::tuning::thread_dim_stride())
+    // (mnk / par_mnk_per_worker, capped by cores and jobs) purely for the printed estimate
+    let auto_w = ((m * k * n) / gemmkit::tuning::par_mnk_per_worker().max(1))
         .min(avail)
         .min(n_jobs)
         .max(1);

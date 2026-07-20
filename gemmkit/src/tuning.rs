@@ -148,6 +148,17 @@ pub const LHS_PACK_STRIDE_DEFAULT: usize = 0;
 static LHS_PACK_STRIDE: Threshold =
     Threshold::new("GEMMKIT_LHS_PACK_STRIDE", LHS_PACK_STRIDE_DEFAULT);
 
+// Address-span companion to the stride gate above: a page-scale per-step stride is only
+// actually TLB/cache-hostile when the whole depth-slice walk (`csa * sizeof(Lhs) * kc`) also
+// spans more address range than stays resident under it. Both gates must hold before the
+// driver force-packs a column-major A: measured on the Zen5 9950X (f32, 32 workers), a
+// page-scale stride over a <= 2 MiB slice span re-walks warm lines and beats the redundant
+// per-worker packing it replaces by 1.5-2.7x, while a >= 4 MiB span is where packing wins
+/// Compiled default for [`lhs_pack_span`]: overridden by `GEMMKIT_LHS_PACK_SPAN` or
+/// [`set_lhs_pack_span`]; `0` means auto (4 MiB; see `cache::lhs_pack_span_bytes`)
+pub const LHS_PACK_SPAN_DEFAULT: usize = 0;
+static LHS_PACK_SPAN: Threshold = Threshold::new("GEMMKIT_LHS_PACK_SPAN", LHS_PACK_SPAN_DEFAULT);
+
 // Cap on `min(m, n)` for taking the dedicated gemv (matrix*vector) path when the other dimension
 // is 1. The shape (m == 1 or n == 1) decides whether gemv is even a candidate; this only caps how
 // large the vector side may be before falling back to the general driver
@@ -241,15 +252,27 @@ pub const PARALLEL_OVERSAMPLE_DEFAULT: usize = 8;
 static PARALLEL_OVERSAMPLE: Threshold =
     Threshold::new("GEMMKIT_PARALLEL_OVERSAMPLE", PARALLEL_OVERSAMPLE_DEFAULT);
 
-// Auto worker-count ramp granularity, in units of linear problem dimension per worker: the auto
-// `Rayon(0)` path targets `cbrt(m*n*k).div_ceil(this)` workers. `0` (the default) means auto:
-// derive the stride from the core count instead (see [`thread_dim_stride`]); a non-zero
-// env/setter value is used verbatim
-/// Compiled default for [`thread_dim_stride`]: overridden by `GEMMKIT_THREAD_DIM_STRIDE` or
-/// [`set_thread_dim_stride`]; `0` means auto (derived from the core count)
-pub const THREAD_DIM_STRIDE_DEFAULT: usize = 0;
-static THREAD_DIM_STRIDE: Threshold =
-    Threshold::new("GEMMKIT_THREAD_DIM_STRIDE", THREAD_DIM_STRIDE_DEFAULT);
+// Auto worker-count ramp granularity: how much total work (`m*n*k`) each additional worker
+// must bring before the auto `Rayon(0)` path widens by one, i.e. it targets `mnk / this`
+// workers, floored at 1 and capped by the core and job counts. The ramp is work-based rather
+// than dimension-based because the measured optimum tracks total flops, not linear size: on
+// the Zen5 9950X, 128^3 (2e6) runs fastest serial, 192^3 (7e6) at 2-3 workers, and 384^3
+// (5.7e7) already wants all 32 hardware threads - a linear-dimension stride cannot fit both
+// ends of that curve. Calibrated on the 9950X; sweep with gemmkit-tune on other machines
+/// Compiled default for [`par_mnk_per_worker`]: overridden by `GEMMKIT_PAR_MNK_PER_WORKER`
+/// or [`set_par_mnk_per_worker`]. Public so the `gemmkit-tune` calibration tool can read this
+/// target-split value as its baseline instead of hard-coding a copy that could drift
+#[cfg(not(all(target_arch = "wasm32", feature = "wasm_threads")))]
+pub const PAR_MNK_PER_WORKER_DEFAULT: usize = 2_000_000;
+/// The threaded-wasm default: a wasm worker costs far less to engage than a native thread
+/// (no `available_parallelism` walk, a dedicated pre-sized pool, cheap wasmtime scheduling),
+/// and the measured optimum under wasmtime keeps all 8 default workers profitable down to
+/// `128^3` (5x serial there, where the native machine wants that shape serial) - so the
+/// per-worker work floor sits 8x lower than the native calibration
+#[cfg(all(target_arch = "wasm32", feature = "wasm_threads"))]
+pub const PAR_MNK_PER_WORKER_DEFAULT: usize = 262_144;
+static PAR_MNK_PER_WORKER: Threshold =
+    Threshold::new("GEMMKIT_PAR_MNK_PER_WORKER", PAR_MNK_PER_WORKER_DEFAULT);
 
 // Worker count for a threaded wasm build (the `wasm_threads` feature). wasm has no
 // `available_parallelism`, so the deployer sets the parallel width here instead: it both caps
@@ -415,16 +438,17 @@ static I8_VNNI_MIN_PAR_MNK: Threshold =
 // itself against this one, so a knob added above cannot silently escape their coverage. A static
 // cannot be iterated over without a macro (which this crate avoids), so this manual mirror is the
 // chosen tradeoff: every `Threshold` static declared above must have its env name appear here
-// The 23 knobs that exist in every build live in `KNOB_ENV_NAMES_BASE`; the 2 that are cfg-gated
+// The 24 knobs that exist in every build live in `KNOB_ENV_NAMES_BASE`; the 2 that are cfg-gated
 // (whose `Threshold` statics above carry the same cfg) are appended only when actually compiled
 // in - `I8_VNNI_MIN_PAR_MNK` under the `int8` feature and `WASM_THREADS` under
 // `wasm32 + wasm_threads`. Declaring a `Threshold` here without adding its name to one of these 2
 // lists is a small diff away from being caught: the consumer sync tests assert against the count
-const KNOB_ENV_NAMES_BASE: [&str; 23] = [
+const KNOB_ENV_NAMES_BASE: [&str; 24] = [
     "GEMMKIT_PARALLEL_THRESHOLD",
     "GEMMKIT_RHS_PACK_THRESHOLD",
     "GEMMKIT_LHS_PACK_THRESHOLD",
     "GEMMKIT_LHS_PACK_STRIDE",
+    "GEMMKIT_LHS_PACK_SPAN",
     "GEMMKIT_GEMV_THRESHOLD",
     "GEMMKIT_SMALL_K_THRESHOLD",
     "GEMMKIT_SMALL_MN_DIM",
@@ -432,7 +456,7 @@ const KNOB_ENV_NAMES_BASE: [&str; 23] = [
     "GEMMKIT_GEMV_PARALLEL_BYTES",
     "GEMMKIT_GEMV_THREAD_CAP",
     "GEMMKIT_PARALLEL_OVERSAMPLE",
-    "GEMMKIT_THREAD_DIM_STRIDE",
+    "GEMMKIT_PAR_MNK_PER_WORKER",
     "GEMMKIT_SHARED_LHS_MNK",
     "GEMMKIT_K_STREAM_MAX",
     "GEMMKIT_SEQ_INTERNAL_BYTES_PER_WORKER",
@@ -528,6 +552,17 @@ pub fn lhs_pack_stride() -> usize {
 /// value
 pub fn set_lhs_pack_stride(v: usize) {
     LHS_PACK_STRIDE.set(v);
+}
+
+/// Get the LHS-packing address-span gate, in bytes: the stride gate only force-packs a
+/// column-major A when the whole depth-slice walk (`csa * sizeof(Lhs) * kc`) also reaches this
+/// many bytes of address range. `0` (the default) means auto (4 MiB)
+pub fn lhs_pack_span() -> usize {
+    LHS_PACK_SPAN.get()
+}
+/// Override the LHS-packing address-span gate, in bytes; `0` restores the auto value
+pub fn set_lhs_pack_span(v: usize) {
+    LHS_PACK_SPAN.set(v);
 }
 
 /// Get the gemv special-path cap on `min(m, n)`
@@ -727,31 +762,15 @@ pub fn set_i8_vnni_min_par_mnk(v: usize) {
     I8_VNNI_MIN_PAR_MNK.set(v);
 }
 
-/// Get the auto worker-count ramp granularity, in units of linear problem dimension per worker.
-/// `0` (the default) derives the stride from the machine's core count (see
-/// `auto_thread_dim_stride`); a non-zero env/setter value is used verbatim. Always `>= 1` so
-/// the `cbrt(mnk).div_ceil(stride)` ramp can never divide by zero
-pub fn thread_dim_stride() -> usize {
-    match THREAD_DIM_STRIDE.get() {
-        0 => auto_thread_dim_stride(),
-        v => v.max(1),
-    }
+/// Get the auto worker-count ramp granularity: the `m*n*k` work each additional worker must
+/// bring before the auto `Rayon(0)` path widens by one (it targets `mnk / this` workers).
+/// Returned verbatim; the consumer clamps to `>= 1` so a `0` cannot divide by zero
+pub fn par_mnk_per_worker() -> usize {
+    PAR_MNK_PER_WORKER.get()
 }
-/// Override the auto worker-count ramp granularity (`0` restores the core-derived auto value)
-pub fn set_thread_dim_stride(v: usize) {
-    THREAD_DIM_STRIDE.set(v);
-}
-
-/// As [`thread_dim_stride`], but deriving the auto value from an already-sampled core count
-/// instead of querying it again: `Parallelism::resolve` needs the core count anyway for its
-/// worker cap, so it samples `available_parallelism` once and passes it here, avoiding a 2nd
-/// affinity/cgroup query on every auto-parallel call
-#[cfg(feature = "parallel")]
-pub(crate) fn thread_dim_stride_for(cores: usize) -> usize {
-    match THREAD_DIM_STRIDE.get() {
-        0 => auto_stride_for(cores),
-        v => v.max(1),
-    }
+/// Override the auto worker-count ramp granularity (`0` behaves as `1`: always full width)
+pub fn set_par_mnk_per_worker(v: usize) {
+    PAR_MNK_PER_WORKER.set(v);
 }
 
 /// Get the worker count for a threaded wasm build (default 8; see `WASM_THREADS_DEFAULT`). Only
@@ -765,39 +784,4 @@ pub fn wasm_threads() -> usize {
 #[cfg(all(target_arch = "wasm32", feature = "wasm_threads"))]
 pub fn set_wasm_threads(v: usize) {
     WASM_THREADS.set(v.max(1));
-}
-
-/// Core-count-derived auto ramp granularity. The ramp saturates all `cores` workers once the
-/// linear problem size reaches `cbrt(mnk) == stride * cores`, so the stride controls how fast a
-/// growing problem climbs to full worker width. This is an empirical calibration, not a
-/// derivation from first principles: it is fit to 2 measured points, a low/mid-core part that
-/// benefits from a fast ramp (small stride) and a higher-core part that wants a slow one (large
-/// stride), giving `stride = clamp(cores^2 / 16, 16, 64)`. The real driver behind the optimal
-/// ramp speed is memory-domain topology (cross-domain traffic favors a slower ramp), which cannot
-/// be robustly detected at runtime, so core count is only a proxy for it and the interpolation
-/// between the 2 anchor points is unvalidated. The `16` floor keeps small machines from ramping
-/// *more* aggressively than what was measured there (a bare `cores^2/16` would give `1` at 4
-/// cores); the `64` ceiling keeps large machines no more aggressive than the legacy default.
-/// Recomputed on every call rather than memoized, since affinity can change at runtime; this
-/// function samples the core count once per call and routes it through [`thread_dim_stride_for`],
-/// so the hot path still pays only a single query. Override `GEMMKIT_THREAD_DIM_STRIDE` on any
-/// topology this 2-point fit gets wrong
-#[cfg(feature = "std")]
-fn auto_thread_dim_stride() -> usize {
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(8);
-    auto_stride_for(cores)
-}
-
-/// The `cores -> stride` fit shared by the self-querying getter above and the
-/// caller-sampled [`thread_dim_stride_for`]
-#[cfg(any(feature = "std", feature = "parallel"))]
-fn auto_stride_for(cores: usize) -> usize {
-    (cores * cores / 16).clamp(16, 64)
-}
-/// Without `std` there is no `available_parallelism` to query; keep the legacy constant instead
-#[cfg(not(feature = "std"))]
-fn auto_thread_dim_stride() -> usize {
-    64
 }

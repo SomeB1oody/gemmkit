@@ -126,17 +126,20 @@ fn gemv_threshold_disables_path_but_stays_correct() {
     }
 }
 
-/// Both LHS paths must be correct under parallelism: packed (forced by a zero-byte
-/// stride gate, so every column-major A packs) and read-in-place (gate disabled).
-/// Exercises the dynamic scheduler's packed-panel grain plus partial row/column tiles,
-/// against a naive reference
+/// Both LHS paths must be correct under parallelism: packed (forced by setting both the
+/// stride gate and its span companion to 1, so every column-major A packs) and read-in-place
+/// (both gates set to `usize::MAX`, so neither fires). Exercises the dynamic scheduler's
+/// packed-panel grain plus partial row/column tiles, against a naive reference
 #[test]
 fn lhs_packing_both_modes_correct() {
     let _g = knob_guard();
-    // 1 = always pack a column-major A (csa*sizeof >= 1); MAX = never via stride
-    // (0 would mean "auto" - derive from page size - so it is not an extreme here)
+    // 1 = always pack a column-major A (both the stride and span gates pass at 1 byte);
+    // MAX = never via stride (0 would mean "auto" - derive from the page size / the
+    // 4 MiB span default - so it is not an extreme here). The span gate mirrors the
+    // stride value: the driver packs only when BOTH gates fire
     for &stride in &[1usize, usize::MAX] {
         tuning::set_lhs_pack_stride(stride);
+        tuning::set_lhs_pack_span(stride);
         for &(m, k, n) in &[(97, 64, 80), (160, 48, 133), (200, 96, 175), (33, 17, 19)] {
             let (a, b) = mkmats(m, k, n);
             let cref = naive_col(&a, &b, m, k, n);

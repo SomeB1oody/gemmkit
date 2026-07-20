@@ -833,12 +833,12 @@ fn main() {
         )
     );
     knob!(
-        "GEMMKIT_THREAD_DIM_STRIDE",
+        "GEMMKIT_PAR_MNK_PER_WORKER",
         sweep_sgemm(
-            "GEMMKIT_THREAD_DIM_STRIDE",
-            tuning::set_thread_dim_stride,
-            tuning::THREAD_DIM_STRIDE_DEFAULT, // 0 = auto
-            &[16, 24, 32, 48, 64],
+            "GEMMKIT_PAR_MNK_PER_WORKER",
+            tuning::set_par_mnk_per_worker,
+            tuning::PAR_MNK_PER_WORKER_DEFAULT,
+            &[500_000, 1_000_000, 4_000_000, 8_000_000],
             &timing,
             &[(256, 256, 256), (512, 512, 512), (1024, 1024, 1024)],
             par,
@@ -891,6 +891,22 @@ fn main() {
                 (4096, 1024, 1024),
                 (8192, 512, 512),
             ],
+            par,
+            false,
+        )
+    );
+    knob!(
+        "GEMMKIT_LHS_PACK_SPAN",
+        sweep_sgemm(
+            "GEMMKIT_LHS_PACK_SPAN",
+            tuning::set_lhs_pack_span,
+            tuning::LHS_PACK_SPAN_DEFAULT, // 0 = auto (4 MiB)
+            &[1 << 20, 2 << 20, 8 << 20, MAX],
+            &timing,
+            // Square col-major shapes bracketing the in-place/pack crossover the
+            // span gate controls (the 9950X measured it between the 2 MiB walk of
+            // n = 1024 and the 4 MiB walk of n = 2048)
+            &[(1024, 1024, 1024), (2048, 2048, 2048), (4096, 4096, 4096)],
             par,
             false,
         )
@@ -1183,8 +1199,8 @@ const NEUTRALIZE: &[(Setter, usize)] = &[
         tuning::PACKED_OVERSAMPLE_DEFAULT,
     ),
     (
-        tuning::set_thread_dim_stride,
-        tuning::THREAD_DIM_STRIDE_DEFAULT,
+        tuning::set_par_mnk_per_worker,
+        tuning::PAR_MNK_PER_WORKER_DEFAULT,
     ),
     (
         tuning::set_rhs_pack_threshold,
@@ -1195,6 +1211,7 @@ const NEUTRALIZE: &[(Setter, usize)] = &[
         tuning::LHS_PACK_THRESHOLD_DEFAULT,
     ),
     (tuning::set_lhs_pack_stride, tuning::LHS_PACK_STRIDE_DEFAULT),
+    (tuning::set_lhs_pack_span, tuning::LHS_PACK_SPAN_DEFAULT),
     (
         tuning::set_small_k_threshold,
         tuning::SMALL_K_THRESHOLD_DEFAULT,
@@ -1445,6 +1462,7 @@ const TUNED: &[&str] = &[
     "GEMMKIT_RHS_PACK_THRESHOLD",
     "GEMMKIT_LHS_PACK_THRESHOLD",
     "GEMMKIT_LHS_PACK_STRIDE",
+    "GEMMKIT_LHS_PACK_SPAN",
     "GEMMKIT_GEMV_THRESHOLD",
     "GEMMKIT_SMALL_K_THRESHOLD",
     "GEMMKIT_SMALL_MN_DIM",
@@ -1452,7 +1470,7 @@ const TUNED: &[&str] = &[
     "GEMMKIT_GEMV_PARALLEL_BYTES",
     "GEMMKIT_GEMV_THREAD_CAP",
     "GEMMKIT_PARALLEL_OVERSAMPLE",
-    "GEMMKIT_THREAD_DIM_STRIDE",
+    "GEMMKIT_PAR_MNK_PER_WORKER",
     "GEMMKIT_SHARED_LHS_MNK",
     "GEMMKIT_K_STREAM_MAX",
     "GEMMKIT_SEQ_INTERNAL_BYTES_PER_WORKER",
