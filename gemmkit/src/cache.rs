@@ -230,21 +230,29 @@ pub(crate) fn lhs_pack_span_bytes() -> usize {
 /// * With an L3 (x86, Graviton): half of the per-core-reachable L3
 ///   ([`Level::effective_bytes`]). Calibrated on the Zen5 9950X as a 16 MiB floor
 ///   against its 32 MiB per-CCD slice
-/// * No L3 (Apple's shared cluster-L2): half the *full* shared L2, not `effective_bytes`,
-///   which divides by the cluster size (`shared_by`) for the per-worker BLIS budget. For the
-///   serial-vs-parallel gemv question, a single core streams from the whole cluster L2 but
-///   cannot saturate its bandwidth alone, so splitting across the cluster still gains once the
-///   matrix exceeds about half of it. Calibrated on an M4 Max (16 MiB P-cluster L2): parallel
-///   ran 0.64x serial at a 4 MiB matrix and 1.12x at 8 MiB, so the ~8 MiB floor (`l2.bytes / 2`)
-///   keeps small gemv serial and parallelizes only the DRAM-bound ones
+/// * No L3 (Apple's shared cluster-L2): a fraction of the *full* shared L2, not
+///   `effective_bytes`, which divides by the cluster size (`shared_by`) for the per-worker BLIS
+///   budget. For the serial-vs-parallel gemv question, a single core streams from the whole
+///   cluster L2 but cannot saturate its bandwidth alone, so splitting across the cluster gains
+///   once the matrix leaves the core-cheap sizes. On aarch64 the fraction is an eighth,
+///   recalibrated on an M4 Max (16 MiB P-cluster L2) with the exact-fit tier pools active,
+///   which cut the very fork/join cost this floor prices: serial still wins at a 2.1 MiB
+///   matrix (47 vs 42 GFLOP/s), parallel wins from 3.2 MiB (+28%) and 4 MiB (+33%), so the
+///   2 MiB floor (`l2.bytes / 8`) admits the winners. An earlier pre-tier-pool calibration
+///   wanted half (parallel only broke even near 8 MiB); the non-aarch64 no-L3 arm keeps that
+///   conservative half, unrevalidated
 #[cfg(feature = "parallel")]
 pub(crate) fn gemv_parallel_floor_bytes() -> usize {
     match crate::tuning::gemv_parallel_bytes() {
         0 => {
             let t = topology();
+            #[cfg(target_arch = "aarch64")]
+            const NO_L3_DIV: usize = 8;
+            #[cfg(not(target_arch = "aarch64"))]
+            const NO_L3_DIV: usize = 2;
             match t.l3 {
                 Some(l3) => (l3.effective_bytes() / 2).max(1),
-                None => (t.l2.bytes / 2).max(1),
+                None => (t.l2.bytes / NO_L3_DIV).max(1),
             }
         }
         v => v,
