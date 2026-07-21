@@ -589,9 +589,9 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize, E>(
         // another redundant copy of every A panel it touches, so from
         // `SHARED_A_MIN_THREADS` up the dedup wins even below the size gate
         // (measured on the Zen5 9950X, row-major f32: tie at 16 workers, +16-35%
-        // shared at 32, and +52% for the forced-pack bf16 dot layout; 16 also
-        // keeps aarch64 behavior unchanged - the M4's auto width tops out below
-        // it - pending on-device validation)
+        // shared at 32, and +52% for the forced-pack bf16 dot layout; the M4's
+        // auto width tops out below 16, so on aarch64 only the size gate decides,
+        // and its on-device calibration lives with `SHARED_LHS_MNK_DEFAULT`)
         const SHARED_A_MIN_THREADS: usize = 16;
         let shared_a = n_threads > 1
             && (rsa != 1 || want_pack_lhs)

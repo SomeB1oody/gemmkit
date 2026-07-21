@@ -362,12 +362,15 @@ static WASM_THREADS: Threshold = Threshold::new("GEMMKIT_WASM_THREADS", WASM_THR
 // and only problems above this crossover use the shared pre-pass
 //
 // The crossover is a **machine** property (barrier cost vs redundant-pack savings), not a tile
-// property, so it does not scale with mr/nr/kc
+// property, so it does not scale with mr/nr/kc. Measured on the M4 Max (row-major A, f32,
+// auto parallelism): shared wins from 8.4e6 up (+66% at 8.4e6, +51% at 1.7e7, +39% at 3.4e7)
+// and only 4.2e6 still prefers per-worker (-4%), so the aarch64 gate sits at 6e6; the Zen5
+// crossover is 3 orders of magnitude higher
 /// Compiled default for [`shared_lhs_mnk`]: overridden by `GEMMKIT_SHARED_LHS_MNK` or
 /// [`set_shared_lhs_mnk`]. Public for the same reason as [`SMALL_K_THRESHOLD_DEFAULT`]: a
 /// calibration tool can read the shipped, arch-split value directly instead of mirroring it
 #[cfg(target_arch = "aarch64")]
-pub const SHARED_LHS_MNK_DEFAULT: usize = 50_000_000;
+pub const SHARED_LHS_MNK_DEFAULT: usize = 6_000_000;
 /// The 64-bit non-aarch64 default; see the aarch64 doc above for what this knob controls
 #[cfg(all(not(target_arch = "aarch64"), target_pointer_width = "64"))]
 pub const SHARED_LHS_MNK_DEFAULT: usize = 8_000_000_000;
