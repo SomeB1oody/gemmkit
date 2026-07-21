@@ -28,7 +28,7 @@ The three block sizes keep the `A` and `B` panels resident, but they say nothing
 
 ## The tiny-matrix shortcut
 
-When both `m` and `n` are at or below `GEMMKIT_TINY_BLOCK_DIM` (default 64), the full model is skipped: `kc` is `k` clamped to the `GEMMKIT_KC` ceiling (default 512), `mc` is whatever row count keeps the panel in L2 at that depth (capped by `m` itself), and `nc` is `n` rounded up to `nr`. A problem whose whole working set fits in L2 gains nothing from three levels of residency analysis; the shortcut spends the saved arithmetic where it matters, on the fixed per-call overhead small products are dominated by.
+When both `m` and `n` are at or below `GEMMKIT_TINY_BLOCK_DIM` (default 64), the full model is skipped: `kc` is `k` clamped to the `GEMMKIT_KC` ceiling (default 512; 16384 on aarch64, where deeper slices measured monotonically faster), `mc` is whatever row count keeps the panel in L2 at that depth (capped by `m` itself), and `nc` is `n` rounded up to `nr`. A problem whose whole working set fits in L2 gains nothing from three levels of residency analysis; the shortcut spends the saved arithmetic where it matters, on the fixed per-call overhead small products are dominated by.
 
 ## Detection: a fallback chain that cannot fail
 

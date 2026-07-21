@@ -68,7 +68,7 @@ The knobs below are the full catalog across every feature and target configurati
 | `GEMMKIT_MC_REG_PANELS` | `set_mc_reg_panels` | 8 | The A macro-panel is bounded to this many microtile rows (`this * MR`), following BLIS's rule that MC stays a small multiple of MR. |
 | `GEMMKIT_NC_NO_L3_PANELS` | `set_nc_no_l3_panels` | 512 | The no-L3 column block (Apple Silicon and the like) is `min(this * NR, N)`. Dead where an L3 exists. |
 | `GEMMKIT_TINY_BLOCK_DIM` | `set_tiny_block_dim` | 64 | A shape with both `m` and `n` at or below this skips the full BLIS blocking model and just keeps A/B panels in L2. |
-| `GEMMKIT_KC` | `set_kc` | 512 | The depth block in the tiny-matrix shortcut: `k` clamped to this. |
+| `GEMMKIT_KC` | `set_kc` | 512 (aarch64: 16384) | The depth block in the tiny-matrix shortcut: `k` clamped to this. On the M4 Max deeper slices measured monotonically faster (`64^2` deep-k f32 4.6x at 4096 vs 512, still gaining through 16384), so aarch64 runs the shortcut near single-slice. |
 | `GEMMKIT_KC_MIN` | `set_kc_min` | 512 | The main-model `kc` floor: the L1-fit depth estimate is raised to at least this, so a small L1 never starves the microkernel's depth walk. |
 
 ### Deep-contraction and wasm

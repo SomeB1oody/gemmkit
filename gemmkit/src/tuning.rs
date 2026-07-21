@@ -452,8 +452,19 @@ pub const TINY_BLOCK_DIM_DEFAULT: usize = 64;
 static TINY_BLOCK_DIM: Threshold = Threshold::new("GEMMKIT_TINY_BLOCK_DIM", TINY_BLOCK_DIM_DEFAULT);
 
 // Depth-block ceiling used only inside the small-matrix shortcut above: there, kc is k clamped to
-// this value
+// this value. The ceiling trades depth-slice count (each extra slice re-reads and re-writes the
+// tiny C and re-enters the driver) against panel residency, so it is arch-split:
+// * x86 (Zen5): 512 keeps the A/B panels L1/L2-resident
+// * aarch64 (M4 Max): deeper is monotonically better through every measured point - the tiny C
+//   makes the per-slice cost dominant while the unified memory feeds streamed panels: 64^2
+//   deep-k f32 runs 4.6x faster at kc = 4096 than at 512 (476 vs 102 GFLOP/s) and f64 3x
+//   (284 vs 95), and 32^2 x 65536 still gains from kc 8192 to 16384 (243 -> 292 GFLOP/s)
+//   while f64 is flat there - hence 16384
 /// Compiled default for [`kc`]: overridden by `GEMMKIT_KC` or [`set_kc`]
+#[cfg(target_arch = "aarch64")]
+pub const KC_DEFAULT: usize = 16384;
+/// The non-aarch64 default; see the aarch64 doc above for what this knob controls
+#[cfg(not(target_arch = "aarch64"))]
 pub const KC_DEFAULT: usize = 512;
 static KC: Threshold = Threshold::new("GEMMKIT_KC", KC_DEFAULT);
 
