@@ -164,12 +164,21 @@ static LHS_PACK_SPAN: Threshold = Threshold::new("GEMMKIT_LHS_PACK_SPAN", LHS_PA
 // how many `nr`-wide column tiles re-read each packed A panel (`n_nt_max = nc.div_ceil(nr)`). A
 // tall, skinny shape (m >> n) has a huge span but few column tiles, so the stride+span gate
 // fires and amortizes an expensive pack over too little reuse. This floor holds the force-pack
-// back until at least this many column tiles reuse the panel: measured on the Zen5 9950X (f32,
-// auto parallelism), in-place beats the pack by 18-71% through n_nt = 86 (m = 4096-8192,
-// k = 512-1024, skinny n) while deep-k squares from n_nt = 171 up (2048^3) still want the pack
-// by 8%, with every n_nt in between a tie - hence the floor at 128
+// back until at least this many column tiles reuse the panel. The crossover trades a
+// **machine's** pack cost against its strided-read penalty, so it is arch-split:
+// * x86 (Zen5, f32, auto parallelism): in-place beats the pack by 18-71% through n_nt = 86
+//   (m = 4096-8192, k = 512-1024, skinny n) while deep-k squares from n_nt = 171 up (2048^3)
+//   still want the pack by 8%, with every n_nt in between a tie - hence the floor at 128
+// * aarch64 (M4 Max): the trade nearly inverts - packing is cheap and the in-place walk
+//   strides 16 KiB pages, so the pack wins from n_nt = 4 up (m = k = 4096: n = 16 +38%,
+//   n = 32 +88%, n = 256 +220%) and in-place only holds n_nt = 2 (n = 8: 177 vs 149
+//   GFLOP/s) - hence the floor at 4
 /// Compiled default for [`lhs_pack_reuse`]: overridden by `GEMMKIT_LHS_PACK_REUSE` or
 /// [`set_lhs_pack_reuse`]; `0` drops the reuse floor (force-pack on the stride+span gate alone)
+#[cfg(target_arch = "aarch64")]
+pub const LHS_PACK_REUSE_DEFAULT: usize = 4;
+/// The non-aarch64 default; see the aarch64 doc above for what this knob controls
+#[cfg(not(target_arch = "aarch64"))]
 pub const LHS_PACK_REUSE_DEFAULT: usize = 128;
 static LHS_PACK_REUSE: Threshold = Threshold::new("GEMMKIT_LHS_PACK_REUSE", LHS_PACK_REUSE_DEFAULT);
 
