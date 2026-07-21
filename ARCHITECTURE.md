@@ -327,15 +327,18 @@ worst point on a bandwidth scaling curve.
 
 Rayon fork/join overhead scales with a pool's idle slack (threads minus
 engaged workers), so a small parallel GEMM forking into the full-width global
-pool pays for threads it never uses. On x86_64 gemmkit also keeps up to
-`GEMMKIT_POOL_CLASSES` (default 2, clamped to 3; 0 on other architectures
-pending on-device validation) private, persistent rayon pools at halving
-tiers of the machine width - e.g. 16 and 8 threads on a 32-thread part -
-built lazily on first use (about 12 microseconds per thread) and never
-rebuilt. The auto path snaps its worker count exactly onto a tier and stays
-on the physical-core tier until `m*n*k` clears `GEMMKIT_FULL_WIDTH_MNK`
-(default auto, 110_000_000 on the 9950X, where the physical-core tier beats
-full width through `448^3`); `MAX` pins auto to that tier unconditionally. A
+pool pays for threads it never uses. On x86_64 and aarch64 gemmkit also
+keeps up to `GEMMKIT_POOL_CLASSES` (default 2 on x86_64, 1 on aarch64,
+clamped to 3; 0 elsewhere pending on-device validation) private, persistent
+rayon pools at halving tiers of the machine width - e.g. 16 and 8 threads on
+a 32-thread part, a single 7-wide tier on a 14-core M4 Max - built lazily on
+first use (about 12 microseconds per thread) and never rebuilt. The auto
+path snaps its worker count exactly onto a tier and stays on its largest
+tier until `m*n*k` clears `GEMMKIT_FULL_WIDTH_MNK` (default auto,
+arch-split: 110_000_000 on the 9950X, where the physical-core tier beats
+full width through `448^3`; 14_000_000 on the M4 Max, where the 7-wide tier
+wins through `224^3` by 2.1-2.6x and full width, engaging the E-cores, wins
+from `256^3`); `MAX` pins auto to the largest tier unconditionally. A
 call already running inside a rayon pool is never redirected, and an
 explicit `Rayon(n)` keeps exactly `n` workers while merely picking the
 smallest fitting tier pool; threaded wasm's dedicated pool is unaffected.

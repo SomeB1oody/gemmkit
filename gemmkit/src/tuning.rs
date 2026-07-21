@@ -297,15 +297,24 @@ static PAR_MNK_PER_WORKER: Threshold =
 // * x86 (Zen5): 2 tiers. Measured on the 9950X (32 HW threads, 16 physical cores), the width/4
 //   tier of 8 wins 96^3 through 288^3 by 2-3x, and the width/2 physical-core tier of 16 wins
 //   320^3 through 448^3, beating full SMT width by 7-11% by staying on the physical cores
-// * other targets: 0 (disabled). aarch64 is pending on-device validation; wasm has its own
-//   dedicated pool and never reaches this path
+// * aarch64 (M4 Max): 1 tier. Measured on the M4 Max (14 cores, 10P + 4E, no SMT), the width/2
+//   tier of 7 wins 128^3 through 224^3 by 2.1-2.6x over the ambient-pool ramp; a deeper ladder
+//   loses (the tier margin would route 128^3..192^3 onto the width/4 tier of 3 and halve those
+//   wins), and an exact 10-worker P-core tier loses to 7 everywhere except 256^3 (+7%), not
+//   worth a 2nd tier. Full width takes over from 256^3 up through the aarch64 arm of the
+//   full-width gate below
+// * other targets: 0 (disabled), pending on-device validation; wasm has its own dedicated pool
+//   and never reaches this path
 /// Compiled default for [`pool_classes`]: overridden by `GEMMKIT_POOL_CLASSES` or
 /// [`set_pool_classes`]; `0` disables the private size-class pools (ambient-pool behavior).
 /// Clamped to at most 3 tiers at the consumer (see `crate::parallel::class_sizes`)
 #[cfg(target_arch = "x86_64")]
 pub const POOL_CLASSES_DEFAULT: usize = 2;
-/// The non-x86_64 default; see the x86_64 doc above for what this knob controls
-#[cfg(not(target_arch = "x86_64"))]
+/// The aarch64 default; see the x86_64 doc above for what this knob controls
+#[cfg(target_arch = "aarch64")]
+pub const POOL_CLASSES_DEFAULT: usize = 1;
+/// The default on every other target; see the x86_64 doc above for what this knob controls
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub const POOL_CLASSES_DEFAULT: usize = 0;
 static POOL_CLASSES: Threshold = Threshold::new("GEMMKIT_POOL_CLASSES", POOL_CLASSES_DEFAULT);
 
@@ -316,10 +325,13 @@ static POOL_CLASSES: Threshold = Threshold::new("GEMMKIT_POOL_CLASSES", POOL_CLA
 // auto value is arch-split at the consumer: aarch64 (M4 Max, no SMT) crosses over an order of
 // magnitude earlier, between 224^3 and 256^3. Only consulted when pool tiers are active
 // (`pool_classes` above is non-zero)
-// the physical-core tier still wins by 7%) and 512^3 (134M, where full width wins by 5%). Only
-// consulted when pool tiers are active (`pool_classes` above is non-zero)
+// the physical-core tier still wins by 7%) and 512^3 (134M, where full width wins by 5%). The
+// auto value is arch-split at the consumer: aarch64 (M4 Max, no SMT) crosses over an order of
+// magnitude earlier, between 224^3 and 256^3. Only consulted when pool tiers are active
+// (`pool_classes` above is non-zero)
 /// Compiled default for [`full_width_mnk`]: overridden by `GEMMKIT_FULL_WIDTH_MNK` or
-/// [`set_full_width_mnk`]; `0` means auto (110_000_000; see `crate::parallel::FULL_WIDTH_MNK_AUTO`)
+/// [`set_full_width_mnk`]; `0` means auto (arch-split, 110_000_000 on x86 and 14_000_000 on
+/// aarch64; see `crate::parallel::FULL_WIDTH_MNK_AUTO`)
 pub const FULL_WIDTH_MNK_DEFAULT: usize = 0;
 static FULL_WIDTH_MNK: Threshold = Threshold::new("GEMMKIT_FULL_WIDTH_MNK", FULL_WIDTH_MNK_DEFAULT);
 
@@ -880,12 +892,13 @@ pub fn set_pool_classes(v: usize) {
 }
 
 /// Get the full-machine-width work gate (`m*n*k`): above it the auto path leaves the largest
-/// private pool tier for the full machine width. `0` means auto (110_000_000). Consulted only
-/// when the size-class pools are active (`pool_classes` is non-zero)
+/// private pool tier for the full machine width. `0` means auto (arch-split, 110_000_000 on
+/// x86 and 14_000_000 on aarch64). Consulted only when the size-class pools are active
+/// (`pool_classes` is non-zero)
 pub fn full_width_mnk() -> usize {
     FULL_WIDTH_MNK.get()
 }
-/// Override the full-machine-width work gate (`0` restores the 110_000_000 auto value)
+/// Override the full-machine-width work gate (`0` restores the arch-split auto value)
 pub fn set_full_width_mnk(v: usize) {
     FULL_WIDTH_MNK.set(v);
 }

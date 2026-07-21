@@ -297,9 +297,13 @@ fn expected_auto_width(m: usize, k: usize, n: usize, avail: usize, n_jobs: usize
     let w = if n_tiers == 0 {
         want
     } else {
-        // 0 means auto: the same 110M gate parallel::FULL_WIDTH_MNK_AUTO uses
+        // 0 means auto: mirror the arch-split parallel::FULL_WIDTH_MNK_AUTO value
+        #[cfg(target_arch = "aarch64")]
+        const FULL_WIDTH_AUTO: usize = 14_000_000;
+        #[cfg(not(target_arch = "aarch64"))]
+        const FULL_WIDTH_AUTO: usize = 110_000_000;
         let full = match gemmkit::tuning::full_width_mnk() {
-            0 => 110_000_000,
+            0 => FULL_WIDTH_AUTO,
             v => v,
         };
         if mnk >= full {

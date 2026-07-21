@@ -73,11 +73,21 @@ fn wasm_pool() -> &'static rayon::ThreadPool {
 }
 
 /// The auto value for `tuning::full_width_mnk` (a `0` knob): the `m*n*k` above which the auto
-/// path leaves the largest private pool tier for the full machine width. Calibrated on the Zen5
-/// 9950X between 448^3 (89.9M, where the physical-core tier still wins by 7%) and 512^3 (134M,
-/// where full SMT width wins by 5%)
-#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+/// path leaves the largest private pool tier for the full machine width. Arch-split, each side
+/// calibrated on its own reference machine:
+/// * x86: between 448^3 (89.9M, where the Zen5 physical-core tier still wins by 7%) and 512^3
+///   (134M, where full SMT width wins by 5%)
+/// * aarch64: between 224^3 (11.2M, where the M4 Max width/2 tier of 7 still wins by 2.2x) and
+///   256^3 (16.8M, where full width, engaging the E-cores, wins by 3%). With no SMT there is no
+///   late SMT tax to defer, so the crossover sits an order of magnitude lower
+#[cfg(all(
+    feature = "parallel",
+    not(target_arch = "wasm32"),
+    not(target_arch = "aarch64")
+))]
 const FULL_WIDTH_MNK_AUTO: usize = 110_000_000;
+#[cfg(all(feature = "parallel", target_arch = "aarch64"))]
+const FULL_WIDTH_MNK_AUTO: usize = 14_000_000;
 
 /// The active exact-fit pool tier sizes, ascending, as a fixed `[size; 3]` array plus a length
 /// (no heap). Derived on every call so the `pool_classes` knob stays sweepable in-process (its
@@ -199,9 +209,12 @@ impl Parallelism {
                 // Calibrated on the Zen5 9950X (32 HW threads, 16 physical cores): 96^3 through
                 // 288^3 want the width/4 tier of 8; 320^3 through 448^3 want the width/2
                 // physical-core tier of 16, which beats full SMT width by 7-11% by staying on the
-                // physical cores; only from ~110M `m*n*k` up does full width finally win. Below
-                // that gate the width never drops below the smallest tier - an exact-fit pool
-                // wakes whole either way, so a sub-tier width is pointless above the serial gate.
+                // physical cores; only from ~110M `m*n*k` up does full width finally win. The
+                // M4 Max (aarch64) mirrors that shape at smaller scale: 128^3 through 224^3
+                // want its single width/2 tier of 7, and the lower aarch64 auto gate hands
+                // 256^3 and up to full width. Below that gate the width never drops below the
+                // smallest tier - an exact-fit pool wakes whole either way, so a sub-tier width
+                // is pointless above the serial gate
                 // The 3/2 tier margin is measured: 256^3 (want 8.4) is still fastest at 8, 288^3
                 // (want 11.9) ties, 320^3 (want 16.4) wants 16. Wasm keeps the plain ramp (its
                 // dedicated pool has no tiers), so this reduces to the old formula there
@@ -777,8 +790,9 @@ mod tests {
             let (tiers, n_tiers) = class_sizes();
             let mut allowed: Vec<usize> = vec![1usize, cores];
             allowed.extend_from_slice(&tiers[..n_tiers]);
-            // Sweep the ramp from below the gate through the full-width regime (the top of the
-            // sweep clears the 110M auto full-width gate on any core count >= 4)
+            // Sweep the ramp from below the gate through the full-width regime (whether the
+            // sweep top clears the arch-split auto full-width gate depends on the machine;
+            // widths on both sides of it are in `allowed` either way)
             for want in 0..=(cores * 2 + 2) {
                 let mnk = (want * per).max(1);
                 let w = Parallelism::Rayon(0).resolve(mnk, n_jobs);
