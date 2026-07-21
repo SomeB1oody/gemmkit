@@ -455,6 +455,24 @@ static KC_MIN: Threshold = Threshold::new("GEMMKIT_KC_MIN", KC_MIN_DEFAULT);
 pub const DEEP_KC_BYTES_DEFAULT: usize = 0;
 static DEEP_KC_BYTES: Threshold = Threshold::new("GEMMKIT_DEEP_KC_BYTES", DEEP_KC_BYTES_DEFAULT);
 
+// Working-set gate for the driver's C-tile prefetch: once a call's working set (the A, B and C
+// bytes together) exceeds the last-level cache, the output tiles stream from DRAM and the driver
+// issues a T0 prefetch of each C microtile just ahead of its microkernel call, hiding part of the
+// tile's read-modify-write latency; below the gate the tiles are cache-resident and the hint
+// would be pure overhead. The prefetch only reorders cache traffic, never arithmetic, so results
+// are bit-identical with the gate on, off, or forced. Measured on the Zen5 9950X (f32, AVX-512):
+// +1.4% parallel and about +1% serial at 2048^3 (48 MiB working set), +2-3% parallel at
+// 3072^3 and deep-k
+// 2048x2048x24576, neutral at 1536^3 and below (under the 32 MiB per-CCD LLC) and at in-cache
+// sizes. Stream-level prefetching inside the kc loop (LHS/RHS, plain or chunked) measured
+// strictly worse on the same hardware and is deliberately absent
+/// Compiled default for [`prefetch_min_bytes`]: overridden by `GEMMKIT_PREFETCH_MIN_BYTES` or
+/// [`set_prefetch_min_bytes`]; `0` means auto (the per-core-reachable last-level cache, see
+/// `crate::cache::prefetch_ws_bytes`)
+pub const PREFETCH_MIN_BYTES_DEFAULT: usize = 0;
+static PREFETCH_MIN_BYTES: Threshold =
+    Threshold::new("GEMMKIT_PREFETCH_MIN_BYTES", PREFETCH_MIN_BYTES_DEFAULT);
+
 // Strip length for the cache-blocked transpose used by every strided packing path: the real
 // packer, the complex packer, and the small-m,n PACK tier's k-contiguous copy. The source is
 // walked along its contiguous dimension in strips of this many depth steps, and each strip is
@@ -487,12 +505,12 @@ static I8_VNNI_MIN_PAR_MNK: Threshold =
 // itself against this one, so a knob added above cannot silently escape their coverage. A static
 // cannot be iterated over without a macro (which this crate avoids), so this manual mirror is the
 // chosen tradeoff: every `Threshold` static declared above must have its env name appear here
-// The 27 knobs that exist in every build live in `KNOB_ENV_NAMES_BASE`; the 2 that are cfg-gated
+// The 28 knobs that exist in every build live in `KNOB_ENV_NAMES_BASE`; the 2 that are cfg-gated
 // (whose `Threshold` statics above carry the same cfg) are appended only when actually compiled
 // in - `I8_VNNI_MIN_PAR_MNK` under the `int8` feature and `WASM_THREADS` under
 // `wasm32 + wasm_threads`. Declaring a `Threshold` here without adding its name to one of these 2
 // lists is a small diff away from being caught: the consumer sync tests assert against the count
-const KNOB_ENV_NAMES_BASE: [&str; 27] = [
+const KNOB_ENV_NAMES_BASE: [&str; 28] = [
     "GEMMKIT_PARALLEL_THRESHOLD",
     "GEMMKIT_RHS_PACK_THRESHOLD",
     "GEMMKIT_LHS_PACK_THRESHOLD",
@@ -519,6 +537,7 @@ const KNOB_ENV_NAMES_BASE: [&str; 27] = [
     "GEMMKIT_KC",
     "GEMMKIT_KC_MIN",
     "GEMMKIT_DEEP_KC_BYTES",
+    "GEMMKIT_PREFETCH_MIN_BYTES",
     "GEMMKIT_PACK_TRANSPOSE_TILE",
 ];
 
@@ -800,6 +819,19 @@ pub fn deep_kc_bytes() -> usize {
 /// Override the deep-contraction engage gate, in bytes (`0` restores the L2-derived auto value)
 pub fn set_deep_kc_bytes(v: usize) {
     DEEP_KC_BYTES.set(v);
+}
+
+/// Get the C-tile prefetch engage gate, in bytes: the driver prefetches each output microtile
+/// just ahead of its microkernel call only when the call's working set (the A, B and C bytes
+/// together) exceeds this. `0` (the default) means auto: derive the gate from the detected
+/// last-level cache (see `crate::cache::prefetch_ws_bytes`); a non-zero value is the byte
+/// threshold verbatim, so `usize::MAX` disables the prefetch and `1` forces it on
+pub fn prefetch_min_bytes() -> usize {
+    PREFETCH_MIN_BYTES.get()
+}
+/// Override the C-tile prefetch engage gate, in bytes (`0` restores the LLC-derived auto value)
+pub fn set_prefetch_min_bytes(v: usize) {
+    PREFETCH_MIN_BYTES.set(v);
 }
 
 /// Get the cache-blocked-transpose strip length used by the strided packing paths. Always `>= 1`

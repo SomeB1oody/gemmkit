@@ -76,6 +76,7 @@ The knobs below are the full catalog across every feature and target configurati
 | Env var | Setter | Default | Controls |
 | --- | --- | --- | --- |
 | `GEMMKIT_DEEP_KC_BYTES` | `set_deep_kc_bytes` | 0 (auto) | The engage gate, in bytes, for the deep-contraction path: a narrow-output family (`f16`/`bf16`) switches from its single-panel form to an f32-output multi-slice twin once its single RHS micropanel (`nr * k * sizeof(N)`) outgrows this. `0` derives it from half the detected L2. |
+| `GEMMKIT_PREFETCH_MIN_BYTES` | `set_prefetch_min_bytes` | 0 (auto) | The engage gate, in bytes, for the driver's C-tile software prefetch: once a call's working set (`A + B + C` bytes) exceeds this, the output microtiles stream from beyond the LLC and the driver issues a T0 prefetch of each just ahead of its microkernel call, hiding the read-modify-write latency; below it the tiles are cache-resident and the hint would be pure overhead. `0` derives it from the per-core-reachable LLC (L3 where present, else L2). A non-zero value is the threshold verbatim, so `usize::MAX` disables the prefetch and `1` forces it on. x86_64-only (a no-op on other targets, so aarch64/wasm are unchanged); numerics-invisible, bit-identical on or off. |
 | `GEMMKIT_WASM_THREADS` | `set_wasm_threads` | 8 | The worker count for a threaded wasm build, since wasm has no `available_parallelism` to query. Sizes gemmkit's wasm rayon pool. Only exists on wasm32 with the `wasm_threads` feature. |
 
 ## A note on GEMMKIT_FAST_TEST

@@ -1147,3 +1147,44 @@ fn mkvec(n: usize, seed: u64) -> Vec<f32> {
         })
         .collect()
 }
+
+/// The C-tile prefetch is a cache hint, never arithmetic: forcing its gate on (`1`, so any
+/// working set clears it) and off (`usize::MAX`) must produce results bit-identical to the
+/// default, serial and parallel alike. The shape is deliberately ragged (m not an `mr`
+/// multiple, n not an `nr` multiple) so edge tiles take the prefetch call too
+#[test]
+fn prefetch_gate_bit_identical_on_off() {
+    let _g = knob_guard();
+    let prev = tuning::prefetch_min_bytes();
+    let (m, k, n) = (129usize, 67usize, 93usize);
+    let (a, b) = mkmats(m, k, n);
+    for par in [Parallelism::Serial, Parallelism::Rayon(0)] {
+        let mut base: Option<Vec<f64>> = None;
+        for force in [prev, 1usize, usize::MAX] {
+            tuning::set_prefetch_min_bytes(force);
+            let mut cc = vec![0.0f64; m * n];
+            gemm(
+                1.0,
+                MatRef::from_col_major(&a, m, k),
+                MatRef::from_col_major(&b, k, n),
+                0.0,
+                MatMut::from_col_major(&mut cc, m, n),
+                par,
+            );
+            match &base {
+                None => base = Some(cc),
+                Some(first) => {
+                    let identical = first
+                        .iter()
+                        .zip(&cc)
+                        .all(|(x, y)| x.to_bits() == y.to_bits());
+                    assert!(
+                        identical,
+                        "prefetch gate at {force} must be numerics-invisible ({par:?})"
+                    );
+                }
+            }
+        }
+    }
+    tuning::set_prefetch_min_bytes(prev);
+}

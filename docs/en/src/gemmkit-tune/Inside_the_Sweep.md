@@ -49,6 +49,7 @@ Some knobs are never swept, and the report and the profile footer say why for ea
 
 - `PARALLEL_THRESHOLD` — the serial/parallel break-even is strongly shape-dependent; a single `m*n*k` scalar cannot fit every aspect ratio, so the calibrated cross-shape default is kept rather than auto-fit. (Contrast `GEMV_THRESHOLD`, which is a clean binary on/off decision and *is* swept.)
 - `DEEP_KC_BYTES` — this gates the f16/bf16 deep-contraction twin, and the tuner runs no narrow-type probe; its auto default is derived from L2, a machine property. Override it directly if you need to retune the narrow deep-`k` engage point.
+- `PREFETCH_MIN_BYTES` — this gates the driver's C-tile prefetch; its auto default is derived from the detected LLC, a machine property, and probing the crossover would need a beyond-LLC working set on every candidate. Override it directly (`usize::MAX` disables the prefetch, `1` forces it on) to retune the engage point.
 
 Others are inert on the current target and skipped for that reason: `SEQ_INTERNAL_BYTES_PER_WORKER` is read only by the aarch64 batched-split planner (swept there, inert and skipped on x86); `I8_VNNI_MIN_PAR_MNK` gates the x86 VNNI small-parallel fallback that no other target's i8 kernel has; `NC_NO_L3_PANELS` is consulted only on a machine with no L3 (swept there, inert and skipped on an L3 host). The two heavy knobs are skipped unless `--large-matrices` is passed.
 

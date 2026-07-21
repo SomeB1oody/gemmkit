@@ -291,6 +291,33 @@ pub(crate) fn deep_k_engage_bytes() -> usize {
     }
 }
 
+/// The C-tile prefetch engage gate in bytes: the driver issues a T0 prefetch of each output
+/// microtile just ahead of its microkernel call only once the call's working set (the A, B and
+/// C bytes together) exceeds this - past it the output streams from beyond the LLC, where the
+/// hardware prefetchers no longer hide the tile's read-modify-write latency; below it the
+/// tiles are cache-resident and the hint is pure overhead. The `GEMMKIT_PREFETCH_MIN_BYTES`
+/// knob overrides it verbatim; `0` (the default) is the per-core-reachable last-level cache
+/// ([`Level::effective_bytes`]): L3 where present, the L2 otherwise. Measured on the Zen5
+/// 9950X (f32, AVX-512) against its 32 MiB per-CCD slice: +1.4% parallel and about +1% serial
+/// at 2048^3
+/// (48 MiB working set), +2-3% at 3072^3 and deep-k 2048x2048x24576, neutral at 1536^3 (27
+/// MiB, under the gate) and at in-cache sizes. On a target without the x86 prefetch emission
+/// the gate still resolves but the prefetch lowers to nothing, so behavior is unchanged
+/// there. Centralized here, like [`lhs_pack_stride_bytes`], as the one home for the
+/// `0 => auto` derivation and its direct test
+pub(crate) fn prefetch_ws_bytes() -> usize {
+    match crate::tuning::prefetch_min_bytes() {
+        0 => {
+            let t = topology();
+            match t.l3 {
+                Some(l3) => l3.effective_bytes().max(1),
+                None => t.l2.effective_bytes().max(1),
+            }
+        }
+        v => v,
+    }
+}
+
 /// Run the fallback chain once, returning the 1st backend's result that both succeeds
 /// and passes [`plausible`]. Never panics: a backend that fails or returns implausible
 /// values is simply skipped
@@ -516,6 +543,30 @@ mod tests {
         crate::tuning::set_deep_kc_bytes(4096);
         assert_eq!(deep_k_engage_bytes(), 4096, "override must pass through");
         crate::tuning::set_deep_kc_bytes(restore);
+    }
+
+    /// The C-tile prefetch engage gate: the default `0` knob must resolve to the
+    /// per-core-reachable last-level cache (L3 where present, L2 otherwise), and any non-zero
+    /// knob must pass through verbatim. Guards the `0 => LLC` derivation and the override
+    /// branch; asserts against the host's own detected topology, so it holds regardless of
+    /// which machine runs the test
+    #[test]
+    fn prefetch_ws_gate_auto_and_override() {
+        let restore = crate::tuning::prefetch_min_bytes();
+        // Auto: 0 => the per-core-reachable LLC (and never zero, so the gate can still fire)
+        crate::tuning::set_prefetch_min_bytes(0);
+        let auto = prefetch_ws_bytes();
+        let t = topology();
+        let expect = match t.l3 {
+            Some(l3) => l3.effective_bytes().max(1),
+            None => t.l2.effective_bytes().max(1),
+        };
+        assert_eq!(auto, expect, "auto gate must be the per-core-reachable LLC");
+        assert!(auto > 0, "auto gate must be non-zero");
+        // Override: any non-zero value is the byte threshold verbatim
+        crate::tuning::set_prefetch_min_bytes(4096);
+        assert_eq!(prefetch_ws_bytes(), 4096, "override must pass through");
+        crate::tuning::set_prefetch_min_bytes(restore);
     }
 
     /// A degenerate dimension (`m`, `n`, or `k` == 0) short-circuits `blocking` before the BLIS

@@ -69,7 +69,7 @@ impl Drop for KnobGuard {
 /// against `tuning::knob_env_names`; the 2 fns drive the sweep and the restore
 type Knob = (&'static str, fn(usize), fn() -> usize);
 
-/// The 27 general-path knobs this suite sweeps: every entry in `tuning::knob_env_names`
+/// The 28 general-path knobs this suite sweeps: every entry in `tuning::knob_env_names`
 /// except i8 VNNI, which is int8/f32-inert and exercised separately by P20. Order-independent:
 /// each entry is set to an independently-drawn value per case. Both `KnobGuard::capture`
 /// (restore side) and `apply_knobs` (sweep side) iterate this one table, so their lengths -
@@ -203,6 +203,11 @@ const KNOBS: &[Knob] = &[
         tuning::set_deep_kc_bytes,
         tuning::deep_kc_bytes,
     ),
+    (
+        "GEMMKIT_PREFETCH_MIN_BYTES",
+        tuning::set_prefetch_min_bytes,
+        tuning::prefetch_min_bytes,
+    ),
 ];
 const KNOB_COUNT: usize = KNOBS.len();
 
@@ -275,7 +280,7 @@ fn run_gemm(
     c
 }
 
-// P16 metamorphic knob sweep: any single assignment of all 27 knobs keeps every path
+// P16 metamorphic knob sweep: any single assignment of all 28 knobs keeps every path
 // correct (frob vs the f64 reference) and deterministic under a fixed config (run twice,
 // compare bit-for-bit). No comparison across 2 different assignments: different knobs
 // change the blocking, hence the summation order

@@ -143,6 +143,13 @@ fn main() {
    fork-join barrier) when `m` clears `rhs_pack_threshold`; `A` is packed per
    worker, or once per row block by a shared pre-pass on large parallel
    problems, or read in place when reuse is too low to amortize the copy.
+   On a shape whose working set (`A + B + C` bytes) outgrows the
+   per-core-reachable LLC, the driver also T0-prefetches each output
+   microtile just ahead of its microkernel call, hiding the out-of-cache
+   read-modify-write latency; the hint is emitted only on `x86_64` (a no-op
+   elsewhere, so aarch64/wasm are untouched) and moves cache lines only, so
+   results are bit-identical with it on or off (`GEMMKIT_PREFETCH_MIN_BYTES`
+   gates it; `0` = auto = the per-core-reachable LLC).
 5. **Microkernel** (`Fam::microkernel_epi`, e.g. `gemmkit/src/kernel/float.rs`):
    one `MR x NR` tile is accumulated in registers by
    `SimdOps::accumulate_tile` (an ascending-`k` fused-multiply-add schedule),

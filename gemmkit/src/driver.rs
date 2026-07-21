@@ -78,6 +78,54 @@ fn do_pack_lhs(rsa: isize, mc_eff: usize, mr: usize, want_pack: bool) -> bool {
     rsa != 1 || !mc_eff.is_multiple_of(mr) || want_pack
 }
 
+/// Prefetch one output microtile (`mr_eff x nr_eff` at element strides `rsc`/`csc`) into L1
+/// with a T0 hint, just ahead of the microkernel call that will read-modify-write it. Issued
+/// only when the call's working set exceeds the LLC (see `cache::prefetch_ws_bytes`), where
+/// the tile otherwise streams from DRAM: measured on the Zen5 9950X, hiding that latency is
+/// worth +1.4% parallel and about +1% serial at 2048^3, and +2-3% parallel at 3072^3 /
+/// deep-k shapes.
+/// Walks whole cache lines along the tile's unit-stride dimension; a tile strided in both
+/// dimensions has no contiguous lines to fetch and is skipped. A line that only straddles the
+/// tile's tail may be left unfetched - this is a hint, never a correctness concern, and
+/// prefetch never faults, so running past the matrix edge inside the last line is safe.
+/// x86_64 only (`prefetcht0` is baseline SSE, no feature gate needed); a no-op elsewhere, so
+/// aarch64 and wasm behavior is untouched
+#[inline(always)]
+fn prefetch_c_tile<T>(c: *const T, rsc: isize, csc: isize, mr_eff: usize, nr_eff: usize) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+        let esz = core::mem::size_of::<T>();
+        if rsc == 1 {
+            // Column-major tile: each of the nr_eff columns is mr_eff * esz contiguous bytes
+            let col_bytes = mr_eff * esz;
+            for j in 0..nr_eff {
+                let col = c.offset(j as isize * csc) as *const i8;
+                let mut off = 0;
+                while off < col_bytes {
+                    _mm_prefetch::<_MM_HINT_T0>(col.add(off));
+                    off += 64;
+                }
+            }
+        } else if csc == 1 {
+            // Row-major tile: each of the mr_eff rows is nr_eff * esz contiguous bytes
+            let row_bytes = nr_eff * esz;
+            for i in 0..mr_eff {
+                let row = c.offset(i as isize * rsc) as *const i8;
+                let mut off = 0;
+                while off < row_bytes {
+                    _mm_prefetch::<_MM_HINT_T0>(row.add(off));
+                    off += 64;
+                }
+            }
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (c, rsc, csc, mr_eff, nr_eff);
+    }
+}
+
 /// Run a GEMM with the given family, ISA token, and microtile geometry
 ///
 /// Preconditions, established by the dispatch layer before this is ever reached:
@@ -561,6 +609,26 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize, E>(
         // already prepacked
         let pack_b = !prepacked && (m > tuning::rhs_pack_threshold() || Fam::FORCE_PACK_RHS);
 
+        // C-tile prefetch gate, decided once per call: past this working set the output
+        // tiles stream from beyond the LLC, and a T0 prefetch just ahead of each
+        // microkernel call hides part of the tile's read-modify-write latency (see
+        // `prefetch_c_tile` / `cache::prefetch_ws_bytes` for the measurements). A prefetch
+        // only moves cache lines, never arithmetic, so results are bit-identical with the
+        // gate on, off, or forced. Saturating: a broadcast (zero-stride) operand's enormous
+        // logical extent gates on rather than wrapping
+        let ws_bytes = m
+            .saturating_mul(k)
+            .saturating_mul(core::mem::size_of::<Fam::Lhs>())
+            .saturating_add(
+                k.saturating_mul(n)
+                    .saturating_mul(core::mem::size_of::<Fam::Rhs>()),
+            )
+            .saturating_add(
+                m.saturating_mul(n)
+                    .saturating_mul(core::mem::size_of::<Fam::Out>()),
+            );
+        let prefetch_c = ws_bytes > cache::prefetch_ws_bytes();
+
         // Whether ANY row block ever packs its A panel, whether via the shared
         // pre-pass or the per-worker path, so the region-reservation code below
         // knows whether to reserve A-pack scratch at all. `do_pack_lhs` decides
@@ -851,6 +919,9 @@ unsafe fn run_inner<Fam, S, const MR_REG: usize, const NR: usize, E>(
                                     };
                                     let cptr =
                                         c.0.offset((ic + ir) as isize * rsc + col as isize * csc);
+                                    if prefetch_c {
+                                        prefetch_c_tile(cptr, rsc, csc, mr_eff, nr_eff);
+                                    }
                                     // `ic + ir`/`col` are this sub-tile's origin in
                                     // the oriented problem frame, letting a
                                     // per-row/per-col epilogue bias resolve its

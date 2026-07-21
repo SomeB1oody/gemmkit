@@ -1177,6 +1177,16 @@ fn main() {
          auto default is derived from L2"
             .to_string(),
     ));
+    // PREFETCH_MIN_BYTES gates the driver's C-tile prefetch on working-set-vs-LLC: the auto
+    // default is derived from the detected LLC (a machine property, like DEEP_KC_BYTES), and
+    // probing the crossover needs beyond-LLC working sets on every candidate; override
+    // GEMMKIT_PREFETCH_MIN_BYTES directly (usize::MAX disables) to retune the engage point
+    skipped.push((
+        "GEMMKIT_PREFETCH_MIN_BYTES",
+        "C-tile prefetch engage gate; the auto default is derived from the detected LLC, and \
+         probing the crossover needs beyond-LLC working sets"
+            .to_string(),
+    ));
     // SEQ_INTERNAL_BYTES_PER_WORKER is swept above on aarch64, the only arch whose resolve_batch
     // reads it; inert on x86, so skip it there
     #[cfg(not(target_arch = "aarch64"))]
@@ -1553,6 +1563,10 @@ const NEVER_TUNED: &[(&str, &str)] = &[
         "GEMMKIT_DEEP_KC_BYTES",
         "narrow-only (f16/bf16 deep-contraction twin); no narrow probe here, auto default is L2-derived",
     ),
+    (
+        "GEMMKIT_PREFETCH_MIN_BYTES",
+        "C-tile prefetch engage gate; auto default is LLC-derived, probing needs beyond-LLC working sets",
+    ),
 ];
 
 // test-only: checks that TUNED and NEVER_TUNED exactly partition gemmkit's knob_env_names()
@@ -1564,7 +1578,7 @@ mod knob_coverage {
     #[test]
     fn sweep_table_covers_every_knob() {
         // gemmkit-tune enables the int8 feature but not wasm_threads (see Cargo.toml), so
-        // knob_env_names() is always the 27 base knobs plus I8_VNNI_MIN_PAR_MNK, 28 total; TUNED
+        // knob_env_names() is always the 28 base knobs plus I8_VNNI_MIN_PAR_MNK, 29 total; TUNED
         // and NEVER_TUNED must partition that set exactly
         let names: BTreeSet<&str> = gemmkit::tuning::knob_env_names().iter().copied().collect();
         let tuned: BTreeSet<&str> = TUNED.iter().copied().collect();
