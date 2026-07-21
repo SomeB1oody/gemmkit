@@ -23,7 +23,7 @@ fn env_knobs_resolution_contract() {
     }
     assert_eq!(
         tuning::small_mn_dim(),
-        16,
+        tuning::SMALL_MN_DIM_DEFAULT,
         "an unset GEMMKIT_* var must fall through to the default"
     );
 
@@ -37,7 +37,7 @@ fn env_knobs_resolution_contract() {
     // Malformed: falls back to the compile-time default without panicking
     assert_eq!(
         tuning::k_stream_max(),
-        32,
+        tuning::K_STREAM_MAX_DEFAULT,
         "a malformed GEMMKIT_* value must fall back to the default"
     );
 

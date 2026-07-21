@@ -300,10 +300,13 @@ impl KernelSimd<bf16, bf16, f32, bf16> for Neon {
 // Integer: i8 inputs, i32 accumulator, 4-wide int32x4_t
 //
 // The i32 accumulator ops below are native NEON. The i8 -> i32 widen-load (in the
-// KernelSimd impl further down) reads 4 bytes one at a time in scalar code rather than
-// widening a full register, to avoid reading past the end of a 4-wide panel slot; widening
-// with vmovl_s8/vmovl_s16 over a full mr row block at once, where an 8-byte read stays in
-// bounds, is a possible follow-up but unmeasured here
+// KernelSimd impl further down) looks like a per-byte scalar loop, but rustc already lowers
+// it to the optimal sequence: 1 4-byte ldr into a lane plus 2 sshll widens. An explicit
+// vmovl_s8/vmovl_s16 rewrite compiles to byte-identical code (the symbols even fold
+// together) and measures as pure noise on the M4 Max (256^3..1024^3 and deep-k, serial and
+// parallel), so the plain loop stays as the source form. A full 8-byte vld1_s8 remains out
+// of bounds regardless: pack_panels sizes the destination exactly, with no trailing slack,
+// so an 8-byte read at the last 4-wide slot of the last panel would overrun it
 //
 // A hardware i8 dot kernel via SDOT (vdotq_s32) is the NEON analogue of x86 VNNI, and
 // cleaner: signed*signed i8*i8 -> i32 is already GEMM's native op, so it needs no +128 bias
