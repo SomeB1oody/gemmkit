@@ -217,9 +217,19 @@ static SMALL_K_THRESHOLD: Threshold =
 // operands contiguously along k computes each output element as one SIMD-reduced dot over k,
 // reading A/B in place with no packing or blocking. The register-tiling driver would instead pad
 // tiny row/column tiles up to a full microtile and spend most of its work on padding; this route
-// computes exactly the m*n outputs it needs
+// computes exactly the m*n outputs it needs. The cap is arch-split:
+// * x86 (Zen5): 16, the original calibration point
+// * aarch64 (M4 Max): 32. The zero-copy tier dominates through 32 on mixed layouts
+//   (32^2 x 65536: 529 vs 74 GFLOP/s against the driver), and on the PACK tier 32 is a net
+//   win over the driver's deep-kc tiny branch from k = 1024 up while conceding k <= 512
+//   (-22 to -27%); a per-tier cap could keep the pack tier on the driver at 16..32 where
+//   that branch is faster still, but one knob gates both tiers
 /// Compiled default for [`small_mn_dim`]: overridden by `GEMMKIT_SMALL_MN_DIM` or
 /// [`set_small_mn_dim`]
+#[cfg(target_arch = "aarch64")]
+pub const SMALL_MN_DIM_DEFAULT: usize = 32;
+/// The non-aarch64 default; see the aarch64 doc above for what this knob controls
+#[cfg(not(target_arch = "aarch64"))]
 pub const SMALL_MN_DIM_DEFAULT: usize = 16;
 static SMALL_MN_DIM: Threshold = Threshold::new("GEMMKIT_SMALL_MN_DIM", SMALL_MN_DIM_DEFAULT);
 
