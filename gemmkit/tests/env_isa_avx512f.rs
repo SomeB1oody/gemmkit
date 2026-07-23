@@ -1,8 +1,8 @@
-//! `GEMMKIT_REQUIRE_ISA=avx512` pin: forces the plain (widen) AVX-512 kernels, which auto-selection
-//! skips in favor of VNNI/BF16 on a host that reports those extensions, so this is the only place
-//! their dispatch code actually runs
+//! `GEMMKIT_REQUIRE_ISA=avx512f` pin: forces the plain (widen) AVX-512F kernels, which
+//! auto-selection skips in favor of VNNI/BF16 on a host that reports those extensions, so this is
+//! the only place their dispatch code actually runs
 //!
-//! Every test wants the same `avx512` pin, so all funnel through [`env_isa_common::pin`] (a single
+//! Every test wants the same `avx512f` pin, so all funnel through [`env_isa_common::pin`] (a single
 //! `set_var` under a `Once`, before any dispatch; see that module for why the shared write is
 //! sound). The tests are otherwise independent, each touching a different knob (RHS-pack
 //! threshold, deep-kc gate) and dtype, so none depends on another's knob state. Every test skips
@@ -14,7 +14,7 @@
     not(miri)
 ))]
 
-// Shared GEMMKIT_REQUIRE_ISA pin helper; every test here pins `avx512` with it
+// Shared GEMMKIT_REQUIRE_ISA pin helper; every test here pins `avx512f` with it
 #[cfg(any(feature = "int8", feature = "half"))]
 mod env_isa_common;
 // Shared prepacked-vs-plain i8 bit-parity check, run under whichever ISA is pinned
@@ -28,14 +28,14 @@ use gemmkit::{bf16, f16, gemm};
 
 // IntGemm::pack_rhs is the widen (non-VNNI) i8 kernel's RHS packer. On a VNNI-capable host
 // auto-selection always picks the vpdpbusd dot kernel instead, which packs through
-// IntGemmVnni::pack_rhs, so the widen packer only runs once avx512 is forced. Also lowers the
+// IntGemmVnni::pack_rhs, so the widen packer only runs once avx512f is forced. Also lowers the
 // RHS-pack threshold from its 2048 default to 1, so a small m still triggers packing without
 // needing a large (and slower) matrix
 
 #[cfg(feature = "int8")]
 #[test]
-fn widen_i8_pack_rhs_under_avx512_pin() {
-    env_isa_common::pin("avx512");
+fn widen_i8_pack_rhs_under_avx512f_pin() {
+    env_isa_common::pin("avx512f");
     if !is_x86_feature_detected!("avx512f") {
         eprintln!("skipping: host does not report avx512f");
         return;
@@ -84,8 +84,8 @@ fn widen_i8_pack_rhs_under_avx512_pin() {
 
 #[cfg(feature = "int8")]
 #[test]
-fn avx512_pin_i8_packed_matches_plain() {
-    env_isa_common::pin("avx512");
+fn avx512f_pin_i8_packed_matches_plain() {
+    env_isa_common::pin("avx512f");
     if !is_x86_feature_detected!("avx512f") {
         eprintln!("skipping: host does not report avx512f");
         return;
@@ -95,8 +95,8 @@ fn avx512_pin_i8_packed_matches_plain() {
 
 // Under this pin both f16 and bf16 dispatch to the widen MixedGemm family (bf16's own
 // vdpbf16ps dot path only gets picked when avx512bf16 is present and unforced), so pinning
-// avx512 is what makes the widen deep-k twin MixedGemmF32<bf16> reachable at all: on an
-// AVX-512-BF16 host, tests/deep_k_narrow.rs's auto-selection never lands on it
+// avx512f is what makes the widen deep-k twin MixedGemmF32<bf16> reachable at all: on an
+// AVX-512 BF16 host, tests/deep_k_narrow.rs's auto-selection never lands on it
 
 #[cfg(feature = "half")]
 fn fill<N: gemmkit::NarrowFloat>(n: usize, seed: u64) -> Vec<N> {
@@ -153,8 +153,8 @@ fn check<N: gemmkit::NarrowFloat + gemmkit::GemmScalar + Copy>(label: &str) {
 
 #[cfg(feature = "half")]
 #[test]
-fn deep_k_widen_under_avx512_pin() {
-    env_isa_common::pin("avx512");
+fn deep_k_widen_under_avx512f_pin() {
+    env_isa_common::pin("avx512f");
     if !is_x86_feature_detected!("avx512f") {
         eprintln!("skipping: host does not report avx512f");
         return;

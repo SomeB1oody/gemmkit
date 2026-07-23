@@ -66,7 +66,7 @@ gemm_i8_requant_u8(
 );
 ```
 
-The output is `C[i,j] = clamp(zero_point + round_ne(scale * (sum_k A*B + bias[i])), LO, HI)` with round-half-to-even, where `scale` is either a single `RequantScale::PerTensor(f32)` or a per-row `RequantScale::PerRow(&[f32])` (the per-channel convention), and the clamp band is set by the entry: `[-128, 127]` for `gemm_i8_requant`, `[0, 255]` for the `u8` twin. There is no `alpha` (it folds into `scale`) and no `beta` (accumulating into a quantized `C` is ill-defined). The requantize map is bit-exact across every ISA (scalar, FMA, AVX-512, VNNI) and across the vector and scalar store paths, so the answer never depends on which kernel ran.
+The output is `C[i,j] = clamp(zero_point + round_ne(scale * (sum_k A*B + bias[i])), LO, HI)` with round-half-to-even, where `scale` is either a single `RequantScale::PerTensor(f32)` or a per-row `RequantScale::PerRow(&[f32])` (the per-channel convention), and the clamp band is set by the entry: `[-128, 127]` for `gemm_i8_requant`, `[0, 255]` for the `u8` twin. There is no `alpha` (it folds into `scale`) and no `beta` (accumulating into a quantized `C` is ill-defined). The requantize map is bit-exact across every ISA (scalar, FMA, AVX-512F, VNNI) and across the vector and scalar store paths, so the answer never depends on which kernel ran.
 
 ## Complex bias
 

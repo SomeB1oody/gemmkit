@@ -37,9 +37,9 @@ unsafe fn gemm_f32_fma(t: Task<f32>, par: Parallelism, ws: &mut Workspace) {
     unsafe { run_typed::<f32, Fma, 2, 6>(Fma, t, par, ws) }
 }
 
-unsafe fn gemm_f32_avx512(t: Task<f32>, par: Parallelism, ws: &mut Workspace) {
+unsafe fn gemm_f32_avx512f(t: Task<f32>, par: Parallelism, ws: &mut Workspace) {
     // MR = 2*16 = 32, NR = 12 -> 24 acc + 2 lhs + 1 rhs = 27 ZMM
-    unsafe { run_typed::<f32, Avx512, 2, 12>(Avx512, t, par, ws) }
+    unsafe { run_typed::<f32, Avx512F, 2, 12>(Avx512F, t, par, ws) }
 }
 ```
 

@@ -5,7 +5,7 @@ use crate::common::*;
 use gemmkit::{MatMut, MatRef, Parallelism, Workspace, gemm, gemm_unchecked};
 
 /// `m` values (crossed with fixed `k`/`n` lists and a few big squares below) spanning
-/// the AVX-512 f32 tile boundaries (`MR=32`, `NR=12`) and general blocking edges
+/// the AVX-512F f32 tile boundaries (`MR=32`, `NR=12`) and general blocking edges
 ///
 /// Under `GEMMKIT_FAST_TEST` this drops to the classes that matter (0, 1, a
 /// sub-tile, the `NR`/`MR` boundary and boundary+1, a multi-tile, a large multi-block)

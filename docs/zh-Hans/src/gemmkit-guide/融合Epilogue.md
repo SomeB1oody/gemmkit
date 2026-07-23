@@ -66,7 +66,7 @@ gemm_i8_requant_u8(
 );
 ```
 
-输出为 `C[i,j] = clamp(zero_point + round_ne(scale * (sum_k A*B + bias[i])), LO, HI)`，采用四舍六入五成双（round-half-to-even），其中 `scale` 要么是单个 `RequantScale::PerTensor(f32)`，要么是逐行的 `RequantScale::PerRow(&[f32])`（逐通道约定），钳位区间由入口决定：`gemm_i8_requant` 为 `[-128, 127]`，`u8` 孪生为 `[0, 255]`。没有 `alpha`（并入 `scale`），也没有 `beta`（往量化后的 `C` 里累加是没有良定义的）。这个重量化映射在每种 ISA（scalar、FMA、AVX-512、VNNI）上、以及向量与标量存储路径之间都是逐位精确的，所以答案绝不取决于跑了哪个内核。
+输出为 `C[i,j] = clamp(zero_point + round_ne(scale * (sum_k A*B + bias[i])), LO, HI)`，采用四舍六入五成双（round-half-to-even），其中 `scale` 要么是单个 `RequantScale::PerTensor(f32)`，要么是逐行的 `RequantScale::PerRow(&[f32])`（逐通道约定），钳位区间由入口决定：`gemm_i8_requant` 为 `[-128, 127]`，`u8` 孪生为 `[0, 255]`。没有 `alpha`（并入 `scale`），也没有 `beta`（往量化后的 `C` 里累加是没有良定义的）。这个重量化映射在每种 ISA（scalar、FMA、AVX-512F、VNNI）上、以及向量与标量存储路径之间都是逐位精确的，所以答案绝不取决于跑了哪个内核。
 
 ## 复数偏置
 

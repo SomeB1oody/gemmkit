@@ -66,8 +66,8 @@ jobs:
           GEMMKIT_REQUIRE_ISA: ${{ matrix.isa }}
         run: cargo test -p gemmkit --all-features --no-fail-fast
 
-  # Run the test suite under Intel SDE so the AVX-512 kernel is validated
-  avx512_test:
+  # Run the test suite under Intel SDE so the AVX-512F kernel is validated
+  avx512f_test:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -75,7 +75,7 @@ jobs:
         include:
           - rust: stable
             target: x86_64-unknown-linux-gnu
-    name: avx512_test/${{ matrix.target }}/${{ matrix.rust }}
+    name: avx512f_test/${{ matrix.target }}/${{ matrix.rust }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -93,7 +93,7 @@ jobs:
         env:
           # Emulate a CPU with avx512f (Sapphire Rapids)
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: "sde64 -spr --"
-          GEMMKIT_REQUIRE_ISA: avx512
+          GEMMKIT_REQUIRE_ISA: avx512f
           # Bound the props_* proptest binaries under SDE emulation; native runs use full case counts
           PROPTEST_CASES: "16"
           # Shrink the deterministic dimension/coefficient sweeps under ~50x SDE emulation;
@@ -381,7 +381,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # Pinned ISA list: the ubuntu-latest pool is heterogeneous (some machines expose
       # avx512f, most don't), so probing cpuinfo would make the coverage % swing
-      # run-to-run. avx512/vnni/bf16 coverage comes from local runs of the same script.
+      # run-to-run. avx512f/vnni/bf16 coverage comes from local runs of the same script.
       - name: Coverage (scalar + fma, report-only)
         env:
           COVERAGE_ISAS: scalar fma

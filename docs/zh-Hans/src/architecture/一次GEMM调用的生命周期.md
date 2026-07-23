@@ -65,7 +65,7 @@ if task.k == 0 || task.alpha == T::ZERO {
 T::dispatch(task, par, ws);
 ```
 
-输出为空意味着无事可做。`A*B` 项消失（`k == 0` 或 `alpha == 0`）时，调用退化成一次从不读取 `A`/`B` 的 `C <- beta*C` 缩放——其中 `beta == 0` 又直接写零而不读 `C`，兑现未初始化 C 的契约。只有真正的乘积才会到达 `T::dispatch`，它读取该类型的 `OnceLock` 槽：首次使用时选择阶梯探测 CPU 特性（尊重 `GEMMKIT_REQUIRE_ISA` 的钉选，不满足时 panic 而非回退），缓存胜出的单态化入口和 tile 几何；此后每次调用都只是一次间接调用。在那台 AVX-512 机器上，`f32` 解析为 `run_typed::<f32, Avx512, 2, 12>`——32x12 的 tile。
+输出为空意味着无事可做。`A*B` 项消失（`k == 0` 或 `alpha == 0`）时，调用退化成一次从不读取 `A`/`B` 的 `C <- beta*C` 缩放——其中 `beta == 0` 又直接写零而不读 `C`，兑现未初始化 C 的契约。只有真正的乘积才会到达 `T::dispatch`，它读取该类型的 `OnceLock` 槽：首次使用时选择阶梯探测 CPU 特性（尊重 `GEMMKIT_REQUIRE_ISA` 的钉选，不满足时 panic 而非回退），缓存胜出的单态化入口和 tile 几何；此后每次调用都只是一次间接调用。在那台 AVX-512 机器上，`f32` 解析为 `run_typed::<f32, Avx512F, 2, 12>`——32x12 的 tile。
 
 ## 第三站：`run_typed` 里的路由
 
@@ -79,7 +79,7 @@ T::dispatch(task, par, ws);
 
 ## 第四站：驱动的循环嵌套
 
-`driver::run` 携带零成本的 `Identity` epilogue 转发给 `run_inner`（`gemmkit/src/driver.rs`）——融合入口带着真 epilogue 落进同一个函数。驱动对家族和 ISA 令牌泛型；对我们这次调用是 `FloatGemm<f32>` 与 `Avx512`，`mr = MR_REG * LANES = 32`，`nr = 12`。
+`driver::run` 携带零成本的 `Identity` epilogue 转发给 `run_inner`（`gemmkit/src/driver.rs`）——融合入口带着真 epilogue 落进同一个函数。驱动对家族和 ISA 令牌泛型；对我们这次调用是 `FloatGemm<f32>` 与 `Avx512F`，`mr = MR_REG * LANES = 32`，`nr = 12`。
 
 先算分块：`cache::topology().blocking(mr, nr, sizeof_lhs, m, n, k)` 按 BLIS 缓存模型给出 `(MC, KC, NC)`，尺寸以**打包输入**元素计（`sizeof(Lhs)` 而非累加器——窄类型因此得到更深的块）。随后循环嵌套按 BLIS 顺序展开：
 

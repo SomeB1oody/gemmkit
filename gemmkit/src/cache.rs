@@ -282,7 +282,7 @@ pub(crate) fn gemv_regblock_engage_bytes() -> usize {
 /// once that outgrows L2, every microtile call streams it, alongside the even larger `mr * k`
 /// LHS micropanel, from L3/DRAM instead. The `GEMMKIT_DEEP_KC_BYTES` knob overrides it verbatim;
 /// `0` (the default) derives it from half the L2 effective per-worker capacity. Measured on a
-/// Zen5 9950X (AVX-512, `nr = 12`, `f16`/`bf16`): the throughput cliff hits at `k = 32768` (a
+/// Zen5 9950X (AVX-512F, `nr = 12`, `f16`/`bf16`): the throughput cliff hits at `k = 32768` (a
 /// 768 KiB RHS micropanel, about 0.75x the 1 MiB L2), while `k = 16384` (384 KiB) is still near
 /// peak, so a full-L2 gate would engage only past `k ~ 43000` and miss the cliff entirely. The
 /// `L2/2` gate instead switches to the multi-slice twin at `k = 32768`/`65536` (2.8x / 3.6x
@@ -306,7 +306,7 @@ pub(crate) fn deep_k_engage_bytes() -> usize {
 /// tiles are cache-resident and the hint is pure overhead. The `GEMMKIT_PREFETCH_MIN_BYTES`
 /// knob overrides it verbatim; `0` (the default) is the per-core-reachable last-level cache
 /// ([`Level::effective_bytes`]): L3 where present, the L2 otherwise. Measured on the Zen5
-/// 9950X (f32, AVX-512) against its 32 MiB per-CCD slice: +1.4% parallel and about +1% serial
+/// 9950X (f32, AVX-512F) against its 32 MiB per-CCD slice: +1.4% parallel and about +1% serial
 /// at 2048^3
 /// (48 MiB working set), +2-3% at 3072^3 and deep-k 2048x2048x24576, neutral at 1536^3 (27
 /// MiB, under the gate) and at in-cache sizes. On a target without the x86 prefetch emission

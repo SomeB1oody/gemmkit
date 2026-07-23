@@ -65,7 +65,7 @@ if task.k == 0 || task.alpha == T::ZERO {
 T::dispatch(task, par, ws);
 ```
 
-An empty output means nothing to do. A vanished `A*B` term (`k == 0` or `alpha == 0`) degrades the call to a `C <- beta*C` scale that never reads `A` or `B` — and within it, `beta == 0` stores zeros without reading `C`, keeping the uninitialized-C contract honest. Only a real product reaches `T::dispatch`, which reads the per-type `OnceLock` slot: on first use the selection ladder probes CPU features (honoring a `GEMMKIT_REQUIRE_ISA` pin, which panics rather than falls back) and caches the winning monomorphized entry points plus tile geometry; every later call is a single indirect call. On the AVX-512 machine, `f32` resolves to `run_typed::<f32, Avx512, 2, 12>` — the 32x12 tile.
+An empty output means nothing to do. A vanished `A*B` term (`k == 0` or `alpha == 0`) degrades the call to a `C <- beta*C` scale that never reads `A` or `B` — and within it, `beta == 0` stores zeros without reading `C`, keeping the uninitialized-C contract honest. Only a real product reaches `T::dispatch`, which reads the per-type `OnceLock` slot: on first use the selection ladder probes CPU features (honoring a `GEMMKIT_REQUIRE_ISA` pin, which panics rather than falls back) and caches the winning monomorphized entry points plus tile geometry; every later call is a single indirect call. On the AVX-512 machine, `f32` resolves to `run_typed::<f32, Avx512F, 2, 12>` — the 32x12 tile.
 
 ## Stage 3: routing in `run_typed`
 
@@ -79,7 +79,7 @@ Then two more gates on the normalized task. A small-`m,n` shape (both dimensions
 
 ## Stage 4: the driver loop nest
 
-`driver::run` forwards to `run_inner` (`gemmkit/src/driver.rs`) with the zero-cost `Identity` epilogue — the fused entries land in the same function with a real one. The driver is generic over the family and ISA token; for our call that is `FloatGemm<f32>` and `Avx512`, `mr = MR_REG * LANES = 32`, `nr = 12`.
+`driver::run` forwards to `run_inner` (`gemmkit/src/driver.rs`) with the zero-cost `Identity` epilogue — the fused entries land in the same function with a real one. The driver is generic over the family and ISA token; for our call that is `FloatGemm<f32>` and `Avx512F`, `mr = MR_REG * LANES = 32`, `nr = 12`.
 
 Blocking comes first: `cache::topology().blocking(mr, nr, sizeof_lhs, m, n, k)` yields `(MC, KC, NC)` from the BLIS cache model, sized in *packed-input* elements (`sizeof(Lhs)`, not the accumulator — narrow types get deeper blocks). The loop nest then runs in BLIS order:
 

@@ -388,7 +388,7 @@ fn scalar_token_conformance() {
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[test]
 fn x86_token_conformance() {
-    use gemmkit::simd::{Avx512, Fma};
+    use gemmkit::simd::{Avx512F, Fma};
 
     if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
         conform_f32(Fma, "fma/f32");
@@ -412,17 +412,17 @@ fn x86_token_conformance() {
     }
 
     if is_x86_feature_detected!("avx512f") {
-        conform_f32(Avx512, "avx512/f32");
-        conform_f64(Avx512, "avx512/f64");
+        conform_f32(Avx512F, "avx512f/f32");
+        conform_f64(Avx512F, "avx512f/f64");
         #[cfg(feature = "int8")]
-        conform_i32(Avx512, "avx512/i32");
+        conform_i32(Avx512F, "avx512f/i32");
         #[cfg(feature = "half")]
         {
-            twin_seam_conformance::<gemmkit::f16, _>(Avx512, "avx512/f16");
-            twin_seam_conformance::<gemmkit::bf16, _>(Avx512, "avx512/bf16");
+            twin_seam_conformance::<gemmkit::f16, _>(Avx512F, "avx512f/f16");
+            twin_seam_conformance::<gemmkit::bf16, _>(Avx512F, "avx512f/bf16");
         }
     } else {
-        eprintln!("skipping Avx512 conformance: avx512f not detected");
+        eprintln!("skipping Avx512F conformance: avx512f not detected");
     }
 
     #[cfg(feature = "int8")]

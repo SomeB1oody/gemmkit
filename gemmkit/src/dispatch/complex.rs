@@ -17,7 +17,7 @@ use crate::simd::Neon;
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 use crate::simd::Simd128;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-use crate::simd::{Avx512, Fma};
+use crate::simd::{Avx512F, Fma};
 use crate::simd::{KernelSimd, ScalarTok};
 use crate::workspace::Workspace;
 
@@ -313,14 +313,14 @@ unsafe fn gemm_c64_fma(ca: bool, cb: bool, t: Task<C64>, par: Parallelism, ws: &
     unsafe { run_complex::<C64, Fma, 1, 5>(Fma, ca, cb, t, par, ws) }
 }
 #[cfg(all(feature = "complex", any(target_arch = "x86", target_arch = "x86_64")))]
-unsafe fn gemm_c32_avx512(ca: bool, cb: bool, t: Task<C32>, par: Parallelism, ws: &mut Workspace) {
-    // c32 AVX-512: real LANES = 16, MR = 2*16 = 32, NR = 6 -> 24 acc + 4 A + 2 B splat = 30 ZMM
-    unsafe { run_complex::<C32, Avx512, 2, 6>(Avx512, ca, cb, t, par, ws) }
+unsafe fn gemm_c32_avx512f(ca: bool, cb: bool, t: Task<C32>, par: Parallelism, ws: &mut Workspace) {
+    // c32 AVX-512F: real LANES = 16, MR = 2*16 = 32, NR = 6 -> 24 acc + 4 A + 2 B splat = 30 ZMM
+    unsafe { run_complex::<C32, Avx512F, 2, 6>(Avx512F, ca, cb, t, par, ws) }
 }
 #[cfg(all(feature = "complex", any(target_arch = "x86", target_arch = "x86_64")))]
-unsafe fn gemm_c64_avx512(ca: bool, cb: bool, t: Task<C64>, par: Parallelism, ws: &mut Workspace) {
-    // c64 AVX-512: real LANES = 8, MR = 2*8 = 16, NR = 6, same 30-ZMM budget as c32
-    unsafe { run_complex::<C64, Avx512, 2, 6>(Avx512, ca, cb, t, par, ws) }
+unsafe fn gemm_c64_avx512f(ca: bool, cb: bool, t: Task<C64>, par: Parallelism, ws: &mut Workspace) {
+    // c64 AVX-512F: real LANES = 8, MR = 2*8 = 16, NR = 6, same 30-ZMM budget as c32
+    unsafe { run_complex::<C64, Avx512F, 2, 6>(Avx512F, ca, cb, t, par, ws) }
 }
 #[cfg(all(feature = "complex", target_arch = "aarch64"))]
 unsafe fn gemm_c32_neon(ca: bool, cb: bool, t: Task<C32>, par: Parallelism, ws: &mut Workspace) {
@@ -415,7 +415,7 @@ unsafe fn gemm_c64_fma_fused(
     feature = "epilogue",
     any(target_arch = "x86", target_arch = "x86_64")
 ))]
-unsafe fn gemm_c32_avx512_fused(
+unsafe fn gemm_c32_avx512f_fused(
     ca: bool,
     cb: bool,
     t: Task<C32>,
@@ -423,14 +423,14 @@ unsafe fn gemm_c32_avx512_fused(
     par: Parallelism,
     ws: &mut Workspace,
 ) {
-    unsafe { run_complex_fused::<C32, Avx512, 2, 6>(Avx512, ca, cb, t, epi, par, ws) }
+    unsafe { run_complex_fused::<C32, Avx512F, 2, 6>(Avx512F, ca, cb, t, epi, par, ws) }
 }
 #[cfg(all(
     feature = "complex",
     feature = "epilogue",
     any(target_arch = "x86", target_arch = "x86_64")
 ))]
-unsafe fn gemm_c64_avx512_fused(
+unsafe fn gemm_c64_avx512f_fused(
     ca: bool,
     cb: bool,
     t: Task<C64>,
@@ -438,7 +438,7 @@ unsafe fn gemm_c64_avx512_fused(
     par: Parallelism,
     ws: &mut Workspace,
 ) {
-    unsafe { run_complex_fused::<C64, Avx512, 2, 6>(Avx512, ca, cb, t, epi, par, ws) }
+    unsafe { run_complex_fused::<C64, Avx512F, 2, 6>(Avx512F, ca, cb, t, epi, par, ws) }
 }
 #[cfg(all(feature = "complex", feature = "epilogue", target_arch = "aarch64"))]
 unsafe fn gemm_c32_neon_fused(
@@ -520,16 +520,16 @@ const CDISP_C64_FMA: CplxDispatched<C64> = CplxDispatched {
     run_fused: gemm_c64_fma_fused,
 };
 #[cfg(all(feature = "complex", any(target_arch = "x86", target_arch = "x86_64")))]
-const CDISP_C32_AVX512: CplxDispatched<C32> = CplxDispatched {
-    run: gemm_c32_avx512,
+const CDISP_C32_AVX512F: CplxDispatched<C32> = CplxDispatched {
+    run: gemm_c32_avx512f,
     #[cfg(feature = "epilogue")]
-    run_fused: gemm_c32_avx512_fused,
+    run_fused: gemm_c32_avx512f_fused,
 };
 #[cfg(all(feature = "complex", any(target_arch = "x86", target_arch = "x86_64")))]
-const CDISP_C64_AVX512: CplxDispatched<C64> = CplxDispatched {
-    run: gemm_c64_avx512,
+const CDISP_C64_AVX512F: CplxDispatched<C64> = CplxDispatched {
+    run: gemm_c64_avx512f,
     #[cfg(feature = "epilogue")]
-    run_fused: gemm_c64_avx512_fused,
+    run_fused: gemm_c64_avx512f_fused,
 };
 #[cfg(all(feature = "complex", target_arch = "aarch64"))]
 const CDISP_C32_NEON: CplxDispatched<C32> = CplxDispatched {
@@ -564,7 +564,7 @@ const CDISP_C64_SIMD128: CplxDispatched<C64> = CplxDispatched {
     run_fused: gemm_c64_simd128_fused,
 };
 
-/// c32 ISA selection: the complex kernel only needs plain AVX2/AVX-512 float ops (no
+/// c32 ISA selection: the complex kernel only needs plain AVX2/AVX-512F float ops (no
 /// VNNI/BF16 dot path)
 #[cfg(feature = "complex")]
 fn select_c32() -> CplxDispatched<C32> {
@@ -582,9 +582,9 @@ fn select_c32() -> CplxDispatched<C32> {
         ForcedIsa::Avx512F | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
             assert!(
                 x86_isa_detected!("avx512f"),
-                "GEMMKIT_REQUIRE_ISA=avx512, but this CPU/emulator does not report avx512f"
+                "GEMMKIT_REQUIRE_ISA=avx512f, but this CPU/emulator does not report avx512f"
             );
-            return CDISP_C32_AVX512;
+            return CDISP_C32_AVX512F;
         }
         #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
         ForcedIsa::Fma | ForcedIsa::Avx512F | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
@@ -605,7 +605,7 @@ fn select_c32() -> CplxDispatched<C32> {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         if x86_isa_detected!("avx512f") {
-            return CDISP_C32_AVX512;
+            return CDISP_C32_AVX512F;
         }
         if x86_isa_detected!("avx2") && x86_isa_detected!("fma") {
             return CDISP_C32_FMA;
@@ -650,9 +650,9 @@ fn select_c64() -> CplxDispatched<C64> {
         ForcedIsa::Avx512F | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
             assert!(
                 x86_isa_detected!("avx512f"),
-                "GEMMKIT_REQUIRE_ISA=avx512, but this CPU/emulator does not report avx512f"
+                "GEMMKIT_REQUIRE_ISA=avx512f, but this CPU/emulator does not report avx512f"
             );
-            return CDISP_C64_AVX512;
+            return CDISP_C64_AVX512F;
         }
         #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
         ForcedIsa::Fma | ForcedIsa::Avx512F | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
@@ -673,7 +673,7 @@ fn select_c64() -> CplxDispatched<C64> {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         if x86_isa_detected!("avx512f") {
-            return CDISP_C64_AVX512;
+            return CDISP_C64_AVX512F;
         }
         if x86_isa_detected!("avx2") && x86_isa_detected!("fma") {
             return CDISP_C64_FMA;

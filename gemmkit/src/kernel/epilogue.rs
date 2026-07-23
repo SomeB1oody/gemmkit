@@ -403,7 +403,7 @@ impl<T: Float<Acc = T>> Epilogue<FloatGemm<T>> for MapEpi<'_, T> {
 }
 
 /// Stack-buffer width for [`MapEpi::apply_reg`]'s per-lane drain: covers every float
-/// [`crate::simd::SimdOps`] lane count that can appear here, `f32` on AVX-512 being the widest at 16
+/// [`crate::simd::SimdOps`] lane count that can appear here, `f32` on AVX-512F being the widest at 16
 #[cfg(feature = "epilogue")]
 const MAP_REG_LANES: usize = 16;
 

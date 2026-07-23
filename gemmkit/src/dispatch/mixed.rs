@@ -33,7 +33,7 @@ use crate::simd::ScalarTok;
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 use crate::simd::Simd128;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-use crate::simd::{Avx512, Fma};
+use crate::simd::{Avx512F, Fma};
 use crate::simd::{KernelSimd, SimdOps};
 use crate::special::{gemv, small_k, small_mn};
 use crate::tuning;
@@ -617,31 +617,31 @@ unsafe fn gemm_bf16_fma_packed(r: PackedConsume<bf16>, par: Parallelism, ws: &mu
     unsafe { run_packed_typed_mixed::<bf16, MixedGemm<bf16>, Fma, 2, 6>(Fma, r, par, ws) }
 }
 #[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
-unsafe fn gemm_f16_avx512(t: Task<f16>, par: Parallelism, ws: &mut Workspace) {
-    // f32 accumulator: MR = 2*16 = 32, NR = 12, the f32 AVX-512 tile
-    unsafe { run_typed_mixed::<f16, MixedGemm<f16>, Avx512, 2, 12>(Avx512, t, par, ws) }
+unsafe fn gemm_f16_avx512f(t: Task<f16>, par: Parallelism, ws: &mut Workspace) {
+    // f32 accumulator: MR = 2*16 = 32, NR = 12, the f32 AVX-512F tile
+    unsafe { run_typed_mixed::<f16, MixedGemm<f16>, Avx512F, 2, 12>(Avx512F, t, par, ws) }
 }
 #[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
-unsafe fn gemm_bf16_avx512(t: Task<bf16>, par: Parallelism, ws: &mut Workspace) {
-    unsafe { run_typed_mixed::<bf16, MixedGemm<bf16>, Avx512, 2, 12>(Avx512, t, par, ws) }
+unsafe fn gemm_bf16_avx512f(t: Task<bf16>, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_typed_mixed::<bf16, MixedGemm<bf16>, Avx512F, 2, 12>(Avx512F, t, par, ws) }
 }
 #[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
-unsafe fn gemm_f16_avx512_packed(r: PackedConsume<f16>, par: Parallelism, ws: &mut Workspace) {
-    unsafe { run_packed_typed_mixed::<f16, MixedGemm<f16>, Avx512, 2, 12>(Avx512, r, par, ws) }
+unsafe fn gemm_f16_avx512f_packed(r: PackedConsume<f16>, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_packed_typed_mixed::<f16, MixedGemm<f16>, Avx512F, 2, 12>(Avx512F, r, par, ws) }
 }
 #[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
-unsafe fn gemm_bf16_avx512_packed(r: PackedConsume<bf16>, par: Parallelism, ws: &mut Workspace) {
-    unsafe { run_packed_typed_mixed::<bf16, MixedGemm<bf16>, Avx512, 2, 12>(Avx512, r, par, ws) }
+unsafe fn gemm_bf16_avx512f_packed(r: PackedConsume<bf16>, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_packed_typed_mixed::<bf16, MixedGemm<bf16>, Avx512F, 2, 12>(Avx512F, r, par, ws) }
 }
 #[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
-unsafe fn gemm_bf16_avx512_dot(t: Task<bf16>, par: Parallelism, ws: &mut Workspace) {
-    // bf16 dot: f32 accumulator, same tile as plain AVX-512 (MR = 2*16 = 32, NR = 12). The
+unsafe fn gemm_bf16_avx512bf16(t: Task<bf16>, par: Parallelism, ws: &mut Workspace) {
+    // bf16 dot: f32 accumulator, same tile as plain AVX-512F (MR = 2*16 = 32, NR = 12). The
     // Bf16DotGemm family swaps in the vdpbf16ps pack and inner loop; the shared
     // run_typed_mixed still routes small_mn / small_k through MixedGemm<bf16>
     unsafe { run_typed_mixed::<bf16, Bf16DotGemm, Avx512Bf16, 2, 12>(Avx512Bf16, t, par, ws) }
 }
 #[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
-unsafe fn gemm_bf16_avx512_dot_packed(
+unsafe fn gemm_bf16_avx512bf16_packed(
     r: PackedConsume<bf16>,
     par: Parallelism,
     ws: &mut Workspace,
@@ -740,27 +740,14 @@ unsafe fn gemm_bf16_fma_fused(
     feature = "epilogue",
     any(target_arch = "x86", target_arch = "x86_64")
 ))]
-unsafe fn gemm_f16_avx512_fused(
+unsafe fn gemm_f16_avx512f_fused(
     t: Task<f16>,
     epi: FusedEpi<f16>,
     par: Parallelism,
     ws: &mut Workspace,
 ) {
-    unsafe { run_typed_mixed_fused::<f16, MixedGemm<f16>, Avx512, 2, 12>(Avx512, t, epi, par, ws) }
-}
-#[cfg(all(
-    feature = "half",
-    feature = "epilogue",
-    any(target_arch = "x86", target_arch = "x86_64")
-))]
-unsafe fn gemm_bf16_avx512_fused(
-    t: Task<bf16>,
-    epi: FusedEpi<bf16>,
-    par: Parallelism,
-    ws: &mut Workspace,
-) {
     unsafe {
-        run_typed_mixed_fused::<bf16, MixedGemm<bf16>, Avx512, 2, 12>(Avx512, t, epi, par, ws)
+        run_typed_mixed_fused::<f16, MixedGemm<f16>, Avx512F, 2, 12>(Avx512F, t, epi, par, ws)
     }
 }
 #[cfg(all(
@@ -768,7 +755,22 @@ unsafe fn gemm_bf16_avx512_fused(
     feature = "epilogue",
     any(target_arch = "x86", target_arch = "x86_64")
 ))]
-unsafe fn gemm_bf16_avx512_dot_fused(
+unsafe fn gemm_bf16_avx512f_fused(
+    t: Task<bf16>,
+    epi: FusedEpi<bf16>,
+    par: Parallelism,
+    ws: &mut Workspace,
+) {
+    unsafe {
+        run_typed_mixed_fused::<bf16, MixedGemm<bf16>, Avx512F, 2, 12>(Avx512F, t, epi, par, ws)
+    }
+}
+#[cfg(all(
+    feature = "half",
+    feature = "epilogue",
+    any(target_arch = "x86", target_arch = "x86_64")
+))]
+unsafe fn gemm_bf16_avx512bf16_fused(
     t: Task<bf16>,
     epi: FusedEpi<bf16>,
     par: Parallelism,
@@ -892,30 +894,15 @@ unsafe fn gemm_bf16_fma_packed_fused(
     feature = "epilogue",
     any(target_arch = "x86", target_arch = "x86_64")
 ))]
-unsafe fn gemm_f16_avx512_packed_fused(
+unsafe fn gemm_f16_avx512f_packed_fused(
     r: PackedConsume<f16>,
     epi: FusedEpi<f16>,
     par: Parallelism,
     ws: &mut Workspace,
 ) {
     unsafe {
-        run_typed_mixed_packed_fused::<f16, MixedGemm<f16>, Avx512, 2, 12>(Avx512, r, epi, par, ws)
-    }
-}
-#[cfg(all(
-    feature = "half",
-    feature = "epilogue",
-    any(target_arch = "x86", target_arch = "x86_64")
-))]
-unsafe fn gemm_bf16_avx512_packed_fused(
-    r: PackedConsume<bf16>,
-    epi: FusedEpi<bf16>,
-    par: Parallelism,
-    ws: &mut Workspace,
-) {
-    unsafe {
-        run_typed_mixed_packed_fused::<bf16, MixedGemm<bf16>, Avx512, 2, 12>(
-            Avx512, r, epi, par, ws,
+        run_typed_mixed_packed_fused::<f16, MixedGemm<f16>, Avx512F, 2, 12>(
+            Avx512F, r, epi, par, ws,
         )
     }
 }
@@ -924,7 +911,24 @@ unsafe fn gemm_bf16_avx512_packed_fused(
     feature = "epilogue",
     any(target_arch = "x86", target_arch = "x86_64")
 ))]
-unsafe fn gemm_bf16_avx512_dot_packed_fused(
+unsafe fn gemm_bf16_avx512f_packed_fused(
+    r: PackedConsume<bf16>,
+    epi: FusedEpi<bf16>,
+    par: Parallelism,
+    ws: &mut Workspace,
+) {
+    unsafe {
+        run_typed_mixed_packed_fused::<bf16, MixedGemm<bf16>, Avx512F, 2, 12>(
+            Avx512F, r, epi, par, ws,
+        )
+    }
+}
+#[cfg(all(
+    feature = "half",
+    feature = "epilogue",
+    any(target_arch = "x86", target_arch = "x86_64")
+))]
+unsafe fn gemm_bf16_avx512bf16_packed_fused(
     r: PackedConsume<bf16>,
     epi: FusedEpi<bf16>,
     par: Parallelism,
@@ -1044,37 +1048,37 @@ const DISP_BF16_FMA: Dispatched<bf16> = Dispatched {
 };
 
 #[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
-const DISP_F16_AVX512: Dispatched<f16> = Dispatched {
-    run: gemm_f16_avx512,
-    run_packed: gemm_f16_avx512_packed,
+const DISP_F16_AVX512F: Dispatched<f16> = Dispatched {
+    run: gemm_f16_avx512f,
+    run_packed: gemm_f16_avx512f_packed,
     #[cfg(feature = "epilogue")]
-    run_fused: gemm_f16_avx512_fused,
+    run_fused: gemm_f16_avx512f_fused,
     #[cfg(feature = "epilogue")]
-    run_packed_fused: gemm_f16_avx512_packed_fused,
+    run_packed_fused: gemm_f16_avx512f_packed_fused,
     mr: 32,
     nr: 12,
     depth_multiple: 1,
 };
 #[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
-const DISP_BF16_AVX512: Dispatched<bf16> = Dispatched {
-    run: gemm_bf16_avx512,
-    run_packed: gemm_bf16_avx512_packed,
+const DISP_BF16_AVX512F: Dispatched<bf16> = Dispatched {
+    run: gemm_bf16_avx512f,
+    run_packed: gemm_bf16_avx512f_packed,
     #[cfg(feature = "epilogue")]
-    run_fused: gemm_bf16_avx512_fused,
+    run_fused: gemm_bf16_avx512f_fused,
     #[cfg(feature = "epilogue")]
-    run_packed_fused: gemm_bf16_avx512_packed_fused,
+    run_packed_fused: gemm_bf16_avx512f_packed_fused,
     mr: 32,
     nr: 12,
     depth_multiple: 1,
 };
 #[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
-const DISP_BF16_AVX512_DOT: Dispatched<bf16> = Dispatched {
-    run: gemm_bf16_avx512_dot,
-    run_packed: gemm_bf16_avx512_dot_packed,
+const DISP_BF16_AVX512BF16: Dispatched<bf16> = Dispatched {
+    run: gemm_bf16_avx512bf16,
+    run_packed: gemm_bf16_avx512bf16_packed,
     #[cfg(feature = "epilogue")]
-    run_fused: gemm_bf16_avx512_dot_fused,
+    run_fused: gemm_bf16_avx512bf16_fused,
     #[cfg(feature = "epilogue")]
-    run_packed_fused: gemm_bf16_avx512_dot_packed_fused,
+    run_packed_fused: gemm_bf16_avx512bf16_packed_fused,
     mr: 32,
     nr: 12,
     // k-pair-interleaved pack: the prepack buffer rounds its depth up to a multiple of 2
@@ -1133,7 +1137,7 @@ const DISP_BF16_SIMD128: Dispatched<bf16> = Dispatched {
 
 /// `f16` ISA selection. The FMA path additionally needs **F16C**
 /// (`vcvtph2ps`/`vcvtps2ph`), checked here so an FMA selection on an F16C-less part falls
-/// back instead of faulting. AVX-512 covers `f16` conversion within `avx512f` itself
+/// back instead of faulting. AVX-512F covers `f16` conversion within `avx512f` itself
 #[cfg(feature = "half")]
 fn select_f16() -> Dispatched<f16> {
     match forced_isa() {
@@ -1150,9 +1154,9 @@ fn select_f16() -> Dispatched<f16> {
         ForcedIsa::Avx512F | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
             assert!(
                 x86_isa_detected!("avx512f"),
-                "GEMMKIT_REQUIRE_ISA=avx512, but this CPU/emulator does not report avx512f"
+                "GEMMKIT_REQUIRE_ISA=avx512f, but this CPU/emulator does not report avx512f"
             );
-            return DISP_F16_AVX512;
+            return DISP_F16_AVX512F;
         }
         #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
         ForcedIsa::Fma | ForcedIsa::Avx512F | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
@@ -1173,7 +1177,7 @@ fn select_f16() -> Dispatched<f16> {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         if x86_isa_detected!("avx512f") {
-            return DISP_F16_AVX512;
+            return DISP_F16_AVX512F;
         }
         if x86_isa_detected!("avx2") && x86_isa_detected!("fma") && x86_isa_detected!("f16c") {
             return DISP_F16_FMA;
@@ -1202,7 +1206,7 @@ fn select_f16() -> Dispatched<f16> {
 }
 
 /// `bf16` ISA selection: auto-selects the `vdpbf16ps` dot kernel first (needs `avx512bf16`),
-/// then plain AVX-512 (`avx512f`), then FMA. The FMA path uses only AVX2 integer ops
+/// then plain AVX-512F (`avx512f`), then FMA. The FMA path uses only AVX2 integer ops
 /// (shift / pack) to widen `bf16 -> f32`, so it needs no F16C, unlike the `f16` ladder
 #[cfg(feature = "half")]
 fn select_bf16() -> Dispatched<bf16> {
@@ -1220,9 +1224,9 @@ fn select_bf16() -> Dispatched<bf16> {
         ForcedIsa::Avx512F | ForcedIsa::Avx512Vnni => {
             assert!(
                 x86_isa_detected!("avx512f"),
-                "GEMMKIT_REQUIRE_ISA=avx512, but this CPU/emulator does not report avx512f"
+                "GEMMKIT_REQUIRE_ISA=avx512f, but this CPU/emulator does not report avx512f"
             );
-            return DISP_BF16_AVX512;
+            return DISP_BF16_AVX512F;
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         ForcedIsa::Avx512Bf16 => {
@@ -1230,7 +1234,7 @@ fn select_bf16() -> Dispatched<bf16> {
                 x86_isa_detected!("avx512bf16") && x86_isa_detected!("avx512f"),
                 "GEMMKIT_REQUIRE_ISA=avx512bf16, but this CPU/emulator does not report avx512f+bf16"
             );
-            return DISP_BF16_AVX512_DOT;
+            return DISP_BF16_AVX512BF16;
         }
         #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
         ForcedIsa::Fma | ForcedIsa::Avx512F | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
@@ -1250,12 +1254,12 @@ fn select_bf16() -> Dispatched<bf16> {
     }
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
-        // bf16 dot kernel first: vdpbf16ps is a structural win over the plain AVX-512 widen path
+        // bf16 dot kernel first: vdpbf16ps is a structural win over the plain AVX-512F widen path
         if x86_isa_detected!("avx512bf16") && x86_isa_detected!("avx512f") {
-            return DISP_BF16_AVX512_DOT;
+            return DISP_BF16_AVX512BF16;
         }
         if x86_isa_detected!("avx512f") {
-            return DISP_BF16_AVX512;
+            return DISP_BF16_AVX512F;
         }
         if x86_isa_detected!("avx2") && x86_isa_detected!("fma") {
             return DISP_BF16_FMA;

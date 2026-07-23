@@ -23,7 +23,7 @@ use crate::simd::Neon;
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 use crate::simd::Simd128;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-use crate::simd::{Avx512, Fma};
+use crate::simd::{Avx512F, Fma};
 use crate::simd::{ScalarTok, SimdOps};
 use crate::special::{gemv, small_k, small_mn};
 use crate::tuning;
@@ -282,14 +282,14 @@ unsafe fn gemm_f64_fma(t: Task<f64>, par: Parallelism, ws: &mut Workspace) {
     unsafe { run_typed::<f64, Fma, 2, 6>(Fma, t, par, ws) }
 }
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-unsafe fn gemm_f32_avx512(t: Task<f32>, par: Parallelism, ws: &mut Workspace) {
+unsafe fn gemm_f32_avx512f(t: Task<f32>, par: Parallelism, ws: &mut Workspace) {
     // MR = 2*16 = 32, NR = 12 -> 24 acc + 2 lhs + 1 rhs = 27 of 32 ZMM
-    unsafe { run_typed::<f32, Avx512, 2, 12>(Avx512, t, par, ws) }
+    unsafe { run_typed::<f32, Avx512F, 2, 12>(Avx512F, t, par, ws) }
 }
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-unsafe fn gemm_f64_avx512(t: Task<f64>, par: Parallelism, ws: &mut Workspace) {
+unsafe fn gemm_f64_avx512f(t: Task<f64>, par: Parallelism, ws: &mut Workspace) {
     // MR = 2*8 = 16, NR = 12, same 27-ZMM budget as f32
-    unsafe { run_typed::<f64, Avx512, 2, 12>(Avx512, t, par, ws) }
+    unsafe { run_typed::<f64, Avx512F, 2, 12>(Avx512F, t, par, ws) }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -338,12 +338,12 @@ unsafe fn gemm_f64_fma_packed(r: PackedConsume<f64>, par: Parallelism, ws: &mut 
     unsafe { run_packed_typed::<f64, Fma, 2, 6>(Fma, r, par, ws) }
 }
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-unsafe fn gemm_f32_avx512_packed(r: PackedConsume<f32>, par: Parallelism, ws: &mut Workspace) {
-    unsafe { run_packed_typed::<f32, Avx512, 2, 12>(Avx512, r, par, ws) }
+unsafe fn gemm_f32_avx512f_packed(r: PackedConsume<f32>, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_packed_typed::<f32, Avx512F, 2, 12>(Avx512F, r, par, ws) }
 }
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-unsafe fn gemm_f64_avx512_packed(r: PackedConsume<f64>, par: Parallelism, ws: &mut Workspace) {
-    unsafe { run_packed_typed::<f64, Avx512, 2, 12>(Avx512, r, par, ws) }
+unsafe fn gemm_f64_avx512f_packed(r: PackedConsume<f64>, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_packed_typed::<f64, Avx512F, 2, 12>(Avx512F, r, par, ws) }
 }
 #[cfg(target_arch = "aarch64")]
 unsafe fn gemm_f32_neon_packed(r: PackedConsume<f32>, par: Parallelism, ws: &mut Workspace) {
@@ -402,22 +402,22 @@ unsafe fn gemm_f64_fma_fused(
     unsafe { run_typed_fused::<f64, Fma, 2, 6>(Fma, t, epi, par, ws) }
 }
 #[cfg(all(feature = "epilogue", any(target_arch = "x86", target_arch = "x86_64")))]
-unsafe fn gemm_f32_avx512_fused(
+unsafe fn gemm_f32_avx512f_fused(
     t: Task<f32>,
     epi: FusedEpi<f32>,
     par: Parallelism,
     ws: &mut Workspace,
 ) {
-    unsafe { run_typed_fused::<f32, Avx512, 2, 12>(Avx512, t, epi, par, ws) }
+    unsafe { run_typed_fused::<f32, Avx512F, 2, 12>(Avx512F, t, epi, par, ws) }
 }
 #[cfg(all(feature = "epilogue", any(target_arch = "x86", target_arch = "x86_64")))]
-unsafe fn gemm_f64_avx512_fused(
+unsafe fn gemm_f64_avx512f_fused(
     t: Task<f64>,
     epi: FusedEpi<f64>,
     par: Parallelism,
     ws: &mut Workspace,
 ) {
-    unsafe { run_typed_fused::<f64, Avx512, 2, 12>(Avx512, t, epi, par, ws) }
+    unsafe { run_typed_fused::<f64, Avx512F, 2, 12>(Avx512F, t, epi, par, ws) }
 }
 #[cfg(all(feature = "epilogue", target_arch = "aarch64"))]
 unsafe fn gemm_f32_neon_fused(
@@ -505,22 +505,22 @@ unsafe fn gemm_f64_fma_packed_fused(
     unsafe { run_typed_packed_fused::<f64, Fma, 2, 6>(Fma, r, epi, par, ws) }
 }
 #[cfg(all(feature = "epilogue", any(target_arch = "x86", target_arch = "x86_64")))]
-unsafe fn gemm_f32_avx512_packed_fused(
+unsafe fn gemm_f32_avx512f_packed_fused(
     r: PackedConsume<f32>,
     epi: FusedEpi<f32>,
     par: Parallelism,
     ws: &mut Workspace,
 ) {
-    unsafe { run_typed_packed_fused::<f32, Avx512, 2, 12>(Avx512, r, epi, par, ws) }
+    unsafe { run_typed_packed_fused::<f32, Avx512F, 2, 12>(Avx512F, r, epi, par, ws) }
 }
 #[cfg(all(feature = "epilogue", any(target_arch = "x86", target_arch = "x86_64")))]
-unsafe fn gemm_f64_avx512_packed_fused(
+unsafe fn gemm_f64_avx512f_packed_fused(
     r: PackedConsume<f64>,
     epi: FusedEpi<f64>,
     par: Parallelism,
     ws: &mut Workspace,
 ) {
-    unsafe { run_typed_packed_fused::<f64, Avx512, 2, 12>(Avx512, r, epi, par, ws) }
+    unsafe { run_typed_packed_fused::<f64, Avx512F, 2, 12>(Avx512F, r, epi, par, ws) }
 }
 #[cfg(all(feature = "epilogue", target_arch = "aarch64"))]
 unsafe fn gemm_f32_neon_packed_fused(
@@ -775,7 +775,7 @@ pub(super) struct Dispatched<T> {
 }
 
 // One descriptor per (type, ISA). mr = MR_REG*LANES, nr = NR: mirrors the tile in each
-// wrapper's comment above (scalar 4x4; FMA 16x6 / f64 8x6; AVX-512 32x12 / f64 16x12;
+// wrapper's comment above (scalar 4x4; FMA 16x6 / f64 8x6; AVX-512F 32x12 / f64 16x12;
 // NEON 16x4 / f64 8x4; simd128 8x4 / f64 4x4)
 const DISP_F32_SCALAR: Dispatched<f32> = Dispatched {
     run: gemm_f32_scalar,
@@ -826,25 +826,25 @@ const DISP_F64_FMA: Dispatched<f64> = Dispatched {
 };
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-const DISP_F32_AVX512: Dispatched<f32> = Dispatched {
-    run: gemm_f32_avx512,
-    run_packed: gemm_f32_avx512_packed,
+const DISP_F32_AVX512F: Dispatched<f32> = Dispatched {
+    run: gemm_f32_avx512f,
+    run_packed: gemm_f32_avx512f_packed,
     #[cfg(feature = "epilogue")]
-    run_fused: gemm_f32_avx512_fused,
+    run_fused: gemm_f32_avx512f_fused,
     #[cfg(feature = "epilogue")]
-    run_packed_fused: gemm_f32_avx512_packed_fused,
+    run_packed_fused: gemm_f32_avx512f_packed_fused,
     mr: 32,
     nr: 12,
     depth_multiple: 1,
 };
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-const DISP_F64_AVX512: Dispatched<f64> = Dispatched {
-    run: gemm_f64_avx512,
-    run_packed: gemm_f64_avx512_packed,
+const DISP_F64_AVX512F: Dispatched<f64> = Dispatched {
+    run: gemm_f64_avx512f,
+    run_packed: gemm_f64_avx512f_packed,
     #[cfg(feature = "epilogue")]
-    run_fused: gemm_f64_avx512_fused,
+    run_fused: gemm_f64_avx512f_fused,
     #[cfg(feature = "epilogue")]
-    run_packed_fused: gemm_f64_avx512_packed_fused,
+    run_packed_fused: gemm_f64_avx512f_packed_fused,
     mr: 16,
     nr: 12,
     depth_multiple: 1,
@@ -915,9 +915,9 @@ fn select_f32() -> Dispatched<f32> {
         ForcedIsa::Avx512F | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
             assert!(
                 x86_isa_detected!("avx512f"),
-                "GEMMKIT_REQUIRE_ISA=avx512, but this CPU/emulator does not report avx512f"
+                "GEMMKIT_REQUIRE_ISA=avx512f, but this CPU/emulator does not report avx512f"
             );
-            return DISP_F32_AVX512;
+            return DISP_F32_AVX512F;
         }
         #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
         ForcedIsa::Fma | ForcedIsa::Avx512F | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
@@ -942,7 +942,7 @@ fn select_f32() -> Dispatched<f32> {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         if x86_isa_detected!("avx512f") {
-            return DISP_F32_AVX512;
+            return DISP_F32_AVX512F;
         }
         if x86_isa_detected!("avx2") && x86_isa_detected!("fma") {
             return DISP_F32_FMA;
@@ -986,9 +986,9 @@ fn select_f64() -> Dispatched<f64> {
         ForcedIsa::Avx512F | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
             assert!(
                 x86_isa_detected!("avx512f"),
-                "GEMMKIT_REQUIRE_ISA=avx512, but this CPU/emulator does not report avx512f"
+                "GEMMKIT_REQUIRE_ISA=avx512f, but this CPU/emulator does not report avx512f"
             );
-            return DISP_F64_AVX512;
+            return DISP_F64_AVX512F;
         }
         #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
         ForcedIsa::Fma | ForcedIsa::Avx512F | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
@@ -1013,7 +1013,7 @@ fn select_f64() -> Dispatched<f64> {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         if x86_isa_detected!("avx512f") {
-            return DISP_F64_AVX512;
+            return DISP_F64_AVX512F;
         }
         if x86_isa_detected!("avx2") && x86_isa_detected!("fma") {
             return DISP_F64_FMA;
@@ -1187,22 +1187,22 @@ unsafe fn gemm_f64_fma_map(
     unsafe { run_typed_map::<f64, Fma, 2, 6>(Fma, t, epi, par, ws) }
 }
 #[cfg(all(feature = "epilogue", any(target_arch = "x86", target_arch = "x86_64")))]
-unsafe fn gemm_f32_avx512_map(
+unsafe fn gemm_f32_avx512f_map(
     t: Task<f32>,
     epi: MapEpi<'_, f32>,
     par: Parallelism,
     ws: &mut Workspace,
 ) {
-    unsafe { run_typed_map::<f32, Avx512, 2, 12>(Avx512, t, epi, par, ws) }
+    unsafe { run_typed_map::<f32, Avx512F, 2, 12>(Avx512F, t, epi, par, ws) }
 }
 #[cfg(all(feature = "epilogue", any(target_arch = "x86", target_arch = "x86_64")))]
-unsafe fn gemm_f64_avx512_map(
+unsafe fn gemm_f64_avx512f_map(
     t: Task<f64>,
     epi: MapEpi<'_, f64>,
     par: Parallelism,
     ws: &mut Workspace,
 ) {
-    unsafe { run_typed_map::<f64, Avx512, 2, 12>(Avx512, t, epi, par, ws) }
+    unsafe { run_typed_map::<f64, Avx512F, 2, 12>(Avx512F, t, epi, par, ws) }
 }
 #[cfg(all(feature = "epilogue", target_arch = "aarch64"))]
 unsafe fn gemm_f32_neon_map(
@@ -1268,9 +1268,9 @@ fn select_map_f32() -> MapFn<f32> {
         ForcedIsa::Avx512F | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
             assert!(
                 x86_isa_detected!("avx512f"),
-                "GEMMKIT_REQUIRE_ISA=avx512, but this CPU/emulator does not report avx512f"
+                "GEMMKIT_REQUIRE_ISA=avx512f, but this CPU/emulator does not report avx512f"
             );
-            return gemm_f32_avx512_map;
+            return gemm_f32_avx512f_map;
         }
         #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
         ForcedIsa::Fma | ForcedIsa::Avx512F | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
@@ -1291,7 +1291,7 @@ fn select_map_f32() -> MapFn<f32> {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         if x86_isa_detected!("avx512f") {
-            return gemm_f32_avx512_map;
+            return gemm_f32_avx512f_map;
         }
         if x86_isa_detected!("avx2") && x86_isa_detected!("fma") {
             return gemm_f32_fma_map;
@@ -1335,9 +1335,9 @@ fn select_map_f64() -> MapFn<f64> {
         ForcedIsa::Avx512F | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
             assert!(
                 x86_isa_detected!("avx512f"),
-                "GEMMKIT_REQUIRE_ISA=avx512, but this CPU/emulator does not report avx512f"
+                "GEMMKIT_REQUIRE_ISA=avx512f, but this CPU/emulator does not report avx512f"
             );
-            return gemm_f64_avx512_map;
+            return gemm_f64_avx512f_map;
         }
         #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
         ForcedIsa::Fma | ForcedIsa::Avx512F | ForcedIsa::Avx512Vnni | ForcedIsa::Avx512Bf16 => {
@@ -1358,7 +1358,7 @@ fn select_map_f64() -> MapFn<f64> {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         if x86_isa_detected!("avx512f") {
-            return gemm_f64_avx512_map;
+            return gemm_f64_avx512f_map;
         }
         if x86_isa_detected!("avx2") && x86_isa_detected!("fma") {
             return gemm_f64_fma_map;

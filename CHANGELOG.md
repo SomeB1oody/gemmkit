@@ -19,7 +19,7 @@ Initial release.
 - f32/f64 GEMM (`C <- alpha*A*B + beta*C`) over strided views, in 3 API tiers:
   checked slice entries (`gemm`), explicit-workspace variants (`*_with`), and raw
   pointer entries accepting negative strides (`*_unchecked`, `*_unchecked_with`)
-- Runtime ISA dispatch with a portable scalar fallback: x86-64 FMA and AVX-512
+- Runtime ISA dispatch with a portable scalar fallback: x86-64 FMA and AVX-512F
   (plus AVX-512 VNNI `vpdpbusd` for `int8` and AVX-512 BF16 `vdpbf16ps` for
   `half`), aarch64 NEON, and wasm32 `simd128` (compile-time feature); the
   `GEMMKIT_REQUIRE_ISA` env knob pins or forbids a kernel end to end

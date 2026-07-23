@@ -441,7 +441,7 @@ fn requant_vector_scalar_bitwise() {
 }
 
 /// Round-half-to-even ties through the vector store path. `m = 37` exceeds every ISA's `i32`
-/// lane width (16 lanes, the AVX-512 max), so a unit-stride C hits at least 1 full lane-run
+/// lane width (16 lanes, the AVX-512F max), so a unit-stride C hits at least 1 full lane-run
 /// under the vector store, plus a sub-lane tail; `1x1` products with `scale = 0.5` land
 /// `scale*acc` on exact half-integers for odd `acc`. Checked against `ref_requant` (std
 /// `round_ties_even`, independent of the kernel), so a round-half-up/away regression in the

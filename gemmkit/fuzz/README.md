@@ -78,7 +78,7 @@ cargo +nightly fuzz run fuzz_knobs -- \
   -max_total_time=14400 -max_len=512 -timeout=60 -malloc_limit_mb=1024 -jobs=4 -workers=4
 
 # per-ISA passes: the dispatch pin is once-per-process, so use SEPARATE processes
-for isa in scalar fma avx512 avx512vnni avx512bf16; do
+for isa in scalar fma avx512f avx512vnni avx512bf16; do
   GEMMKIT_REQUIRE_ISA=$isa \
     cargo +nightly fuzz run fuzz_gemm -- -max_total_time=3600 -max_len=512 -timeout=60
 done

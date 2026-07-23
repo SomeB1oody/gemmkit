@@ -125,7 +125,7 @@ pub fn build_view<T: Elem>(m: &Mat<T>, l: PLayout) -> (Vec<T>, isize, isize) {
 
 /// Dimension distribution, weighted toward degenerate cases: heavy on 0 and 1, then
 /// boundary triples (V-1, V, V+1) around 12, 16, 32, 48, and the tiny-block shortcut gate 64
-/// (`TINY_BLOCK_DIM_DEFAULT` in tuning.rs); 12 and 32 are the AVX-512 f32 microkernel tile's
+/// (`TINY_BLOCK_DIM_DEFAULT` in tuning.rs); 12 and 32 are the AVX-512F f32 microkernel tile's
 /// NR/MR, 16 is the FMA/NEON f32 tile's MR. A few extra small values (2, 4, 5, 6, 24) and a
 /// broad 2..=96 tail round it out
 pub fn dim() -> impl Strategy<Value = usize> {

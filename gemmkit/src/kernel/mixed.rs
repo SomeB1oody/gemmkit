@@ -336,7 +336,7 @@ where
 }
 
 /// The bf16 dot GEMM family: `Lhs = Rhs = Out = bf16`, `Acc = f32`, accumulated via
-/// AVX-512 `vdpbf16ps` (2 bf16 depth steps folded per instruction) instead of
+/// AVX-512 BF16 `vdpbf16ps` (2 bf16 depth steps folded per instruction) instead of
 /// [`MixedGemm`]'s widen-and-FMA
 ///
 /// A sibling of `MixedGemm<bf16>`, not a branch inside it: `pack_lhs`/`pack_rhs` take no

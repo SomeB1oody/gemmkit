@@ -9,7 +9,7 @@
 
 核心引擎开箱即用地支持 `f32` 和 `f64`；在 Cargo feature 之后，还支持
 `f16`/`bf16`（以 `f32` 累加的混合精度）、`i8 -> i32` 整数以及 `c32`/`c64` 复数数据。
-运行时 ISA 分发覆盖 x86-64 FMA 与 AVX-512（`int8` 走 AVX-512 VNNI，`bf16` 走
+运行时 ISA 分发覆盖 x86-64 FMA 与 AVX-512F（`int8` 走 AVX-512 VNNI，`bf16` 走
 AVX-512 BF16）、aarch64 NEON 和 wasm32 `simd128`，并以可移植的标量回退路径兜底；
 `GEMMKIT_REQUIRE_ISA` 环境变量可以锁定或禁用某个后端。多线程是可选的（基于
 rayon），且在输入与配置固定时结果可复现。关闭默认 feature 后，核心可在 `no_std`
@@ -78,7 +78,7 @@ fn main() {
 
 - 标量：可移植的回退路径，不要求任何目标特性
 - x86-64 FMA
-- x86-64 AVX-512，其中 `int8` 使用 AVX-512 VNNI（`vpdpbusd`），`bf16` 使用 AVX-512 BF16（`vdpbf16ps`）
+- x86-64 AVX-512F，其中 `int8` 使用 AVX-512 VNNI（`vpdpbusd`），`bf16` 使用 AVX-512 BF16（`vdpbf16ps`）
 - aarch64 NEON
 - wasm32 `simd128`（编译期特性检测）
 

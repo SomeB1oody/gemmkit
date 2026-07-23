@@ -98,7 +98,7 @@ fn perf_f16() {
 /// narrow result rounds only once at the end), which on this target auto-switches itself to
 /// an `f32`-output multi-slice twin (re-blocked at the same analytic `kc` f32 uses) once the
 /// resulting RHS micropanel (`nr * k * sizeof(N)`) outgrows the deep-contraction engage gate.
-/// On AVX-512 (`nr = 12`, gate = half the detected L2) that crossover sits around `k ~
+/// On AVX-512F (`nr = 12`, gate = half the detected L2) that crossover sits around `k ~
 /// 21800`, so the last 2 points below (32768, 65536) are already running the multi-slice
 /// twin, not the single-slice route the first 3 exercise. The sweep is therefore really 2
 /// questions in 1: does single-slice throughput hold up cleanly all the way to its own
@@ -168,7 +168,7 @@ fn perf_narrow_k_sweep() {
 }
 
 /// bf16-in, f32-accumulate GEMM throughput: no baseline here since the `gemm` crate (0.18) has
-/// no bf16 support to compare against. On an AVX-512-BF16 box the driver auto-selects the
+/// no bf16 support to compare against. On an AVX-512 BF16 box the driver auto-selects the
 /// `vdpbf16ps` dot kernel, whose LHS/RHS packs both go through `pack_kgroup_panels`;
 /// row-major A (contiguous rows) plus col-major B (contiguous columns) is the layout where
 /// both operands hit that packer's fast, straight-copy path rather than its strided one, so

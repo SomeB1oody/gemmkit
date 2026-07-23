@@ -50,7 +50,7 @@ gemm_i8(1, MatRef::from_row_major(&a, 2, 3), MatRef::from_row_major(&b, 3, 2),
         0, MatMut::from_row_major(&mut c, 2, 2), Parallelism::Serial);
 ```
 
-Integer GEMM is **exact**: it is `i32` ring arithmetic that **wraps on overflow**, the conventional integer-GEMM semantics. There is no tolerance to speak of, because there is no rounding - the result is bit-for-bit identical across every ISA (scalar, FMA, AVX-512, and the AVX-512 VNNI `vpdpbusd` dot kernel), and identical serial versus parallel, since integer addition over a ring is order-independent. If you feed values whose products can exceed `i32`, the wraparound is defined and reproducible, not undefined behavior. The `int8` feature pulls in no extra dependency. Adding `epilogue` on top unlocks the requantizing entries (`i8`/`u8` output in one pass); see [Fused Epilogues](Fused_Epilogues.md).
+Integer GEMM is **exact**: it is `i32` ring arithmetic that **wraps on overflow**, the conventional integer-GEMM semantics. There is no tolerance to speak of, because there is no rounding - the result is bit-for-bit identical across every ISA (scalar, FMA, AVX-512F, and the AVX-512 VNNI `vpdpbusd` dot kernel), and identical serial versus parallel, since integer addition over a ring is order-independent. If you feed values whose products can exceed `i32`, the wraparound is defined and reproducible, not undefined behavior. The `int8` feature pulls in no extra dependency. Adding `epilogue` on top unlocks the requantizing entries (`i8`/`u8` output in one pass); see [Fused Epilogues](Fused_Epilogues.md).
 
 ## Complex: the `complex` feature
 

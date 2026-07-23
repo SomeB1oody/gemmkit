@@ -21,7 +21,7 @@ validate their own inputs.
 
 Beyond the plain product, gemmkit provides:
 
-- Runtime ISA dispatch: x86-64 FMA and AVX-512 (AVX-512 VNNI for int8, AVX-512
+- Runtime ISA dispatch: x86-64 FMA and AVX-512F (AVX-512 VNNI for int8, AVX-512
   BF16 for bf16), aarch64 NEON, wasm32 simd128 (compile-time feature detection),
   and a scalar fallback. The `GEMMKIT_REQUIRE_ISA` env var pins or forbids a
   backend.

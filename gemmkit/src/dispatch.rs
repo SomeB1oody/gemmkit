@@ -13,9 +13,9 @@
 //! ## Pinning the kernel: `GEMMKIT_REQUIRE_ISA`
 //!
 //! By default the best available ISA is selected at runtime. Setting the environment variable
-//! `GEMMKIT_REQUIRE_ISA` to `scalar`, `fma`, `avx512`, `avx512vnni`, `avx512bf16`, `neon`, or
+//! `GEMMKIT_REQUIRE_ISA` to `scalar`, `fma`, `avx512f`, `avx512vnni`, `avx512bf16`, `neon`, or
 //! `simd128` **forces** exactly that kernel (`avx512vnni` selects the `i8` `vpdpbusd` dot
-//! kernel, `avx512bf16` the `bf16` `vdpbf16ps` dot kernel, and the plain AVX-512 path for every
+//! kernel, `avx512bf16` the `bf16` `vdpbf16ps` dot kernel, and the plain AVX-512F path for every
 //! other type); if the CPU (or an emulator such as Intel SDE) does not report the required
 //! feature, or the requested ISA does not exist on this target architecture, selection
 //! **panics** rather than falling back, so a CI job that means to exercise a given kernel fails

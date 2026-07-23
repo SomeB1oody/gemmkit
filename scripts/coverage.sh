@@ -59,7 +59,7 @@ else
     if [ "$ARCH" = x86_64 ]; then
         # f16c is required for the fma pin on f16
         { have_flag 'avx2' && have_flag 'fma' && have_flag 'f16c'; } && ISAS+=(fma)
-        have_flag 'avx512f'                    && ISAS+=(avx512)
+        have_flag 'avx512f'                    && ISAS+=(avx512f)
         have_flag 'avx512_vnni|avx512vnni'     && ISAS+=(avx512vnni)
         have_flag 'avx512_bf16|avx512bf16'     && ISAS+=(avx512bf16)
     elif [ "$ARCH" = aarch64 ]; then

@@ -196,7 +196,7 @@ static GEMV_THRESHOLD: Threshold = Threshold::new("GEMMKIT_GEMV_THRESHOLD", GEMV
 // packing. Above it the register-tiling driver wins, since packing A into contiguous panels pays
 // for a better microkernel depth-walk once there is enough depth to amortize the pack. The
 // crossover trades a **machine's** depth-walk speed against its pack cost, so it is arch-split:
-// * x86 (Zen5, AVX-512): in-place stays ahead through k = 16 (about 120-140% of the driver on
+// * x86 (Zen5, AVX-512F): in-place stays ahead through k = 16 (about 120-140% of the driver on
 //   skinny GEMM) and falls behind by k = 32, so the crossover sits between them
 // * aarch64 (M4, NEON): the narrower 16x4 tile packs cheaply and its depth-walk wins sooner:
 //   in-place leads only through k = 8 (about 115% of the driver) and the driver is already ahead
@@ -241,7 +241,7 @@ static SMALL_MN_DIM: Threshold = Threshold::new("GEMMKIT_SMALL_MN_DIM", SMALL_MN
 // the driver's padding overhead. The zero-copy tier (both operands already unit-stride along k)
 // ignores this knob entirely and keeps using `small_k_threshold`. The crossover is the same class
 // of machine property as `small_k_threshold` (copy cost and cache geometry vs the driver's padded
-// deficit), calibrated on Zen5 (AVX-512): the packed route beats the driver at every measured k
+// deficit), calibrated on Zen5 (AVX-512F): the packed route beats the driver at every measured k
 // for every small shape (1.1x at 16x16 k=32, up to about 6.8x at 4x4, never a regression), so the
 // gate is set right at the small-k boundary - a strided small-m,n shape starts packing exactly
 // where an in-place shape would have left the small-k route anyway
@@ -505,7 +505,7 @@ static DEEP_KC_BYTES: Threshold = Threshold::new("GEMMKIT_DEEP_KC_BYTES", DEEP_K
 // issues a T0 prefetch of each C microtile just ahead of its microkernel call, hiding part of the
 // tile's read-modify-write latency; below the gate the tiles are cache-resident and the hint
 // would be pure overhead. The prefetch only reorders cache traffic, never arithmetic, so results
-// are bit-identical with the gate on, off, or forced. Measured on the Zen5 9950X (f32, AVX-512):
+// are bit-identical with the gate on, off, or forced. Measured on the Zen5 9950X (f32, AVX-512F):
 // +1.4% parallel and about +1% serial at 2048^3 (48 MiB working set), +2-3% parallel at
 // 3072^3 and deep-k
 // 2048x2048x24576, neutral at 1536^3 and below (under the 32 MiB per-CCD LLC) and at in-cache

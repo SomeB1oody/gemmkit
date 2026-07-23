@@ -35,7 +35,7 @@ pub(super) enum ForcedIsa {
     Scalar,
     /// AVX2 + FMA widen kernel
     Fma,
-    /// AVX-512 foundation (`avx512f`) widen kernel
+    /// AVX-512 Foundation (`avx512f`) widen kernel
     Avx512F,
     /// AVX-512 VNNI: the `i8` `vpdpbusd` dot kernel
     Avx512Vnni,
@@ -67,7 +67,7 @@ pub(super) fn forced_isa() -> ForcedIsa {
                 ForcedIsa::Scalar
             } else if t.eq_ignore_ascii_case("fma") || t.eq_ignore_ascii_case("avx2") {
                 ForcedIsa::Fma
-            } else if t.eq_ignore_ascii_case("avx512") || t.eq_ignore_ascii_case("avx512f") {
+            } else if t.eq_ignore_ascii_case("avx512f") {
                 ForcedIsa::Avx512F
             } else if t.eq_ignore_ascii_case("avx512vnni") || t.eq_ignore_ascii_case("vnni") {
                 ForcedIsa::Avx512Vnni
@@ -79,7 +79,7 @@ pub(super) fn forced_isa() -> ForcedIsa {
                 ForcedIsa::Simd128
             } else {
                 panic!(
-                    "GEMMKIT_REQUIRE_ISA: unknown value `{t}` (expected scalar|fma|avx512|avx512vnni|avx512bf16|neon|simd128|auto)"
+                    "GEMMKIT_REQUIRE_ISA: unknown value `{t}` (expected scalar|fma|avx512f|avx512vnni|avx512bf16|neon|simd128|auto)"
                 )
             }
         }

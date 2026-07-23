@@ -247,7 +247,7 @@ fn perf_call_latency() {
 
 /// A rough estimate of the (MR, NR) microtile the default `gemm()` dispatch would use on this
 /// target, for sizing the printed "jobs/region" estimate below (not for driving any call
-/// here). Assumes the best available x86 ISA is AVX-512; on an AVX2-only box the real tile is
+/// here). Assumes the best available x86 ISA is AVX-512F; on an AVX2-only box the real tile is
 /// the smaller 16x6: `mc`'s cap scales directly with `mr` (`tuning::mc_reg_panels`), and the
 /// per-region job count divides directly by both `mr` and `nr`, so the smaller tile splits the
 /// same problem into more, finer jobs than this bigger assumed tile predicts, making the

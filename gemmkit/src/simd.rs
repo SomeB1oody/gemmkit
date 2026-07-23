@@ -10,7 +10,7 @@
 //! * [`SimdOps<T>`]: the per-element-type vocabulary of a token: register type, lane
 //!   count, and every primitive the microkernel needs (load/store/broadcast/mul/add/
 //!   fma/reduce). Token and element type are decoupled, so `LANES` depends on the
-//!   `(ISA, T)` pair: `f32` is 8 lanes on FMA, 16 on AVX-512; `f64` is half of `f32`
+//!   `(ISA, T)` pair: `f32` is 8 lanes on FMA, 16 on AVX-512F; `f64` is half of `f32`
 //!   on the same token
 //!
 //! Every primitive a microkernel needs lives on these 2 traits, so the microkernel body
@@ -34,7 +34,7 @@ use crate::scalar::Scalar;
 #[cfg(feature = "complex")]
 #[macro_use]
 mod complex;
-// AVX-512 ISA token, plus its VNNI and bf16 dot-product variants
+// AVX-512F ISA token, plus its VNNI and bf16 dot-product variants
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod avx512;
 // AVX2 + FMA ISA token
@@ -49,10 +49,10 @@ mod scalar;
 #[cfg(target_arch = "wasm32")]
 mod wasm;
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-pub use self::avx512::Avx512;
 #[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
 pub use self::avx512::Avx512Bf16;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+pub use self::avx512::Avx512F;
 #[cfg(all(feature = "int8", any(target_arch = "x86", target_arch = "x86_64")))]
 pub use self::avx512::Avx512Vnni;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -522,7 +522,7 @@ pub trait SimdOps<T: Scalar>: Simd {
     ) {
         debug_assert_eq!(acc.len(), Self::LANES);
         unsafe {
-            // 16 is the widest LANES across every ISA (AVX-512 f32), so this buffer
+            // 16 is the widest LANES across every ISA (AVX-512F f32), so this buffer
             // always fits the register being spilled regardless of the caller's token
             let mut buf = [T::ZERO; 16];
             self.storeu(buf.as_mut_ptr(), bvec);
@@ -779,12 +779,12 @@ mod requant_store_tests {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         // SAFETY: each token runs only after `is_x86_feature_detected!` confirms its features
         unsafe {
-            use super::{Avx512, Avx512Vnni, Fma};
+            use super::{Avx512F, Avx512Vnni, Fma};
             if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
                 check_token(Fma, "fma");
             }
             if is_x86_feature_detected!("avx512f") {
-                check_token(Avx512, "avx512");
+                check_token(Avx512F, "avx512f");
             }
             if is_x86_feature_detected!("avx512f")
                 && is_x86_feature_detected!("avx512bw")

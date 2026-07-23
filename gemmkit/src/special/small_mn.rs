@@ -45,7 +45,7 @@ use crate::workspace::Workspace;
 /// Output register-tile shape: `MT` rows by `NT` columns of live accumulators per pass over
 /// `k`. `4x4` was chosen so the tile's accumulators plus its 1 live A-row-vector-per-row and
 /// 1 B-column-vector fit comfortably inside the ISA's vector register file: on Zen5
-/// (AVX-512, 32 `zmm`) that is 16 + 4 + 1 = 21 registers, well under the 32 available.
+/// (AVX-512F, 32 `zmm`) that is 16 + 4 + 1 = 21 registers, well under the 32 available.
 /// Measured on M4 (NEON, also 32 vector registers): larger tiles (`4x6`/`6x4`/`5x5`, 29-31
 /// live vectors) regress sharply, from ~120 GFLOP/s down to 44-62, because the larger
 /// accumulator array no longer fits and LLVM starts spilling it. `4x4` stays in the same

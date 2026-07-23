@@ -182,7 +182,7 @@ Each element type has one `OnceLock<Dispatched<T>>` slot
 (`gemmkit/src/dispatch/`): feature detection runs once, the winning
 monomorphized entry points (plain, prepacked, fused) plus the microtile
 geometry are cached, and every later call is a plain indirect call. The
-auto-selection ladders prefer AVX-512 then FMA/AVX2 then scalar on x86; NEON
+auto-selection ladders prefer AVX-512F then FMA/AVX2 then scalar on x86; NEON
 is baseline on aarch64; `simd128` is chosen at compile time on wasm32 (no
 runtime feature detection there, so the build must pass
 `-C target-feature=+simd128`); scalar is the portable floor everywhere.
@@ -194,11 +194,11 @@ and its `#[inline(always)]` primitives inline into that context, landing every
 intrinsic in feature-enabled codegen.
 
 Tile geometry `(MR_REG, NR)` is the only per-(type, ISA) knob, chosen at the
-dispatch site as const generics: for `f32`, AVX-512 runs 32x12, FMA 16x6, NEON
+dispatch site as const generics: for `f32`, AVX-512F runs 32x12, FMA 16x6, NEON
 16x4, simd128 8x4, scalar 4x4 (`MR = MR_REG * LANES`; `f64` halves the lane
 count).
 
-`GEMMKIT_REQUIRE_ISA` pins the kernel end to end: `scalar`, `fma`, `avx512`,
+`GEMMKIT_REQUIRE_ISA` pins the kernel end to end: `scalar`, `fma`, `avx512f`,
 `avx512vnni` (the i8 dot kernel), `avx512bf16` (the bf16 dot kernel), `neon`,
 `simd128`, or `auto`. If the CPU or target does not support the request,
 dispatch panics rather than falling back, so a CI job that means to exercise
@@ -509,7 +509,7 @@ for `--save-baseline` regression tracking.
   binaries (a separate process cannot race another's knob state) and serialize
   their mutations under a per-binary `KNOB_LOCK`.
 - **ISA pins** (`tests/env_isa_*.rs`): one binary per `GEMMKIT_REQUIRE_ISA`
-  value (`avx512`, `vnni`, `bf16`, `scalar`, `neon`, `wasm`, plus a
+  value (`avx512f`, `vnni`, `bf16`, `scalar`, `neon`, `wasm`, plus a
   garbage-value guard). Each pins its ISA once through a shared `Once`
   (`tests/env_isa_common/`) before any dispatch, so the memoized per-ISA
   dispatch resolves the pinned kernel in an isolated process; the write
@@ -519,7 +519,7 @@ for `--save-baseline` regression tracking.
   negative-stride entry under Miri; `cfg(miri)` detours exist only where Miri
   cannot interpret hardware conversions.
 - **ISA pinning in CI** (`.github/workflows/ci.yml`): jobs pin each kernel via
-  `GEMMKIT_REQUIRE_ISA` (AVX-512, VNNI, and BF16 under Intel SDE, NEON on
+  `GEMMKIT_REQUIRE_ISA` (AVX-512F, VNNI, and BF16 under Intel SDE, NEON on
   aarch64, simd128 on wasm), plus no_std builds, an MSRV job, and
   feature-matrix builds. `GEMMKIT_FAST_TEST` is a test-suite-only switch that
   shrinks the sweeps; the library never reads it.

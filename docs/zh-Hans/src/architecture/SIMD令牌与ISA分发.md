@@ -4,7 +4,7 @@ gemmkit 在运行时选择指令集，而这个决定与 Rust 编译 SIMD 内建
 
 ## ISA 令牌与 vectorize 蹦床
 
-ISA 令牌是一个零尺寸类型，代表一种指令集选择：x86 上有 `Fma`（AVX2 + FMA）和 `Avx512`，外加点积内核变体 `Avx512Vnni` 与 `Avx512Bf16`；aarch64 上是 `Neon`；wasm32 上是 `Simd128`；而 `ScalarTok` 在任何平台都存在，是可移植的兜底。每个令牌实现 `Simd` trait，它唯一的方法是 `vectorize`：在该令牌的 target feature 已启用的上下文中运行一个闭包。整个机制就这么大，摘自 `gemmkit/src/simd/fma.rs`：
+ISA 令牌是一个零尺寸类型，代表一种指令集选择：x86 上有 `Fma`（AVX2 + FMA）和 `Avx512F`，外加点积内核变体 `Avx512Vnni` 与 `Avx512Bf16`；aarch64 上是 `Neon`；wasm32 上是 `Simd128`；而 `ScalarTok` 在任何平台都存在，是可移植的兜底。每个令牌实现 `Simd` trait，它唯一的方法是 `vectorize`：在该令牌的 target feature 已启用的上下文中运行一个闭包。整个机制就这么大，摘自 `gemmkit/src/simd/fma.rs`：
 
 ```rust
 /// AVX2 + FMA ISA token
@@ -30,7 +30,7 @@ impl Simd for Fma {
 
 ## SimdOps：按元素类型展开的指令词汇表
 
-令牌刻意对元素类型一无所知。所有实际运算都放在第二个 trait `SimdOps<T>` 上，按 `(ISA, T)` 对分别实现：它给出寄存器类型 `Reg`、通道数 `LANES`，以及微内核需要的每一条原语。因为令牌与元素类型解耦，`LANES` 随二元组变化——`f32` 在 `Fma` 下是 8 通道、在 `Avx512` 下是 16 通道，`f64` 减半。
+令牌刻意对元素类型一无所知。所有实际运算都放在第二个 trait `SimdOps<T>` 上，按 `(ISA, T)` 对分别实现：它给出寄存器类型 `Reg`、通道数 `LANES`，以及微内核需要的每一条原语。因为令牌与元素类型解耦，`LANES` 随二元组变化——`f32` 在 `Fma` 下是 8 通道、在 `Avx512F` 下是 16 通道，`f64` 减半。
 
 这份词汇表刻意做得很厚。基础操作有 `zero`、`splat`、`loadu`、`storeu`、`mul`、`add`、融合乘加 `mul_add` 及其减法搭档 `fnma`（`c - a*b`，复数内核需要），还有 gemv 与点积 epilogue 用的水平求和 `reduce_sum`。在此之上还有 `max`/`min`（只有实数浮点令牌覆写，供融合 ReLU/clip epilogue 使用）、`LANE_FMA` 标志与 `fma_bvec`（NEON 的按通道索引 FMA 路径：把一段 RHS 列作为一个向量整体加载，替代逐列 splat），以及 `accumulate_tile`——GEMM 的内层循环本体，其可移植默认调度在任何乱序核心上都会被 LLVM 直接降低成教科书式的寄存器分块内核。复数拆分内核在这里也有自己的接缝（`cplx_microkernel`），点积内核亦然（伴生 trait `KernelSimd` 上的 `dot_accumulate`）——细节见[标量与内核家族](标量与内核家族.md)和[点积内核与深K孪生](点积内核与深K孪生.md)。
 
@@ -55,9 +55,9 @@ pub(super) struct Dispatched<T> {
 }
 ```
 
-槽位缓存获胜的单态化入口——普通内核、预打包 RHS 内核，以及（`epilogue` feature 下）它们的融合孪生——外加微铺块几何 `(mr, nr)` 和家族的 `depth_multiple`。缓存几何是为了让 `prepack_rhs` 用与后续消费调用*相同*的 ISA 选择来确定缓冲区尺寸；`depth_multiple` 则让 bf16 预打包路径把打包深度取整到点积内核的布局。一切都是带类型的函数指针：没有 `transmute`，没有 `AtomicPtr<()>`。一次调用的路径是 `gemm` → `dispatch::execute`（退化情形在此处理）→ `T::dispatch` → 记忆化的槽位 → 一次间接调用进入 `gemm_f32_avx512` 这样的包装函数，后者把共享泛型入口实例化为 `run_typed::<f32, Avx512, 2, 12>`。
+槽位缓存获胜的单态化入口——普通内核、预打包 RHS 内核，以及（`epilogue` feature 下）它们的融合孪生——外加微铺块几何 `(mr, nr)` 和家族的 `depth_multiple`。缓存几何是为了让 `prepack_rhs` 用与后续消费调用*相同*的 ISA 选择来确定缓冲区尺寸；`depth_multiple` 则让 bf16 预打包路径把打包深度取整到点积内核的布局。一切都是带类型的函数指针：没有 `transmute`，没有 `AtomicPtr<()>`。一次调用的路径是 `gemm` → `dispatch::execute`（退化情形在此处理）→ `T::dispatch` → 记忆化的槽位 → 一次间接调用进入 `gemm_f32_avx512f` 这样的包装函数，后者把共享泛型入口实例化为 `run_typed::<f32, Avx512F, 2, 12>`。
 
-选择只跑一次，就在 `OnceLock` 的初始化器里。在优先处理 `GEMMKIT_REQUIRE_ISA` 锁定（见下文）之后，自动阶梯在 x86 上先探测 `avx512f`，再探 `avx2` + `fma`，最后落到标量。aarch64 上 NEON 是基线——架构规定必备，无需探测。wasm32 上根本没有运行时特性检测：`simd128` 在编译期由 `cfg(target_feature = "simd128")` 决定，构建必须传 `-C target-feature=+simd128`，否则拿到标量内核。标量在所有架构上都是地板。各类型的阶梯在同一骨架上加自己的门槛：`f16` 的 FMA 分支额外要求 `f16c`（`vcvtph2ps`/`vcvtps2ph` 转换需要），`bf16` 阶梯在普通 AVX-512 之前先试 `avx512bf16` 点积内核，`i8` 阶梯在加宽内核之前先试 `avx512vnni`（连同 `avx512bw`）。
+选择只跑一次，就在 `OnceLock` 的初始化器里。在优先处理 `GEMMKIT_REQUIRE_ISA` 锁定（见下文）之后，自动阶梯在 x86 上先探测 `avx512f`，再探 `avx2` + `fma`，最后落到标量。aarch64 上 NEON 是基线——架构规定必备，无需探测。wasm32 上根本没有运行时特性检测：`simd128` 在编译期由 `cfg(target_feature = "simd128")` 决定，构建必须传 `-C target-feature=+simd128`，否则拿到标量内核。标量在所有架构上都是地板。各类型的阶梯在同一骨架上加自己的门槛：`f16` 的 FMA 分支额外要求 `f16c`（`vcvtph2ps`/`vcvtps2ph` 转换需要），`bf16` 阶梯在普通 AVX-512F 之前先试 `avx512bf16` 点积内核，`i8` 阶梯在加宽内核之前先试 `avx512vnni`（连同 `avx512bw`）。
 
 两个构建模式细节值得知道。有 `std` 时，特性检测走 `is_x86_feature_detected!`，结果记忆化在 `OnceLock` 里。没有 `std` 时不存在运行时 CPU 检测（`raw-cpuid` 由 `std` 门控）：探测宏退化为 `cfg!(target_feature = ...)`，`GEMMKIT_REQUIRE_ISA` 解析退化为 `Auto`，select 函数每次调用都会执行——但其中每个分支此时都是编译期常量，直接折叠成一个确定选择。`no_std` 构建就跑其编译期 target feature 保证的那条路径；参见 [no_std 与 WebAssembly](../gemmkit-guide/no_std与WebAssembly.md)。
 
@@ -67,17 +67,17 @@ pub(super) struct Dispatched<T> {
 
 | ISA | `(MR_REG, NR)` | `LANES` | 铺块 `MR x NR` | 寄存器预算 |
 |---|---|---|---|---|
-| AVX-512 | `(2, 12)` | 16 | 32 x 12 | 24 累加 + 2 lhs + 1 rhs = 27 个 ZMM |
+| AVX-512F | `(2, 12)` | 16 | 32 x 12 | 24 累加 + 2 lhs + 1 rhs = 27 个 ZMM |
 | FMA（AVX2） | `(2, 6)` | 8 | 16 x 6 | 12 累加 + 2 lhs + 1 rhs = 15 个 YMM |
 | NEON | `(4, 4)` | 4 | 16 x 4 | 16 累加 + 4 lhs + 1 rhs = 21/32 个向量寄存器 |
 | simd128 | `(2, 4)` | 4 | 8 x 4 | 8 累加 + 2 lhs + 1 rhs = 11 个活跃 `v128` |
 | 标量 | `(4, 4)` | 1 | 4 x 4 | 普通局部变量 |
 
-`f64` 通道数减半，同样的 `(MR_REG, NR)` 组合于是给出 16x12（AVX-512）、8x6（FMA）、8x4（NEON）、4x4（simd128）。这些预算不是巧合：NEON 刻意留出约 11 个空闲寄存器，给宽乱序核心以重命名余量，让下一步的加载与当前的 FMA 重叠；simd128 停在 11 个活跃向量，因为 LLVM 的 wasm 后端在大约 16 个之后开始溢出。这些注释就写在 `dispatch/float.rs` 的包装函数旁边——上表是代码本身，不是愿望。
+`f64` 通道数减半，同样的 `(MR_REG, NR)` 组合于是给出 16x12（AVX-512F）、8x6（FMA）、8x4（NEON）、4x4（simd128）。这些预算不是巧合：NEON 刻意留出约 11 个空闲寄存器，给宽乱序核心以重命名余量，让下一步的加载与当前的 FMA 重叠；simd128 停在 11 个活跃向量，因为 LLVM 的 wasm 后端在大约 16 个之后开始溢出。这些注释就写在 `dispatch/float.rs` 的包装函数旁边——上表是代码本身，不是愿望。
 
 ## 用 GEMMKIT_REQUIRE_ISA 端到端锁定内核
 
-默认由最优可用 ISA 胜出。设置环境变量 `GEMMKIT_REQUIRE_ISA` 则强制锁定唯一一个内核。接受的取值（不区分大小写）为 `scalar`、`fma`（别名 `avx2`）、`avx512`（别名 `avx512f`）、`avx512vnni`（别名 `vnni`）、`avx512bf16`（别名 `bf16`）、`neon`、`simd128`（别名 `wasm`）和 `auto`；未设置或空串等同 `auto`，无法识别的值直接 panic，这样 CI 配置里的拼写错误不可能悄悄选中别的东西。`avx512vnni` 锁定 `i8` 的 `vpdpbusd` 点积内核，`avx512bf16` 锁定 `bf16` 的 `vdpbf16ps` 点积内核；对其余元素类型，两者都解析为普通 AVX-512 路径。
+默认由最优可用 ISA 胜出。设置环境变量 `GEMMKIT_REQUIRE_ISA` 则强制锁定唯一一个内核。接受的取值（不区分大小写）为 `scalar`、`fma`（别名 `avx2`）、`avx512f`、`avx512vnni`（别名 `vnni`）、`avx512bf16`（别名 `bf16`）、`neon`、`simd128`（别名 `wasm`）和 `auto`；未设置或空串等同 `auto`，无法识别的值直接 panic，这样 CI 配置里的拼写错误不可能悄悄选中别的东西。`avx512vnni` 锁定 `i8` 的 `vpdpbusd` 点积内核，`avx512bf16` 锁定 `bf16` 的 `vdpbf16ps` 点积内核；对其余元素类型，两者都解析为普通 AVX-512F 路径。
 
 决定性的行为是：锁定永不回退。如果 CPU（或 Intel SDE 这类模拟器）没有报告所需特性，或者所请求的 ISA 在目标架构上根本不存在——非 aarch64 上的 `neon`、非 x86 上的 `fma`/`avx512*`——分发会带着指明缺失特性的消息 panic。理由是 CI 的诚实性：一个想要检验某个内核的任务必须大声失败，而不是默默测了另一个内核。`simd128` 的锁定在 wasm 上同理见效：那个 target feature 是个极易遗忘的编译期开关，锁定把"忘了传开关"从静默回退标量变成拒绝运行。
 

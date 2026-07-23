@@ -12,7 +12,7 @@ use gemmkit::simd::ScalarTok;
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 use gemmkit::simd::Simd128;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-use gemmkit::simd::{Avx512, Fma};
+use gemmkit::simd::{Avx512F, Fma};
 use gemmkit::{MatMut, MatRef, Parallelism, Workspace, gemm};
 
 // Per-ISA kernels, driven directly through the generic driver, column-major throughout
@@ -367,19 +367,19 @@ fn isa_fma() {
     }
 }
 
-/// AVX-512 (skipped when the running CPU lacks `avx512f`), tile `MR_REG=2, NR=12`,
+/// AVX-512F (skipped when the running CPU lacks `avx512f`), tile `MR_REG=2, NR=12`,
 /// matching production dispatch for both f32 and f64
 #[test]
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[cfg_attr(miri, ignore = "Miri cannot execute AVX intrinsics")]
-fn isa_avx512() {
+fn isa_avx512f() {
     if !is_x86_feature_detected!("avx512f") {
-        eprintln!("skipping AVX-512 test: not supported");
+        eprintln!("skipping AVX-512F test: not supported");
         return;
     }
     for (m, k, n) in isa_shapes() {
-        driver_case::<f32, Avx512, 2, 12>(Avx512, m, k, n);
-        driver_case::<f64, Avx512, 2, 12>(Avx512, m, k, n);
+        driver_case::<f32, Avx512F, 2, 12>(Avx512F, m, k, n);
+        driver_case::<f64, Avx512F, 2, 12>(Avx512F, m, k, n);
     }
 }
 
@@ -412,12 +412,12 @@ fn isa_simd128() {
 /// `KernelSimd::store_out` (the vector narrowing store) must round every f32 lane to
 /// the same bits as the scalar `NarrowFloat::narrow` (`half::from_f32`), across normals,
 /// subnormals, +/-0, +/-Inf, and NaN payloads, so a full SIMD tile and a partial
-/// scalar-drained tile never disagree at the boundary. AVX-512, 16 lanes wide
+/// scalar-drained tile never disagree at the boundary. AVX-512F, 16 lanes wide
 #[test]
 #[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
 #[cfg_attr(miri, ignore = "Miri cannot execute AVX intrinsics")]
-fn simd_narrow_store_matches_half_avx512() {
-    use gemmkit::simd::{Avx512, KernelSimd, Simd, SimdOps};
+fn simd_narrow_store_matches_half_avx512f() {
+    use gemmkit::simd::{Avx512F, KernelSimd, Simd, SimdOps};
     if !is_x86_feature_detected!("avx512f") {
         eprintln!("skipping: no avx512f");
         return;
@@ -444,19 +444,19 @@ fn simd_narrow_store_matches_half_avx512() {
         f32::from_bits(0xFFC00000), // negative, quiet-NaN mantissa pattern
         123.456,
     ];
-    // Round the count up to a whole number of 16-lane AVX-512 chunks
+    // Round the count up to a whole number of 16-lane AVX-512F chunks
     let mut padded = vals.clone();
     while !padded.len().is_multiple_of(16) {
         padded.push(0.0);
     }
 
     unsafe {
-        Avx512.vectorize(|| {
+        Avx512F.vectorize(|| {
             for chunk in padded.chunks(16) {
-                let reg = <Avx512 as SimdOps<f32>>::loadu(Avx512, chunk.as_ptr());
+                let reg = <Avx512F as SimdOps<f32>>::loadu(Avx512F, chunk.as_ptr());
                 let mut out = [gemmkit::f16::from_f32(0.0); 16];
-                <Avx512 as KernelSimd<gemmkit::f16, gemmkit::f16, f32, gemmkit::f16>>::store_out(
-                    Avx512,
+                <Avx512F as KernelSimd<gemmkit::f16, gemmkit::f16, f32, gemmkit::f16>>::store_out(
+                    Avx512F,
                     out.as_mut_ptr(),
                     reg,
                 );
@@ -473,12 +473,12 @@ fn simd_narrow_store_matches_half_avx512() {
         });
     }
     unsafe {
-        Avx512.vectorize(|| {
+        Avx512F.vectorize(|| {
             for chunk in padded.chunks(16) {
-                let reg = <Avx512 as SimdOps<f32>>::loadu(Avx512, chunk.as_ptr());
+                let reg = <Avx512F as SimdOps<f32>>::loadu(Avx512F, chunk.as_ptr());
                 let mut out = [gemmkit::bf16::from_f32(0.0); 16];
-                <Avx512 as KernelSimd<gemmkit::bf16, gemmkit::bf16, f32, gemmkit::bf16>>::store_out(
-                    Avx512,
+                <Avx512F as KernelSimd<gemmkit::bf16, gemmkit::bf16, f32, gemmkit::bf16>>::store_out(
+                    Avx512F,
                     out.as_mut_ptr(),
                     reg,
                 );

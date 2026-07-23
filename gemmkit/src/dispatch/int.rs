@@ -31,7 +31,7 @@ use crate::simd::ScalarTok;
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 use crate::simd::Simd128;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-use crate::simd::{Avx512, Fma};
+use crate::simd::{Avx512F, Fma};
 use crate::special::{small_k, small_mn};
 use crate::tuning;
 use crate::workspace::Workspace;
@@ -224,13 +224,13 @@ unsafe fn gemm_i8_fma(t: IntTask, par: Parallelism, ws: &mut Workspace) {
     unsafe { run_typed_int::<IntGemm, Fma, 2, 6>(Fma, t, par, ws) }
 }
 #[cfg(all(feature = "int8", any(target_arch = "x86", target_arch = "x86_64")))]
-unsafe fn gemm_i8_avx512(t: IntTask, par: Parallelism, ws: &mut Workspace) {
-    // i32 is the same width as f32 -> MR = 2*16 = 32, NR = 12, the f32 AVX-512 tile
-    unsafe { run_typed_int::<IntGemm, Avx512, 2, 12>(Avx512, t, par, ws) }
+unsafe fn gemm_i8_avx512f(t: IntTask, par: Parallelism, ws: &mut Workspace) {
+    // i32 is the same width as f32 -> MR = 2*16 = 32, NR = 12, the f32 AVX-512F tile
+    unsafe { run_typed_int::<IntGemm, Avx512F, 2, 12>(Avx512F, t, par, ws) }
 }
 #[cfg(all(feature = "int8", any(target_arch = "x86", target_arch = "x86_64")))]
 unsafe fn gemm_i8_avx512vnni(t: IntTask, par: Parallelism, ws: &mut Workspace) {
-    // Same tile as plain AVX-512: MR = 2*16 = 32, NR = 12 -> 24 acc + 2 A + 1 B = 27 of 32
+    // Same tile as plain AVX-512F: MR = 2*16 = 32, NR = 12 -> 24 acc + 2 A + 1 B = 27 of 32
     // ZMM. vpdpbusd dot-folds 4 depth steps x 16 lanes per instruction
     unsafe { run_typed_int::<IntGemmVnni, Avx512Vnni, 2, 12>(Avx512Vnni, t, par, ws) }
 }
@@ -286,8 +286,8 @@ unsafe fn gemm_i8_fma_packed(r: IntPackedConsume, par: Parallelism, ws: &mut Wor
     unsafe { run_packed_typed_int::<IntGemm, Fma, 2, 6>(Fma, r, par, ws) }
 }
 #[cfg(all(feature = "int8", any(target_arch = "x86", target_arch = "x86_64")))]
-unsafe fn gemm_i8_avx512_packed(r: IntPackedConsume, par: Parallelism, ws: &mut Workspace) {
-    unsafe { run_packed_typed_int::<IntGemm, Avx512, 2, 12>(Avx512, r, par, ws) }
+unsafe fn gemm_i8_avx512f_packed(r: IntPackedConsume, par: Parallelism, ws: &mut Workspace) {
+    unsafe { run_packed_typed_int::<IntGemm, Avx512F, 2, 12>(Avx512F, r, par, ws) }
 }
 #[cfg(all(feature = "int8", any(target_arch = "x86", target_arch = "x86_64")))]
 unsafe fn gemm_i8_avx512vnni_packed(r: IntPackedConsume, par: Parallelism, ws: &mut Workspace) {
@@ -410,10 +410,10 @@ const DISP_I8_FMA: IntDispatched = IntDispatched {
     depth_multiple: 1,
 };
 #[cfg(all(feature = "int8", any(target_arch = "x86", target_arch = "x86_64")))]
-const DISP_I8_AVX512: IntDispatched = IntDispatched {
-    run: gemm_i8_avx512,
+const DISP_I8_AVX512F: IntDispatched = IntDispatched {
+    run: gemm_i8_avx512f,
     small_par_fallback: None,
-    run_packed: gemm_i8_avx512_packed,
+    run_packed: gemm_i8_avx512f_packed,
     pack_rhs: pack_rhs_i8_widen,
     mr: 32,
     nr: 12,
@@ -471,9 +471,9 @@ fn select_i8() -> IntDispatched {
         ForcedIsa::Avx512F | ForcedIsa::Avx512Bf16 => {
             assert!(
                 x86_isa_detected!("avx512f"),
-                "GEMMKIT_REQUIRE_ISA=avx512, but this CPU/emulator does not report avx512f"
+                "GEMMKIT_REQUIRE_ISA=avx512f, but this CPU/emulator does not report avx512f"
             );
-            return DISP_I8_AVX512;
+            return DISP_I8_AVX512F;
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         ForcedIsa::Avx512Vnni => {
@@ -511,12 +511,12 @@ fn select_i8() -> IntDispatched {
             && x86_isa_detected!("avx512f")
         {
             return IntDispatched {
-                small_par_fallback: Some(gemm_i8_avx512),
+                small_par_fallback: Some(gemm_i8_avx512f),
                 ..DISP_I8_AVX512VNNI
             };
         }
         if x86_isa_detected!("avx512f") {
-            return DISP_I8_AVX512;
+            return DISP_I8_AVX512F;
         }
         if x86_isa_detected!("avx2") && x86_isa_detected!("fma") {
             return DISP_I8_FMA;
@@ -819,9 +819,9 @@ pub(crate) struct IntRequantDispatched<O> {
 macro_rules! requant_dispatch {
     (
         $O:ty,
-        $w_scalar:ident, $w_fma:ident, $w_avx512:ident, $w_vnni:ident, $w_neon:ident,
+        $w_scalar:ident, $w_fma:ident, $w_avx512f:ident, $w_vnni:ident, $w_neon:ident,
         $w_simd128:ident,
-        $d_scalar:ident, $d_fma:ident, $d_avx512:ident, $d_vnni:ident, $d_neon:ident,
+        $d_scalar:ident, $d_fma:ident, $d_avx512f:ident, $d_vnni:ident, $d_neon:ident,
         $d_simd128:ident,
         $select:ident, $slot:ident, $accessor:ident, $doc:literal
     ) => {
@@ -835,8 +835,8 @@ macro_rules! requant_dispatch {
             unsafe { run_typed_int_requant::<IntGemmQ<$O>, Fma, $O, 2, 6>(Fma, t, par, ws) }
         }
         #[cfg(all(feature = "int8", any(target_arch = "x86", target_arch = "x86_64")))]
-        unsafe fn $w_avx512(t: RequantTask<$O>, par: Parallelism, ws: &mut Workspace) {
-            unsafe { run_typed_int_requant::<IntGemmQ<$O>, Avx512, $O, 2, 12>(Avx512, t, par, ws) }
+        unsafe fn $w_avx512f(t: RequantTask<$O>, par: Parallelism, ws: &mut Workspace) {
+            unsafe { run_typed_int_requant::<IntGemmQ<$O>, Avx512F, $O, 2, 12>(Avx512F, t, par, ws) }
         }
         #[cfg(all(feature = "int8", any(target_arch = "x86", target_arch = "x86_64")))]
         unsafe fn $w_vnni(t: RequantTask<$O>, par: Parallelism, ws: &mut Workspace) {
@@ -870,8 +870,8 @@ macro_rules! requant_dispatch {
             small_par_fallback: None,
         };
         #[cfg(all(feature = "int8", any(target_arch = "x86", target_arch = "x86_64")))]
-        const $d_avx512: IntRequantDispatched<$O> = IntRequantDispatched {
-            run: $w_avx512,
+        const $d_avx512f: IntRequantDispatched<$O> = IntRequantDispatched {
+            run: $w_avx512f,
             small_par_fallback: None,
         };
         #[cfg(all(feature = "int8", any(target_arch = "x86", target_arch = "x86_64")))]
@@ -907,9 +907,9 @@ macro_rules! requant_dispatch {
                 ForcedIsa::Avx512F | ForcedIsa::Avx512Bf16 => {
                     assert!(
                         x86_isa_detected!("avx512f"),
-                        "GEMMKIT_REQUIRE_ISA=avx512, but this CPU/emulator does not report avx512f"
+                        "GEMMKIT_REQUIRE_ISA=avx512f, but this CPU/emulator does not report avx512f"
                     );
-                    return $d_avx512;
+                    return $d_avx512f;
                 }
                 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
                 ForcedIsa::Avx512Vnni => {
@@ -950,12 +950,12 @@ macro_rules! requant_dispatch {
                     && x86_isa_detected!("avx512f")
                 {
                     return IntRequantDispatched {
-                        small_par_fallback: Some($w_avx512),
+                        small_par_fallback: Some($w_avx512f),
                         ..$d_vnni
                     };
                 }
                 if x86_isa_detected!("avx512f") {
-                    return $d_avx512;
+                    return $d_avx512f;
                 }
                 if x86_isa_detected!("avx2") && x86_isa_detected!("fma") {
                     return $d_fma;
@@ -991,13 +991,13 @@ requant_dispatch!(
     i8,
     requant_i8_scalar,
     requant_i8_fma,
-    requant_i8_avx512,
+    requant_i8_avx512f,
     requant_i8_vnni,
     requant_i8_neon,
     requant_i8_simd128,
     RDISP_I8_SCALAR,
     RDISP_I8_FMA,
-    RDISP_I8_AVX512,
+    RDISP_I8_AVX512F,
     RDISP_I8_VNNI,
     RDISP_I8_NEON,
     RDISP_I8_SIMD128,
@@ -1012,13 +1012,13 @@ requant_dispatch!(
     u8,
     requant_u8_scalar,
     requant_u8_fma,
-    requant_u8_avx512,
+    requant_u8_avx512f,
     requant_u8_vnni,
     requant_u8_neon,
     requant_u8_simd128,
     RDISP_U8_SCALAR,
     RDISP_U8_FMA,
-    RDISP_U8_AVX512,
+    RDISP_U8_AVX512F,
     RDISP_U8_VNNI,
     RDISP_U8_NEON,
     RDISP_U8_SIMD128,

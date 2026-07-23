@@ -450,7 +450,7 @@ pub unsafe fn gemm_i8_requant_unchecked_with(
 ///
 /// # Determinism
 /// Same contract as [`gemm_i8_requant`]: the `i32` accumulation is exact and ISA-independent,
-/// and the requantize step is bit-exact across every ISA (scalar, FMA, AVX-512, VNNI) and
+/// and the requantize step is bit-exact across every ISA (scalar, FMA, AVX-512F, VNNI) and
 /// across the vector and scalar store paths
 ///
 /// # Panics

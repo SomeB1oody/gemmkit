@@ -1,4 +1,4 @@
-//! Shared prepacked-i8 bit-parity check, used by the per-ISA pin binaries (`env_isa_avx512`,
+//! Shared prepacked-i8 bit-parity check, used by the per-ISA pin binaries (`env_isa_avx512f`,
 //! `env_isa_vnni`, `env_isa_scalar`)
 //!
 //! Each binary pins `GEMMKIT_REQUIRE_ISA` once, in its own process, before any dispatch runs,

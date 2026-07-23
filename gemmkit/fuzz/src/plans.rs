@@ -60,7 +60,7 @@ impl<'a> Arbitrary<'a> for GemmPlan {
         };
         Ok(GemmPlan {
             ty,
-            // m, n range past the AVX-512 f32 tile edges (mr=32, nr=12 on this dispatch);
+            // m, n range past the AVX-512F f32 tile edges (mr=32, nr=12 on this dispatch);
             // k ranges past the bf16/i8-VNNI DEPTH_MULTIPLE padding, into partial-depth panels
             m: u.int_in_range(0usize..=48)?,
             k: u.int_in_range(0usize..=130)?,
@@ -457,7 +457,7 @@ impl<'a> Arbitrary<'a> for PrepackPlan {
         };
         Ok(PrepackPlan {
             ty,
-            // dims 1..=48 cross the AVX-512 tile edges; 0 is excluded since the trivial
+            // dims 1..=48 cross the AVX-512F tile edges; 0 is excluded since the trivial
             // empty-prepack path is already covered by fuzz_api_validation
             m: u.int_in_range(1usize..=48)?,
             k: u.int_in_range(1usize..=48)?,
@@ -517,7 +517,7 @@ pub struct PrepackI8Plan {
 impl<'a> Arbitrary<'a> for PrepackI8Plan {
     fn arbitrary(u: &mut Unstructured<'a>) -> Result<Self> {
         Ok(PrepackI8Plan {
-            // dims 1..=48 cross the AVX-512 i8 tile edges (mr=32, nr=12); k additionally
+            // dims 1..=48 cross the AVX-512F i8 tile edges (mr=32, nr=12); k additionally
             // crosses the VNNI DEPTH_MULTIPLE (4) pack padding into partial-depth panels
             // 0 is excluded: an empty prepack is a trivial exact 0-result, and is already
             // covered by fuzz_api_validation

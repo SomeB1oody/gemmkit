@@ -11,7 +11,7 @@ best available instruction set at runtime.
 The core engine works on `f32` and `f64` out of the box, and, behind Cargo
 features, on `f16`/`bf16` (mixed precision with `f32` accumulation), `i8 -> i32`
 integer, and `c32`/`c64` complex data. Runtime ISA dispatch covers x86-64 FMA and
-AVX-512 (with AVX-512 VNNI for `int8` and AVX-512 BF16 for `bf16`), aarch64 NEON,
+AVX-512F (with AVX-512 VNNI for `int8` and AVX-512 BF16 for `bf16`), aarch64 NEON,
 and wasm32 `simd128`, over a portable scalar fallback; the `GEMMKIT_REQUIRE_ISA`
 environment variable pins or forbids a backend. Multithreading is optional
 (rayon) and produces run-to-run reproducible results for a fixed input and
@@ -83,7 +83,7 @@ Backends, selected at runtime (or pinned with `GEMMKIT_REQUIRE_ISA`):
 
 - Scalar: portable fallback, no target features required
 - x86-64 FMA
-- x86-64 AVX-512, with AVX-512 VNNI (`vpdpbusd`) for `int8` and AVX-512 BF16 (`vdpbf16ps`) for `bf16`
+- x86-64 AVX-512F, with AVX-512 VNNI (`vpdpbusd`) for `int8` and AVX-512 BF16 (`vdpbf16ps`) for `bf16`
 - aarch64 NEON
 - wasm32 `simd128` (compile-time feature detection)
 

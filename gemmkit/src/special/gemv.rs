@@ -1108,14 +1108,14 @@ mod tests {
 
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
-            use crate::simd::{Avx512, Fma};
+            use crate::simd::{Avx512F, Fma};
             if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
                 check_f32(Fma, "fma/f32");
                 check_f64(Fma, "fma/f64");
             }
             if is_x86_feature_detected!("avx512f") {
-                check_f32(Avx512, "avx512/f32");
-                check_f64(Avx512, "avx512/f64");
+                check_f32(Avx512F, "avx512f/f32");
+                check_f64(Avx512F, "avx512f/f64");
             }
         }
 
@@ -1227,14 +1227,14 @@ mod tests {
 
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
-            use crate::simd::{Avx512, Fma};
+            use crate::simd::{Avx512F, Fma};
             if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
                 dot_check_f32(Fma, "fma/f32");
                 dot_check_f64(Fma, "fma/f64");
             }
             if is_x86_feature_detected!("avx512f") {
-                dot_check_f32(Avx512, "avx512/f32");
-                dot_check_f64(Avx512, "avx512/f64");
+                dot_check_f32(Avx512F, "avx512f/f32");
+                dot_check_f64(Avx512F, "avx512f/f64");
             }
         }
 
