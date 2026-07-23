@@ -3,7 +3,7 @@
 use super::*;
 use crate::common::{dims_strides, filled_dmatrix};
 #[cfg(all(feature = "int8", feature = "epilogue"))]
-use crate::common::{requant_bias, requant_scale};
+use gemmkit::adapter::{requant_bias, requant_scale};
 
 /// Integer `C(i32) <- alpha*A(i8)*B(i8) + beta*C`: the nalgebra adapter over gemmkit's
 /// [`gemmkit::gemm_i8`]. `i8` inputs accumulate into an `i32` output, so `alpha`/`beta`/`C` are

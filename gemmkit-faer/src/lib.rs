@@ -74,10 +74,9 @@ pub use gemmkit::{RequantScale, Requantize};
 // defines its own type of the same name for its checked slice API, but it is never imported here
 #[cfg(feature = "epilogue")]
 use gemmkit::{
-    BiasDim, FusedScalar, MapScalar, gemm_fused_unchecked, gemm_fused_unchecked_with,
-    gemm_map_unchecked, gemm_map_unchecked_with, gemm_packed_a_fused_unchecked,
-    gemm_packed_a_fused_unchecked_with, gemm_packed_b_fused_unchecked,
-    gemm_packed_b_fused_unchecked_with,
+    FusedScalar, MapScalar, gemm_fused_unchecked, gemm_fused_unchecked_with, gemm_map_unchecked,
+    gemm_map_unchecked_with, gemm_packed_a_fused_unchecked, gemm_packed_a_fused_unchecked_with,
+    gemm_packed_b_fused_unchecked, gemm_packed_b_fused_unchecked_with,
 };
 #[cfg(all(feature = "complex", feature = "epilogue"))]
 use gemmkit::{gemm_cplx_fused_unchecked, gemm_cplx_fused_unchecked_with};

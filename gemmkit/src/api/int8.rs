@@ -230,85 +230,30 @@ pub fn gemm_i8_requant(
 
 /// Bias validation shared by the `i8`- and `u8`-output requantizing entries: checks length
 /// against `a_rows` and checks the byte ranges of `bias` and `C` for overlap (`TO` is 1 byte
-/// either way), then lowers to the `(ptr, has_bias)` pair the dispatch task carries. `scale`
-/// and `zero_point` are checked separately in each entry since the zero-point band differs
-/// between `i8` and `u8`
+/// either way), then lowers to the `(ptr, has_bias)` pair the dispatch task carries. Both checks
+/// delegate to [`crate::adapter::requant_bias`], the single pointer-level implementation the view
+/// adapters also consume, over `C`'s backing slice as a unit-stride footprint (the same byte range
+/// the slice-based check compared). `scale` and `zero_point` are checked separately in each entry
+/// since the zero-point band differs between `i8` and `u8`
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 fn requant_bias<TO>(a_rows: usize, c: &MatMut<'_, TO>, bias: Option<&[i32]>) -> (*const i32, bool) {
-    match bias {
-        Some(bias) => {
-            assert_eq!(
-                bias.len(),
-                a_rows,
-                "gemmkit: requantize bias length ({}) != A.rows ({})",
-                bias.len(),
-                a_rows
-            );
-            // bias (i32) must not overlap C (a 1-byte quantized output)
-            if overlaps_bytes(
-                c.data.as_ptr() as *const u8,
-                c.data.len(),
-                core::mem::size_of::<TO>(),
-                bias.as_ptr() as *const u8,
-                bias.len(),
-                4,
-            ) {
-                panic!("gemmkit: requantize bias overlaps C");
-            }
-            (bias.as_ptr(), true)
-        }
-        None => (core::ptr::null(), false),
-    }
+    crate::adapter::requant_bias(a_rows, c.data.as_ptr(), &[(c.data.len(), 1)], bias)
 }
 
 /// Scale validation shared by the `i8`- and `u8`-output requantizing entries: a
 /// [`RequantScale::PerTensor`] must be finite and `> 0`; a [`RequantScale::PerRow`] must have
 /// length `a_rows`, must not overlap `C`'s byte range, and every element must be finite and
 /// `> 0`. Lowers to the `(scale, row_scales_ptr, has_row_scales)` triple the dispatch task
-/// carries: `PerTensor(s) -> (s, null, false)`, `PerRow(p) -> (0.0, p, true)`
+/// carries: `PerTensor(s) -> (s, null, false)`, `PerRow(p) -> (0.0, p, true)`. Delegates to
+/// [`crate::adapter::requant_scale`], the single pointer-level implementation the view adapters
+/// also consume, over `C`'s backing slice as a unit-stride footprint
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 fn requant_scale<TO>(
     a_rows: usize,
     c: &MatMut<'_, TO>,
     scale: RequantScale<'_>,
 ) -> (f32, *const f32, bool) {
-    match scale {
-        RequantScale::PerTensor(s) => {
-            assert!(
-                s.is_finite() && s > 0.0,
-                "gemmkit: requantize scale ({s}) must be finite and > 0"
-            );
-            (s, core::ptr::null(), false)
-        }
-        RequantScale::PerRow(scales) => {
-            assert_eq!(
-                scales.len(),
-                a_rows,
-                "gemmkit: requantize scales length ({}) != A.rows ({})",
-                scales.len(),
-                a_rows
-            );
-            // Overlap checked before the per-element finite/> 0 loop below, so an
-            // aliasing scales slice panics before any element is read
-            if overlaps_bytes(
-                c.data.as_ptr() as *const u8,
-                c.data.len(),
-                core::mem::size_of::<TO>(),
-                scales.as_ptr() as *const u8,
-                scales.len(),
-                4,
-            ) {
-                panic!("gemmkit: requantize scales overlap C");
-            }
-            for &s in scales {
-                assert!(
-                    s.is_finite() && s > 0.0,
-                    "gemmkit: requantize scale ({s}) must be finite and > 0"
-                );
-            }
-            (0.0, scales.as_ptr(), true)
-        }
-    }
+    crate::adapter::requant_scale(a_rows, c.data.as_ptr(), &[(c.data.len(), 1)], scale)
 }
 
 /// Like [`gemm_i8_requant`] but reuses a caller-owned [`Workspace`] instead of the

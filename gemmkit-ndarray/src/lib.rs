@@ -46,16 +46,15 @@
 /// [`gemm_fused`] need not depend on `gemmkit` directly
 #[cfg(feature = "epilogue")]
 pub use gemmkit::{Activation, Bias};
-#[cfg(feature = "epilogue")]
-use gemmkit::{
-    BiasDim, FusedScalar, MapScalar, gemm_batched_fused_unchecked,
-    gemm_batched_fused_unchecked_with, gemm_fused_unchecked, gemm_fused_unchecked_with,
-    gemm_map_unchecked, gemm_map_unchecked_with, gemm_packed_a_fused_unchecked,
-    gemm_packed_a_fused_unchecked_with, gemm_packed_b_fused_unchecked,
-    gemm_packed_b_fused_unchecked_with,
-};
 #[cfg(feature = "complex")]
 use gemmkit::{ComplexScalar, gemm_cplx_unchecked, gemm_cplx_unchecked_with};
+#[cfg(feature = "epilogue")]
+use gemmkit::{
+    FusedScalar, MapScalar, gemm_batched_fused_unchecked, gemm_batched_fused_unchecked_with,
+    gemm_fused_unchecked, gemm_fused_unchecked_with, gemm_map_unchecked, gemm_map_unchecked_with,
+    gemm_packed_a_fused_unchecked, gemm_packed_a_fused_unchecked_with,
+    gemm_packed_b_fused_unchecked, gemm_packed_b_fused_unchecked_with,
+};
 use gemmkit::{
     GemmScalar, Parallelism, Workspace, gemm_batched_unchecked, gemm_batched_unchecked_with,
     gemm_packed_a_unchecked, gemm_packed_a_unchecked_with, gemm_packed_b_unchecked,
@@ -83,7 +82,8 @@ use ndarray::{Array2, Array3, ArrayBase, Data, DataMut, Ix2, Ix3};
 
 // Batched ndarray GEMM entries, batch on axis 0 of a 3-D array
 mod batched;
-// Shared dims/strides extraction plus bias/requant validation for the epilogue-gated entries
+// Shared dims/strides extraction for the entry modules (bias/requant validation lives in
+// gemmkit's adapter module)
 mod common;
 // Complex ndarray GEMM entries with optional conjugation
 #[cfg(feature = "complex")]

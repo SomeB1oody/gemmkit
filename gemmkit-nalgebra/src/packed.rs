@@ -3,7 +3,7 @@
 use super::*;
 use crate::common::dims_strides;
 #[cfg(feature = "epilogue")]
-use crate::common::lower_bias;
+use gemmkit::adapter::lower_bias;
 
 /// Pre-packs a RHS `B` into a reusable [`PackedRhs`] (gemmkit's fixed-weight reuse path): pack once
 /// here, then skip the per-call repack across many [`gemm_packed_b`] calls that share this `B`.

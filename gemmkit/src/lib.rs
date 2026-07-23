@@ -77,6 +77,12 @@ pub mod tuning;
 
 // Public API: safe slice/stride entry points plus the raw unchecked engine (layer L8a)
 mod api;
+// Shared validation/lowering surface for the view adapters (support for L8a, not a layer of
+// its own): the pointer-level bias/requant checks the raw-pointer adapters and the checked
+// core entries both consume. doc(hidden) = not part of the documented API, versioned in
+// lockstep with the adapters
+#[doc(hidden)]
+pub mod adapter;
 // Runtime ISA dispatch, memoized per element type (layer L7)
 mod dispatch;
 // Packing primitives shared by every kernel family (layer L1)

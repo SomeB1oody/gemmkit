@@ -1,9 +1,9 @@
 //! Prepacked-operand (PackedLhs/PackedRhs) GEMM entries: pack an operand once, reuse it across
 //! many calls
 use super::*;
-#[cfg(feature = "epilogue")]
-use crate::common::lower_bias;
 use crate::common::ref_parts;
+#[cfg(feature = "epilogue")]
+use gemmkit::adapter::lower_bias;
 
 /// Pre-pack a RHS `B` into a reusable [`PackedRhs`] (gemmkit's fixed-weight reuse path): pack once
 /// here, then every later [`gemm_packed_b`] call sharing this `B` skips its own repack. Reads B's

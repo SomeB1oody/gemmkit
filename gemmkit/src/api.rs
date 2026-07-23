@@ -301,39 +301,19 @@ fn validate_gemm_views<TI, TO>(a: &MatRef<'_, TI>, b: &MatRef<'_, TI>, c: &MatMu
 /// The shared fused-bias validation for every checked fused entry (plain, batched,
 /// packed-A, packed-B, and the complex `gemm_cplx_fused_with`): a `PerRow` bias must
 /// have length `m` (the output rows) and a `PerCol` bias length `n` (the output cols), and
-/// the bias slice must not overlap `C`'s storage (compared via [`overlaps`]). `None` is a
-/// no-op. Panic messages match the wording tests assert on, so this helper is the single
-/// source of that wording. The activation / `LeakyRelu`-slope check is entry-local (complex
-/// has no activation) and stays at the call sites
+/// the bias slice must not overlap `C`'s storage. `None` is a no-op. Both the length and the
+/// overlap check delegate to [`crate::adapter::lower_bias`], the single pointer-level
+/// implementation the view adapters also consume, so the panic wording tests assert on lives
+/// in exactly 1 place. `C`'s backing slice is passed as a single unit-stride axis, whose byte
+/// range `[c_ptr, c_ptr + c_len*size_of::<T>())` is the same one the slice-based overlap test
+/// used before. The activation / `LeakyRelu`-slope check is entry-local (complex has no
+/// activation) and stays at the call sites
 #[cfg(feature = "epilogue")]
-fn validate_bias<T>(bias: &Option<Bias<'_, T>>, m: usize, n: usize, c: &MatMut<'_, T>) {
-    if let Some(bd) = bias {
-        let (bp, bl) = match bd {
-            Bias::PerRow(s) => {
-                assert_eq!(
-                    s.len(),
-                    m,
-                    "gemmkit: PerRow bias length ({}) != A.rows ({})",
-                    s.len(),
-                    m
-                );
-                (s.as_ptr(), s.len())
-            }
-            Bias::PerCol(s) => {
-                assert_eq!(
-                    s.len(),
-                    n,
-                    "gemmkit: PerCol bias length ({}) != B.cols ({})",
-                    s.len(),
-                    n
-                );
-                (s.as_ptr(), s.len())
-            }
-        };
-        if overlaps(c.data.as_ptr(), c.data.len(), bp, bl) {
-            panic!("gemmkit: bias slice overlaps C");
-        }
-    }
+fn validate_bias<T: Copy>(bias: &Option<Bias<'_, T>>, m: usize, n: usize, c: &MatMut<'_, T>) {
+    // Discard the lowered triple: this entry only validates, the lowering to FusedEpi happens
+    // separately. C's full slice as a unit-stride footprint reproduces the byte range the old
+    // slice-based overlaps() test compared against
+    let _ = crate::adapter::lower_bias(*bias, m, n, c.data.as_ptr(), &[(c.data.len(), 1)]);
 }
 
 /// Lower the public `Option<Bias>` / `Option<Activation>` epilogue selectors into the internal

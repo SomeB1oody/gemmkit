@@ -1,8 +1,8 @@
 //! Complex GEMM entries with optional per-operand conjugation
 use super::*;
-#[cfg(feature = "epilogue")]
-use crate::common::lower_bias;
 use crate::common::{filled_mat, ref_parts};
+#[cfg(feature = "epilogue")]
+use gemmkit::adapter::lower_bias;
 
 /// Complex `C <- alpha*op(A)*op(B) + beta*C`, with `op(A) = conj(A)` when `conj_a` (resp.
 /// `conj(B)` when `conj_b`); `conj_a = conj_b = false` is the plain product `A*B`. `T` is

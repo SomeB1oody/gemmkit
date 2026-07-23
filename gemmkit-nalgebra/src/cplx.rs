@@ -1,8 +1,8 @@
 //! Complex GEMM (`Complex<f32>`/`Complex<f64>`) with optional per-operand conjugation
 use super::*;
-#[cfg(feature = "epilogue")]
-use crate::common::lower_bias;
 use crate::common::{dims_strides, filled_dmatrix};
+#[cfg(feature = "epilogue")]
+use gemmkit::adapter::lower_bias;
 
 /// Complex `C <- alpha*op(A)*op(B) + beta*C`, where `op(A) = conj(A)` when `conj_a` is set (resp.
 /// `op(B) = conj(B)` when `conj_b` is set). `T` is `Complex<f32>`/`Complex<f64>`; needs the

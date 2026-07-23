@@ -2,7 +2,7 @@
 //! element's dims/strides read straight out of the array (any layout, not just C-order)
 use super::*;
 #[cfg(feature = "epilogue")]
-use crate::common::lower_bias;
+use gemmkit::adapter::lower_bias;
 
 #[inline]
 fn dims_strides3<T, S: Data<Elem = T>>(

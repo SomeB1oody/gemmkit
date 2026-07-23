@@ -55,7 +55,14 @@ crates.io); the fuzz crate is a separate nightly-only root.
 
 The adapters pull matrix pointers and strides straight out of each library's
 native views (C-order, F-order, general and reversed strides, no copies) and
-forward to the `*_unchecked` engine. Batched GEMM is exposed in the shape each
+forward to the `*_unchecked` engine. The bias/scale length and `C`-overlap
+checks the fused and requantizing entries still need — over raw, possibly gappy
+or reversed views the core's slice-based `validate_gemm_views` cannot describe —
+live once in gemmkit's `#[doc(hidden)]` `adapter` module (a pointer-level support
+surface for the L8a checked entries, not a layer, versioned in lockstep with the
+adapters, following the `knob_env_names` precedent); all three adapters and the
+core's own checked entries consume that single implementation rather than each
+re-deriving gemmkit's exact panic wording. Batched GEMM is exposed in the shape each
 library's types allow: the ndarray adapter's 3-D strided `gemm_batched`
 (batch on axis 0, over the strided-batched engine), and the nalgebra/faer
 `gemm_batched` over a slice of per-element `(A, B)` inputs paired with a slice

@@ -1,8 +1,8 @@
 //! Fused bias/activation GEMM entries
 use super::*;
-#[cfg(feature = "epilogue")]
-use crate::common::lower_bias;
 use crate::common::ref_parts;
+#[cfg(feature = "epilogue")]
+use gemmkit::adapter::lower_bias;
 
 /// `C <- act(alpha*A*B + beta*C + bias)` in 1 fused pass, the faer adapter over gemmkit's
 /// [`gemmkit::gemm_fused`]. The optional [`Bias`] is [`Bias::PerRow`] (length `A.rows`) or

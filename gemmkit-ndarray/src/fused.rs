@@ -1,6 +1,7 @@
 //! Fused bias/activation ndarray GEMM entries
 use super::*;
-use crate::common::{dims_strides, lower_bias};
+use crate::common::dims_strides;
+use gemmkit::adapter::lower_bias;
 
 /// `C <- act(alpha*A*B + beta*C + bias)` in 1 fused pass: the ndarray adapter over gemmkit's
 /// [`gemmkit::gemm_fused`]. The optional [`Bias`] is [`Bias::PerRow`] (length `A.rows`) or

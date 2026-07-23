@@ -47,15 +47,14 @@
 /// don't need a direct `gemmkit` dependency
 #[cfg(feature = "epilogue")]
 pub use gemmkit::{Activation, Bias};
-#[cfg(feature = "epilogue")]
-use gemmkit::{
-    BiasDim, FusedScalar, MapScalar, gemm_fused_unchecked, gemm_fused_unchecked_with,
-    gemm_map_unchecked, gemm_map_unchecked_with, gemm_packed_a_fused_unchecked,
-    gemm_packed_a_fused_unchecked_with, gemm_packed_b_fused_unchecked,
-    gemm_packed_b_fused_unchecked_with,
-};
 #[cfg(feature = "complex")]
 use gemmkit::{ComplexScalar, gemm_cplx_unchecked, gemm_cplx_unchecked_with};
+#[cfg(feature = "epilogue")]
+use gemmkit::{
+    FusedScalar, MapScalar, gemm_fused_unchecked, gemm_fused_unchecked_with, gemm_map_unchecked,
+    gemm_map_unchecked_with, gemm_packed_a_fused_unchecked, gemm_packed_a_fused_unchecked_with,
+    gemm_packed_b_fused_unchecked, gemm_packed_b_fused_unchecked_with,
+};
 use gemmkit::{
     GemmProblem, GemmScalar, Parallelism, Workspace, gemm_batched_ptr_unchecked,
     gemm_packed_a_unchecked, gemm_packed_a_unchecked_with, gemm_packed_b_unchecked,
@@ -83,7 +82,8 @@ use nalgebra::{DMatrix, Dim, Dyn, Matrix, RawStorage, RawStorageMut, VecStorage}
 
 // batched GEMM over a slice of independently shaped (&A, &B) -> &mut C triples
 mod batched;
-// dims/strides extraction plus bias/scale validation shared by every entry module
+// dims/strides extraction and output-buffer allocation shared by the entry modules (bias/scale
+// validation lives in gemmkit's adapter module)
 mod common;
 // complex GEMM (Complex<f32>/Complex<f64>) with optional per-operand conjugation
 #[cfg(feature = "complex")]

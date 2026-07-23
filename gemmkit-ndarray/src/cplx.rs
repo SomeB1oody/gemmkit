@@ -2,7 +2,7 @@
 use super::*;
 use crate::common::dims_strides;
 #[cfg(feature = "epilogue")]
-use crate::common::lower_bias;
+use gemmkit::adapter::lower_bias;
 
 /// Complex `C <- alpha*op(A)*op(B) + beta*C`, with `op(A) = conj(A)` when `conj_a` (resp.
 /// `conj(B)` when `conj_b`). `T` is `Complex<f32>`/`Complex<f64>`; needs the `complex` feature.

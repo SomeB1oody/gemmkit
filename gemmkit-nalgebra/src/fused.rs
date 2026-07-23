@@ -2,7 +2,7 @@
 use super::*;
 use crate::common::dims_strides;
 #[cfg(feature = "epilogue")]
-use crate::common::lower_bias;
+use gemmkit::adapter::lower_bias;
 
 /// `C <- act(alpha*A*B + beta*C + bias)` in 1 fused pass: the nalgebra adapter over gemmkit's
 /// [`gemmkit::gemm_fused`]. The optional [`Bias`] is [`Bias::PerRow`] (length `A.rows`) or
