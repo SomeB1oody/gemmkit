@@ -55,12 +55,32 @@ fn main() {
 
 每个 flag 都转发到 `gemmkit` 上的同名 feature。
 
-- `parallel`（默认）：基于 rayon 的并行（`gemmkit/parallel`）。
-- `wasm_threads`：为 `wasm32-wasip1-threads` 启用 `parallel` 和 `gemmkit/wasm_threads`。
-- `half`：`f16`/`bf16` 输入，以 `f32` 累加。
-- `complex`：`Complex<f32>`/`Complex<f64>` 入口，可选做共轭。
-- `int8`：`i8 -> i32` 整数入口。
-- `epilogue`：融合的偏置/激活、逐元素映射，以及（配合 `int8`）`i8`/`u8` 重量化。
+| Feature | 默认 | 作用 |
+| --- | --- | --- |
+| `parallel` | 是 | 基于 rayon 的并行（`gemmkit/parallel`）。 |
+| `wasm_threads` | 否 | 为 `wasm32-wasip1-threads` 启用 `parallel` 和 `gemmkit/wasm_threads`。 |
+| `half` | 否 | `f16`/`bf16` 输入，以 `f32` 累加。 |
+| `complex` | 否 | `Complex<f32>`/`Complex<f64>` 入口，可选做共轭。 |
+| `int8` | 否 | `i8 -> i32` 整数入口。 |
+| `epilogue` | 否 | 融合的偏置/激活、逐元素映射，以及（配合 `int8`）`i8`/`u8` 重量化。 |
+
+## 支持的元素类型
+
+实数 `f32` 与 `f64` 路径始终构建，其余类型由上面的 feature 门控。每种类型都直接从
+nalgebra 矩阵读出，因此列主序（nalgebra 的自然布局）、行主序以及一般步长的视图都无需
+转换即可工作。
+
+| 元素类型 | Feature | 计算 | 入口 |
+| --- | --- | --- | --- |
+| `f32`、`f64` | 内置 | `C <- alpha*A*B + beta*C` | `gemm`、`dot`、`gemm_fused`、`gemm_map` |
+| `f16`、`bf16` | `half` | 同上，输入即输出类型，以 `f32` 累加 | `gemm`、`dot`、`gemm_fused` |
+| `i8` | `int8` | `i8 * i8 -> i32` | `gemm_i8`、`dot_i8` |
+| `i8`（重量化） | `int8` + `epilogue` | `i8 * i8 ->` `i8` 或 `u8` | `gemm_i8_requant`、`gemm_i8_requant_u8` |
+| `Complex<f32>`、`Complex<f64>` | `complex` | 同上，可选 `conj(A)` / `conj(B)` | `gemm_cplx`、`dot_cplx`、`gemm_cplx_fused` |
+
+每个入口还有一个复用调用方持有的 `Workspace` 的 `_with` 变体，预打包
+（`gemm_packed_a` / `gemm_packed_b`）与批量（`gemm_batched`，以每个批次元素的输入切片
+形式）路径也承载同样的元素类型。
 
 ## 相关 crate
 

@@ -46,12 +46,32 @@ Each entry has a `_with` variant that reuses a caller-owned `Workspace`. See the
 
 Every feature forwards to the same-named `gemmkit` feature.
 
-- `parallel` (default): rayon-based parallelism.
-- `wasm_threads`: threading on `wasm32-wasip1-threads` (also enables `parallel`).
-- `half`: `f16` and `bf16` element types, accumulated in `f32`.
-- `complex`: `c32` and `c64` element types.
-- `int8`: `i8` inputs into an `i32` output.
-- `epilogue`: the fused bias/activation, requantization, and per-element map entries.
+| Feature | Default | Effect |
+| --- | --- | --- |
+| `parallel` | Yes | rayon-based parallelism. |
+| `wasm_threads` | No | Threading on `wasm32-wasip1-threads` (also enables `parallel`). |
+| `half` | No | `f16` and `bf16` element types, accumulated in `f32`. |
+| `complex` | No | `c32` and `c64` element types. |
+| `int8` | No | `i8` inputs into an `i32` output. |
+| `epilogue` | No | The fused bias/activation, requantization, and per-element map entries. |
+
+## Supported element types
+
+The real `f32` and `f64` paths are always built; the rest are gated behind the
+features above. `T` is read straight out of faer's view, so every type below works
+in faer's native `c32` / `c64` and `f16` / `bf16` spellings without conversion.
+
+| Element type | Feature | Computes | Entry points |
+| --- | --- | --- | --- |
+| `f32`, `f64` | built-in | `C <- alpha*A*B + beta*C` | `gemm`, `dot`, `gemm_fused`, `gemm_map` |
+| `f16`, `bf16` | `half` | same, output type in, `f32` accumulate | `gemm`, `dot`, `gemm_fused` |
+| `i8` | `int8` | `i8 * i8 -> i32` | `gemm_i8`, `dot_i8` |
+| `i8` (requantized) | `int8` + `epilogue` | `i8 * i8 ->` `i8` or `u8` | `gemm_i8_requant`, `gemm_i8_requant_u8` |
+| `c32`, `c64` | `complex` | same, optional `conj(A)` / `conj(B)` | `gemm_cplx`, `dot_cplx`, `gemm_cplx_fused` |
+
+Each entry also has a `_with` variant that reuses a caller-owned `Workspace`, and
+the prepacked (`gemm_packed_a` / `gemm_packed_b`) and batched (`gemm_batched`)
+paths carry the same element types.
 
 ## Related crates
 

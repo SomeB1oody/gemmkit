@@ -56,12 +56,32 @@ The reusable-`Workspace` variants (`gemm_with`, and so on) and the feature-gated
 
 Each flag forwards to the same-named `gemmkit` feature.
 
-- `parallel` (default): rayon-based multithreading (`gemmkit/parallel`).
-- `wasm_threads`: threading on `wasm32-wasip1-threads`; implies `parallel`.
-- `half`: `f16` / `bf16` inputs with `f32` accumulation.
-- `complex`: `Complex<f32>` / `Complex<f64>` matrices.
-- `int8`: `i8` inputs accumulating into `i32`.
-- `epilogue`: fused bias / activation, `i8` / `u8` requantization, and a user per-element map.
+| Feature | Default | Effect |
+| --- | --- | --- |
+| `parallel` | Yes | rayon-based multithreading (`gemmkit/parallel`). |
+| `wasm_threads` | No | Threading on `wasm32-wasip1-threads`; implies `parallel`. |
+| `half` | No | `f16` / `bf16` inputs with `f32` accumulation. |
+| `complex` | No | `Complex<f32>` / `Complex<f64>` matrices. |
+| `int8` | No | `i8` inputs accumulating into `i32`. |
+| `epilogue` | No | Fused bias / activation, `i8` / `u8` requantization, and a user per-element map. |
+
+## Supported element types
+
+The real `f32` and `f64` paths are always built; the rest are gated behind the
+features above. Each type is read straight out of the `ndarray` array, in C-order,
+F-order, or any strided layout, without conversion.
+
+| Element type | Feature | Computes | Entry points |
+| --- | --- | --- | --- |
+| `f32`, `f64` | built-in | `C <- alpha*A*B + beta*C` | `gemm`, `dot`, `gemm_fused`, `gemm_map`, `gemm_batched` |
+| `f16`, `bf16` | `half` | same, output type in, `f32` accumulate | `gemm`, `dot`, `gemm_fused` |
+| `i8` | `int8` | `i8 * i8 -> i32` | `gemm_i8`, `dot_i8` |
+| `i8` (requantized) | `int8` + `epilogue` | `i8 * i8 ->` `i8` or `u8` | `gemm_i8_requant`, `gemm_i8_requant_u8` |
+| `Complex<f32>`, `Complex<f64>` | `complex` | same, optional `conj(A)` / `conj(B)` | `gemm_cplx`, `dot_cplx`, `gemm_cplx_fused` |
+
+Each entry also has a `_with` variant that reuses a caller-owned `Workspace`, and
+the prepacked (`gemm_packed_a` / `gemm_packed_b`) path carries the same types.
+`gemm_batched` maps onto ndarray's rank-3 array (`Ix3`, batch on axis 0).
 
 ## Related crates
 

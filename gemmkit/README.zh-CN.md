@@ -60,16 +60,32 @@ fn main() {
 
 ## Feature 说明
 
-- `std`（默认）：运行时 CPU 特性与缓存检测、`GEMMKIT_REQUIRE_ISA` 及各项调优环境
-  旋钮，以及线程局部的工作区池。关闭后 crate 即为 `no_std`，仅需 `core` 和 `alloc`。
-- `parallel`（默认，隐含开启 `std`）：rayon 多线程。关闭后一切照常编译并以单线程运行。
-- `wasm_threads`：在 `wasm32-wasip1-threads` 目标上启用 rayon 并行。
-- `complex`：c32/c64 复数 GEMM，支持对 A 或 B 的可选共轭（`gemm_cplx`）；引入
-  `num-complex` 依赖。
-- `half`：以 f32 累加的 f16/bf16 混合精度 GEMM；引入 `half` 依赖。
-- `int8`：i8 到 i32 的整数 GEMM（`gemm_i8`）；算术在溢出时回绕。
-- `epilogue`：融合尾部运算（偏置与激活、逐元素映射，以及在开启 `int8` 时的 i8/u8
-  重量化）。默认关闭，因此纯 GEMM 构建不会为它的代码生成付出任何代价。
+| Feature | 默认 | 作用 |
+| --- | --- | --- |
+| `std` | 是 | 运行时 CPU 特性与缓存检测、`GEMMKIT_REQUIRE_ISA` 及各项 `GEMMKIT_*` 调优旋钮，以及线程局部的工作区池。关闭后 crate 即为 `no_std`，仅需 `core` 和 `alloc`。 |
+| `parallel` | 是 | rayon 多线程（隐含开启 `std`）。关闭后一切照常编译并以单线程运行。 |
+| `wasm_threads` | 否 | 在 `wasm32-wasip1-threads` 目标上启用 rayon 并行（隐含开启 `parallel`）。 |
+| `complex` | 否 | c32/c64 复数 GEMM，支持对 A 或 B 的可选共轭；引入 `num-complex` 依赖。 |
+| `half` | 否 | 以 f32 累加的 f16/bf16 混合精度 GEMM；引入 `half` 依赖。 |
+| `int8` | 否 | i8 到 i32 的整数 GEMM；算术在溢出时回绕。 |
+| `epilogue` | 否 | 融合尾部运算：偏置与激活、逐元素映射，以及（配合 `int8`）i8/u8 重量化。默认关闭，因此纯 GEMM 构建不会为它的代码生成付出任何代价。 |
+
+## 支持的元素类型
+
+实数 f32 与 f64 路径始终构建；其余类型族由上面的 cargo feature 门控。每个类型族都
+可走同样的带检查 / `_with` / `_unchecked` 三档 API，以及预打包和批量入口。
+
+| 元素类型 | Feature | 计算 | 入口 | ISA 加速 |
+| --- | --- | --- | --- | --- |
+| `f32`、`f64` | 内置 | `C <- alpha*A*B + beta*C` | `gemm`、`gemm_fused`、`gemm_map` | FMA、AVX-512F、NEON、simd128、标量 |
+| `f16`、`bf16` | `half` | 同上，输入即输出类型，以 f32 累加 | `gemm`、`gemm_fused` | bf16 走 AVX-512 BF16 点积；f16 及所有回退路径都先加宽到 f32 |
+| `i8` | `int8` | `i8 * i8 -> i32` | `gemm_i8` | AVX-512 VNNI 点积，否则通用加宽 |
+| `i8`（重量化） | `int8` + `epilogue` | `i8 * i8 ->` `i8` 或 `u8` | `gemm_i8_requant`、`gemm_i8_requant_u8` | 同 `int8`，外加一趟融合的整数重量化 |
+| `c32`、`c64` | `complex` | 同上，可选 `conj(A)` / `conj(B)` | `gemm_cplx`、`gemm_cplx_fused` | 实部/虚部拆分，走 FMA、AVX-512F、NEON、simd128、标量 |
+
+`c32` / `c64` 即 `num_complex::Complex<f32>` / `Complex<f64>`。`epilogue` 的各入口
+（`gemm_fused`、`gemm_map`、`gemm_i8_requant*`、`gemm_cplx_fused`）把偏置、激活、
+逐元素闭包或重量化折叠进最后一趟计算。
 
 ## 调优
 

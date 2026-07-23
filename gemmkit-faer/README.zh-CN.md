@@ -46,12 +46,31 @@ fn main() {
 
 每个 feature 都转发到 `gemmkit` 中的同名 feature。
 
-- `parallel`（默认）：基于 rayon 的并行。
-- `wasm_threads`：在 `wasm32-wasip1-threads` 上启用线程（同时启用 `parallel`）。
-- `half`：`f16` 和 `bf16` 元素类型，以 `f32` 累加。
-- `complex`：`c32` 和 `c64` 元素类型。
-- `int8`：`i8` 输入进入 `i32` 输出。
-- `epilogue`：融合的偏置/激活、重量化以及逐元素映射入口。
+| Feature | 默认 | 作用 |
+| --- | --- | --- |
+| `parallel` | 是 | 基于 rayon 的并行。 |
+| `wasm_threads` | 否 | 在 `wasm32-wasip1-threads` 上启用线程（同时启用 `parallel`）。 |
+| `half` | 否 | `f16` 和 `bf16` 元素类型，以 `f32` 累加。 |
+| `complex` | 否 | `c32` 和 `c64` 元素类型。 |
+| `int8` | 否 | `i8` 输入进入 `i32` 输出。 |
+| `epilogue` | 否 | 融合的偏置/激活、重量化以及逐元素映射入口。 |
+
+## 支持的元素类型
+
+实数 `f32` 与 `f64` 路径始终构建，其余类型由上面的 feature 门控。`T` 直接从 faer 的
+视图读出，因此下面每种类型都以 faer 原生的 `c32` / `c64`、`f16` / `bf16` 写法工作，
+无需任何转换。
+
+| 元素类型 | Feature | 计算 | 入口 |
+| --- | --- | --- | --- |
+| `f32`、`f64` | 内置 | `C <- alpha*A*B + beta*C` | `gemm`、`dot`、`gemm_fused`、`gemm_map` |
+| `f16`、`bf16` | `half` | 同上，输入即输出类型，以 `f32` 累加 | `gemm`、`dot`、`gemm_fused` |
+| `i8` | `int8` | `i8 * i8 -> i32` | `gemm_i8`、`dot_i8` |
+| `i8`（重量化） | `int8` + `epilogue` | `i8 * i8 ->` `i8` 或 `u8` | `gemm_i8_requant`、`gemm_i8_requant_u8` |
+| `c32`、`c64` | `complex` | 同上，可选 `conj(A)` / `conj(B)` | `gemm_cplx`、`dot_cplx`、`gemm_cplx_fused` |
+
+每个入口还有一个复用调用方持有的 `Workspace` 的 `_with` 变体，预打包
+（`gemm_packed_a` / `gemm_packed_b`）与批量（`gemm_batched`）路径也承载同样的元素类型。
 
 ## 相关 crate
 

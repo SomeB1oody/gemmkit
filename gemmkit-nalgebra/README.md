@@ -55,13 +55,33 @@ fn main() {
 
 Each flag forwards to the same-named feature on `gemmkit`.
 
-- `parallel` (default): rayon-based parallelism (`gemmkit/parallel`).
-- `wasm_threads`: enables `parallel` and `gemmkit/wasm_threads` for `wasm32-wasip1-threads`.
-- `half`: `f16`/`bf16` inputs with `f32` accumulation.
-- `complex`: `Complex<f32>`/`Complex<f64>` entries with optional conjugation.
-- `int8`: `i8 -> i32` integer entries.
-- `epilogue`: fused bias/activation, per-element map, and (with `int8`) `i8`/`u8`
-  requantization.
+| Feature | Default | Effect |
+| --- | --- | --- |
+| `parallel` | Yes | rayon-based parallelism (`gemmkit/parallel`). |
+| `wasm_threads` | No | Enables `parallel` and `gemmkit/wasm_threads` for `wasm32-wasip1-threads`. |
+| `half` | No | `f16`/`bf16` inputs with `f32` accumulation. |
+| `complex` | No | `Complex<f32>`/`Complex<f64>` entries with optional conjugation. |
+| `int8` | No | `i8 -> i32` integer entries. |
+| `epilogue` | No | Fused bias/activation, per-element map, and (with `int8`) `i8`/`u8` requantization. |
+
+## Supported element types
+
+The real `f32` and `f64` paths are always built; the rest are gated behind the
+features above. Each type is read straight out of the nalgebra matrix, so
+column-major (nalgebra's natural layout), row-major, and general-stride views all
+work without conversion.
+
+| Element type | Feature | Computes | Entry points |
+| --- | --- | --- | --- |
+| `f32`, `f64` | built-in | `C <- alpha*A*B + beta*C` | `gemm`, `dot`, `gemm_fused`, `gemm_map` |
+| `f16`, `bf16` | `half` | same, output type in, `f32` accumulate | `gemm`, `dot`, `gemm_fused` |
+| `i8` | `int8` | `i8 * i8 -> i32` | `gemm_i8`, `dot_i8` |
+| `i8` (requantized) | `int8` + `epilogue` | `i8 * i8 ->` `i8` or `u8` | `gemm_i8_requant`, `gemm_i8_requant_u8` |
+| `Complex<f32>`, `Complex<f64>` | `complex` | same, optional `conj(A)` / `conj(B)` | `gemm_cplx`, `dot_cplx`, `gemm_cplx_fused` |
+
+Each entry also has a `_with` variant that reuses a caller-owned `Workspace`, and
+the prepacked (`gemm_packed_a` / `gemm_packed_b`) and batched (`gemm_batched`, over
+a slice of per-element inputs) paths carry the same element types.
 
 ## Related crates
 

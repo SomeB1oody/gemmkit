@@ -69,19 +69,33 @@ fn main() {
 
 ## Feature flags
 
-- `std` (default): runtime CPU-feature and cache detection, the
-  `GEMMKIT_REQUIRE_ISA` and tuning env knobs, and the thread-local workspace
-  pool. With it off the crate is `no_std`, needing only `core` and `alloc`.
-- `parallel` (default, implies `std`): rayon multithreading. With it off,
-  everything compiles and runs single-threaded.
-- `wasm_threads`: rayon parallelism on the `wasm32-wasip1-threads` target.
-- `complex`: c32/c64 complex GEMM with optional conjugation of A or B
-  (`gemm_cplx`); pulls in `num-complex`.
-- `half`: f16/bf16 mixed-precision GEMM with f32 accumulation; pulls in `half`.
-- `int8`: i8 to i32 integer GEMM (`gemm_i8`); arithmetic wraps on overflow.
-- `epilogue`: fused epilogues (bias and activation, per-element map, and, with
-  `int8`, i8/u8 requantization). Off by default, so a plain-GEMM build pays for
-  none of its codegen.
+| Feature | Default | Effect |
+| --- | --- | --- |
+| `std` | Yes | Runtime CPU-feature and cache detection, the `GEMMKIT_REQUIRE_ISA` and `GEMMKIT_*` tuning knobs, and the thread-local workspace pool. With it off the crate is `no_std`, needing only `core` and `alloc`. |
+| `parallel` | Yes | rayon multithreading (implies `std`). With it off, everything compiles and runs single-threaded. |
+| `wasm_threads` | No | rayon parallelism on the `wasm32-wasip1-threads` target (implies `parallel`). |
+| `complex` | No | c32/c64 complex GEMM with optional conjugation of A or B; pulls in `num-complex`. |
+| `half` | No | f16/bf16 mixed-precision GEMM with f32 accumulation; pulls in `half`. |
+| `int8` | No | i8 to i32 integer GEMM; arithmetic wraps on overflow. |
+| `epilogue` | No | Fused epilogues: bias and activation, a per-element map, and (with `int8`) i8/u8 requantization. Off by default, so a plain-GEMM build pays for none of its codegen. |
+
+## Supported element types
+
+The real f32 and f64 paths are always built; the other families are gated behind
+the cargo features above. Every family runs on the same checked/`_with`/`_unchecked`
+API tiers and the prepacked and batched entries.
+
+| Element type | Feature | Computes | Entry points | ISA acceleration |
+| --- | --- | --- | --- | --- |
+| `f32`, `f64` | built-in | `C <- alpha*A*B + beta*C` | `gemm`, `gemm_fused`, `gemm_map` | FMA, AVX-512F, NEON, simd128, scalar |
+| `f16`, `bf16` | `half` | same, output type in, f32 accumulate | `gemm`, `gemm_fused` | bf16 uses the AVX-512 BF16 dot; f16 and every fallback widen to f32 |
+| `i8` | `int8` | `i8 * i8 -> i32` | `gemm_i8` | AVX-512 VNNI dot, else a generic widen |
+| `i8` (requantized) | `int8` + `epilogue` | `i8 * i8 ->` `i8` or `u8` | `gemm_i8_requant`, `gemm_i8_requant_u8` | as `int8`, plus a fused integer requantize |
+| `c32`, `c64` | `complex` | same, with optional `conj(A)` / `conj(B)` | `gemm_cplx`, `gemm_cplx_fused` | split real/imag over FMA, AVX-512F, NEON, simd128, scalar |
+
+`c32` / `c64` are `num_complex::Complex<f32>` / `Complex<f64>`. The `epilogue`
+entries (`gemm_fused`, `gemm_map`, `gemm_i8_requant*`, `gemm_cplx_fused`) fold
+bias, activation, a per-element closure, or requantization into the final pass.
 
 ## Tuning
 
