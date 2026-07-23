@@ -28,7 +28,7 @@
 //! once, at the store
 
 use crate::kernel::FloatGemm;
-use crate::kernel::epilogue::{Epilogue, Identity};
+use crate::kernel::epilogue::Epilogue;
 use crate::parallel::{self, JobCursor, Parallelism, Ptr};
 use crate::scalar::Float;
 #[cfg(feature = "half")]
@@ -74,58 +74,19 @@ fn row_sweep(
     });
 }
 
-/// Entry point for a gemv shape: dispatches to the core routine, partitioning the output rows
-/// across up to `par` workers. Since gemv is bandwidth-bound rather than compute-bound, the
-/// worker count comes from a bandwidth model ([`Parallelism::resolve_bandwidth`]) instead of the
-/// usual compute ramp: past however many cores saturate DRAM, adding workers stops helping.
-/// Every output row is reduced over the full `k` by 1 worker, so the split never crosses a
-/// reduction boundary and the result is unchanged from the serial run
-///
-/// Calls [`run_typed_epi`] with the zero-cost [`Identity`] epilogue: `E::IS_IDENTITY` folds the
-/// fused-epilogue pass away entirely, so this stays the plain, epilogue-free route while sharing
-/// its implementation with the fused entry point
-///
-/// # Safety
-/// Pointers must be valid for the regions their strides and sizes imply; `c` must not alias
-/// `a`/`b`. The CPU must support `S`'s target features
-#[allow(clippy::too_many_arguments)]
-pub unsafe fn run_typed<T, S>(
-    simd: S,
-    m: usize,
-    k: usize,
-    n: usize,
-    par: Parallelism,
-    alpha: T,
-    a: *const T,
-    rsa: isize,
-    csa: isize,
-    b: *const T,
-    rsb: isize,
-    csb: isize,
-    beta: T,
-    c: *mut T,
-    rsc: isize,
-    csc: isize,
-) where
-    T: Float<Acc = T>,
-    S: SimdOps<T>,
-{
-    // SAFETY: `Identity` is the zero-cost epilogue, so this reproduces exactly what the route
-    // stored before `run_typed_epi` existed (`E::IS_IDENTITY` folds the epilogue sweep away)
-    unsafe {
-        run_typed_epi::<T, S, Identity>(
-            simd, m, k, n, par, alpha, a, rsa, csa, b, rsb, csb, beta, c, rsc, csc, &Identity,
-        )
-    }
-}
-
 /// gemv entry point with a fused [`Epilogue`] `E` applied to the output. gemv is dispatched
 /// before orientation normalization runs, so `epi` still speaks the caller's original, unflipped
 /// coordinate frame. In the `n == 1` branch output element `i` is `C[i, 0]` (`swap_rc = false`);
 /// the `m == 1` branch instead views `C^T`, where element `i` is `C[0, i]` (`swap_rc = true`)
 ///
+/// The float dispatch ladder drives this generic directly; `E = Identity` on the plain path
+/// const-folds every epilogue hook away, so that route stays the plain, epilogue-free gemv while
+/// a real `E` shares this same body
+///
 /// # Safety
-/// As [`run_typed`], plus `epi`'s interior pointers must be valid for the problem's `m`/`n`
+/// Pointers must be valid for the regions their strides and sizes imply; `c` must not alias
+/// `a`/`b`; the CPU must support `S`'s target features; and `epi`'s interior pointers must be
+/// valid for the problem's `m`/`n`
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn run_typed_epi<T, S, E>(
     simd: S,
@@ -170,7 +131,8 @@ pub unsafe fn run_typed_epi<T, S, E>(
 
 /// `out[i] = beta*out[i] + alpha * sum_k(mat[i,k]*vec[k])` for `i in 0..rows`: partitions the
 /// rows across bandwidth-capped workers, picks a layout strategy once for the whole call, then,
-/// if `E` is not [`Identity`], sweeps each worker's own row range once more to apply the fused
+/// if `E` is not [`Identity`](crate::kernel::epilogue::Identity), sweeps each worker's own row
+/// range once more to apply the fused
 /// epilogue in place. `swap_rc` selects the epilogue coordinate for output element `i`: `(i, 0)`
 /// when `false` (the `n == 1` shape), `(0, i)` when `true` (the transposed `m == 1` view)
 ///
@@ -638,22 +600,22 @@ unsafe fn strided_rows<T, S>(
 // Mixed-precision gemv (f16/bf16 operands, f32 accumulate): the narrow twin of the float routines
 // above. Same output-row partition and same reproducibility guarantee, but every N load widens to
 // f32 through the KernelSimd<N, N, f32, N> seam, the reduction runs in f32, and the result rounds
-// back to N exactly once at the store (the same single-rounding discipline small_mn::run_mixed
+// back to N exactly once at the store (the same single-rounding discipline small_mn::run_mixed_epi
 // follows). Kept as its own family instead of generalizing the float code over a widen seam, so
 // the float instantiation stays byte-identical: f32 is not a NarrowFloat, so it has no
 // widen/narrow scalar ops for such a generalization to fold to. i8 and complex gemv are out of
 // scope here
 
 /// Entry point for a mixed-precision gemv shape (`f16`/`bf16` operands, `f32` accumulate): the
-/// sibling of [`run_typed`], viewing the `m == 1` problem as a transposed `n x k` matrix times a
-/// `k`-vector exactly as [`run_typed_epi`] does. `alpha`/`beta` arrive already widened to `f32`.
-/// There is no fused-epilogue sibling here: the mixed fused path deliberately keeps gemv on the
-/// general driver instead (see `dispatch/mixed.rs`'s `run_typed_mixed_fused`), so this route stays
-/// plain-only
+/// sibling of the float [`run_typed_epi`], viewing the `m == 1` problem as a transposed `n x k`
+/// matrix times a `k`-vector exactly as that entry does. `alpha`/`beta` arrive already widened to
+/// `f32`. There is no fused-epilogue sibling here: the mixed fused path deliberately keeps gemv on
+/// the general driver instead (see `dispatch/mixed.rs`'s `run_typed_mixed_fused`), so this route
+/// stays plain-only
 ///
 /// # Safety
-/// As [`run_typed`], with `N` operands and an `f32` accumulator; `c` must not alias `a`/`b`, and
-/// the CPU must support `S`'s target features
+/// As [`run_typed_epi`], with `N` operands and an `f32` accumulator; `c` must not alias `a`/`b`,
+/// and the CPU must support `S`'s target features
 #[cfg(feature = "half")]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn run_mixed<N, S>(

@@ -116,6 +116,17 @@ pub trait Epilogue<Fam: KernelFamily>: Copy + Send + Sync {
     {
         unreachable!("apply_store requires VECTOR_STORE = true")
     }
+
+    /// React to an orientation-normalization swap that transposes the engine frame. The float and
+    /// mixed dispatch ladders call this exactly once, right after `orient_transpose` reports a
+    /// swap: a row-major-ish `C` makes the engine compute `C^T = B^T*A^T` (swapping `m<->n`), so an
+    /// epilogue whose state is tied to the problem frame re-orients itself here - [`FusedEpi`]
+    /// flips its bias axis Row<->Col, [`MapEpi`] flags the coordinate transpose. A stateless
+    /// epilogue keeps this no-op default: [`Identity`], and `KRequantize`, whose i8 requant ladder
+    /// re-orients its bias and scales before constructing the epilogue, so the hook must never be
+    /// relied on there
+    #[inline(always)]
+    fn on_orient_swap(&mut self) {}
 }
 
 /// The no-op epilogue: every family's fused kernel hook checks `!E::IS_IDENTITY` before
@@ -202,6 +213,25 @@ pub struct FusedEpi<T> {
     pub(crate) act: Act<T>,
 }
 
+#[cfg(feature = "epilogue")]
+impl<T> FusedEpi<T> {
+    /// Flip the bias axis Row<->Col: the orientation-swap reaction shared by every family's
+    /// [`Epilogue`] impl (through [`Epilogue::on_orient_swap`]) and the complex ladder. A
+    /// row-major-ish `C` computes `C^T = B^T*A^T` (swapping `m<->n`), so a per-row bias becomes
+    /// per-col in the oriented frame; `None` stays `None`
+    #[inline(always)]
+    pub(crate) fn flip_bias(&mut self) {
+        // Match by reference and rebuild from the raw pointer: *mut T is Copy for any T, so this
+        // needs no T: Copy bound (BiasSpec's derived Copy would demand one) while carrying the exact
+        // same pointer onto the flipped axis
+        self.bias = match &self.bias {
+            BiasSpec::None => BiasSpec::None,
+            BiasSpec::Row(p) => BiasSpec::Col(Ptr(p.0)),
+            BiasSpec::Col(p) => BiasSpec::Row(Ptr(p.0)),
+        };
+    }
+}
+
 // `Float<Acc = T> + PartialOrd` rather than the public `FusedScalar` trait: this keeps the
 // kernel layer free of a dispatch-layer dependency, and it still selects exactly the real
 // floats, since `Complex` implements `Float` but not `PartialOrd`, and `f16`/`bf16` are not
@@ -209,6 +239,11 @@ pub struct FusedEpi<T> {
 #[cfg(feature = "epilogue")]
 impl<T: Float<Acc = T> + PartialOrd> Epilogue<FloatGemm<T>> for FusedEpi<T> {
     const VECTOR: bool = true;
+
+    #[inline(always)]
+    fn on_orient_swap(&mut self) {
+        self.flip_bias();
+    }
 
     #[inline(always)]
     unsafe fn apply(&self, v: T, r: usize, c: usize) -> T {
@@ -326,6 +361,13 @@ impl<T: Float<Acc = T>> Epilogue<FloatGemm<T>> for MapEpi<'_, T> {
     // path's rounding must match plain gemm's); apply_reg then applies the closure per lane
     const VECTOR: bool = true;
 
+    #[inline(always)]
+    fn on_orient_swap(&mut self) {
+        // The oriented routes compute C^T (m<->n swap), so flag apply to transpose (row, col)
+        // back to the user frame before handing them to the closure
+        self.swapped = true;
+    }
+
     #[inline]
     unsafe fn apply(&self, v: T, r: usize, c: usize) -> T {
         // The oriented routes transpose (r, c) before it gets here; undo that for the closure
@@ -383,6 +425,11 @@ where
     Fam: KernelFamily<Lhs = N, Rhs = N, Acc = f32, Out = N>,
 {
     const VECTOR: bool = true;
+
+    #[inline(always)]
+    fn on_orient_swap(&mut self) {
+        self.flip_bias();
+    }
 
     #[inline(always)]
     unsafe fn apply(&self, v: f32, r: usize, c: usize) -> N {
@@ -460,6 +507,11 @@ impl<T, const CA: bool, const CB: bool> Epilogue<crate::kernel::ComplexGemm<T, C
 where
     T: crate::scalar::ComplexFloat,
 {
+    #[inline(always)]
+    fn on_orient_swap(&mut self) {
+        self.flip_bias();
+    }
+
     #[inline(always)]
     unsafe fn apply(&self, v: T, r: usize, c: usize) -> T {
         // num_complex's Add, the same operation a gemm_cplx-then-map oracle would use

@@ -7,12 +7,12 @@ The gates live at the top of each per-type dispatch entry, in a fixed order. Fro
 ```rust
 // gemmkit/src/dispatch/float.rs (run_typed, trimmed)
 if (t.n == 1 || t.m == 1) && core::cmp::min(t.m, t.n) <= tuning::gemv_threshold() {
-    gemv::run_typed::<T, S>(/* user frame, before orientation */);
+    gemv::run_typed_epi::<T, S, Identity>(/* user frame, before orientation */);
     return;
 }
 orient_transpose(&mut t);
 if small_mn_eligible(&t) || small_mn_pack_eligible(&t) {
-    small_mn::run::<T, S>(/* horizontal dot kernel */);
+    small_mn::run_epi::<T, S, Identity>(/* horizontal dot kernel */);
     return;
 }
 if t.k <= tuning::small_k_threshold() {

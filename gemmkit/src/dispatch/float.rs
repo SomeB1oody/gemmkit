@@ -13,8 +13,9 @@ use super::{
 };
 use crate::driver;
 use crate::kernel::FloatGemm;
+use crate::kernel::epilogue::{Epilogue, Identity};
 #[cfg(feature = "epilogue")]
-use crate::kernel::epilogue::{BiasSpec, Epilogue, FusedEpi, MapEpi};
+use crate::kernel::epilogue::{FusedEpi, MapEpi};
 use crate::parallel::Parallelism;
 use crate::scalar::Float;
 #[cfg(target_arch = "aarch64")]
@@ -28,75 +29,124 @@ use crate::special::{gemv, small_k, small_mn};
 use crate::tuning;
 use crate::workspace::Workspace;
 
-/// Route one concrete `(type, ISA, tile)` GEMM through gemv, the small-`m,n` horizontal
-/// kernel, the small-`k` panel kernel, or the general driver, whichever the shape and
-/// tuning gates select. Concrete typing here (`T: Float<Acc = T>`) gives the special paths
-/// the `Float` bound the fully generic driver entry intentionally lacks
+/// The single route-priority ladder for the float family (`f32`/`f64`): route one concrete
+/// `(type, ISA, tile)` GEMM through gemv, the small-`m,n` horizontal kernel, the small-`k` panel
+/// kernel, or the general driver, whichever the shape and tuning gates select, with the fused
+/// [`Epilogue`] `E` threaded into every route. The named entries below ([`run_typed`],
+/// [`run_typed_fused`], [`run_typed_map`]) are thin epilogue-choice wrappers over this one body,
+/// mirroring the `Identity`-wrapper pattern the special layer and driver already use: with
+/// `E = Identity` every hook const-folds away, so the plain route is bit-identical to the
+/// non-fused kernel; for a real epilogue each route stores exactly the bits plain `gemm` would and
+/// applies the same scalar map exactly once per element (the vector fast path agrees bitwise with
+/// the scalar map by the [`Epilogue::apply_reg`] contract), so a fused / map result is `gemm()`
+/// then that map for every shape
+///
+/// Concrete typing here (`T: Float<Acc = T>`) gives the special paths the `Float` bound the fully
+/// generic driver entry intentionally lacks
+///
+/// Route-frame semantics: gemv dispatches **before** orientation normalization, in the user frame,
+/// so `epi` still speaks the caller's original coordinates (gemv resolves its own per-row / per-col
+/// ambiguity through `swap_rc`, so a [`FusedEpi`] needs no bias-axis flip and a [`MapEpi`] stays
+/// `swapped = false`). Every route after it runs in the **oriented** frame, and `on_orient_swap`
+/// re-orients the epilogue's frame-dependent state exactly once on a swap - a field write flipping
+/// a bias axis or flagging a coordinate transpose, not a new monomorphization
 ///
 /// # Safety
-/// As [`execute`]
+/// As [`crate::dispatch::execute`], plus `epi`'s interior pointers valid for the (pre-swap) problem's `m`/`n`
+#[inline]
+unsafe fn run_typed_epi<T, S, E, const MR_REG: usize, const NR: usize>(
+    simd: S,
+    mut t: Task<T>,
+    mut epi: E,
+    par: Parallelism,
+    ws: &mut Workspace,
+) where
+    T: Float<Acc = T>,
+    S: SimdOps<T>,
+    E: Epilogue<FloatGemm<T>>,
+{
+    unsafe {
+        // gemv/gevv shape, skipped if tuning::gemv_threshold() has been lowered below the true
+        // minimum dimension; either way falls through correctly to the general driver. gemv
+        // dispatches before orientation normalization, so epi stays in the user frame: it resolves
+        // the per-row / per-col coordinate itself from its own n == 1 / m == 1 swap_rc branch (no
+        // bias-axis flip, a MapEpi stays swapped == false)
+        if (t.n == 1 || t.m == 1) && core::cmp::min(t.m, t.n) <= tuning::gemv_threshold() {
+            gemv::run_typed_epi::<T, S, E>(
+                simd, t.m, t.k, t.n, par, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb, t.beta,
+                t.c, t.rsc, t.csc, &epi,
+            );
+            return;
+        }
+
+        // Orientation normalization transposes the engine frame for the routes below (they all
+        // consume the oriented epi): a row-major-ish C computes C^T = B^T*A^T (swapping m<->n), so
+        // on_orient_swap re-orients epi's frame-dependent state once - flipping a FusedEpi bias
+        // axis (per-row becomes per-col) or flagging a MapEpi (row, col) transpose (a no-op for
+        // Identity)
+        if orient_transpose(&mut t) {
+            epi.on_orient_swap();
+        }
+
+        // Small m,n with a long contraction: the driver would pad the tiny row/col tiles to a
+        // full microtile and pack mostly padding, where the horizontal path computes each output
+        // as a direct SIMD dot over k instead, applying the epilogue at that cell's single store
+        // The zero-copy gate needs k above small_k_threshold and both operands unit-stride along k
+        // (csa == 1, rsb == 1); the pack gate needs k above its own small_mn_pack_min_k floor and
+        // covers the rest by copying only the failing operand into k-contiguous scratch first (the
+        // epilogue still fires on the same per-cell store either way). Short k instead takes the
+        // small_k route below
+        if small_mn_eligible(&t) || small_mn_pack_eligible(&t) {
+            small_mn::run_epi::<T, S, E>(
+                simd, t.m, t.k, t.n, par, ws, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb,
+                t.beta, t.c, t.rsc, t.csc, &epi,
+            );
+            return;
+        }
+        // Low-depth shape: the whole product fits in one depth panel, so the driver's
+        // blocking/packing setup would be pure overhead; read A/B in place instead and apply the
+        // epilogue at that single per-tile store (last_k is structurally true here)
+        if t.k <= tuning::small_k_threshold() {
+            small_k::run_epi::<FloatGemm<T>, S, E, MR_REG, NR>(
+                simd, t.m, t.k, t.n, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb, t.beta, t.c,
+                t.rsc, t.csc, &epi, par, ws,
+            );
+            return;
+        }
+        driver::run_epilogue::<FloatGemm<T>, S, E, MR_REG, NR>(
+            simd, t.m, t.k, t.n, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb, t.beta, t.c, t.rsc,
+            t.csc, &epi, par, ws,
+        );
+    }
+}
+
+/// Route one concrete `(type, ISA, tile)` plain GEMM: the `E = Identity` choice of
+/// [`run_typed_epi`], so every epilogue hook const-folds away and the monomorphization is
+/// bit-identical to a non-fused kernel
+///
+/// # Safety
+/// As [`crate::dispatch::execute`]
 #[inline]
 unsafe fn run_typed<T, S, const MR_REG: usize, const NR: usize>(
     simd: S,
-    mut t: Task<T>,
+    t: Task<T>,
     par: Parallelism,
     ws: &mut Workspace,
 ) where
     T: Float<Acc = T>,
     S: SimdOps<T>,
 {
-    unsafe {
-        // gemv/gevv shape, skipped if tuning::gemv_threshold() has been lowered below the
-        // true minimum dimension; either way falls through correctly to the general driver
-        if (t.n == 1 || t.m == 1) && core::cmp::min(t.m, t.n) <= tuning::gemv_threshold() {
-            gemv::run_typed::<T, S>(
-                simd, t.m, t.k, t.n, par, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb, t.beta,
-                t.c, t.rsc, t.csc,
-            );
-            return;
-        }
-
-        orient_transpose(&mut t);
-        // Small m,n with a long contraction: the driver would pad the tiny row/col tiles to a
-        // full microtile and pack mostly padding, where the horizontal path computes each output
-        // as a direct SIMD dot over k instead. The zero-copy gate needs k above small_k_threshold
-        // and both operands unit-stride along k (csa == 1, rsb == 1); the pack gate needs k above
-        // its own small_mn_pack_min_k floor and covers the rest by copying only the failing
-        // operand into k-contiguous scratch first. Short k instead takes the small_k route below
-        if small_mn_eligible(&t) || small_mn_pack_eligible(&t) {
-            small_mn::run::<T, S>(
-                simd, t.m, t.k, t.n, par, ws, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb,
-                t.beta, t.c, t.rsc, t.csc,
-            );
-            return;
-        }
-        // Low-depth shape: the whole product fits in one depth panel, so the driver's
-        // blocking/packing setup would be pure overhead; read A/B in place instead
-        if t.k <= tuning::small_k_threshold() {
-            small_k::run::<FloatGemm<T>, S, MR_REG, NR>(
-                simd, t.m, t.k, t.n, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb, t.beta, t.c,
-                t.rsc, t.csc, par, ws,
-            );
-            return;
-        }
-        driver::run::<FloatGemm<T>, S, MR_REG, NR>(
-            simd, t.m, t.k, t.n, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb, t.beta, t.c, t.rsc,
-            t.csc, par, ws,
-        );
-    }
+    unsafe { run_typed_epi::<T, S, Identity, MR_REG, NR>(simd, t, Identity, par, ws) }
 }
 
-/// Fused-epilogue driver entry for a concrete `(type, ISA, tile)`: the mirror of [`run_typed`]
-/// with `epi` fused into each route, so a fused shape takes the same kernel plain `gemm` would
-/// (gemv / small_mn / small_k / general driver) rather than paying the driver's pack/blocking
-/// overhead on a shape one of the special paths wins. Each route stores exactly the bits plain
-/// `gemm` would and applies the same scalar map exactly once per element, so the fused result is
-/// bit-identical to `gemm()` followed by that map for every shape (the vector fast path agrees
-/// bitwise with the scalar map by the [`Epilogue::apply_reg`] contract). gemv dispatches before
-/// orientation normalization, in the user frame (no bias flip); the other routes run after the
-/// orientation swap, which flips the bias axis (a row-major-ish C makes the engine compute
-/// `C^T = B^T*A^T`, swapping `m<->n`, so a user per-row bias becomes per-col in the oriented
-/// frame): a field write, not a new monomorphization
+/// Fused-epilogue driver entry for a concrete `(type, ISA, tile)`: the [`FusedEpi`] choice of
+/// [`run_typed_epi`]. A fused shape takes the same kernel plain `gemm` would (gemv / small_mn /
+/// small_k / general driver) rather than paying the driver's pack/blocking overhead on a shape one
+/// of the special paths wins, and each route stores exactly the bits plain `gemm` would and applies
+/// the same scalar map exactly once per element, so the fused result is bit-identical to `gemm()`
+/// followed by that map for every shape (the vector fast path agrees bitwise with the scalar map by
+/// the [`Epilogue::apply_reg`] contract). The orientation swap flips the bias axis through
+/// `on_orient_swap` (see [`run_typed_epi`] for the route-frame semantics)
 ///
 /// # Safety
 /// As [`run_typed`], plus `epi`'s interior pointers valid for the (pre-swap) problem's `m`/`n`
@@ -104,82 +154,30 @@ unsafe fn run_typed<T, S, const MR_REG: usize, const NR: usize>(
 #[inline]
 unsafe fn run_typed_fused<T, S, const MR_REG: usize, const NR: usize>(
     simd: S,
-    mut t: Task<T>,
-    mut epi: FusedEpi<T>,
+    t: Task<T>,
+    epi: FusedEpi<T>,
     par: Parallelism,
     ws: &mut Workspace,
 ) where
-    // FusedEpi<T>: Epilogue<FloatGemm<T>> and the special paths need Float<Acc = T> + PartialOrd;
-    // FusedScalar itself does not imply them, since it also covers the narrow f16/bf16 types,
-    // which route through run_typed_mixed_fused instead
+    // FusedEpi<T>: Epilogue<FloatGemm<T>> needs Float<Acc = T> + PartialOrd; FusedScalar itself
+    // does not imply them, since it also covers the narrow f16/bf16 types, which route through
+    // run_typed_mixed_fused instead
     T: Float<Acc = T> + PartialOrd,
     S: SimdOps<T>,
 {
-    unsafe {
-        // gemv/gevv shape, skipped the same way as in run_typed above; fused via a final
-        // in-place epilogue sweep. gemv dispatches before orientation normalization, so epi
-        // stays in the user frame: run_typed_epi resolves the per-row / per-col coordinate
-        // itself from its own n == 1 / m == 1 branch (no bias-axis flip needed here)
-        if (t.n == 1 || t.m == 1) && core::cmp::min(t.m, t.n) <= tuning::gemv_threshold() {
-            gemv::run_typed_epi::<T, S, FusedEpi<T>>(
-                simd, t.m, t.k, t.n, par, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb, t.beta,
-                t.c, t.rsc, t.csc, &epi,
-            );
-            return;
-        }
-
-        // Orientation normalization flips the bias axis for the routes below (they all consume
-        // the oriented epi): row-major-ish C computes C^T = B^T*A^T (swapping m<->n), so a
-        // per-row bias becomes per-col in the oriented frame
-        let swap = orient_transpose(&mut t);
-        if swap {
-            epi.bias = match epi.bias {
-                BiasSpec::None => BiasSpec::None,
-                BiasSpec::Row(p) => BiasSpec::Col(p),
-                BiasSpec::Col(p) => BiasSpec::Row(p),
-            };
-        }
-
-        // Small m,n with a long contraction: the horizontal path computes each output as a
-        // direct SIMD dot, applying the epilogue at that cell's single store. A strided operand
-        // is copied into k-contiguous scratch first by the pack tier (the epilogue still fires
-        // on the same per-cell store either way)
-        if small_mn_eligible(&t) || small_mn_pack_eligible(&t) {
-            small_mn::run_epi::<T, S, FusedEpi<T>>(
-                simd, t.m, t.k, t.n, par, ws, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb,
-                t.beta, t.c, t.rsc, t.csc, &epi,
-            );
-            return;
-        }
-        // Low-depth shape: one depth panel over the microkernel, so the epilogue applies at
-        // that single per-tile store (last_k is structurally true here)
-        if t.k <= tuning::small_k_threshold() {
-            small_k::run_epi::<FloatGemm<T>, S, FusedEpi<T>, MR_REG, NR>(
-                simd, t.m, t.k, t.n, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb, t.beta, t.c,
-                t.rsc, t.csc, &epi, par, ws,
-            );
-            return;
-        }
-        driver::run_epilogue::<FloatGemm<T>, S, FusedEpi<T>, MR_REG, NR>(
-            simd, t.m, t.k, t.n, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb, t.beta, t.c, t.rsc,
-            t.csc, &epi, par, ws,
-        );
-    }
+    unsafe { run_typed_epi::<T, S, FusedEpi<T>, MR_REG, NR>(simd, t, epi, par, ws) }
 }
 
-/// User-defined map-epilogue driver entry for a concrete `(type, ISA, tile)`: the mirror of
-/// [`run_typed_fused`] threading the borrowed-closure [`MapEpi`] through each route, so a
-/// `gemm_map` shape takes the same kernel plain `gemm` would (gemv / small_mn / small_k /
-/// general driver), each route storing exactly the bits plain `gemm` would and then applying
-/// the closure exactly once per element. [`MapEpi`] sets `VECTOR = true`, so the microkernel
-/// takes the same path selection plain `gemm` does (fast vector store for a full column-major
-/// tile, scratch for an edge), and the value handed to the closure is bit-for-bit the
-/// plain-`gemm` store value on every path, so `gemm_map` is `gemm()` then the per-element `f`
-/// for every `f32`/`f64` shape. gemv dispatches before orientation, in the user frame
-/// (`swapped` stays `false`: gemv's own `swap_rc` already resolves user-frame coordinates); the
-/// other routes run after the orientation swap, which transposes their `(row, col)`, so
-/// `swapped` is set and [`MapEpi::apply`] flips the coordinates back to the user frame for the
-/// closure (the coordinate analogue of the fused bias-axis flip)
+/// User-defined map-epilogue driver entry for a concrete `(type, ISA, tile)`: the borrowed-closure
+/// [`MapEpi`] choice of [`run_typed_epi`]. A `gemm_map` shape takes the same kernel plain `gemm`
+/// would (gemv / small_mn / small_k / general driver), each route storing exactly the bits plain
+/// `gemm` would and then applying the closure exactly once per element. [`MapEpi`] sets
+/// `VECTOR = true`, so the microkernel takes the same path selection plain `gemm` does (fast vector
+/// store for a full column-major tile, scratch for an edge), and the value handed to the closure is
+/// bit-for-bit the plain-`gemm` store value on every path, so `gemm_map` is `gemm()` then the
+/// per-element `f` for every `f32`/`f64` shape. The orientation swap flags `MapEpi`'s coordinate
+/// transpose through `on_orient_swap`, so [`MapEpi::apply`] flips `(row, col)` back to the user
+/// frame for the closure (see [`run_typed_epi`] for the route-frame semantics)
 ///
 /// # Safety
 /// As [`run_typed`]; the closure in `epi` is total (it is called on every stored element)
@@ -187,8 +185,8 @@ unsafe fn run_typed_fused<T, S, const MR_REG: usize, const NR: usize>(
 #[inline]
 unsafe fn run_typed_map<'u, T, S, const MR_REG: usize, const NR: usize>(
     simd: S,
-    mut t: Task<T>,
-    mut epi: MapEpi<'u, T>,
+    t: Task<T>,
+    epi: MapEpi<'u, T>,
     par: Parallelism,
     ws: &mut Workspace,
 ) where
@@ -197,49 +195,7 @@ unsafe fn run_typed_map<'u, T, S, const MR_REG: usize, const NR: usize>(
     T: Float<Acc = T>,
     S: SimdOps<T>,
 {
-    unsafe {
-        // gemv dispatches before orientation normalization, so epi stays in the user frame:
-        // run_typed_epi resolves (row, col) itself from its own n == 1 / m == 1 swap_rc branch
-        // and calls apply with swapped == false
-        if (t.n == 1 || t.m == 1) && core::cmp::min(t.m, t.n) <= tuning::gemv_threshold() {
-            gemv::run_typed_epi::<T, S, MapEpi<'u, T>>(
-                simd, t.m, t.k, t.n, par, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb, t.beta,
-                t.c, t.rsc, t.csc, &epi,
-            );
-            return;
-        }
-
-        // Orientation normalization transposes the frame for the routes below (row-major-ish C
-        // computes C^T = B^T*A^T, swapping m<->n), so their oriented (row, col) is the user's
-        // (col, row): flag it so MapEpi::apply flips the closure's coordinates back
-        if orient_transpose(&mut t) {
-            epi.swapped = true;
-        }
-
-        // Small m,n with a long contraction: the horizontal path applies the closure at each
-        // cell's single store. A strided operand is packed into k-contiguous scratch first (the
-        // value handed to the closure is bit-for-bit the plain-gemm store either way)
-        if small_mn_eligible(&t) || small_mn_pack_eligible(&t) {
-            small_mn::run_epi::<T, S, MapEpi<'u, T>>(
-                simd, t.m, t.k, t.n, par, ws, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb,
-                t.beta, t.c, t.rsc, t.csc, &epi,
-            );
-            return;
-        }
-        // Low-depth shape: one depth panel over the microkernel, so the closure applies at
-        // that single per-tile store (last_k is structurally true here)
-        if t.k <= tuning::small_k_threshold() {
-            small_k::run_epi::<FloatGemm<T>, S, MapEpi<'u, T>, MR_REG, NR>(
-                simd, t.m, t.k, t.n, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb, t.beta, t.c,
-                t.rsc, t.csc, &epi, par, ws,
-            );
-            return;
-        }
-        driver::run_epilogue::<FloatGemm<T>, S, MapEpi<'u, T>, MR_REG, NR>(
-            simd, t.m, t.k, t.n, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb, t.beta, t.c, t.rsc,
-            t.csc, &epi, par, ws,
-        );
-    }
+    unsafe { run_typed_epi::<T, S, MapEpi<'u, T>, MR_REG, NR>(simd, t, epi, par, ws) }
 }
 
 /// Prepacked-RHS driver entry for a concrete `(type, ISA, tile)`. No gemv route and no

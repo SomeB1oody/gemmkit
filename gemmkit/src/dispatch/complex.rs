@@ -10,7 +10,7 @@ use super::isa::{ForcedIsa, forced_isa};
 use super::{Task, orient_transpose, scale_c_float};
 use crate::driver;
 #[cfg(all(feature = "complex", feature = "epilogue"))]
-use crate::kernel::epilogue::{BiasSpec, Epilogue, FusedEpi};
+use crate::kernel::epilogue::{Epilogue, FusedEpi};
 use crate::parallel::Parallelism;
 #[cfg(target_arch = "aarch64")]
 use crate::simd::Neon;
@@ -116,11 +116,7 @@ unsafe fn run_complex_fused<T, S, const MR_REG: usize, const NR: usize>(
         if orient_transpose(&mut t) {
             core::mem::swap(&mut ca, &mut cb);
             // row-major-ish C computes C^T = B^T*A^T (m<->n swap), so bias axis flips too
-            epi.bias = match epi.bias {
-                BiasSpec::None => BiasSpec::None,
-                BiasSpec::Row(p) => BiasSpec::Col(p),
-                BiasSpec::Col(p) => BiasSpec::Row(p),
-            };
+            epi.flip_bias();
         }
         match (ca, cb) {
             (false, false) => {

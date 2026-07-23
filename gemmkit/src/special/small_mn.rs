@@ -32,7 +32,7 @@
 use crate::kernel::FloatGemm;
 #[cfg(feature = "half")]
 use crate::kernel::MixedGemm;
-use crate::kernel::epilogue::{Epilogue, Identity};
+use crate::kernel::epilogue::Epilogue;
 use crate::parallel::{self, JobCursor, Parallelism, Ptr};
 use crate::scalar::Float;
 #[cfg(feature = "half")]
@@ -216,53 +216,19 @@ unsafe fn prepack_operands<T: Copy>(
     }
 }
 
-/// Small-`m,n` horizontal GEMM, plain (non-fused) output. Thin [`Identity`] wrapper over
-/// [`run_epi`]: with `E = Identity` the epilogue hook const-folds to the raw store, so this
-/// is exactly the code this route ran before the epilogue mechanism existed
-///
-/// # Safety
-/// Pointers must be valid for the regions implied by the strides/sizes; `c` must not alias
-/// `a`/`b`; A rows must be unit-stride (`csa == 1`) and B columns unit-stride (`rsb == 1`) so
-/// both stream contiguously along `k`. Must be called only when the CPU supports `S`'s features
-#[allow(clippy::too_many_arguments)]
-pub unsafe fn run<T, S>(
-    simd: S,
-    m: usize,
-    k: usize,
-    n: usize,
-    par: Parallelism,
-    ws: &mut Workspace,
-    alpha: T,
-    a: *const T,
-    rsa: isize,
-    csa: isize,
-    b: *const T,
-    rsb: isize,
-    csb: isize,
-    beta: T,
-    c: *mut T,
-    rsc: isize,
-    csc: isize,
-) where
-    T: Float<Acc = T>,
-    S: SimdOps<T>,
-{
-    // SAFETY: forwards to `run_epi` with `Identity`, which const-folds to the raw store
-    unsafe {
-        run_epi::<T, S, Identity>(
-            simd, m, k, n, par, ws, alpha, a, rsa, csa, b, rsb, csb, beta, c, rsc, csc, &Identity,
-        )
-    }
-}
-
 /// Small-`m,n` horizontal GEMM with a fused [`Epilogue`] `E` applied at each cell's single
 /// store. Each cell is one complete `k`-reduction, so the epilogue fires exactly once per
 /// element; a non-identity `E` changes only that store, leaving the tiling and partition
-/// identical to plain [`run`] (`row`/`col` passed to `epi` are oriented-frame coordinates -
-/// dispatch already flipped the bias axis on an orientation swap before calling in)
+/// identical to the `E = Identity` plain path the float dispatch ladder drives this generic
+/// through directly, const-folding every hook away there (`row`/`col` passed to `epi` are
+/// oriented-frame coordinates - dispatch already flipped the bias axis on an orientation swap
+/// before calling in)
 ///
 /// # Safety
-/// As [`run`], plus `epi`'s interior pointers must be valid for the (oriented) problem's `m`/`n`
+/// Pointers must be valid for the regions implied by the strides/sizes; `c` must not alias
+/// `a`/`b`; A rows must be unit-stride (`csa == 1`) and B columns unit-stride (`rsb == 1`) so both
+/// stream contiguously along `k`; the CPU must support `S`'s features; and `epi`'s interior
+/// pointers must be valid for the (oriented) problem's `m`/`n`
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn run_epi<T, S, E>(
     simd: S,
@@ -492,62 +458,19 @@ unsafe fn cell_dot<T, S, E>(
     }
 }
 
-/// Mixed-precision (`f16`/`bf16` in, `f32` accumulate) sibling of [`run`]: same `MT x NT`
-/// tiling and output partition, but each A-row / B-column load widens `N -> f32`
-/// ([`KernelSimd::load_lhs`]) before accumulating, and each cell narrows back to `N` once,
-/// in the epilogue slot. `alpha`/`beta` are passed in already widened to `f32`. Same
-/// reproducibility guarantee as [`run`]
-///
-/// Thin [`Identity`] wrapper over [`run_mixed_epi`]: with `E = Identity` the per-cell hook
-/// const-folds to the raw narrowing store, so this is exactly the code this route ran
-/// before the epilogue mechanism existed
-///
-/// # Safety
-/// As [`run`] (A rows / B cols unit-stride along `k`, `c` not aliasing `a`/`b`, CPU supports `S`)
-#[cfg(feature = "half")]
-#[allow(clippy::too_many_arguments)]
-pub unsafe fn run_mixed<N, S>(
-    simd: S,
-    m: usize,
-    k: usize,
-    n: usize,
-    par: Parallelism,
-    ws: &mut Workspace,
-    alpha: f32,
-    a: *const N,
-    rsa: isize,
-    csa: isize,
-    b: *const N,
-    rsb: isize,
-    csb: isize,
-    beta: f32,
-    c: *mut N,
-    rsc: isize,
-    csc: isize,
-) where
-    N: NarrowFloat,
-    S: KernelSimd<N, N, f32, N>,
-{
-    // SAFETY: forwards to `run_mixed_epi` with `Identity`, which const-folds to the raw
-    // narrowing store
-    unsafe {
-        run_mixed_epi::<N, S, Identity>(
-            simd, m, k, n, par, ws, alpha, a, rsa, csa, b, rsb, csb, beta, c, rsc, csc, &Identity,
-        )
-    }
-}
-
 /// Mixed-precision small-`m,n` horizontal GEMM with a fused [`Epilogue`] `E` (over the
 /// [`MixedGemm`] family) applied to each cell's `f32` accumulated value, right before that
-/// value is narrowed to `N` at its single store. [`run_mixed`] is exactly this with `E =
-/// Identity`. Applying `E` before the narrowing (rather than narrowing first and mapping
+/// value is narrowed to `N` at its single store. The mixed dispatch ladder drives this generic
+/// directly; `E = Identity` on the plain path const-folds every hook away to the raw narrowing
+/// store. Applying `E` before the narrowing (rather than narrowing first and mapping
 /// after) matches the driver's mixed-precision epilogue semantics and is more precise than
 /// narrowing first, since it avoids rounding to `N` before the epilogue's own math runs
 /// (`row`/`col` are oriented-frame coordinates - dispatch already flipped the bias axis on
 /// an orientation swap before calling in)
 ///
 /// # Safety
-/// As [`run_mixed`], plus `epi`'s interior pointers must be valid for the (oriented) `m`/`n`
+/// As [`run_epi`], with `N` operands and an `f32` accumulator, plus `epi`'s interior pointers
+/// must be valid for the (oriented) `m`/`n`
 #[cfg(feature = "half")]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn run_mixed_epi<N, S, E>(
@@ -784,7 +707,7 @@ unsafe fn cell_dot_mixed<N, S, E>(
     }
 }
 
-/// Integer (`i8` in, `i32` accumulate) sibling of [`run`]: same `MT x NT` tiling and output
+/// Integer (`i8` in, `i32` accumulate) sibling of [`run_epi`]: same `MT x NT` tiling and output
 /// partition, but each A-row / B-column load widens `i8 -> i32` ([`KernelSimd::load_lhs`],
 /// the same seam the `IntGemm` microkernel uses), and `alpha`/`beta`/`C` are all `i32`,
 /// combined as `C <- alpha*dot + beta*C` in wrapping `i32` arithmetic
@@ -794,10 +717,10 @@ unsafe fn cell_dot_mixed<N, S, E>(
 /// panel-split accumulation produces, regardless of how either splits the sum: bit-identical
 /// to both the `IntGemm` driver route and the `IntGemmVnni` dot kernel this route bypasses.
 /// No epilogue variant exists here (the plain `i8 -> i32` path never fuses; requantizing
-/// families keep their own dedicated route). Same reproducibility guarantee as [`run`]
+/// families keep their own dedicated route). Same reproducibility guarantee as [`run_epi`]
 ///
 /// # Safety
-/// As [`run`] (A rows / B cols unit-stride along `k`, `c` not aliasing `a`/`b`, CPU supports `S`)
+/// As [`run_epi`] (A rows / B cols unit-stride along `k`, `c` not aliasing `a`/`b`, CPU supports `S`)
 #[cfg(feature = "int8")]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn run_int<S>(

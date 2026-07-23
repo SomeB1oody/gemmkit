@@ -41,7 +41,11 @@ const SMALL_K_MAX: usize = 32;
 /// # Safety
 /// All pointers must be valid for the regions implied by the strides/sizes, and `C` must
 /// not alias `A` or `B`
+// dead_code without int8: the unified float/mixed dispatch ladders now call run_epi directly (with
+// Identity for the plain route), so the i8 ladder in dispatch/int.rs is this wrapper's only caller;
+// it stays as the documented plain entry the run_epi docs reference
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(feature = "int8"), allow(dead_code))]
 pub unsafe fn run<Fam, S, const MR_REG: usize, const NR: usize>(
     simd: S,
     m: usize,
