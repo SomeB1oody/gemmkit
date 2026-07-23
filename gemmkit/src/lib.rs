@@ -64,9 +64,9 @@ extern crate alloc;
 
 // Cache topology detection and BLIS-model analytical blocking (layer L3)
 pub mod cache;
-// Generic 5-loop GEMM driver, generic over the kernel family and the ISA (layer L4)
+// Generic 5-loop GEMM driver, generic over the kernel family and the ISA (layer L5)
 pub mod driver;
-// Kernel families: the operation-family seam (layer L1)
+// Kernel families: the operation-family seam (layer L4)
 pub mod kernel;
 // Numeric scalar abstraction: identity constants and the accumulator type (layer L0)
 pub mod scalar;
@@ -79,9 +79,9 @@ pub mod tuning;
 mod api;
 // Runtime ISA dispatch, memoized per element type (layer L7)
 mod dispatch;
-// Packing primitives shared by every kernel family (layer L2)
+// Packing primitives shared by every kernel family (layer L1)
 mod pack;
-// Parallelism control and job splitting across workers (layer L5)
+// Parallelism control and job splitting across workers (layer L2)
 mod parallel;
 // Special-case paths that bypass the driver for shapes it fits poorly (layer L6)
 mod special;

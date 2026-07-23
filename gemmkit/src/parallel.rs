@@ -1,4 +1,4 @@
-//! Parallelism control and job splitting (layer L5)
+//! Parallelism control and job splitting (layer L2)
 //!
 //! The driver flattens its per-panel work into a 1-D list of (row-block, column-tile)
 //! jobs, and workers pull contiguous chunks from a shared [`JobCursor`] on demand: one

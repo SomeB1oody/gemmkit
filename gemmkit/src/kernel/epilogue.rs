@@ -1,4 +1,4 @@
-//! Fused epilogues (layer L1): a transform a family applies to each output element as
+//! Fused epilogues (layer L4): a transform a family applies to each output element as
 //! the microkernel stores it, instead of writing the raw `alpha*A*B + beta*C` and
 //! mapping over `C` in a 2nd pass
 //!
@@ -448,7 +448,7 @@ where
 // arms unreachable
 //
 // VECTOR stays false (the default): a complex tile is stored by the SoA kernel's own scalar
-// alpha/beta epilogue, inside the L0 cplx_microkernel seam that must not depend on this L1 trait,
+// alpha/beta epilogue, inside the L0 cplx_microkernel seam that must not depend on this L4 trait,
 // and this apply instead rides the in-place post-pass ComplexGemm::microkernel_epi runs over the
 // finished tile on the final depth panel. So only apply is implemented here, no apply_reg or
 // apply_store. Since that post-pass runs after the kernel has already stored exactly the bits

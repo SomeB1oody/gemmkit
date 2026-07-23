@@ -641,7 +641,7 @@ pub trait SimdOps<T: Scalar>: Simd {
     /// `KernelSimd<T, T, T, T>` bound. The default is unreachable: only the complex
     /// `SimdOps<Complex<_>>` impls override it, and each forwards to the shared,
     /// ISA-generic `complex::soa_microkernel`, which has the real ops available
-    /// concretely. Alpha/beta state arrives as plain bools rather than the L1
+    /// concretely. Alpha/beta state arrives as plain bools rather than the L4
     /// `AlphaStatus`/`BetaStatus` enums, since depending on those would be an upward
     /// dependency from this L0 seam
     ///

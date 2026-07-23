@@ -1,4 +1,4 @@
-//! The generic GEMM driver (layer L4): one 5-loop nest, fully generic over the
+//! The generic GEMM driver (layer L5): one 5-loop nest, fully generic over the
 //! [`KernelFamily`] and the ISA token. It never names a concrete element type, a
 //! concrete ISA, or a macro, so adding a family or an ISA never touches this file -
 //! the open/closed property the architecture promises (proven by a test that

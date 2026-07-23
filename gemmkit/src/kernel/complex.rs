@@ -209,7 +209,7 @@ where
         S: KernelSimd<T, T, T, T>,
     {
         // Forward to the L0 SoA seam, translating AlphaStatus/BetaStatus to plain bools
-        // (L0 must not depend on the L1 status enums). b_cs is dropped: a packed RHS
+        // (L0 must not depend on the L4 status enums). b_cs is dropped: a packed RHS
         // panel is always contiguous (b_cs == 1)
         unsafe {
             simd.cplx_microkernel::<MR_REG, NR>(
@@ -261,7 +261,7 @@ where
         S: KernelSimd<T, T, T, T>,
         E: Epilogue<Self>,
     {
-        // cplx_microkernel (L0) cannot take E directly: it must not depend on the L1
+        // cplx_microkernel (L0) cannot take E directly: it must not depend on the L4
         // Epilogue trait, same layering rule that keeps AlphaStatus/BetaStatus out of L0
         // So run the plain microkernel first (it stores the finished alpha*AB + beta*C
         // tile, the same bits plain gemm_cplx writes), then, only on the final depth

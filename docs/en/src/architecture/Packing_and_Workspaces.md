@@ -4,7 +4,7 @@ The microkernel wants its inputs in exactly one shape: for each depth step, `mr`
 
 ## One routine, both operands
 
-The mechanical copy lives in a single routine, `pack_panels` (`gemmkit/src/pack.rs`, layer L2), because the LHS and RHS layouts are the same layout viewed from different sides. An LHS macro-block packs into panels `mr` rows tall, stored column by column: panel 0 holds rows `0..mr` with each depth step's `mr` elements contiguous, panel 1 holds rows `mr..2*mr`, and so on. An RHS macro-block packs into panels `nr` columns wide, stored row by row. Both are "`width` contiguous leading elements per depth step"; the only difference is which matrix axis is the leading one, so the two `KernelFamily` hooks call the same routine with the strides swapped:
+The mechanical copy lives in a single routine, `pack_panels` (`gemmkit/src/pack.rs`, layer L1), because the LHS and RHS layouts are the same layout viewed from different sides. An LHS macro-block packs into panels `mr` rows tall, stored column by column: panel 0 holds rows `0..mr` with each depth step's `mr` elements contiguous, panel 1 holds rows `mr..2*mr`, and so on. An RHS macro-block packs into panels `nr` columns wide, stored row by row. Both are "`width` contiguous leading elements per depth step"; the only difference is which matrix axis is the leading one, so the two `KernelFamily` hooks call the same routine with the strides swapped:
 
 ```rust
 // gemmkit/src/kernel/float.rs

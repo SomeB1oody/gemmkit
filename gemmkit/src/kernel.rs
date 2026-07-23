@@ -1,6 +1,6 @@
-//! Kernel families (layer L1): the seam between the driver and a concrete kind of GEMM
+//! Kernel families (layer L4): the seam between the driver and a concrete kind of GEMM
 //!
-//! The driver (layer L4) is generic over [`KernelFamily`], not over "do an FMA on
+//! The driver (layer L5) is generic over [`KernelFamily`], not over "do an FMA on
 //! `T`". A family bundles everything that distinguishes one kind of GEMM from
 //! another: the input/accumulator/output element types, the pack layout, the
 //! microkernel, and the epilogue. [`float::FloatGemm`] is the baseline family;

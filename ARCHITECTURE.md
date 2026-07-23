@@ -66,34 +66,45 @@ engine, since neither library has a rank-3 type). Each adapter feature
 
 ## Layer map
 
-Module docs in the core crate carry explicit layer labels; this is the stack
-they declare, public API at the top. Dependencies point strictly downward
-(`simd` depends only on `scalar` and `core`; the driver never names a
-concrete element type or ISA):
+Module docs in the core crate carry explicit layer labels; the map below lists
+the modules in dependency order, public API at the top, which is what makes the
+downward claim checkable. `parallel` sits low because it is self-contained
+worker vocabulary - the `Parallelism` policy enum, the `Ptr` Send-pointer
+wrapper, the `JobCursor` - depending only on `tuning` and used by `kernel`,
+`driver`, `special`, and `dispatch` alike; `pack` sits below `kernel` because
+the families' pack hooks build on the packing primitives. Dependencies then
+point strictly downward, with one annotated re-entry detailed below the chart
+(`simd` depends only on `scalar` and `core`; the driver never names a concrete
+element type or ISA):
 
 ```
 L8a  api        safe slice entries, *_with, *_unchecked; MatRef/MatMut
 L7   dispatch   runtime ISA selection, one memoized fn pointer per type
 L6   special    gemv, small-k, small-m,n, batched reroutes
-L5   parallel   worker-count resolution, JobCursor work distribution
-L4   driver     the generic 5-loop blocked GEMM, one for all families
+L5   driver     the generic 5-loop blocked GEMM, one for all families
+L4   kernel     KernelFamily seam (float/mixed/int/complex) + Epilogue
 L3   cache      topology detection + BLIS analytical blocking
-L2   pack       micropanel packing primitives
-L1   kernel     KernelFamily seam (float/mixed/int/complex) + Epilogue
+L2   parallel   worker-count resolution, JobCursor work distribution
+L1   pack       micropanel packing primitives
 L0   simd       ISA tokens + SimdOps vocabulary;  scalar: Scalar/Acc types
      ---        cross-cutting: tuning (GEMMKIT_* knobs), workspace (buffers)
 ```
+
+The one exception to the downward rule: `special/batched.rs` (L6) re-enters
+`dispatch::execute` (L7) once per batch element, so each element inherits the
+same driver / small-k / small-mn / gemv routing a standalone `gemm` on its
+shape would take rather than a second dispatch ladder maintained by hand.
 
 | Layer | Path | Responsibility |
 |---|---|---|
 | L8a | `gemmkit/src/api.rs` + `api/` | Public entries per family (`batched`, `cplx`, `fused`, `int8`, `map`, `packed`); validation; lowering to dispatch tasks |
 | L7 | `gemmkit/src/dispatch.rs` + `dispatch/` | Per-type `OnceLock<fn>` selection ladders (`float`, `mixed`, `int`, `complex`, `isa`); orientation normalization; special-path gates |
-| L6 | `gemmkit/src/special.rs` + `special/` | `gemv`, `small_k`, `small_mn`, `batched` orchestration |
-| L5 | `gemmkit/src/parallel.rs` | `Parallelism`, worker ramps, `JobCursor`, rayon integration |
-| L4 | `gemmkit/src/driver.rs` | The blocked loop nest, packing decisions, prepacked-RHS consumption |
+| L6 | `gemmkit/src/special.rs` + `special/` | `gemv`, `small_k`, `small_mn`, `batched` orchestration (`batched` re-enters L7 `dispatch::execute` per element) |
+| L5 | `gemmkit/src/driver.rs` | The blocked loop nest, packing decisions, prepacked-RHS consumption |
+| L4 | `gemmkit/src/kernel.rs` + `kernel/` | `KernelFamily` trait, the families, `Epilogue` trait and built-ins |
 | L3 | `gemmkit/src/cache.rs` + `cache/` | Cache detection (`cpuid`, `sysfs`, `sysctl`), `blocking()` model |
-| L2 | `gemmkit/src/pack.rs` | `pack_panels` and the k-group-interleaved `pack_kgroup_panels` |
-| L1 | `gemmkit/src/kernel.rs` + `kernel/` | `KernelFamily` trait, the families, `Epilogue` trait and built-ins |
+| L2 | `gemmkit/src/parallel.rs` | `Parallelism`, worker ramps, `JobCursor`, rayon integration |
+| L1 | `gemmkit/src/pack.rs` | `pack_panels` and the k-group-interleaved `pack_kgroup_panels` |
 | L0 | `gemmkit/src/simd.rs` + `simd/`, `gemmkit/src/scalar.rs` | `Simd` tokens, `SimdOps`/`KernelSimd`, `Scalar`/`Float`/`NarrowFloat`/`ComplexFloat` |
 | - | `gemmkit/src/tuning.rs`, `gemmkit/src/workspace.rs` | Threshold knobs; packing-buffer pool |
 
@@ -192,7 +203,7 @@ Two small traits carry the type variation. `Scalar`
 (`gemmkit/src/scalar.rs`, L0) holds only the identity constants and the
 accumulator type `Acc` (`f32`/`f64` accumulate in themselves, `f16`/`bf16` in
 `f32`, `i8` in `i32`, complex in itself); no arithmetic lives on it.
-`KernelFamily` (`gemmkit/src/kernel.rs`, L1) bundles what distinguishes one
+`KernelFamily` (`gemmkit/src/kernel.rs`, L4) bundles what distinguishes one
 kind of GEMM: the `Lhs`/`Rhs`/`Acc`/`Out` types, the pack layout, and the
 microkernel; the driver is generic over the family and never branches on
 element type. The families:

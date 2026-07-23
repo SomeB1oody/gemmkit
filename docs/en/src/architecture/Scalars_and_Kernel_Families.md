@@ -1,6 +1,6 @@
 # Scalars and Kernel Families
 
-Every element type gemmkit multiplies — `f32`, `f64`, `f16`, `bf16`, `i8`, `Complex<f32>`, `Complex<f64>`, with `u8` appearing only as a requantize output — flows through the same driver, the same packing framework, the same cache model, and the same parallel scheduler. Two traits carry all of the variation: `Scalar` at L0 (`gemmkit/src/scalar.rs`) answers "what is this type and what does it accumulate in", and `KernelFamily` at L1 (`gemmkit/src/kernel.rs`) answers "what makes this *kind* of GEMM different from the others". The driver is generic over the family and never branches on element type; this page walks the split and why it is drawn where it is.
+Every element type gemmkit multiplies — `f32`, `f64`, `f16`, `bf16`, `i8`, `Complex<f32>`, `Complex<f64>`, with `u8` appearing only as a requantize output — flows through the same driver, the same packing framework, the same cache model, and the same parallel scheduler. Two traits carry all of the variation: `Scalar` at L0 (`gemmkit/src/scalar.rs`) answers "what is this type and what does it accumulate in", and `KernelFamily` at L4 (`gemmkit/src/kernel.rs`) answers "what makes this *kind* of GEMM different from the others". The driver is generic over the family and never branches on element type; this page walks the split and why it is drawn where it is.
 
 ## Scalar: constants and an accumulator, nothing else
 

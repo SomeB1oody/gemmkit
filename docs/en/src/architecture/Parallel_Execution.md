@@ -1,6 +1,6 @@
 # Parallel Execution
 
-Parallelism in gemmkit is one small layer (`gemmkit/src/parallel.rs`, L5) with two jobs: decide *how many* workers a problem deserves, and hand *which* work to each of them. Both decisions are deliberately conservative - more threads are not free, and the layer's design starts from the observation that the wrong worker count loses more performance than the wrong schedule - and both are shaped so that the numerical result never depends on either. The user-facing surface is a single enum: `Parallelism::Serial`, or `Parallelism::Rayon(n)` with `Rayon(0)` (the default) meaning auto.
+Parallelism in gemmkit is one small layer (`gemmkit/src/parallel.rs`, L2) with two jobs: decide *how many* workers a problem deserves, and hand *which* work to each of them. Both decisions are deliberately conservative - more threads are not free, and the layer's design starts from the observation that the wrong worker count loses more performance than the wrong schedule - and both are shaped so that the numerical result never depends on either. The user-facing surface is a single enum: `Parallelism::Serial`, or `Parallelism::Rayon(n)` with `Rayon(0)` (the default) meaning auto.
 
 ## Workload-aware worker resolution
 

@@ -1,4 +1,4 @@
-//! Packing primitives (layer L2)
+//! Packing primitives (layer L1)
 //!
 //! Copies a strided A or B region into contiguous, microkernel-sized panels. Every
 //! [`crate::kernel::KernelFamily`] chooses its own packed layout (interleaved for a
