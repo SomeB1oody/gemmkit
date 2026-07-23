@@ -13,6 +13,8 @@ use half::{bf16, f16};
 
 #[cfg(any(feature = "half", feature = "int8"))]
 use super::KernelSimd;
+#[cfg(feature = "int8")]
+use super::VNNI_A_BIAS;
 use super::{Simd, SimdOps};
 
 /// AVX-512 Foundation ISA token: 512-bit vector registers
@@ -531,8 +533,7 @@ impl KernelSimd<i8, i8, i32, i32> for Avx512Vnni {
             // lane) to recover the true signed sum_k(A*B); this is the same bias constant
             // the LHS pack added
             for j in 0..NR {
-                let corr =
-                    _mm512_set1_epi32(crate::kernel::int::VNNI_A_BIAS.wrapping_mul(colsum[j]));
+                let corr = _mm512_set1_epi32(VNNI_A_BIAS.wrapping_mul(colsum[j]));
                 for i in 0..MR_REG {
                     acc[j][i] = _mm512_sub_epi32(acc[j][i], corr);
                 }

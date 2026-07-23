@@ -180,6 +180,17 @@ pub trait KernelSimd<L: Scalar, R: Scalar, A: Scalar, O: Scalar>: SimdOps<A> {
     }
 }
 
+/// The `+128` bias the VNNI families add to the LHS: `vpdpbusd` multiplies an unsigned byte
+/// by a signed byte, so packing A as `A + 128` turns the signed x signed GEMM product into
+/// the unsigned x signed form the instruction computes. [`KernelSimd::dot_accumulate`] then
+/// subtracts `VNNI_A_BIAS * sum_k(B)` per column to recover the true product. The pack
+/// transform (`vnni_a_xform` in [`crate::kernel::int`]) and that correction must use the
+/// same constant, hence one definition shared by both. It lives here at L0, beside the
+/// `dot_accumulate` contract it corrects, so the kernel-side pack transform imports it
+/// downward and this module keeps its no-upward-references invariant
+#[cfg(feature = "int8")]
+pub(crate) const VNNI_A_BIAS: i32 = 128;
+
 /// Homogeneous blanket: when every family type equals the accumulator type there is
 /// nothing to widen or narrow, so `load_lhs`/`splat_rhs`/`load_out`/`store_out` are
 /// plain [`SimdOps`] load/splat/store and any homogeneous family (e.g.

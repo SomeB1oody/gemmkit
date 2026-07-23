@@ -18,7 +18,7 @@ use super::epilogue::{Epilogue, QuantOut};
 use super::{AlphaStatus, BetaStatus, KernelFamily};
 use crate::pack::{pack_kgroup_panels, pack_panels};
 use crate::scalar::Scalar;
-use crate::simd::{KernelSimd, SimdOps};
+use crate::simd::{KernelSimd, SimdOps, VNNI_A_BIAS};
 
 /// Fold `alpha` into `acc`, then store `C <- combine(alpha*A*B, beta*C)`, exactly, in `i32`
 ///
@@ -348,14 +348,6 @@ impl KernelFamily for IntGemm {
         }
     }
 }
-
-/// The `+128` bias the VNNI families add to the LHS: `vpdpbusd` multiplies an unsigned byte
-/// by a signed byte, so packing A as `A + 128` turns the signed x signed GEMM product into
-/// the unsigned x signed form the instruction computes. The [`crate::simd::KernelSimd::dot_accumulate`]
-/// override then subtracts `VNNI_A_BIAS * sum_k(B)` per column to recover the true product.
-/// The pack transform ([`vnni_a_xform`]) and that correction must use the same constant,
-/// hence one definition shared by both
-pub(crate) const VNNI_A_BIAS: i32 = 128;
 
 /// The LHS pack transform for the VNNI families ([`IntGemmVnni`] and, by delegation,
 /// `IntGemmVnniQ`): offset each byte by [`VNNI_A_BIAS`] into the unsigned domain `vpdpbusd`
