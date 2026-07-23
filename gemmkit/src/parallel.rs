@@ -250,8 +250,8 @@ impl Parallelism {
     /// Worker count for a bandwidth-bound shape (gemv/gevv) touching `bytes_touched`
     /// bytes over `rows` partitionable output rows
     ///
-    /// Unlike [`Parallelism::resolve`], whose `cbrt(mnk)` ramp models compute, this gates on
-    /// memory: below an LLC-derived byte floor the data is cache-resident and stays serial,
+    /// Unlike [`Parallelism::resolve`], whose work-based `m*n*k` ramp models compute, this gates
+    /// on memory: below an LLC-derived byte floor the data is cache-resident and stays serial,
     /// since splitting only adds fork/join and shared-cache contention with no DRAM to gain.
     /// Above the floor, auto steps straight to the topology bandwidth cap instead of ramping
     /// through it: a handful of workers is the worst point on a bandwidth-bound scaling curve,
@@ -314,8 +314,8 @@ pub(crate) enum BatchPlan {
 impl Parallelism {
     /// Pick the batched schedule for `batch` products of shape `m x k x n` (`sizeof` bytes per
     /// element). The batch is independent elements, not one big GEMM, so this does not use the
-    /// `cbrt(mnk)` compute ramp: it hands whole elements to workers once the total work justifies
-    /// forking at all
+    /// work-based `m*n*k` compute ramp: it hands whole elements to workers once the total work
+    /// justifies forking at all
     ///
     /// With `batch >= budget` there are enough elements to keep every worker busy on its own,
     /// running whole GEMMs serially and cache-hot. With fewer elements than workers, the spare

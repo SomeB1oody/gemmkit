@@ -164,7 +164,6 @@ pub(crate) fn check_fused<T: Flt>(
         m,
         k,
         &b,
-        k,
         n,
         beta,
         &mut c_fused,
@@ -209,8 +208,8 @@ pub(crate) fn check_fused<T: Flt>(
 }
 
 /// Wraps raw column-major LHS/RHS/C storage in `MatRef`/`MatMut` views and forwards to
-/// `gemm_fused_with`, so `check_fused` can drive it with borrowed bias slices. `_k2` is unused;
-/// `k` alone sizes both operands' contraction dimension
+/// `gemm_fused_with`, so `check_fused` can drive it with borrowed bias slices; `k` alone sizes
+/// both operands' contraction dimension
 pub(crate) fn gemm_fused_with_layout<T: Flt>(
     ws: &mut Workspace,
     alpha: T,
@@ -218,7 +217,6 @@ pub(crate) fn gemm_fused_with_layout<T: Flt>(
     m: usize,
     k: usize,
     b: &[T],
-    _k2: usize,
     n: usize,
     beta: T,
     c: &mut [T],

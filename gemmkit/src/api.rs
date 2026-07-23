@@ -339,9 +339,9 @@ fn validate_bias<T>(bias: &Option<Bias<'_, T>>, m: usize, n: usize, c: &MatMut<'
 /// Lower the public `Option<Bias>` / `Option<Activation>` epilogue selectors into the internal
 /// [`FusedEpi`] the dispatch layer consumes: the bias slice pointer is erased to the
 /// `Send + Sync` [`Ptr`] shim, and a `None` selector maps to the matching `None` variant. Used
-/// by every checked fused entry that takes borrowed `Bias`/`Activation` values (plain, batched,
-/// packed-A, packed-B); the complex entry builds its own bias-only [`FusedEpi`] (no activation)
-/// and the `_unchecked` entries lower raw pointers through [`to_fused_epi_raw`] instead
+/// by every checked fused entry that takes borrowed `Bias`/`Activation` values (plain, complex,
+/// batched, packed-A, packed-B); the `_unchecked` entries lower raw pointers through
+/// [`to_fused_epi_raw`] instead
 #[cfg(feature = "epilogue")]
 fn to_fused_epi<T>(bias: Option<Bias<'_, T>>, act: Option<Activation<T>>) -> FusedEpi<T> {
     let bias = match bias {

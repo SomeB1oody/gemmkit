@@ -7,9 +7,7 @@
 use super::*;
 use crate::dispatch::ComplexScalar;
 #[cfg(feature = "epilogue")]
-use crate::kernel::epilogue::{Act, BiasDim, BiasSpec, FusedEpi};
-#[cfg(feature = "epilogue")]
-use crate::parallel::Ptr;
+use crate::kernel::epilogue::BiasDim;
 
 /// Complex GEMM with optional conjugation: `C <- alpha*op(A)*op(B) + beta*C`, where
 /// `op(A) = conj(A)` when `conj_a` (independently, `op(B) = conj(B)` when `conj_b`). `T` is
@@ -151,15 +149,8 @@ pub fn gemm_cplx_fused_with<T: ComplexScalar>(
     // Bias length matches its axis and stays clear of C
     validate_bias(&Some(bias), a.rows, b.cols, &c);
 
-    let bias_spec = match bias {
-        Bias::PerRow(s) => BiasSpec::Row(Ptr(s.as_ptr() as *mut T)),
-        Bias::PerCol(s) => BiasSpec::Col(Ptr(s.as_ptr() as *mut T)),
-    };
-    // No activation on complex: always Act::None
-    let epi = FusedEpi {
-        bias: bias_spec,
-        act: Act::None,
-    };
+    // No activation on complex (ordering-based activations are undefined there); act stays None
+    let epi = to_fused_epi(Some(bias), None);
 
     // SAFETY: shapes, bounds, and non-aliasing validated above; the bias is in-bounds and
     // disjoint from C, and its borrow outlives this execute_complex_fused call
