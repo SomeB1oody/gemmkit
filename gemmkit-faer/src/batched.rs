@@ -19,7 +19,7 @@ use crate::common::ref_parts;
 ///
 /// ```
 /// use faer::Mat;
-/// use gemmkit::Parallelism;
+/// use gemmkit_faer::Parallelism;
 /// use gemmkit_faer::gemm_batched;
 /// let a = Mat::from_fn(2, 2, |i, j| [[1.0_f64, 2.0], [3.0, 4.0]][i][j]);
 /// let b = Mat::from_fn(2, 2, |i, j| [[5.0_f64, 6.0], [7.0, 8.0]][i][j]);

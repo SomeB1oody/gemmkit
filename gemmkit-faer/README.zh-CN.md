@@ -15,7 +15,6 @@
 ```toml
 [dependencies]
 gemmkit-faer = "0.1"
-gemmkit = "0.1" # for the Parallelism argument, which is not re-exported
 faer = "0.24"
 ```
 
@@ -31,7 +30,7 @@ fn main() {
 }
 ```
 
-`dot` 在一个新建的列主序 `Mat` 中返回 `A*B`。若要就地执行通用更新 `C <- alpha*A*B + beta*C`，请使用 `gemm(alpha, a, b, beta, c, par)`，其中 `par` 是一个 `gemmkit::Parallelism`；`gemm_with` 执行同样的调用，但使用调用方持有的 `gemmkit::Workspace`。元素类型 `T` 为 `f32` 或 `f64`，在 `half` 下还有 `f16` 和 `bf16`。
+`dot` 在一个新建的列主序 `Mat` 中返回 `A*B`。若要就地执行通用更新 `C <- alpha*A*B + beta*C`，请使用 `gemm(alpha, a, b, beta, c, par)`，其中 `par` 是一个 `gemmkit_faer::Parallelism`；`gemm_with` 执行同样的调用，但使用调用方持有的 `gemmkit_faer::Workspace`。元素类型 `T` 为 `f32` 或 `f64`，在 `half` 下还有 `f16` 和 `bf16`。
 
 除 `gemm` 和 `dot` 之外，本 crate 还提供：
 

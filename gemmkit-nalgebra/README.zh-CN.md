@@ -32,7 +32,6 @@ nalgebra 没有三维数组类型，所以批量 GEMM（`gemm_batched`）以每�
 ```toml
 [dependencies]
 gemmkit-nalgebra = "0.1"
-gemmkit = "0.1" # for the Parallelism argument, which is not re-exported
 nalgebra = "0.35"
 ```
 
@@ -49,7 +48,7 @@ fn main() {
 
 `dot(a, b)` 在一个新建的列主序 `DMatrix` 中返回 `A*B`。若需要累加形式
 `C <- alpha*A*B + beta*C`，请调用 `gemm(alpha, &a, &b, beta, &mut c, par)`，其中 `par`
-为一个 `gemmkit::Parallelism` 值。
+为一个 `gemmkit_nalgebra::Parallelism` 值。
 
 ## Cargo feature
 

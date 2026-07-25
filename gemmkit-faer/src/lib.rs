@@ -57,14 +57,16 @@ pub use gemmkit::{Activation, Bias};
 #[cfg(feature = "complex")]
 use gemmkit::{ComplexScalar, gemm_cplx_unchecked, gemm_cplx_unchecked_with};
 use gemmkit::{
-    GemmProblem, GemmScalar, Parallelism, Workspace, gemm_batched_ptr_unchecked,
-    gemm_packed_a_unchecked, gemm_packed_a_unchecked_with, gemm_packed_b_unchecked,
-    gemm_packed_b_unchecked_with, gemm_unchecked, gemm_unchecked_with, prepack_lhs_unchecked,
-    prepack_rhs_unchecked,
+    GemmProblem, GemmScalar, gemm_batched_ptr_unchecked, gemm_packed_a_unchecked,
+    gemm_packed_a_unchecked_with, gemm_packed_b_unchecked, gemm_packed_b_unchecked_with,
+    gemm_unchecked, gemm_unchecked_with, prepack_lhs_unchecked, prepack_rhs_unchecked,
 };
 /// The handles produced by [`prepack_rhs`]/[`prepack_lhs`] and consumed by the `gemm_packed_*`
 /// entries, re-exported so callers need not depend on `gemmkit` directly
 pub use gemmkit::{PackedLhs, PackedRhs};
+/// The [`Parallelism`] selector taken by every entry and the reusable [`Workspace`] taken by the
+/// `_with` variants, re-exported so callers need not depend on `gemmkit` directly
+pub use gemmkit::{Parallelism, Workspace};
 /// The requantization parameters ([`Requantize`]) and its per-tensor / per-row output scale
 /// ([`RequantScale`]), taken by [`gemm_i8_requant`] and [`gemm_i8_requant_u8`], re-exported so
 /// callers need not depend on `gemmkit` directly

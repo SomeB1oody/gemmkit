@@ -56,14 +56,16 @@ use gemmkit::{
     gemm_packed_b_fused_unchecked, gemm_packed_b_fused_unchecked_with,
 };
 use gemmkit::{
-    GemmProblem, GemmScalar, Parallelism, Workspace, gemm_batched_ptr_unchecked,
-    gemm_packed_a_unchecked, gemm_packed_a_unchecked_with, gemm_packed_b_unchecked,
-    gemm_packed_b_unchecked_with, gemm_unchecked, gemm_unchecked_with, prepack_lhs_unchecked,
-    prepack_rhs_unchecked,
+    GemmProblem, GemmScalar, gemm_batched_ptr_unchecked, gemm_packed_a_unchecked,
+    gemm_packed_a_unchecked_with, gemm_packed_b_unchecked, gemm_packed_b_unchecked_with,
+    gemm_unchecked, gemm_unchecked_with, prepack_lhs_unchecked, prepack_rhs_unchecked,
 };
 /// Prepacked-operand handles, re-exported so callers of [`prepack_rhs`]/[`prepack_lhs`] don't need
 /// a direct `gemmkit` dependency
 pub use gemmkit::{PackedLhs, PackedRhs};
+/// The [`Parallelism`] selector every entry takes and the reusable [`Workspace`] the `_with`
+/// variants take, re-exported so callers don't need a direct `gemmkit` dependency
+pub use gemmkit::{Parallelism, Workspace};
 /// Requantization parameters ([`Requantize`], with its per-tensor / per-row output scale
 /// [`RequantScale`]) for the `int8` fused entries, re-exported so callers of [`gemm_i8_requant`]
 /// don't need a direct `gemmkit` dependency

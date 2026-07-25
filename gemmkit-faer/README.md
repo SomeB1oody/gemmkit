@@ -15,7 +15,6 @@ A step-by-step guide for this adapter lives in the [gemmkit Guide](https://someb
 ```toml
 [dependencies]
 gemmkit-faer = "0.1"
-gemmkit = "0.1" # for the Parallelism argument, which is not re-exported
 faer = "0.24"
 ```
 
@@ -31,7 +30,7 @@ fn main() {
 }
 ```
 
-`dot` returns `A*B` in a fresh column-major `Mat`. For the general update `C <- alpha*A*B + beta*C` in place, use `gemm(alpha, a, b, beta, c, par)`, where `par` is a `gemmkit::Parallelism`; `gemm_with` runs the same call against a caller-owned `gemmkit::Workspace`. The element type `T` is `f32` or `f64`, plus `f16` and `bf16` under `half`.
+`dot` returns `A*B` in a fresh column-major `Mat`. For the general update `C <- alpha*A*B + beta*C` in place, use `gemm(alpha, a, b, beta, c, par)`, where `par` is a `gemmkit_faer::Parallelism`; `gemm_with` runs the same call against a caller-owned `gemmkit_faer::Workspace`. The element type `T` is `f32` or `f64`, plus `f16` and `bf16` under `half`.
 
 Beyond `gemm` and `dot`, the crate exposes:
 

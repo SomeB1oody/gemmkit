@@ -20,7 +20,7 @@ use crate::common::dims_strides;
 ///
 /// ```
 /// use nalgebra::DMatrix;
-/// use gemmkit::Parallelism;
+/// use gemmkit_nalgebra::Parallelism;
 /// use gemmkit_nalgebra::gemm_batched;
 /// let a = DMatrix::from_row_slice(2, 2, &[1.0_f32, 2.0, 3.0, 4.0]);
 /// let b = DMatrix::from_row_slice(2, 2, &[5.0_f32, 6.0, 7.0, 8.0]);

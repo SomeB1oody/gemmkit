@@ -15,7 +15,6 @@ A step-by-step guide for this adapter lives in the [gemmkit Guide](https://someb
 ```toml
 [dependencies]
 gemmkit-ndarray = "0.1"
-gemmkit = "0.1" # for the Parallelism argument, which is not re-exported
 ndarray = "0.17.1"
 ```
 
@@ -35,7 +34,7 @@ fn main() {
 `gemm` writes the general `C <- alpha*A*B + beta*C` in place and takes any layout without copying, including a transposed (column-major) view:
 
 ```rust
-use gemmkit::Parallelism;
+use gemmkit_ndarray::Parallelism;
 use ndarray::{Array2, array};
 
 fn main() {

@@ -15,7 +15,6 @@
 ```toml
 [dependencies]
 gemmkit-ndarray = "0.1"
-gemmkit = "0.1" # for the Parallelism argument, which is not re-exported
 ndarray = "0.17.1"
 ```
 
@@ -35,7 +34,7 @@ fn main() {
 `gemm` 就地写入通用形式 `C <- alpha*A*B + beta*C`，并且接受任意布局而无需拷贝，包括转置后的（列主序）视图：
 
 ```rust
-use gemmkit::Parallelism;
+use gemmkit_ndarray::Parallelism;
 use ndarray::{Array2, array};
 
 fn main() {

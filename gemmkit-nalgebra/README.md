@@ -32,7 +32,6 @@ A step-by-step guide for this adapter lives in the
 ```toml
 [dependencies]
 gemmkit-nalgebra = "0.1"
-gemmkit = "0.1" # for the Parallelism argument, which is not re-exported
 nalgebra = "0.35"
 ```
 
@@ -49,7 +48,7 @@ fn main() {
 
 `dot(a, b)` returns `A*B` in a fresh column-major `DMatrix`. For the accumulating form
 `C <- alpha*A*B + beta*C`, call `gemm(alpha, &a, &b, beta, &mut c, par)` with a
-`gemmkit::Parallelism` value.
+`gemmkit_nalgebra::Parallelism` value.
 
 ## Feature flags
 
