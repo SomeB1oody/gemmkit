@@ -230,7 +230,7 @@ fn small_k_threshold_route_correct() {
 
 /// `gemv_parallel_bytes` is a live knob: the byte floor forced to `1` (parallelize any gemv)
 /// or `usize::MAX` (never) must both produce the correct matrix*vector result. (`0` is *auto*,
-/// an LLC-derived floor, not an extreme, so it is not exercised here)
+/// a cache-derived floor, not an extreme, so it is not exercised here)
 #[test]
 fn gemv_parallel_bytes_route_correct() {
     let _g = knob_guard();

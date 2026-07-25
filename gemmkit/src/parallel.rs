@@ -430,32 +430,27 @@ impl Parallelism {
     }
 }
 
-/// Worker cap for a bandwidth-bound shape, from the `GEMMKIT_GEMV_THREAD_CAP` knob (`0`
-/// picks this auto proxy, non-zero passes through verbatim). DRAM saturates at far fewer
-/// workers than the logical core count: only a handful of physical cores are needed to
-/// saturate the memory controllers, and SMT siblings share a core's load/store units and
-/// memory ports besides. Neither the physical-core nor the memory-channel count is exposed
-/// (`l2.shared_by` is the GEMM-worker cluster size, `1` on x86/Neoverse), so this proxy is
-/// an arch-dependent fraction of the logical count, floored at 2
+/// Worker cap for a bandwidth-bound shape, from the `GEMMKIT_GEMV_THREAD_CAP` knob (`0` picks
+/// this auto proxy, non-zero passes through verbatim). A gemv saturates its bandwidth well below
+/// the logical core count, and past that point extra workers only add fork/join and cross-cache
+/// contention, so the auto proxy is half the logical count, floored at 2. Neither the
+/// physical-core nor the memory-channel count is exposed (`l2.shared_by` is the GEMM-worker
+/// cluster size, `1` on x86/Neoverse), so a fraction of the logical count is the available proxy
 ///
-/// * x86: a quarter (halved for SMT, halved again since roughly half the physical cores
-///   suffice to saturate DDR). Calibrated on Zen5, where a bandwidth-bound gemv plateaus
-///   around a quarter of the 32 logical cores
-/// * aarch64 (Apple/ARM, no SMT): a half, dropping the SMT-halving factor. Calibrated on
-///   M4 Max (10P+4E, ~245 GB/s aggregate): a bandwidth-bound gemv climbs to about 8 of 14
-///   workers and then declines as the E-cores add contention rather than bandwidth, so
-///   half the logical count (7) sits on the broad t=4-8 plateau. A higher-bandwidth part
-///   wants more workers; raise the knob for it
+/// Half, not a quarter: on the Zen5 9950X (32 logical) a forced-width gemv is fastest at 16
+/// workers across the mid-to-large hot band (8-32 MiB L3-resident, beating 8 workers by 28-47%)
+/// and every DRAM-cold size measured (a pool larger than L3, +4-10% under both the powersave and
+/// performance governors), while 32 workers regress below 16 everywhere, so the cap is real. Only
+/// a small hot matrix (2-4 MiB) peaks at 8 rather than 16, a size-dependent optimum a flat
+/// fraction cannot track; the byte floor above already lifts that band ~3x by admitting
+/// parallelism at all, so the wider cap still leaves it far ahead of the old serial. The aarch64
+/// half was calibrated on an M4 Max (10P+4E, ~245 GB/s): a gemv climbs to about 8 of 14 workers,
+/// so half the logical count sits on the plateau. A higher-bandwidth part wants more workers;
+/// raise the knob for it
 #[cfg(feature = "parallel")]
 fn bandwidth_cap(cores: usize) -> usize {
     match tuning::gemv_thread_cap() {
-        0 => {
-            #[cfg(target_arch = "aarch64")]
-            let auto = cores / 2;
-            #[cfg(not(target_arch = "aarch64"))]
-            let auto = cores / 4;
-            auto.max(2)
-        }
+        0 => (cores / 2).max(2),
         v => v.max(1),
     }
 }

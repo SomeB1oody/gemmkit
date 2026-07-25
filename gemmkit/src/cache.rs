@@ -221,15 +221,20 @@ pub(crate) fn lhs_pack_span_bytes() -> usize {
     }
 }
 
-/// The gemv/gevv parallelism byte floor: below this much touched data the problem is
-/// LLC-resident and one core already gets the full LLC bandwidth, so splitting only adds
-/// fork/join and shared-cache contention with no DRAM bandwidth to gain. `GEMMKIT_GEMV_PARALLEL_BYTES`
-/// overrides it verbatim; `0` (the default) derives it from the last-level cache. Centralized
-/// here (like [`lhs_pack_stride_bytes`]) as the one home for the `0 => auto` derivation
+/// The gemv/gevv parallelism byte floor: below this much touched data the matrix fits a single
+/// core's private cache, which that core saturates alone, so splitting only adds fork/join and
+/// shared-cache contention with no bandwidth to gain. Above it the matrix spills to the shared
+/// last level, whose bandwidth a single core cannot saturate, so splitting pays.
+/// `GEMMKIT_GEMV_PARALLEL_BYTES` overrides it verbatim; `0` (the default) derives it from the
+/// cache. Centralized here (like [`lhs_pack_stride_bytes`]) as the one home for the `0 => auto`
+/// derivation
 ///
-/// * With an L3 (x86, Graviton): half of the per-core-reachable L3
-///   ([`Level::effective_bytes`]). Calibrated on the Zen5 9950X as a 16 MiB floor
-///   against its 32 MiB per-CCD slice
+/// * With an L3 (x86, Graviton): the per-core private L2 (`l2.bytes`), where the matrix stops
+///   fitting private cache and spills to the shared L3. Calibrated on the Zen5 9950X (1 MiB L2):
+///   a hot gemv breaks even near 0.75x L2, wins 1.8x at L2 and 3-5x above, while below 0.5x L2
+///   serial wins by ~20%. The old l3/2 floor (16 MiB) forced serial across the whole L2-to-L3
+///   band, leaving 3-5x unclaimed for a repeatedly scanned matrix. Graviton follows by analogy
+///   (private L2, shared L3), unrevalidated
 /// * No L3 (Apple's shared cluster-L2): a fraction of the *full* shared L2, not
 ///   `effective_bytes`, which divides by the cluster size (`shared_by`) for the per-worker BLIS
 ///   budget. For the serial-vs-parallel gemv question, a single core streams from the whole
@@ -251,7 +256,7 @@ pub(crate) fn gemv_parallel_floor_bytes() -> usize {
             #[cfg(not(target_arch = "aarch64"))]
             const NO_L3_DIV: usize = 2;
             match t.l3 {
-                Some(l3) => (l3.effective_bytes() / 2).max(1),
+                Some(_) => t.l2.bytes.max(1),
                 None => (t.l2.bytes / NO_L3_DIV).max(1),
             }
         }

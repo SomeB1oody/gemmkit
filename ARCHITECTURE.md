@@ -339,8 +339,9 @@ available jobs); the auto count scales with the total work, one worker per
 `GEMMKIT_PAR_MNK_PER_WORKER` block of `m*n*k` (default 2_000_000), capped by
 cores and jobs and floored at 1. It is work-based rather than dimension-based
 because the measured optimum tracks total flops, not linear size. Bandwidth-
-bound shapes (gemv/gevv) use a different rule: serial below an LLC-derived
-byte floor, then straight to a bandwidth cap, because a few workers is the
+bound shapes (gemv/gevv) use a different rule: serial below a cache-derived
+byte floor (the per-core private L2, above which the matrix spills to the
+shared L3), then straight to a bandwidth cap, because a few workers is the
 worst point on a bandwidth scaling curve.
 
 Rayon fork/join overhead scales with a pool's idle slack (threads minus
