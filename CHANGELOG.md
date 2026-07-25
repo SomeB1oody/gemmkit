@@ -8,7 +8,29 @@ workspace crates (`gemmkit`, `gemmkit-ndarray`, `gemmkit-nalgebra`, `gemmkit-fae
 `gemmkit-tune`) share one version and release in lockstep, so releases are recorded
 once with per-crate subsections where a change is crate-specific.
 
-## [0.1.0] - Unreleased
+## [0.1.1] - 2026-07-24
+
+### gemmkit
+
+#### Changed
+
+- Recalibrated the bandwidth-bound (gemv/gevv) parallelism defaults on the Zen5
+  reference machine: the serial floor dropped from half the per-core L3 to the
+  per-core private L2, so a repeatedly scanned matrix in the L2-to-L3 band now
+  parallelizes instead of running single-threaded, and the auto worker cap rose
+  from a quarter to half the logical core count. Both stay auto-derived and
+  overridable with `GEMMKIT_GEMV_PARALLEL_BYTES` and `GEMMKIT_GEMV_THREAD_CAP`;
+  gemv output remains bit-identical across worker counts
+
+### gemmkit-ndarray, gemmkit-nalgebra, gemmkit-faer
+
+#### Added
+
+- Re-export `Parallelism` and `Workspace` from each adapter, so callers no longer
+  need a direct `gemmkit` dependency to name the parallelism argument every entry
+  takes or the workspace the `*_with` variants reuse
+
+## [0.1.0] - 2026-07-24
 
 Initial release.
 

@@ -611,7 +611,7 @@ dependencies = [
 
 [[package]]
 name = "gemmkit"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "criterion",
  "gemm 0.18.2",
@@ -625,7 +625,7 @@ dependencies = [
 
 [[package]]
 name = "gemmkit-faer"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "faer",
  "gemmkit",
@@ -633,7 +633,7 @@ dependencies = [
 
 [[package]]
 name = "gemmkit-nalgebra"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "approx",
  "gemmkit",
@@ -642,7 +642,7 @@ dependencies = [
 
 [[package]]
 name = "gemmkit-ndarray"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "approx",
  "gemmkit",
@@ -651,7 +651,7 @@ dependencies = [
 
 [[package]]
 name = "gemmkit-tune"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "console",
  "gemmkit",
