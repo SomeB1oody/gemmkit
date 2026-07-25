@@ -97,15 +97,18 @@ impl SimdOps<f32> for Simd128 {
     }
     #[inline(always)]
     unsafe fn max(self, a: Self::Reg, b: Self::Reg) -> Self::Reg {
-        // f32x4_pmax(a, b) is `a < b ? b : a`, and an unordered compare (NaN in either
-        // side) makes `a < b` false, so it takes the `a` branch: a NaN `a` returns NaN
-        // here, not `b`. NOT f32x4_max, which propagates NaN from either operand
-        f32x4_pmax(a, b)
+        // Operands reversed on purpose: f32x4_pmax(x, y) is `x < y ? y : x`, so
+        // pmax(b, a) is `b < a ? a : b`, which is the trait's `if a > b { a } else { b }`.
+        // An unordered compare is false, so a NaN `a` falls to `b`, and `max(-0.0, +0.0)`
+        // is `+0.0`; the natural argument order gets both backwards. NOT f32x4_max, which
+        // propagates NaN from either operand
+        f32x4_pmax(b, a)
     }
     #[inline(always)]
     unsafe fn min(self, a: Self::Reg, b: Self::Reg) -> Self::Reg {
-        // f32x4_pmin(a, b) is `b < a ? b : a`; same unordered-takes-`a` shape as pmax
-        f32x4_pmin(a, b)
+        // Reversed for the same reason: f32x4_pmin(x, y) is `y < x ? y : x`, so
+        // pmin(b, a) is `a < b ? a : b`
+        f32x4_pmin(b, a)
     }
     #[inline(always)]
     unsafe fn reduce_sum(self, v: Self::Reg) -> f32 {
@@ -157,14 +160,13 @@ impl SimdOps<f64> for Simd128 {
     }
     #[inline(always)]
     unsafe fn max(self, a: Self::Reg, b: Self::Reg) -> Self::Reg {
-        // f64x2_pmax(a, b) is `a < b ? b : a`: a NaN `a` returns NaN, not `b`; see the
-        // f32 impl
-        f64x2_pmax(a, b)
+        // Operands reversed to get `if a > b { a } else { b }`; see the f32 impl
+        f64x2_pmax(b, a)
     }
     #[inline(always)]
     unsafe fn min(self, a: Self::Reg, b: Self::Reg) -> Self::Reg {
-        // f64x2_pmin(a, b) is `b < a ? b : a`; see the f32 impl
-        f64x2_pmin(a, b)
+        // Operands reversed to get `if a < b { a } else { b }`; see the f32 impl
+        f64x2_pmin(b, a)
     }
     #[inline(always)]
     unsafe fn reduce_sum(self, v: Self::Reg) -> f64 {
