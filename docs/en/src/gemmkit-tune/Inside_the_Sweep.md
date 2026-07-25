@@ -30,6 +30,7 @@ The probes are picked per knob to make the knob bind. A few examples:
 | `LHS_PACK_THRESHOLD` | col-major A, candidates 32..MAX | brackets both the aarch64 low-reuse plateau and the x86 default of 1024 |
 | `SMALL_K_THRESHOLD` | skinny large-`m,n` small-`k`, e.g. 4096x16x4096 | `k` straddles the in-place / packed-driver crossover |
 | `GEMV_PARALLEL_BYTES` | huge-`m` gemv, GB/s | spans the cache-resident / DRAM-bound byte floor |
+| `GEMV_TIER_STEP`, `GEMV_THREAD_CAP` | gemv from about 2.4 to 134 MiB touched, GB/s | straddles a rung of the gemv worker ladder: a probe set sitting entirely in one rung would score every candidate the same |
 | `SEQ_INTERNAL_BYTES_PER_WORKER` (aarch64) | batched shapes giving 96/192/384/432 KiB per batch-worker | straddles the ~128 KiB default on both sides — a two-sided validator |
 | `I8_VNNI_MIN_PAR_MNK` (x86) | square i8, 384/512/640 | brackets the VNNI / widen-fallback parallel crossover |
 

@@ -680,7 +680,7 @@ fn main() {
     let mut large_skipped: Vec<(&'static str, String)> = Vec::new();
 
     let sweep_total: u64 = {
-        let mut n: u64 = 16;
+        let mut n: u64 = 17;
         n += u64::from(gemmkit::topology().l3.is_none());
         n += u64::from(cfg!(target_arch = "x86_64"));
         n += u64::from(cfg!(target_arch = "aarch64"));
@@ -1012,15 +1012,19 @@ fn main() {
     // Bandwidth-bound gemv knobs
     // GEMMKIT_K_STREAM_MAX is a heavy opt-in knob swept only under --large-matrices; see the
     // "Large-matrix probes" block below
+    // The 2.4 MiB shape is the point of the shape list: the auto width is a size ladder, so a
+    // probe set that sits entirely in one rung (these 2 large shapes alone are both ~134 MiB,
+    // deep in the top rung) cannot see a flat override lose to the ladder, and would report
+    // every candidate as equivalent
     knob!(
         "GEMMKIT_GEMV_THREAD_CAP",
         sweep_gemv(
             "GEMMKIT_GEMV_THREAD_CAP",
             tuning::set_gemv_thread_cap,
-            tuning::GEMV_THREAD_CAP_DEFAULT, // 0 = auto
+            tuning::GEMV_THREAD_CAP_DEFAULT, // 0 = auto (the size ladder)
             &[2, 4, 8, 16],
             &timing,
-            &[(1 << 20, 32), (1 << 21, 16)],
+            &[(1 << 16, 8), (1 << 20, 32), (1 << 21, 16)],
             par,
         )
     );
@@ -1029,10 +1033,27 @@ fn main() {
         sweep_gemv(
             "GEMMKIT_GEMV_PARALLEL_BYTES",
             tuning::set_gemv_parallel_bytes,
-            tuning::GEMV_PARALLEL_BYTES_DEFAULT, // 0 = auto (LLC-derived)
+            tuning::GEMV_PARALLEL_BYTES_DEFAULT, // 0 = auto (cache-derived)
             &[1 << 20, 1 << 22, 1 << 24],
             &timing,
             &[(1 << 16, 8), (1 << 19, 4), (1 << 22, 8)],
+            par,
+        )
+    );
+    // Rung spacing for that same ladder, so the shapes must straddle a rung boundary to
+    // discriminate: ~2.4 MiB, ~10.5 MiB and ~134 MiB of touched bytes, which the candidates move
+    // between rungs (a step of 4 or 8 puts the smallest shape one rung below the other 2, while
+    // 32 pulls the middle shape down with it). Inert where fewer than 2 pool tiers are active,
+    // which the report flags as a no-effect sweep rather than a recommendation
+    knob!(
+        "GEMMKIT_GEMV_TIER_STEP",
+        sweep_gemv(
+            "GEMMKIT_GEMV_TIER_STEP",
+            tuning::set_gemv_tier_step,
+            tuning::GEMV_TIER_STEP_DEFAULT, // 0 = auto
+            &[2, 4, 16, 32],
+            &timing,
+            &[(1 << 16, 8), (1 << 19, 4), (1 << 20, 32)],
             par,
         )
     );
@@ -1534,6 +1555,7 @@ const TUNED: &[&str] = &[
     "GEMMKIT_SMALL_MN_PACK_MIN_K",
     "GEMMKIT_GEMV_PARALLEL_BYTES",
     "GEMMKIT_GEMV_THREAD_CAP",
+    "GEMMKIT_GEMV_TIER_STEP",
     "GEMMKIT_PARALLEL_OVERSAMPLE",
     "GEMMKIT_PAR_MNK_PER_WORKER",
     "GEMMKIT_POOL_CLASSES",
@@ -1578,7 +1600,7 @@ mod knob_coverage {
     #[test]
     fn sweep_table_covers_every_knob() {
         // gemmkit-tune enables the int8 feature but not wasm_threads (see Cargo.toml), so
-        // knob_env_names() is always the 28 base knobs plus I8_VNNI_MIN_PAR_MNK, 29 total; TUNED
+        // knob_env_names() is always the 29 base knobs plus I8_VNNI_MIN_PAR_MNK, 30 total; TUNED
         // and NEVER_TUNED must partition that set exactly
         let names: BTreeSet<&str> = gemmkit::tuning::knob_env_names().iter().copied().collect();
         let tuned: BTreeSet<&str> = TUNED.iter().copied().collect();

@@ -265,13 +265,30 @@ static GEMV_PARALLEL_BYTES: Threshold =
 // Hard cap on the worker count a bandwidth-bound gemv/gevv may use. This is the escape hatch for
 // the fact that the memory-parallel width is a heuristic proxy: no physical-core or
 // memory-channel count is exposed at runtime, and DRAM saturates at far fewer workers than the
-// logical core count. Raise it on a high-bandwidth shared-cache part (e.g. Apple Silicon)
+// logical core count. Raise it on a high-bandwidth shared-cache part (e.g. Apple Silicon). A
+// non-zero value is the width verbatim, which also pins the size ladder below flat: it is the
+// "I measured this machine, use exactly this" override, not a ceiling on the auto ladder
 /// Compiled default for [`gemv_thread_cap`]: overridden by `GEMMKIT_GEMV_THREAD_CAP` or
-/// [`set_gemv_thread_cap`]; `0` means auto (derived from the logical core count, see
+/// [`set_gemv_thread_cap`]; `0` means auto (a size ladder over the pool tiers, see
 /// `crate::parallel::bandwidth_cap`)
 pub const GEMV_THREAD_CAP_DEFAULT: usize = 0;
 static GEMV_THREAD_CAP: Threshold =
     Threshold::new("GEMMKIT_GEMV_THREAD_CAP", GEMV_THREAD_CAP_DEFAULT);
+
+// Byte spacing between the rungs of the auto bandwidth-bound worker ladder: rung `i`, counting up
+// from the smallest active pool tier, takes over at `gemv_parallel_floor_bytes` times this to the
+// `i`, so the gemv width climbs one pool tier per factor of this in touched bytes. How MANY rungs
+// exist is deliberately not a separate knob - the ladder IS the exact-fit pool tier ladder
+// (`pool_classes` below), so the two cannot disagree and land on a width no pool fits, which would
+// pay rayon's slack tax. Calibrated on the Zen5 9950X (1 MiB private-L2 floor, tiers of 8 and 16):
+// a repeatedly scanned matrix peaks at 8 workers up through about 8 MiB and at 16 from about
+// 12 MiB, putting the single crossover near 8x the floor. Only consulted where 2 or more tiers are
+// active, so aarch64's single-tier default never reaches it
+/// Compiled default for [`gemv_tier_step`]: overridden by `GEMMKIT_GEMV_TIER_STEP` or
+/// [`set_gemv_tier_step`]; `0` means auto (see `crate::parallel::GEMV_TIER_STEP_AUTO`), and `1`
+/// collapses the ladder onto its top tier
+pub const GEMV_TIER_STEP_DEFAULT: usize = 0;
+static GEMV_TIER_STEP: Threshold = Threshold::new("GEMMKIT_GEMV_TIER_STEP", GEMV_TIER_STEP_DEFAULT);
 
 // Dynamic-scheduling granularity for the general parallel path: the driver aims for this many
 // work chunks per worker, handed out from a shared atomic cursor on demand, so a faster core
@@ -340,10 +357,6 @@ static POOL_CLASSES: Threshold = Threshold::new("GEMMKIT_POOL_CLASSES", POOL_CLA
 // Work gate (`m*n*k`) at which the auto path leaves the largest private pool tier for the full
 // machine width. Below it a tier pool (the physical cores on x86, no SMT) wins; only the largest
 // problems pay for the full machine width. Calibrated on the Zen5 9950X between 448^3 (89.9M, where
-// the physical-core tier still wins by 7%) and 512^3 (134M, where full width wins by 5%). The
-// auto value is arch-split at the consumer: aarch64 (M4 Max, no SMT) crosses over an order of
-// magnitude earlier, between 224^3 and 256^3. Only consulted when pool tiers are active
-// (`pool_classes` above is non-zero)
 // the physical-core tier still wins by 7%) and 512^3 (134M, where full width wins by 5%). The
 // auto value is arch-split at the consumer: aarch64 (M4 Max, no SMT) crosses over an order of
 // magnitude earlier, between 224^3 and 256^3. Only consulted when pool tiers are active
@@ -550,12 +563,12 @@ static I8_VNNI_MIN_PAR_MNK: Threshold =
 // itself against this one, so a knob added above cannot silently escape their coverage. A static
 // cannot be iterated over without a macro (which this crate avoids), so this manual mirror is the
 // chosen tradeoff: every `Threshold` static declared above must have its env name appear here
-// The 28 knobs that exist in every build live in `KNOB_ENV_NAMES_BASE`; the 2 that are cfg-gated
+// The 29 knobs that exist in every build live in `KNOB_ENV_NAMES_BASE`; the 2 that are cfg-gated
 // (whose `Threshold` statics above carry the same cfg) are appended only when actually compiled
 // in - `I8_VNNI_MIN_PAR_MNK` under the `int8` feature and `WASM_THREADS` under
 // `wasm32 + wasm_threads`. Declaring a `Threshold` here without adding its name to one of these 2
 // lists is a small diff away from being caught: the consumer sync tests assert against the count
-const KNOB_ENV_NAMES_BASE: [&str; 28] = [
+const KNOB_ENV_NAMES_BASE: [&str; 29] = [
     "GEMMKIT_PARALLEL_THRESHOLD",
     "GEMMKIT_RHS_PACK_THRESHOLD",
     "GEMMKIT_LHS_PACK_THRESHOLD",
@@ -568,6 +581,7 @@ const KNOB_ENV_NAMES_BASE: [&str; 28] = [
     "GEMMKIT_SMALL_MN_PACK_MIN_K",
     "GEMMKIT_GEMV_PARALLEL_BYTES",
     "GEMMKIT_GEMV_THREAD_CAP",
+    "GEMMKIT_GEMV_TIER_STEP",
     "GEMMKIT_PARALLEL_OVERSAMPLE",
     "GEMMKIT_PAR_MNK_PER_WORKER",
     "GEMMKIT_POOL_CLASSES",
@@ -753,6 +767,19 @@ pub fn gemv_thread_cap() -> usize {
 /// Override the gemv/gevv worker cap (`0` restores the core-derived auto proxy)
 pub fn set_gemv_thread_cap(v: usize) {
     GEMV_THREAD_CAP.set(v);
+}
+
+/// Get the byte spacing between rungs of the auto gemv/gevv worker ladder: the width climbs one
+/// exact-fit pool tier per factor of this in touched bytes, starting from
+/// [`gemv_parallel_bytes`]. `0` means auto (see `crate::parallel::GEMV_TIER_STEP_AUTO`).
+/// Consulted only when the auto path runs (`gemv_thread_cap` is `0`) with 2 or more pool tiers
+/// active (`pool_classes`)
+pub fn gemv_tier_step() -> usize {
+    GEMV_TIER_STEP.get()
+}
+/// Override the gemv/gevv worker ladder's byte spacing (`0` restores the auto value)
+pub fn set_gemv_tier_step(v: usize) {
+    GEMV_TIER_STEP.set(v);
 }
 
 /// Get the parallel dynamic-scheduling oversample factor (target chunks per worker). Always

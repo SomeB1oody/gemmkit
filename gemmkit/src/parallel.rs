@@ -89,6 +89,18 @@ const FULL_WIDTH_MNK_AUTO: usize = 110_000_000;
 #[cfg(all(feature = "parallel", target_arch = "aarch64"))]
 const FULL_WIDTH_MNK_AUTO: usize = 14_000_000;
 
+/// The auto value for `tuning::gemv_tier_step` (a `0` knob): the factor in touched bytes between
+/// two rungs of the bandwidth-bound worker ladder in [`bandwidth_cap`]. Measured on the Zen5
+/// 9950X, whose 1 MiB private-L2 floor and tiers of 8 and 16 give the ladder a single crossover,
+/// placed by this factor: a repeatedly scanned matrix is fastest at 8 workers up through about
+/// 8 MiB (by 55% at 1.5 MiB, 9% at 8 MiB) and at 16 from about 12 MiB (by 4%, then 12-34%). A
+/// step of 8 puts the boundary at 8 MiB, a hair early; the next candidate, 16, would put it at
+/// 16 MiB and give up more on the other side. Not arch-split, because the only shipped
+/// multi-tier default is the x86 one this was measured on; a machine whose bandwidth scales
+/// differently sweeps the knob
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+const GEMV_TIER_STEP_AUTO: usize = 8;
+
 /// The active exact-fit pool tier sizes, ascending, as a fixed `[size; 3]` array plus a length
 /// (no heap). Derived on every call so the `pool_classes` knob stays sweepable in-process (its
 /// getter is a cached atomic, cheap). `pool_classes` (clamped to 3) picks how many tiers halve
@@ -251,12 +263,13 @@ impl Parallelism {
     /// bytes over `rows` partitionable output rows
     ///
     /// Unlike [`Parallelism::resolve`], whose work-based `m*n*k` ramp models compute, this gates
-    /// on memory: below an LLC-derived byte floor the data is cache-resident and stays serial,
-    /// since splitting only adds fork/join and shared-cache contention with no DRAM to gain.
-    /// Above the floor, auto steps straight to the topology bandwidth cap instead of ramping
-    /// through it: a handful of workers is the worst point on a bandwidth-bound scaling curve,
-    /// so ramping through that dip is worse than jumping past it. The floor gate runs before
-    /// the request check, like `resolve`'s work gate, so an explicit `Rayon(n)` also stays
+    /// on memory: below a cache-derived byte floor the data fits one core's private cache, which
+    /// that core saturates alone, so splitting only adds fork/join and shared-cache contention
+    /// with no bandwidth to gain. Above the floor, auto steps straight to the [`bandwidth_cap`]
+    /// width for those bytes instead of ramping up to it: a handful of workers is the worst point
+    /// on a bandwidth-bound scaling curve, so ramping through that dip is worse than jumping past
+    /// it (the width itself still climbs with size, but in pool-tier steps). The floor gate runs
+    /// before the request check, like `resolve`'s work gate, so an explicit `Rayon(n)` also stays
     /// serial below it and is honored (capped by cores and rows) above it
     #[cfg_attr(not(feature = "parallel"), allow(unused_variables))]
     pub(crate) fn resolve_bandwidth(self, bytes_touched: usize, rows: usize) -> usize {
@@ -271,8 +284,8 @@ impl Parallelism {
                 if !RAYON_USABLE {
                     return 1;
                 }
-                // Below the LLC-resident floor: one core already gets full LLC bandwidth, so
-                // splitting only adds fork/join and shared-cache contention with no DRAM to gain
+                // Below the floor the data fits one core's private cache, which that core
+                // saturates alone, so splitting only adds fork/join and shared-cache contention
                 if bytes_touched < crate::cache::gemv_parallel_floor_bytes() {
                     return 1;
                 }
@@ -281,12 +294,15 @@ impl Parallelism {
                 if req != 0 {
                     return req.min(auto_threads()).min(rows).max(1);
                 }
-                // Auto: jump straight to the cap rather than ramp through it. A handful of
-                // workers is the worst point on a bandwidth-bound curve (fork/join and
-                // shared-cache contention, before the cap's aggregate DRAM bandwidth pays
-                // off), so neither serial nor a slow ramp beats the cap here
+                // Auto: jump straight to the width for these bytes rather than ramp up to it. A
+                // handful of workers is the worst point on a bandwidth-bound curve (fork/join and
+                // shared-cache contention, before the aggregate DRAM bandwidth pays off), so
+                // neither serial nor a slow ramp beats it here
                 let cores = auto_threads();
-                bandwidth_cap(cores).min(cores).min(rows).max(1)
+                bandwidth_cap(cores, bytes_touched)
+                    .min(cores)
+                    .min(rows)
+                    .max(1)
             }
         }
     }
@@ -430,28 +446,69 @@ impl Parallelism {
     }
 }
 
-/// Worker cap for a bandwidth-bound shape, from the `GEMMKIT_GEMV_THREAD_CAP` knob (`0` picks
-/// this auto proxy, non-zero passes through verbatim). A gemv saturates its bandwidth well below
-/// the logical core count, and past that point extra workers only add fork/join and cross-cache
-/// contention, so the auto proxy is half the logical count, floored at 2. Neither the
-/// physical-core nor the memory-channel count is exposed (`l2.shared_by` is the GEMM-worker
-/// cluster size, `1` on x86/Neoverse), so a fraction of the logical count is the available proxy
+/// Worker width for a bandwidth-bound shape touching `bytes` bytes, from the
+/// `GEMMKIT_GEMV_THREAD_CAP` knob (`0` picks the auto ladder below, non-zero passes through
+/// verbatim as a flat width). A gemv saturates its bandwidth well below the logical core count,
+/// and past that point extra workers only add fork/join and cross-cache contention, so the auto
+/// width tops out at half the logical count. Neither the physical-core nor the memory-channel
+/// count is exposed (`l2.shared_by` is the GEMM-worker cluster size, `1` on x86/Neoverse), so a
+/// fraction of the logical count is the available proxy
 ///
-/// Half, not a quarter: on the Zen5 9950X (32 logical) a forced-width gemv is fastest at 16
-/// workers across the mid-to-large hot band (8-32 MiB L3-resident, beating 8 workers by 28-47%)
-/// and every DRAM-cold size measured (a pool larger than L3, +4-10% under both the powersave and
-/// performance governors), while 32 workers regress below 16 everywhere, so the cap is real. Only
-/// a small hot matrix (2-4 MiB) peaks at 8 rather than 16, a size-dependent optimum a flat
-/// fraction cannot track; the byte floor above already lifts that band ~3x by admitting
-/// parallelism at all, so the wider cap still leaves it far ahead of the old serial. The aarch64
-/// half was calibrated on an M4 Max (10P+4E, ~245 GB/s): a gemv climbs to about 8 of 14 workers,
-/// so half the logical count sits on the plateau. A higher-bandwidth part wants more workers;
-/// raise the knob for it
+/// The width is a ladder over bytes, not one fraction: on the Zen5 9950X (32 logical) a
+/// forced-width gemv is fastest at 16 workers across the mid-to-large hot band (8-32 MiB
+/// L3-resident, beating 8 workers by 28-47%), while a small hot matrix (1.5-4 MiB) peaks at 8
+/// instead, where 16 workers lose 30-50%. DRAM-cold sizes agree: a pool larger than L3 is
+/// near-flat from 4 MiB up (16 ahead of 8 by 1-10%) but prefers 8 at 2 MiB by 14%, since nothing
+/// there is resident to contend over. 32 workers regress below 16 everywhere, so the ladder must
+/// also stop short of the full width. The rungs are the
+/// [`class_sizes`] pool tiers themselves rather than a private set of fractions, so an auto gemv
+/// width always has an exact-fit pool waiting for it in [`for_each_worker`] and never pays
+/// rayon's slack tax; `gemv_tier_step` sets how many bytes apart the rungs sit, starting from
+/// the serial floor. With the tiers off (or a machine too narrow to form one) there are no rungs
+/// to climb and the width falls back to the flat half
+///
+/// The aarch64 side was calibrated on an M4 Max (10P+4E, ~245 GB/s): a gemv climbs to about 8 of
+/// 14 workers, so half the logical count sits on the plateau. Its single default tier makes the
+/// ladder degenerate to that one width, which is deliberate - a second aarch64 tier would change
+/// the compute path's tier snapping too, and has not been measured. A higher-bandwidth part
+/// wants more workers; raise the knob for it
 #[cfg(feature = "parallel")]
-fn bandwidth_cap(cores: usize) -> usize {
-    match tuning::gemv_thread_cap() {
-        0 => (cores / 2).max(2),
-        v => v.max(1),
+fn bandwidth_cap(cores: usize, bytes: usize) -> usize {
+    // An explicit width is the "I measured this machine" override: it pins the ladder flat rather
+    // than capping it, so the knob means exactly what it did before the ladder existed
+    let knob = tuning::gemv_thread_cap();
+    if knob != 0 {
+        return knob.max(1);
+    }
+    let flat = (cores / 2).max(2);
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = bytes;
+        flat
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let (tiers, n_tiers) = class_sizes();
+        if n_tiers == 0 {
+            return flat;
+        }
+        let step = match tuning::gemv_tier_step() {
+            0 => GEMV_TIER_STEP_AUTO,
+            v => v.max(1),
+        };
+        // Climb one tier per `step` in touched bytes above the serial floor: rung `i` owns
+        // `[floor * step^i, floor * step^(i+1))`, and the top tier owns everything above. A
+        // `step` of 1 (or a saturated bound on a huge floor) simply lands on the top tier
+        let mut rung = 0;
+        let mut bound = crate::cache::gemv_parallel_floor_bytes();
+        while rung + 1 < n_tiers {
+            bound = bound.saturating_mul(step);
+            if bytes < bound {
+                break;
+            }
+            rung += 1;
+        }
+        tiers[rung]
     }
 }
 
@@ -725,8 +782,9 @@ mod tests {
     }
 
     // Serializes the size-class-pool knob tests below: they mutate the process-global
-    // `pool_classes` / `full_width_mnk` knobs, so 2 running concurrently in this binary could
-    // interleave their set/restore. Recovers a poisoned lock so 1 panic does not cascade
+    // `pool_classes` / `full_width_mnk` / gemv-ladder knobs, so 2 running concurrently in this
+    // binary could interleave their set/restore. Recovers a poisoned lock so 1 panic does not
+    // cascade
     #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
     static POOL_KNOB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -813,5 +871,82 @@ mod tests {
         let w = Parallelism::Rayon(0).resolve(usize::MAX / 4, n_jobs);
         assert_eq!(w, cores.min(n_jobs).max(1), "huge mnk must take full width");
         crate::tuning::set_pool_classes(prev);
+    }
+
+    /// The auto bandwidth width climbs the pool-tier ladder with touched bytes: serial below the
+    /// floor, the smallest tier at it, one tier up per `gemv_tier_step` factor, and the top tier
+    /// from there on. Derived from the live tiers and floor, never a hard-coded width, and
+    /// skipped on a machine too narrow to form the 2 tiers a ladder needs
+    #[test]
+    #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+    fn resolve_bandwidth_climbs_the_tier_ladder() {
+        let _lock = POOL_KNOB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_pc = crate::tuning::pool_classes();
+        crate::tuning::set_pool_classes(2);
+        let (tiers, n_tiers) = class_sizes();
+        if n_tiers < 2 {
+            crate::tuning::set_pool_classes(prev_pc);
+            return; // no ladder to climb on this machine; nothing to assert
+        }
+        let prev_step = crate::tuning::gemv_tier_step();
+        let step = 4;
+        crate::tuning::set_gemv_tier_step(step);
+        let floor = crate::cache::gemv_parallel_floor_bytes();
+        // Rows never bind here, so the width is the ladder's alone
+        let at = |bytes: usize| Parallelism::Rayon(0).resolve_bandwidth(bytes, usize::MAX);
+
+        assert_eq!(
+            at(floor.saturating_sub(1)),
+            1,
+            "below the floor stays serial"
+        );
+        assert_eq!(at(floor), tiers[0], "the floor takes the smallest tier");
+        let first_step = floor.saturating_mul(step);
+        assert_eq!(at(first_step - 1), tiers[0], "just under the first step");
+        assert_eq!(at(first_step), tiers[1], "one step up takes the next tier");
+        assert_eq!(
+            at(usize::MAX / 2),
+            tiers[n_tiers - 1],
+            "past the ladder takes the top tier"
+        );
+
+        // Monotone: more bytes never buy fewer workers
+        let mut prev_w = 0;
+        let mut bytes = floor;
+        for _ in 0..8 {
+            let w = at(bytes);
+            assert!(
+                w >= prev_w,
+                "width fell from {prev_w} to {w} at {bytes} bytes"
+            );
+            prev_w = w;
+            bytes = bytes.saturating_mul(2);
+        }
+
+        crate::tuning::set_gemv_tier_step(prev_step);
+        crate::tuning::set_pool_classes(prev_pc);
+    }
+
+    /// A non-zero `gemv_thread_cap` is the machine-measured override, so it pins the width flat
+    /// and the size ladder never runs: the same width comes back at every size above the floor
+    #[test]
+    #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+    fn gemv_thread_cap_knob_pins_the_width_flat() {
+        let _lock = POOL_KNOB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pinned = 3;
+        if auto_threads() < pinned {
+            return; // the width would clamp to the core count, not the knob
+        }
+        let prev = crate::tuning::gemv_thread_cap();
+        crate::tuning::set_gemv_thread_cap(pinned);
+        let floor = crate::cache::gemv_parallel_floor_bytes();
+        for bytes in [floor, floor.saturating_mul(64), usize::MAX / 2] {
+            assert_eq!(
+                Parallelism::Rayon(0).resolve_bandwidth(bytes, usize::MAX),
+                pinned,
+                "the pinned width must hold at {bytes} bytes"
+            );
+        }
+        crate::tuning::set_gemv_thread_cap(prev);
     }
 }

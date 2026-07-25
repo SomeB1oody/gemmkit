@@ -341,8 +341,13 @@ cores and jobs and floored at 1. It is work-based rather than dimension-based
 because the measured optimum tracks total flops, not linear size. Bandwidth-
 bound shapes (gemv/gevv) use a different rule: serial below a cache-derived
 byte floor (the per-core private L2, above which the matrix spills to the
-shared L3), then straight to a bandwidth cap, because a few workers is the
-worst point on a bandwidth scaling curve.
+shared L3), then straight to a width for those bytes, because a few workers
+is the worst point on a bandwidth scaling curve. That width is a ladder over
+the same pool tiers described below, climbing one tier per
+`GEMMKIT_GEMV_TIER_STEP` (default auto, 8) factor of touched bytes above the
+floor and stopping at the largest tier - never the full width, since a gemv
+saturates its bandwidth first. `GEMMKIT_GEMV_THREAD_CAP` replaces the whole
+ladder with one flat width.
 
 Rayon fork/join overhead scales with a pool's idle slack (threads minus
 engaged workers), so a small parallel GEMM forking into the full-width global

@@ -8,6 +8,36 @@ workspace crates (`gemmkit`, `gemmkit-ndarray`, `gemmkit-nalgebra`, `gemmkit-fae
 `gemmkit-tune`) share one version and release in lockstep, so releases are recorded
 once with per-crate subsections where a change is crate-specific.
 
+## [Unreleased]
+
+### gemmkit
+
+#### Added
+
+- `GEMMKIT_GEMV_TIER_STEP` (`set_gemv_tier_step`, default auto): the byte spacing
+  between the rungs of the new gemv/gevv worker ladder
+
+#### Changed
+
+- The auto worker count for a bandwidth-bound gemv/gevv is now a ladder over the
+  touched bytes instead of one flat fraction of the core count. Its rungs are the
+  exact-fit thread-pool tiers the compute path already snaps to, so a gemv width
+  always has a pool sized to it, and it climbs one tier per `GEMMKIT_GEMV_TIER_STEP`
+  factor of bytes above the serial floor, stopping at the largest tier rather than
+  the full machine width. Measured on the Zen5 reference machine, a repeatedly
+  scanned 2-4 MiB matrix gains 30-50% and a DRAM-cold 2 MiB one 11%, with no
+  measured regression at any other size. `GEMMKIT_GEMV_THREAD_CAP` is unchanged: a
+  non-zero value still pins one flat width, now bypassing the ladder. gemv output
+  remains bit-identical across worker counts
+
+### gemmkit-tune
+
+#### Changed
+
+- The `GEMMKIT_GEMV_THREAD_CAP` sweep gained a small cache-resident probe shape. Its
+  2 previous shapes both touched about 134 MiB, so the sweep could not observe the
+  size-dependent behavior it is meant to calibrate
+
 ## [0.1.1] - 2026-07-24
 
 ### gemmkit
