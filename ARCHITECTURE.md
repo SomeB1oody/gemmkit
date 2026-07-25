@@ -431,6 +431,13 @@ store instead of a second pass over `C`. The seam is the `Epilogue` trait
 - **Fire-once semantics**: the driver passes `last_k` and the epilogue applies
   only on the final depth panel; earlier panels store raw accumulator partials
   (`OUT_IS_ACC = false` families have a single panel by construction).
+- **Whole-tile application**: the vector path hands the entire `MR_REG x NR`
+  register tile to `apply_tile`, not one register at a time. The kernel's store
+  pass is unrolled by the tile const generics, so a per-register hook replicates
+  whatever the epilogue branches on once per accumulator, and that branch web
+  costs the compiler the accumulator tile itself. `apply_tile` defaults to a
+  loop over the per-register `apply_reg`; an epilogue with a runtime
+  discriminant overrides it and decodes once.
 - **Built-ins**: `FusedEpi` (per-row/per-col bias, ReLU / LeakyReLU) behind
   `gemm_fused*`, its batched/prepacked variants, and the bias-only
   `gemm_cplx_fused*`; `MapEpi` (a user per-element closure, `f32`/`f64`)
@@ -465,7 +472,9 @@ vector store is proven bit-equal to its scalar map per lane.
   capable token; `accumulate_tile` overrides are reserved for scheduling
   changes that keep the rounding shape.
 - **A new fused transform** is an `Epilogue` impl; the vector and scalar paths
-  must agree bitwise.
+  must agree bitwise, and an impl that dispatches on a runtime discriminant
+  also overrides `apply_tile` so the decode is hoisted out of the unrolled
+  store pass.
 
 ## Tuning knobs
 

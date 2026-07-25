@@ -215,35 +215,19 @@ unsafe fn microkernel_impl<T, S, E, const MR_REG: usize, const NR: usize>(
         // scratch route below for every tile; Identity and any VECTOR epilogue can take
         // the vector route whenever the tile itself is full and column-major
         if (E::IS_IDENTITY || E::VECTOR) && mr_eff == mr && nr_eff == NR && rsc == 1 {
-            // Vector load/store of the full tile; apply_reg runs on the LANES rows just
-            // loaded/computed, only on the last depth panel and only for a real epilogue
+            // Vector load/store of the full tile, in 3 passes over `acc`: fold beta in,
+            // apply the epilogue, store. The epilogue goes through the whole-tile
+            // `apply_tile` hook rather than per register, because these loops are unrolled
+            // by the const generics and a per-register hook replicates whatever the
+            // epilogue branches on once per accumulator (see `Epilogue::apply_tile`)
             match beta_status {
-                BetaStatus::Zero => {
-                    for j in 0..NR {
-                        let col = c.offset(j as isize * csc);
-                        for i in 0..MR_REG {
-                            let r = acc[j][i];
-                            let r = if !E::IS_IDENTITY && last_k {
-                                epi.apply_reg(simd, r, row0 + i * lanes, col0 + j)
-                            } else {
-                                r
-                            };
-                            simd.storeu(col.add(i * lanes), r);
-                        }
-                    }
-                }
+                BetaStatus::Zero => {}
                 BetaStatus::One => {
                     for j in 0..NR {
                         let col = c.offset(j as isize * csc);
                         for i in 0..MR_REG {
                             let cv = simd.loadu(col.add(i * lanes));
-                            let r = simd.add(cv, acc[j][i]);
-                            let r = if !E::IS_IDENTITY && last_k {
-                                epi.apply_reg(simd, r, row0 + i * lanes, col0 + j)
-                            } else {
-                                r
-                            };
-                            simd.storeu(col.add(i * lanes), r);
+                            acc[j][i] = simd.add(cv, acc[j][i]);
                         }
                     }
                 }
@@ -254,15 +238,19 @@ unsafe fn microkernel_impl<T, S, E, const MR_REG: usize, const NR: usize>(
                         for i in 0..MR_REG {
                             let cv = simd.loadu(col.add(i * lanes));
                             // beta*C + alpha*AB, one fused multiply-add
-                            let r = simd.mul_add(cv, bv, acc[j][i]);
-                            let r = if !E::IS_IDENTITY && last_k {
-                                epi.apply_reg(simd, r, row0 + i * lanes, col0 + j)
-                            } else {
-                                r
-                            };
-                            simd.storeu(col.add(i * lanes), r);
+                            acc[j][i] = simd.mul_add(cv, bv, acc[j][i]);
                         }
                     }
+                }
+            }
+            // Fires on the last depth panel only, and only for a real epilogue
+            if !E::IS_IDENTITY && last_k {
+                acc = epi.apply_tile::<S, MR_REG, NR>(simd, acc, row0, col0);
+            }
+            for j in 0..NR {
+                let col = c.offset(j as isize * csc);
+                for i in 0..MR_REG {
+                    simd.storeu(col.add(i * lanes), acc[j][i]);
                 }
             }
         } else {

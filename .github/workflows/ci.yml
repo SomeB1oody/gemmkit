@@ -39,6 +39,11 @@ jobs:
         run: cargo build -p gemmkit --no-default-features --features epilogue
       - name: build with std off + element-type families + epilogue
         run: cargo build -p gemmkit --no-default-features --features half,int8,complex,epilogue
+      # Self-relative (fused vs plain on this runner), so no absolute figure to go stale.
+      # Serial arm only: the parallel one measures the same kernel and is the noisier of
+      # the 2 on a shared runner. Run both by hand with `-- --ignored perf_fused`
+      - name: fused-epilogue overhead vs plain gemm
+        run: cargo test -p gemmkit --release --features epilogue --test perf -- --ignored --nocapture perf_fused_overhead_serial
 
   # Force a specific kernel end-to-end via GEMMKIT_REQUIRE_ISA
   kernel:

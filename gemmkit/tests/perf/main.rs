@@ -34,6 +34,9 @@ mod harness;
 mod bandwidth;
 // Batched GEMM (gemm_batched) vs naive gemm() loops, serial and parallel
 mod batched;
+// Fused-epilogue overhead vs plain gemm, same shape and ISA; asserts a ratio bound
+#[cfg(feature = "epilogue")]
+mod fused;
 // f16 / bf16 / i8 / c32 element-type throughput, each vs its available external baseline
 #[cfg(all(
     not(target_family = "wasm"),

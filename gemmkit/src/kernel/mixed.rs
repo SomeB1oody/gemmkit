@@ -135,35 +135,19 @@ unsafe fn mixed_epilogue<Fam, N, S, E, const MR_REG: usize, const NR: usize>(
         // for every tile; Identity and any VECTOR epilogue can take the vector route
         // whenever the tile itself is full and column-major
         if (E::IS_IDENTITY || E::VECTOR) && mr_eff == mr && nr_eff == NR && rsc == 1 {
-            // Vector widen-load / store of the full tile; apply_reg transforms the f32
-            // register and store_out performs the single narrowing to N
+            // Vector widen-load / store of the full tile, in 3 passes over `acc`: fold
+            // beta in, apply the epilogue, store. apply_tile transforms the f32 registers
+            // and store_out performs the single narrowing to N. The epilogue goes through
+            // the whole-tile hook rather than per register for the register-allocation
+            // reason spelled out at `Epilogue::apply_tile`
             match beta_status {
-                BetaStatus::Zero => {
-                    for j in 0..NR {
-                        let col = c.offset(j as isize * csc);
-                        for i in 0..MR_REG {
-                            let r = acc[j][i];
-                            let r = if !E::IS_IDENTITY {
-                                epi.apply_reg(simd, r, row0 + i * lanes, col0 + j)
-                            } else {
-                                r
-                            };
-                            simd.store_out(col.add(i * lanes), r);
-                        }
-                    }
-                }
+                BetaStatus::Zero => {}
                 BetaStatus::One => {
                     for j in 0..NR {
                         let col = c.offset(j as isize * csc);
                         for i in 0..MR_REG {
                             let cv = simd.load_out(col.add(i * lanes));
-                            let r = simd.add(cv, acc[j][i]);
-                            let r = if !E::IS_IDENTITY {
-                                epi.apply_reg(simd, r, row0 + i * lanes, col0 + j)
-                            } else {
-                                r
-                            };
-                            simd.store_out(col.add(i * lanes), r);
+                            acc[j][i] = simd.add(cv, acc[j][i]);
                         }
                     }
                 }
@@ -174,15 +158,18 @@ unsafe fn mixed_epilogue<Fam, N, S, E, const MR_REG: usize, const NR: usize>(
                         for i in 0..MR_REG {
                             let cv = simd.load_out(col.add(i * lanes));
                             // beta*C + alpha*AB, in f32
-                            let r = simd.mul_add(cv, bv, acc[j][i]);
-                            let r = if !E::IS_IDENTITY {
-                                epi.apply_reg(simd, r, row0 + i * lanes, col0 + j)
-                            } else {
-                                r
-                            };
-                            simd.store_out(col.add(i * lanes), r);
+                            acc[j][i] = simd.mul_add(cv, bv, acc[j][i]);
                         }
                     }
+                }
+            }
+            if !E::IS_IDENTITY {
+                *acc = epi.apply_tile::<S, MR_REG, NR>(simd, *acc, row0, col0);
+            }
+            for j in 0..NR {
+                let col = c.offset(j as isize * csc);
+                for i in 0..MR_REG {
+                    simd.store_out(col.add(i * lanes), acc[j][i]);
                 }
             }
         } else {

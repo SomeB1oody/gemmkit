@@ -10,7 +10,7 @@
 //! epilogue the contract is stronger: `gemm()` followed by a scalar map matches the
 //! fused call bit-for-bit for floats, because every route (the general driver, and the
 //! gemv / small-`m,n` / small-`k` special paths) fuses the same way: blocking never
-//! depends on the epilogue, and [`Epilogue::apply_reg`] transforms the exact register
+//! depends on the epilogue, and [`Epilogue::apply_tile`] transforms the exact registers
 //! the plain store would have written (see [`FusedEpi`] below for the argument in full)
 //!
 //! 2 built-in epilogues ship: [`FusedEpi`] (per-row/per-col bias then ReLU/LeakyReLU,
@@ -35,9 +35,12 @@ use crate::simd::{KernelSimd, SimdOps};
 /// false` family, which never splits `k` into more than one panel
 ///
 /// A tile takes one of 2 application paths, and both MUST return the same bits for the
-/// same input: the fast vector [`Epilogue::apply_reg`] for a full column-major tile
+/// same input: the fast vector [`Epilogue::apply_tile`] for a full column-major tile
 /// (`rsc == 1`), or the scalar [`Epilogue::apply`] for an edge or arbitrarily strided
-/// tile, which drains through scratch first
+/// tile, which drains through scratch first. [`Epilogue::apply_reg`] is the per-register
+/// form `apply_tile` defaults to, and is what a `VECTOR` epilogue normally implements;
+/// the `gemv` / small-`m,n` special paths are scalar throughout and only ever call
+/// [`Epilogue::apply`]
 pub trait Epilogue<Fam: KernelFamily>: Copy + Send + Sync {
     /// `true` marks the identity transform: every hook the kernel gates on this const
     /// const-folds away, making the monomorphization bit-identical to a non-fused kernel
@@ -80,6 +83,45 @@ pub trait Epilogue<Fam: KernelFamily>: Copy + Send + Sync {
         S: KernelSimd<Fam::Lhs, Fam::Rhs, Fam::Acc, Fam::Out>,
     {
         unreachable!("apply_reg requires VECTOR = true")
+    }
+
+    /// Vector transform of a whole `MR_REG x NR` register tile: `acc[j][i]` holds the
+    /// finished values for rows `[row0 + i*LANES, row0 + (i+1)*LANES)` of column
+    /// `col0 + j`. MUST return the same bits as [`Epilogue::apply_reg`] applied to each
+    /// register in turn
+    ///
+    /// The default does exactly that, and is correct for any `VECTOR` epilogue. An
+    /// epilogue that dispatches on a runtime discriminant should still override it and
+    /// match once, outside the loops: the kernel's store pass is unrolled by the
+    /// `MR_REG`/`NR` const generics, so a per-register match is replicated once per
+    /// accumulator, and past a couple of accumulators the resulting branch web stops the
+    /// compiler keeping the tile in registers at all - it writes every accumulator
+    /// through to the stack from inside the kc loop, where the epilogue does not even
+    /// run. On the 24-accumulator AVX-512 `f32` tile that cost 24 extra stores per kc
+    /// iteration and ran a fused GEMM at 1/3 the plain rate. Hoisting the match restores
+    /// it: the cost of the epilogue itself is immeasurable at that tile size
+    ///
+    /// # Safety
+    /// As [`Epilogue::apply_reg`]
+    #[inline(always)]
+    #[allow(clippy::needless_range_loop)]
+    unsafe fn apply_tile<S, const MR_REG: usize, const NR: usize>(
+        &self,
+        simd: S,
+        mut acc: [[<S as SimdOps<Fam::Acc>>::Reg; MR_REG]; NR],
+        row0: usize,
+        col0: usize,
+    ) -> [[<S as SimdOps<Fam::Acc>>::Reg; MR_REG]; NR]
+    where
+        S: KernelSimd<Fam::Lhs, Fam::Rhs, Fam::Acc, Fam::Out>,
+    {
+        let lanes = <S as SimdOps<Fam::Acc>>::LANES;
+        for j in 0..NR {
+            for i in 0..MR_REG {
+                acc[j][i] = unsafe { self.apply_reg(simd, acc[j][i], row0 + i * lanes, col0 + j) };
+            }
+        }
+        acc
     }
 
     /// `true` enables the vector store path via [`Epilogue::apply_store`], for an
@@ -293,6 +335,70 @@ impl<T: Float<Acc = T> + PartialOrd> Epilogue<FloatGemm<T>> for FusedEpi<T> {
             }
         }
     }
+
+    // Both discriminants are decoded once for the whole tile, so the unrolled store pass
+    // stays straight-line; see the trait method for why that is worth ~3x on a wide tile.
+    // The per-element operations, and their order, are exactly apply_reg's
+    #[inline(always)]
+    #[allow(clippy::needless_range_loop)]
+    unsafe fn apply_tile<S, const MR_REG: usize, const NR: usize>(
+        &self,
+        s: S,
+        mut acc: [[S::Reg; MR_REG]; NR],
+        row0: usize,
+        col0: usize,
+    ) -> [[S::Reg; MR_REG]; NR]
+    where
+        S: KernelSimd<T, T, T, T>,
+    {
+        unsafe {
+            let lanes = <S as SimdOps<T>>::LANES;
+            match self.bias {
+                BiasSpec::None => {}
+                // Full tile, rsc == 1: the LANES rows at row0 + i*lanes are consecutive
+                // in the bias slice
+                BiasSpec::Row(p) => {
+                    for j in 0..NR {
+                        for i in 0..MR_REG {
+                            let bv = s.loadu(p.0.add(row0 + i * lanes));
+                            acc[j][i] = s.add(acc[j][i], bv);
+                        }
+                    }
+                }
+                // 1 bias element per column, so the splat is hoisted out of the row loop
+                BiasSpec::Col(p) => {
+                    for j in 0..NR {
+                        let bv = s.splat(*p.0.add(col0 + j));
+                        for i in 0..MR_REG {
+                            acc[j][i] = s.add(acc[j][i], bv);
+                        }
+                    }
+                }
+            }
+            match self.act {
+                Act::None => {}
+                Act::Relu => {
+                    let z = s.zero();
+                    for j in 0..NR {
+                        for i in 0..MR_REG {
+                            acc[j][i] = s.max(acc[j][i], z);
+                        }
+                    }
+                }
+                Act::LeakyRelu(sl) => {
+                    let z = s.zero();
+                    let sv = s.splat(sl);
+                    for j in 0..NR {
+                        for i in 0..MR_REG {
+                            let v = acc[j][i];
+                            acc[j][i] = s.add(s.max(v, z), s.mul(sv, s.min(v, z)));
+                        }
+                    }
+                }
+            }
+            acc
+        }
+    }
 }
 
 /// A user-defined per-element epilogue: the closure `f` applied to each stored output element at
@@ -484,6 +590,67 @@ where
                     s.mul(s.splat(sl.widen()), s.min(v, s.zero())),
                 ),
             }
+        }
+    }
+
+    // Decodes both discriminants once per tile, as the FloatGemm impl does and for the
+    // same reason; the per-element operations and their order are apply_reg's
+    #[inline(always)]
+    #[allow(clippy::needless_range_loop)]
+    unsafe fn apply_tile<S, const MR_REG: usize, const NR: usize>(
+        &self,
+        s: S,
+        mut acc: [[S::Reg; MR_REG]; NR],
+        row0: usize,
+        col0: usize,
+    ) -> [[S::Reg; MR_REG]; NR]
+    where
+        S: KernelSimd<N, N, f32, N>,
+    {
+        unsafe {
+            let lanes = <S as SimdOps<f32>>::LANES;
+            match self.bias {
+                BiasSpec::None => {}
+                // load_lhs widens the LANES consecutive narrow bias values in one shot
+                BiasSpec::Row(p) => {
+                    for j in 0..NR {
+                        for i in 0..MR_REG {
+                            let bv = s.load_lhs(p.0.add(row0 + i * lanes));
+                            acc[j][i] = s.add(acc[j][i], bv);
+                        }
+                    }
+                }
+                BiasSpec::Col(p) => {
+                    for j in 0..NR {
+                        let bv = s.splat((*p.0.add(col0 + j)).widen());
+                        for i in 0..MR_REG {
+                            acc[j][i] = s.add(acc[j][i], bv);
+                        }
+                    }
+                }
+            }
+            match self.act {
+                Act::None => {}
+                Act::Relu => {
+                    let z = s.zero();
+                    for j in 0..NR {
+                        for i in 0..MR_REG {
+                            acc[j][i] = s.max(acc[j][i], z);
+                        }
+                    }
+                }
+                Act::LeakyRelu(sl) => {
+                    let z = s.zero();
+                    let sv = s.splat(sl.widen());
+                    for j in 0..NR {
+                        for i in 0..MR_REG {
+                            let v = acc[j][i];
+                            acc[j][i] = s.add(s.max(v, z), s.mul(sv, s.min(v, z)));
+                        }
+                    }
+                }
+            }
+            acc
         }
     }
 }

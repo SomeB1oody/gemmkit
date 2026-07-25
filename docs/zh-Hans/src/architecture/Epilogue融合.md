@@ -20,6 +20,9 @@ pub trait Epilogue<Fam: KernelFamily>: Copy + Send + Sync {
     unsafe fn apply(&self, v: Fam::Acc, row: usize, col: usize) -> Fam::Out;
     /// Vector transform of LANES consecutive rows; MUST agree with apply bit-for-bit
     unsafe fn apply_reg<S>(&self, simd: S, v: ..., row: usize, col: usize) -> ...;
+    /// 整个 MR_REG x NR 寄存器 tile 的向量变换；默认实现是对 apply_reg 循环。
+    /// 覆写它是为了把运行期判别式提到展开的存储遍之外
+    unsafe fn apply_tile<S, const MR_REG: usize, const NR: usize>(&self, simd: S, acc: ..., row0: usize, col0: usize) -> ...;
     /// Vector store-transform from Acc scratch to Out; same bit-agreement contract
     unsafe fn apply_store<S>(&self, simd: S, src: *const Fam::Acc, dst: *mut Fam::Out, ...);
 }
@@ -31,7 +34,7 @@ pub trait Epilogue<Fam: KernelFamily>: Copy + Send + Sync {
 
 随库发布三个 epilogue，各有自己的公开入口（feature `epilogue`，其中重量化入口还需同时开启 `int8`；面向用户的视角见[融合 Epilogue](../gemmkit-guide/融合Epilogue.md)）：
 
-**`FusedEpi`** 是运行期组合的“偏置 + 激活”epilogue：先加按行或按列的偏置（`Bias::PerRow` / `Bias::PerCol`），再做 `Relu` 或 `LeakyRelu(slope)`。一次单态化覆盖所有组合——枚举分支只是每个 tile 上几次可预测的判断，被 `mr*nr*kc` 的 FMA 循环摊薄——所以融合内核的数量不会随 epilogue 种类相乘。它支撑 `gemm_fused` 及其整个家族：`gemm_batched_fused`（整批共享一份偏置和激活）、预打包孪生 `gemm_packed_b_fused` / `gemm_packed_a_fused`，以及复数入口 `gemm_cplx_fused`——后者只有偏置，因为基于大小比较的激活在复数上没有数学定义。它设 `VECTOR = true`：快路径上偏置加法与激活以寄存器操作运行（`max(v, 0)` 等），SIMD `max`/`min` 的 NaN 契约经过挑选，使向量与标量形态严格一致（两边都是 `ReLU(NaN) = 0`）。
+**`FusedEpi`** 是运行期组合的“偏置 + 激活”epilogue：先加按行或按列的偏置（`Bias::PerRow` / `Bias::PerCol`），再做 `Relu` 或 `LeakyRelu(slope)`。一次单态化覆盖所有组合，所以融合内核的数量不会随 epilogue 种类相乘——但这只在枚举分支*每个 tile 只解码一次*（在 `apply_tile` 覆写里）时才成立，而不是每个累加器解码一次。这个区别不是微优化。内核的存储遍按 tile 常量泛型展开，所以逐寄存器的钩子会把两个 match 复制到 tile 的每一个累加器槽位上；在宽 tile 上，由此产生的分支网会让编译器付出整个累加器 tile 的代价：它不再把 `acc` 留在寄存器里，而是从 `kc` 循环内部就把每个值写穿到栈上——而 epilogue 在那里根本不会执行。在 24 个累加器的 AVX-512 `f32` tile 上，这意味着每次 `kc` 迭代多 24 次存储、融合 GEMM 只跑到普通版三分之一的速度，代价却来自一个本身开销测不出来的 epilogue。把解码提出去就精确恢复了性能；`tests/perf/fused.rs` 钉住这个比值，防止它悄悄回归。它支撑 `gemm_fused` 及其整个家族：`gemm_batched_fused`（整批共享一份偏置和激活）、预打包孪生 `gemm_packed_b_fused` / `gemm_packed_a_fused`，以及复数入口 `gemm_cplx_fused`——后者只有偏置，因为基于大小比较的激活在复数上没有数学定义。它设 `VECTOR = true`：快路径上偏置加法与激活以寄存器操作运行（`max(v, 0)` 等），SIMD `max`/`min` 的 NaN 契约经过挑选，使向量与标量形态严格一致（两边都是 `ReLU(NaN) = 0`）。
 
 **`MapEpi`** 是逃生门：`gemm_map` 把任意用户闭包 `f(value, row, col) -> value` 应用到每个输出元素的最终值上，`(row, col)` 位于用户坐标系。闭包是借用的 `&dyn Fn + Sync`——每个 `(类型, ISA)` 一次单态化，而不是每个闭包一次——以标量方式每元素调用一次，由每个元素背后 `O(k)` 的浮点运算摊销。仅限 `f32`/`f64`：窄类型将不得不先舍入到 `N`、应用 `N` 域闭包、再舍入一次，破坏下述逐位契约。
 
@@ -43,7 +46,7 @@ pub trait Epilogue<Fam: KernelFamily>: Copy + Send + Sync {
 
 1. **相同的路由。** 融合调用把每个形状送进普通 `gemm` 会用的同一个内核：通用 driver、gemv、small-k、small-mn 各有融合形态（见[特殊路径](特殊路径.md)），融合分发入口与普通的门一一镜像。没有哪个形状因为要了偏置就得付 driver 的开销。（唯一刻意的路由例外是混合 `f16`/`bf16` 的融合 gemv：出于特殊路径一页解释的舍入原因，它留在 driver 上——窄类型本来就在下述逐位契约之外。）
 2. **与 epilogue 无关的引擎。** 分块、调度、打包与累加顺序都不依赖穿入的是哪个 epilogue；epilogue 只碰存储。
-3. **逐位一致的两条应用路径。** 完整的列主序 tile 走向量路径（`apply_reg` / `apply_store`）；边缘或跨步 tile 经暂存走标量 `apply`；同一个输出矩阵自由混用两者——所以 trait 契约要求同一 token 下两者逐位一致。
+3. **逐位一致的两条应用路径。** 完整的列主序 tile 走向量路径（`apply_tile`，其默认实现即 `apply_reg`，或 `apply_store`）；边缘或跨步 tile 经暂存走标量 `apply`；同一个输出矩阵自由混用两者——所以 trait 契约要求同一 token 下两者逐位一致。`apply_tile` 的覆写继承这条义务：它必须逐元素留下与 `apply_reg` 完全相同的结果。
 
 三者合起来给出头条保证：对 `f32`/`f64`，`gemm_fused`（以及 `gemm_map`、批量与预打包的融合入口）等于 `gemm()` 再接同一个标量映射，**逐位一致，对每一种形状成立**。`MapEpi` 展示了这有多刻意：它设 `VECTOR = true` 不是为了向量化闭包（做不到），而是让内核做出与普通 `gemm` *相同的路径选择*——快路径融合的 `beta*C + alpha*AB` 存储在一般 `beta` 下与标量路径的非融合算式差一个 ULP，只走暂存的 epilogue 会把普通 `gemm` 从未写出过的值交给闭包。`apply_reg` 于是把寄存器排空到栈缓冲、逐 lane 调用同一个标量 `apply`，`f` 看到的永远是普通 `gemm` 的精确位。
 
