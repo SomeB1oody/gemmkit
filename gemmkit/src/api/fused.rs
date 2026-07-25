@@ -13,7 +13,7 @@ use crate::kernel::epilogue::{BiasDim, FusedEpi};
 
 /// 1 bias value broadcast across a whole output row or column, combined into a [`gemm_fused`]
 /// call's epilogue after the `alpha*A*B + beta*C` product and before the activation
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub enum Bias<'a, T> {
     /// 1 value per output row, added to every element of that row (length `m`)
     PerRow(&'a [T]),
@@ -22,6 +22,7 @@ pub enum Bias<'a, T> {
 }
 
 /// The activation a [`gemm_fused`] call applies last, after the bias add
+#[derive(Copy, Clone, Debug)]
 pub enum Activation<T> {
     /// `max(v, 0)`; NaN maps to 0
     Relu,

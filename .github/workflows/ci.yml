@@ -320,8 +320,6 @@ jobs:
         env:
           RUSTFLAGS: -C target-feature=+simd128 -D warnings
         run: cargo build -p gemmkit --target wasm32-wasip1 --no-default-features --features std,half,int8,complex,epilogue --tests
-      # The epilogue suite is what pins the SimdOps max/min NaN and -0.0 contract on this
-      # backend: its vector arm only runs with `epilogue` on and simd128 pinned
       - name: Correctness under wasmtime — +simd128, element families (pin simd128 to assert the SIMD path is live)
         env:
           RUSTFLAGS: -C target-feature=+simd128
@@ -386,9 +384,6 @@ jobs:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: Swatinem/rust-cache@v2
-      # Pinned ISA list: the ubuntu-latest pool is heterogeneous (some machines expose
-      # avx512f, most don't), so probing cpuinfo would make the coverage % swing
-      # run-to-run. avx512f/vnni/bf16 coverage comes from local runs of the same script.
       - name: Coverage (scalar + fma, report-only)
         env:
           COVERAGE_ISAS: scalar fma

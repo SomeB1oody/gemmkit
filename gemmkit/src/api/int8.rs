@@ -180,7 +180,7 @@ pub unsafe fn gemm_i8_unchecked_with(
 /// or 1 value per output row/channel (the per-channel quantized-inference convention). Every
 /// scale must be finite and `> 0`
 #[cfg(all(feature = "int8", feature = "epilogue"))]
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub enum RequantScale<'a> {
     /// 1 scale applied to every output element (`alpha` folds into this)
     PerTensor(f32),
@@ -196,6 +196,7 @@ pub enum RequantScale<'a> {
 /// `scale_i`, and `[LO, HI]` is set by the entry: `[-128, 127]` for [`gemm_i8_requant`],
 /// `[0, 255]` for [`gemm_i8_requant_u8`]
 #[cfg(all(feature = "int8", feature = "epilogue"))]
+#[derive(Copy, Clone, Debug)]
 pub struct Requantize<'a> {
     /// Output scale, per-tensor or per-row/channel; every value must be finite and `> 0`
     pub scale: RequantScale<'a>,

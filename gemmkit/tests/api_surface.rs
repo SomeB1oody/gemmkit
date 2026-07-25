@@ -85,3 +85,40 @@ fn workspace_constructors_and_unchecked_with() {
         );
     }
 }
+
+/// Every public epilogue-configuration value is `Copy + Clone + Debug`. These are passed by
+/// value into entries a caller invokes in a loop (1 per layer, 1 per batch step), so a
+/// move-only config forces a fresh construction per call for no reason, and a missing
+/// `Debug` makes the config the one thing a caller cannot print while debugging a layer.
+/// Pinned rather than left incidental: dropping a derive is a silent source break for that
+/// loop, and it would not show up in any correctness test
+#[cfg(feature = "epilogue")]
+#[test]
+fn epilogue_config_values_are_copy_clone_debug() {
+    fn assert_copy_clone_debug<T: Copy + Clone + core::fmt::Debug>(_: &T) {}
+
+    let bias = [1.0f32, 2.0];
+    let b = gemmkit::Bias::PerRow(&bias);
+    let act = gemmkit::Activation::LeakyRelu(0.1f32);
+    assert_copy_clone_debug(&b);
+    assert_copy_clone_debug(&act);
+    // The loop the derives exist for: both configs are built once and reused by value
+    for _ in 0..2 {
+        let (_b, _a) = (b, act);
+    }
+
+    #[cfg(feature = "int8")]
+    {
+        let scale = gemmkit::RequantScale::PerTensor(0.5);
+        let req = gemmkit::Requantize {
+            scale,
+            zero_point: 0,
+            bias: None,
+        };
+        assert_copy_clone_debug(&scale);
+        assert_copy_clone_debug(&req);
+        for _ in 0..2 {
+            let _r = req;
+        }
+    }
+}
