@@ -30,6 +30,23 @@ once with per-crate subsections where a change is crate-specific.
   non-zero value still pins one flat width, now bypassing the ladder. gemv output
   remains bit-identical across worker counts
 
+#### Fixed
+
+- A gemv sweep with fewer output rows than one SIMD register no longer takes the
+  axpy strategy. That strategy vectorizes over output rows, so below one register
+  its vector loops were unreachable and the whole reduction ran on the scalar
+  remainder. It only ever arose where both classifications fit at once — a
+  single-row matrix, whose row and column strides are both 1 — which is the pure
+  dot-product shape `m == n == 1`, and which is how the column-major libraries
+  (nalgebra, faer) naturally describe a row vector, so the adapters hit it by
+  default. Such a sweep now takes the dot strategy, which vectorizes over `k`.
+  Measured on the Zen5 reference machine: 5.7x at `k = 16M` and 13x at `k = 1M`
+  (10.3 GB/s to 59-134 GB/s), and the dot form's wider accumulator tree is also
+  the more accurate of the 2. The affected shapes change bits, since the summation
+  order changes; gemv output remains bit-identical across worker counts, and no
+  other shape changes route. The same fix applies to the `half` mixed-precision
+  twin
+
 ### gemmkit-ndarray, gemmkit-nalgebra, gemmkit-faer
 
 #### Added

@@ -18,6 +18,12 @@
 //!   instead of holding it in registers. Cheaper when the output stays cache-resident, and its
 //!   single contiguous matrix stream is what a large `k` wants
 //!
+//! A single-row matrix fits both the axpy and the dot classification at once, since its row and
+//! column strides are both 1 and each description is equally true of the same bytes. That tie goes
+//! to the dot form: the axpy vectorization runs over output rows, and a lone row cannot fill a
+//! SIMD register, so the axpy kernels would drop the whole reduction onto their scalar remainder
+//! (see [`axpy_yields_to_dot`])
+//!
 //! Every output element is reduced over the full `k` by exactly 1 worker, so splitting the output
 //! rows across workers changes nothing about how any single element is computed: the result is
 //! reproducible, and in fact bit-identical, at any worker count
@@ -172,9 +178,10 @@ unsafe fn core_epi<T, S, E>(
 
         // Classify the layout once, up front, so every worker below runs the identical branch
         // and no worker's tier choice can depend on which rows it happened to draw
-        let axpy = mat_rs == 1 && out_s == 1;
+        let dot_legal = mat_cs == 1 && vec_s == 1;
+        let axpy = mat_rs == 1 && out_s == 1 && !axpy_yields_to_dot(rows, lanes, dot_legal);
         let output_block = axpy && output_register_block(rows, sizeof, k);
-        let dot = !axpy && mat_cs == 1 && vec_s == 1;
+        let dot = !axpy && dot_legal;
 
         // The minimum traffic this call must move: the matrix once, the vector once, the output
         // once. `rows` caps the worker count so no worker can end up with 0 rows
@@ -241,6 +248,24 @@ unsafe fn core_epi<T, S, E>(
         // serial result regardless of `n_threads`
         row_sweep(rows, block, n_threads, body);
     }
+}
+
+/// Whether an axpy-shape sweep must hand itself to the dot form instead. The axpy kernels
+/// vectorize over OUTPUT ROWS - they hold `lanes` of them in a register at a time - so a sweep of
+/// fewer rows than that never enters their vector loops (`while i + lanes <= e`) and runs entirely
+/// on the scalar remainder. The dot kernels vectorize over `k` instead, which a gemv this narrow
+/// has in abundance, so wherever the dot form is also legal it takes the sweep
+///
+/// Both classifications fit at once only when the matrix row and column strides are both 1, which
+/// over a `rows x k` view means a single row: the pure dot-product shape `m == n == 1`, whose one
+/// row is described equally truthfully as column-major or row-major. Breaking that tie toward the
+/// axpy form left the whole reduction scalar - measured on the Zen5 reference machine at 10.3 GB/s
+/// against 59-134 GB/s for the dot form, a 5.7x gap at `k = 16M` and 13x at `k = 1M` - and the dot
+/// form's wider accumulator tree is the more accurate of the 2 as well. A `lanes == 1` token has
+/// no row vectorization to lose, so it never yields
+#[inline]
+fn axpy_yields_to_dot(rows: usize, lanes: usize, dot_legal: bool) -> bool {
+    dot_legal && rows < lanes
 }
 
 /// Whether an axpy-shape gemv should use the register-blocked output strategy instead of the
@@ -696,9 +721,11 @@ unsafe fn core_mixed<N, S>(
 
         // Classify the layout once, up front, so every worker runs the identical branch. The
         // axpy form always register-blocks (see its own doc), so there is no output-size gate
-        // here the way there is in the float core
-        let axpy = mat_rs == 1 && out_s == 1;
-        let dot = !axpy && mat_cs == 1 && vec_s == 1;
+        // here the way there is in the float core; the short-sweep yield to the dot form is the
+        // same one, over the f32 accumulator lane count the panel is held in
+        let dot_legal = mat_cs == 1 && vec_s == 1;
+        let axpy = mat_rs == 1 && out_s == 1 && !axpy_yields_to_dot(rows, lanes, dot_legal);
+        let dot = !axpy && dot_legal;
 
         // The minimum narrow-element traffic: the matrix once, the vector once, the output once
         // `rows` caps the worker count so no worker can end up with 0 rows
@@ -1019,11 +1046,36 @@ unsafe fn strided_rows_mixed<N, S>(
     }
 }
 
-// Correctness checks for the axpy and dot gemv kernels above
+// Correctness checks for the axpy and dot gemv kernels above, plus the layout classification
+// that picks between them
 #[cfg(test)]
 mod tests {
-    use super::{DOT_RB, MB_REG};
+    use super::{DOT_RB, MB_REG, axpy_yields_to_dot};
     use crate::simd::{ScalarTok, SimdOps};
+
+    /// The axpy form vectorizes over output rows, so a sweep too short to fill 1 SIMD register
+    /// must yield to the dot form wherever that form's own strides also hold - the single-row
+    /// matrix of a pure dot product. From 1 full register up, and wherever the dot form is not
+    /// legal, the classification is unchanged. Pure arithmetic over the lane count, so this
+    /// pins the rule on every platform rather than only on whichever token the host detects
+    #[test]
+    fn short_sweeps_yield_to_the_dot_form() {
+        for &lanes in &[1usize, 2, 4, 8, 16] {
+            for rows in 0..=(2 * lanes) {
+                assert!(
+                    !axpy_yields_to_dot(rows, lanes, false),
+                    "rows={rows} lanes={lanes}: nothing to yield to when the dot strides fail"
+                );
+                assert_eq!(
+                    axpy_yields_to_dot(rows, lanes, true),
+                    rows < lanes,
+                    "rows={rows} lanes={lanes}"
+                );
+            }
+        }
+        // The scalar token's axpy loop always runs, so a 1-lane build never changes route
+        assert!(!axpy_yields_to_dot(1, 1, true));
+    }
 
     /// Builds a per-float-type checker for [`super::axpy_regblocked`]: a row count chosen to hit
     /// all 3 tiers (1 wide `MB_REG*lanes` panel, 1 single-register `lanes`-wide row group, and a

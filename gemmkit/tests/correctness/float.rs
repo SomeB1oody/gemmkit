@@ -453,7 +453,9 @@ fn negative_strides_unchecked() {
 // gemv shapes (n == 1 or m == 1, routed through gemm's gemv fast path)
 
 /// `n == 1` (mat*vec) and `m == 1` (vec*mat) shapes, including a `k == 1` degenerate
-/// case, across every A/B layout combination, alpha/beta both nonzero
+/// case and the `m == n == 1` pure dot product, whose single row has both strides equal
+/// to 1 and so fits the axpy and the dot classification at once, across every A/B layout
+/// combination, alpha/beta both nonzero
 #[test]
 fn gemv_shapes() {
     for &(m, k, n) in &[
@@ -462,6 +464,7 @@ fn gemv_shapes() {
         (100, 1, 1),
         (1, 1, 100),
         (255, 129, 1),
+        (1, 129, 1),
     ] {
         for &la in &[Layout::Row, Layout::Col] {
             for &lb in &[Layout::Row, Layout::Col] {
