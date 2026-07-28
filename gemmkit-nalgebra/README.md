@@ -13,7 +13,7 @@ and forwards them to gemmkit's raw engine, so column-major (nalgebra's natural l
 row-major, and general-stride views all work without copying.
 
 The exposed surface mirrors the core engine. Real-scalar `gemm`, `gemm_with`, and `dot`
-are generic over `gemmkit::GemmScalar` (`f32`/`f64`, plus `f16`/`bf16` under the `half`
+are generic over `GemmScalar` (`f32`/`f64`, plus `f16`/`bf16` under the `half`
 feature). `prepack_lhs`/`prepack_rhs` build a reused pack handle for the
 `gemm_packed_a`/`gemm_packed_b` fixed-operand loop. Feature-gated families add integer
 (`gemm_i8`/`dot_i8`, `i8 -> i32`) and complex (`gemm_cplx`/`dot_cplx`) entries, and the

@@ -20,14 +20,15 @@ That `(rows, cols, row_stride, col_stride)` tuple, plus `a.as_ptr()`, is everyth
 
 ## Adding it to a project
 
-The adapter re-exports the fused selectors (`Bias`, `Activation`) but not `Parallelism` or `Workspace`, so a typical project depends on both crates:
+Two crates, not three. The adapter re-exports everything its own signatures name, so a direct `gemmkit` dependency is not part of the normal setup:
 
 ```toml
 [dependencies]
 gemmkit-ndarray = "0.1"
-gemmkit = "0.1" # for Parallelism and Workspace
 ndarray = "0.17.1"
 ```
+
+What comes back out of `gemmkit_ndarray` is: the `Parallelism` selector and the `Workspace` every `_with` variant takes; the fused selectors `Bias` and `Activation`; the prepacked handles `PackedLhs` and `PackedRhs`; the requantization parameters `Requantize` and `RequantScale`; the element-type bounds `GemmScalar`, `FusedScalar`, `MapScalar`, and `ComplexScalar`, which you need to name when writing a wrapper generic over an entry; the element types `f16`, `bf16`, `Complex`, `c32`, and `c64` under their features, so `half` and `num-complex` stay out of your manifest too; and the `tuning` module. Reach for `tuning` through the adapter rather than through a `gemmkit` dependency of your own — the knobs are process-global atomics, and a second, separately resolved `gemmkit` would give you a set of atomics the adapter never reads.
 
 Every feature on `gemmkit-ndarray` is a straight forward to the same-named feature on `gemmkit`, so you turn capabilities on here and they light up the matching entry points:
 
@@ -76,7 +77,7 @@ where
 The output binds `SC: DataMut`, so `C` is a `&mut Array2` or an `ArrayViewMut2` and, like the inputs, may carry any layout. Here `A` is a row-major buffer transposed into a column-major view with no copy, and the multiply runs single-threaded:
 
 ```rust
-use gemmkit::Parallelism;
+use gemmkit_ndarray::Parallelism;
 use ndarray::{Array2, array};
 
 // row-major storage, transposed into a column-major view with no copy
@@ -103,14 +104,14 @@ Aliasing is not checked at runtime, and does not need to be: `C` arrives as `&mu
 
 ## Choosing parallelism
 
-`Parallelism` comes from `gemmkit`. `Parallelism::Serial` runs on the calling thread; `Parallelism::Rayon(n)` uses a rayon pool of at most `n` threads, and `Rayon(0)` auto-detects the machine's core count. `Parallelism::default()` is `Rayon(0)`, which is what `dot` uses, so `dot` is parallel out of the box. The threaded paths need the `parallel` feature (on by default); with it off, treat every call as serial. gemmkit keeps a serial and a parallel run bit-for-bit reproducible under a fixed input and configuration, so switching `par` never changes the numbers. The reasoning behind the thread counts lives in [Parallelism in Practice](../gemmkit-guide/Parallelism_in_Practice.md).
+`Parallelism` is re-exported by the adapter. `Parallelism::Serial` runs on the calling thread; `Parallelism::Rayon(n)` uses a rayon pool of at most `n` threads, and `Rayon(0)` auto-detects the machine's core count. `Parallelism::default()` is `Rayon(0)`, which is what `dot` uses, so `dot` is parallel out of the box. The threaded paths need the `parallel` feature (on by default); with it off, treat every call as serial. gemmkit keeps a serial and a parallel run bit-for-bit reproducible under a fixed input and configuration, so switching `par` never changes the numbers. The reasoning behind the thread counts lives in [Parallelism in Practice](../gemmkit-guide/Parallelism_in_Practice.md).
 
 ## Reusing a workspace
 
 Every allocating entry borrows scratch from gemmkit's internal thread-local pool for the duration of the call, so a lone `gemm` never leaks an allocation into your steady state. When you run a hot loop of similar products, the `_with` variants let you own that scratch instead: pass a `&mut Workspace` as the first argument and it grows once to the largest size the loop needs, then gets reused with no further allocation.
 
 ```rust
-use gemmkit::{Parallelism, Workspace};
+use gemmkit_ndarray::{Parallelism, Workspace};
 use ndarray::Array2;
 
 let mut ws = Workspace::new();

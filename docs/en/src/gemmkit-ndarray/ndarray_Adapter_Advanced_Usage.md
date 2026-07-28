@@ -7,8 +7,7 @@ Beyond the plain real product, the adapter mirrors the whole of gemmkit's surfac
 `gemm_i8` multiplies `i8` inputs into an `i32` accumulator: `C(i32) <- alpha*A(i8)*B(i8) + beta*C`, with `alpha`, `beta`, and `C` all `i32`. It is a separate entry from `gemm` precisely because the input and output element types differ. Arithmetic wraps on overflow, the conventional integer-GEMM contract. `dot_i8` is the convenience twin, returning a fresh `Array2<i32>`.
 
 ```rust
-use gemmkit::Parallelism;
-use gemmkit_ndarray::{dot_i8, gemm_i8};
+use gemmkit_ndarray::{Parallelism, dot_i8, gemm_i8};
 use ndarray::Array2;
 
 let a = Array2::<i8>::zeros((16, 12));
@@ -27,8 +26,7 @@ gemm_i8(2, &a, &b, 1, &mut acc, Parallelism::Serial);
 Quantized inference rarely wants the raw `i32` accumulator; it wants an 8-bit tensor back. `gemm_i8_requant` fuses the multiply and the requantize into one pass, folding the `i32` accumulator to an `i8` output without ever materializing the full `m*n` intermediate. There is no `alpha` (it folds into the scale) and no `beta` (accumulating into a quantized output is ill-defined). The parameters live in a `Requantize`:
 
 ```rust
-use gemmkit::Parallelism;
-use gemmkit_ndarray::{RequantScale, Requantize, gemm_i8_requant, gemm_i8_requant_u8};
+use gemmkit_ndarray::{Parallelism, RequantScale, Requantize, gemm_i8_requant, gemm_i8_requant_u8};
 use ndarray::Array2;
 
 let a = Array2::<i8>::zeros((16, 12));
@@ -63,8 +61,7 @@ The output is `clamp(zero_point + round_ne(scale * (accumulator + bias[i])), LO,
 Complex products get their own entries because the two conjugation flags do not fit the homogeneous real signature. `gemm_cplx` computes `C <- alpha*op(A)*op(B) + beta*C`, where `op(A)` is `conj(A)` when `conj_a` is set and `op(B)` is `conj(B)` when `conj_b` is set, over `Complex<f32>` or `Complex<f64>`. `dot_cplx` is the non-conjugated convenience.
 
 ```rust
-use gemmkit::{Complex, Parallelism};
-use gemmkit_ndarray::{dot_cplx, gemm_cplx};
+use gemmkit_ndarray::{Complex, Parallelism, dot_cplx, gemm_cplx};
 use ndarray::Array2;
 
 type C = Complex<f64>;
@@ -95,8 +92,7 @@ With `complex` and `epilogue` both on, `gemm_cplx_fused` adds an optional `Bias`
 `gemm_fused` computes `C <- act(alpha*A*B + beta*C + bias)` in one pass. The bias is an optional `Bias::PerRow` (length `A.rows`) or `Bias::PerCol` (length `B.cols`); the activation is an optional `Relu` or `LeakyRelu(slope)`, applied last. With both `None` it is exactly `gemm`.
 
 ```rust
-use gemmkit::Parallelism;
-use gemmkit_ndarray::{Activation, Bias, gemm_fused, gemm_map};
+use gemmkit_ndarray::{Activation, Bias, Parallelism, gemm_fused, gemm_map};
 use ndarray::Array2;
 
 let a = Array2::<f32>::zeros((12, 9));
@@ -125,8 +121,7 @@ gemm_map(1.0, &a, &b, 0.0, &mut c2, &f, Parallelism::default());
 This is the one operation with no plain-`gemm` analogue and no counterpart in the sibling adapters: a stack of independent products carried on a rank-3 `Array3`, with the batch on axis 0. `a` is `(batch, m, k)`, `b` is `(batch, k, n)`, `c` is `(batch, m, n)`; axis 0 is each operand's batch stride and axes 1 and 2 are the element strides. It parallelizes across the batch, each element running serial on one worker, so the result reproduces a loop of `gemm` calls exactly.
 
 ```rust
-use gemmkit::Parallelism;
-use gemmkit_ndarray::{dot_batched, gemm_batched};
+use gemmkit_ndarray::{Parallelism, dot_batched, gemm_batched};
 use ndarray::Array3;
 
 let a = Array3::<f32>::zeros((32, 8, 5)); // (batch, m, k)
@@ -149,8 +144,7 @@ When one operand is fixed and the other streams, packing the fixed side once and
 The fused twins `gemm_packed_b_fused` and `gemm_packed_a_fused` accept the same handles plus a bias and activation, which is exactly the fixed-weight inference layer. Here a weight matrix is packed once as the LHS and reused across inference steps, with a per-output-channel bias and a ReLU folded in:
 
 ```rust
-use gemmkit::Parallelism;
-use gemmkit_ndarray::{Activation, Bias, gemm_packed_a_fused, prepack_lhs};
+use gemmkit_ndarray::{Activation, Bias, Parallelism, gemm_packed_a_fused, prepack_lhs};
 use ndarray::Array2;
 
 let (out, in_features) = (256usize, 512usize);

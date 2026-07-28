@@ -13,7 +13,7 @@
 即可工作。
 
 对外暴露的 API 镜像了核心引擎。实数标量的 `gemm`、`gemm_with` 和 `dot` 对
-`gemmkit::GemmScalar` 泛型（`f32`/`f64`，在 `half` feature 下还有 `f16`/`bf16`）。
+`GemmScalar` 泛型（`f32`/`f64`，在 `half` feature 下还有 `f16`/`bf16`）。
 `prepack_lhs`/`prepack_rhs` 构建可复用的打包句柄，供
 `gemm_packed_a`/`gemm_packed_b` 的固定操作数循环使用。feature 门控的类型族补充了整数
 （`gemm_i8`/`dot_i8`，`i8 -> i32`）和复数（`gemm_cplx`/`dot_cplx`）入口，而

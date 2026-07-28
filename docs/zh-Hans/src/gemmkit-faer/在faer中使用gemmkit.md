@@ -6,14 +6,15 @@
 
 ## 安装与 feature
 
-`gemmkit-faer` 不会重新导出 `Parallelism` 或 `Workspace`，因此还需要依赖 `gemmkit` 来获取这两个参数类型。
+`gemmkit-faer` 把自己签名里出现的东西都重新导出了，所以常规配置中并不需要直接依赖 `gemmkit`。
 
 ```toml
 [dependencies]
 gemmkit-faer = "0.1"
-gemmkit = "0.1" # 用于 Parallelism 与 Workspace 参数类型
 faer = "0.24"
 ```
+
+从 `gemmkit_faer` 里能拿到的有：`Parallelism` 选择器和每个 `_with` 变体所需的 `Workspace`；fused 选择器 `Bias` 与 `Activation`；预打包句柄 `PackedLhs` 与 `PackedRhs`；重量化参数 `Requantize` 与 `RequantScale`；元素类型约束 `GemmScalar`、`FusedScalar`、`MapScalar`、`ComplexScalar`——当你要写一个对某个入口泛型的封装时需要命名它们；对应 feature 下的元素类型 `f16`、`bf16`、`Complex`、`c32`、`c64`，于是 `half` 和 `num-complex` 也不必进入你的 manifest；以及 `tuning` 模块。请通过适配器去用 `tuning`，而不是自己再依赖一份 `gemmkit`——这些 knob 是进程级全局原子量，第二份单独解析出来的 `gemmkit` 会给你一组适配器根本不会读的原子量。
 
 每个 Cargo feature 都转发到 `gemmkit` 中的同名 feature，所以你在这里启用某个元素类型族或融合入口，底层的核心也会随之打开它。
 
@@ -41,7 +42,7 @@ pub(crate) fn ref_parts<T>(a: MatRef<'_, T>) -> (usize, usize, isize, isize, *co
 
 ## gemm 与 dot
 
-两个主力是 `dot`（返回一个全新的乘积）和 `gemm`（就地更新一个输出）。二者都对 `gemmkit::GemmScalar` 泛型：始终支持 `f32` 与 `f64`，在启用 `half` feature 时再加上 `f16` 与 `bf16`。
+两个主力是 `dot`（返回一个全新的乘积）和 `gemm`（就地更新一个输出）。二者都对 `GemmScalar` 泛型：始终支持 `f32` 与 `f64`，在启用 `half` feature 时再加上 `f16` 与 `bf16`。
 
 ```rust
 use faer::Mat;
@@ -58,8 +59,7 @@ assert_eq!(c[(1, 1)], 50.0);
 
 ```rust
 use faer::Mat;
-use gemmkit::Parallelism;
-use gemmkit_faer::gemm;
+use gemmkit_faer::{Parallelism, gemm};
 
 let a = Mat::<f64>::from_fn(4, 3, |i, j| (i + j) as f64);
 let b = Mat::<f64>::from_fn(3, 5, |i, j| (i as f64) * (j as f64));
@@ -68,7 +68,7 @@ let mut c = Mat::<f64>::zeros(4, 5);
 gemm(1.5, a.as_dyn_stride(), b.as_dyn_stride(), 2.0, c.as_dyn_stride_mut(), Parallelism::Serial);
 ```
 
-`gemm(alpha, a, b, beta, c, par)` 就地计算 `C <- alpha*A*B + beta*C`。当 `beta == 0` 时，`C` 原有内容被覆盖、绝不读取（这正是 `dot` 内部所做的）；当 `beta` 非零时，调用会在 `C` 已有的值上累加。签名就是上面看到的样子：输入是 `MatRef<'_, T>`，输出是 `MatMut<'_, T>`，`par` 是一个 `gemmkit::Parallelism`。`.as_dyn_stride()` / `.as_dyn_stride_mut()` 转换把 faer 静态类型化的步长变成适配器所接受的动态步长视图；它们在运行时没有任何开销。
+`gemm(alpha, a, b, beta, c, par)` 就地计算 `C <- alpha*A*B + beta*C`。当 `beta == 0` 时，`C` 原有内容被覆盖、绝不读取（这正是 `dot` 内部所做的）；当 `beta` 非零时，调用会在 `C` 已有的值上累加。签名就是上面看到的样子：输入是 `MatRef<'_, T>`，输出是 `MatMut<'_, T>`，`par` 是一个 `Parallelism`。`.as_dyn_stride()` / `.as_dyn_stride_mut()` 转换把 faer 静态类型化的步长变成适配器所接受的动态步长视图；它们在运行时没有任何开销。
 
 ## 无需拷贝即可直通的布局
 
@@ -85,15 +85,14 @@ let c = gemmkit_faer::dot(a, b.as_dyn_stride());
 
 ## 选择并行度
 
-每个入口都取一个 `gemmkit::Parallelism`。`Parallelism::Serial` 单线程运行；`Parallelism::Rayon(n)` 用 rayon 以至多 `n` 个线程运行，`Rayon(0)` 则自动探测。gemmkit 让线程数随负载渐进增长，而不是一上来就用满所有核心，并且在固定配置下结果对线程数可复现，因此在 `Serial` 与 `Rayon` 之间切换不会改变你得到的答案。调度模型见[并行实践](../gemmkit-guide/并行实践.md)指南。
+每个入口都取一个 `Parallelism`。`Parallelism::Serial` 单线程运行；`Parallelism::Rayon(n)` 用 rayon 以至多 `n` 个线程运行，`Rayon(0)` 则自动探测。gemmkit 让线程数随负载渐进增长，而不是一上来就用满所有核心，并且在固定配置下结果对线程数可复现，因此在 `Serial` 与 `Rayon` 之间切换不会改变你得到的答案。调度模型见[并行实践](../gemmkit-guide/并行实践.md)指南。
 
 ## 跨调用复用工作区
 
-`gemm` 从一个线程局部池分配它的临时空间。如果你在循环里驱动大量 GEMM，并想显式持有那块临时缓冲区，每个入口都有一个 `_with` 孪生版本，把 `&mut gemmkit::Workspace` 作为第一个参数并在多次调用间复用它。
+`gemm` 从一个线程局部池分配它的临时空间。如果你在循环里驱动大量 GEMM，并想显式持有那块临时缓冲区，每个入口都有一个 `_with` 孪生版本，把 `&mut Workspace` 作为第一个参数并在多次调用间复用它。
 
 ```rust
-use gemmkit::{Parallelism, Workspace};
-use gemmkit_faer::gemm_with;
+use gemmkit_faer::{Parallelism, Workspace, gemm_with};
 
 let mut ws = Workspace::new();
 for (a, b, mut c) in problems {

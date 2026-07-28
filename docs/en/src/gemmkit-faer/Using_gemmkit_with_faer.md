@@ -6,14 +6,15 @@ The crate targets faer 0.24 and requires Rust 1.89.
 
 ## Installation and features
 
-`gemmkit-faer` does not re-export `Parallelism` or `Workspace`, so depend on `gemmkit` too for those argument types.
+`gemmkit-faer` re-exports everything its own signatures name, so a direct `gemmkit` dependency is not part of the normal setup.
 
 ```toml
 [dependencies]
 gemmkit-faer = "0.1"
-gemmkit = "0.1" # for the Parallelism and Workspace argument types
 faer = "0.24"
 ```
+
+What comes back out of `gemmkit_faer` is: the `Parallelism` selector and the `Workspace` every `_with` variant takes; the fused selectors `Bias` and `Activation`; the prepacked handles `PackedLhs` and `PackedRhs`; the requantization parameters `Requantize` and `RequantScale`; the element-type bounds `GemmScalar`, `FusedScalar`, `MapScalar`, and `ComplexScalar`, which you need to name when writing a wrapper generic over an entry; the element types `f16`, `bf16`, `Complex`, `c32`, and `c64` under their features, so `half` and `num-complex` stay out of your manifest too; and the `tuning` module. Reach for `tuning` through the adapter rather than through a `gemmkit` dependency of your own — the knobs are process-global atomics, and a second, separately resolved `gemmkit` would give you a set of atomics the adapter never reads.
 
 Every Cargo feature forwards to the same-named `gemmkit` feature, so you enable an element family or the fused entries here and the core turns them on underneath.
 
@@ -41,7 +42,7 @@ The adapter validates the three shared dimensions itself, then forwards the poin
 
 ## gemm and dot
 
-The two workhorses are `dot`, which returns a fresh product, and `gemm`, which updates an output in place. Both are generic over `gemmkit::GemmScalar`: `f32` and `f64` always, plus `f16` and `bf16` when the `half` feature is on.
+The two workhorses are `dot`, which returns a fresh product, and `gemm`, which updates an output in place. Both are generic over `GemmScalar`: `f32` and `f64` always, plus `f16` and `bf16` when the `half` feature is on.
 
 ```rust
 use faer::Mat;
@@ -58,8 +59,7 @@ assert_eq!(c[(1, 1)], 50.0);
 
 ```rust
 use faer::Mat;
-use gemmkit::Parallelism;
-use gemmkit_faer::gemm;
+use gemmkit_faer::{Parallelism, gemm};
 
 let a = Mat::<f64>::from_fn(4, 3, |i, j| (i + j) as f64);
 let b = Mat::<f64>::from_fn(3, 5, |i, j| (i as f64) * (j as f64));
@@ -68,7 +68,7 @@ let mut c = Mat::<f64>::zeros(4, 5);
 gemm(1.5, a.as_dyn_stride(), b.as_dyn_stride(), 2.0, c.as_dyn_stride_mut(), Parallelism::Serial);
 ```
 
-`gemm(alpha, a, b, beta, c, par)` computes `C <- alpha*A*B + beta*C` in place. With `beta == 0` the prior contents of `C` are overwritten and never read (this is exactly what `dot` does internally); with a nonzero `beta` the call accumulates onto what `C` already holds. The signatures are the ones you see above: inputs are `MatRef<'_, T>`, the output is `MatMut<'_, T>`, and `par` is a `gemmkit::Parallelism`. The `.as_dyn_stride()` / `.as_dyn_stride_mut()` conversions turn faer's statically-typed strides into the dynamic-stride views the adapter accepts; they cost nothing at runtime.
+`gemm(alpha, a, b, beta, c, par)` computes `C <- alpha*A*B + beta*C` in place. With `beta == 0` the prior contents of `C` are overwritten and never read (this is exactly what `dot` does internally); with a nonzero `beta` the call accumulates onto what `C` already holds. The signatures are the ones you see above: inputs are `MatRef<'_, T>`, the output is `MatMut<'_, T>`, and `par` is a `Parallelism`. The `.as_dyn_stride()` / `.as_dyn_stride_mut()` conversions turn faer's statically-typed strides into the dynamic-stride views the adapter accepts; they cost nothing at runtime.
 
 ## Layouts that pass through untouched
 
@@ -85,15 +85,14 @@ The same holds for an offset sub-matrix (`submatrix(...)`, which moves the base 
 
 ## Choosing parallelism
 
-Every entry takes a `gemmkit::Parallelism`. `Parallelism::Serial` runs single-threaded; `Parallelism::Rayon(n)` uses rayon with at most `n` threads, and `Rayon(0)` auto-detects. gemmkit ramps thread count with the workload rather than jumping to all cores, and the result is reproducible across thread counts for a fixed configuration, so switching between `Serial` and `Rayon` does not change the answer you get. The [Parallelism in Practice](../gemmkit-guide/Parallelism_in_Practice.md) guide covers the scheduling model.
+Every entry takes a `Parallelism`. `Parallelism::Serial` runs single-threaded; `Parallelism::Rayon(n)` uses rayon with at most `n` threads, and `Rayon(0)` auto-detects. gemmkit ramps thread count with the workload rather than jumping to all cores, and the result is reproducible across thread counts for a fixed configuration, so switching between `Serial` and `Rayon` does not change the answer you get. The [Parallelism in Practice](../gemmkit-guide/Parallelism_in_Practice.md) guide covers the scheduling model.
 
 ## Reusing a workspace across calls
 
-`gemm` allocates its scratch space from a thread-local pool. If you drive many GEMMs in a loop and want to own that scratch buffer explicitly, every entry has a `_with` twin that takes a `&mut gemmkit::Workspace` as its first argument and reuses it across calls.
+`gemm` allocates its scratch space from a thread-local pool. If you drive many GEMMs in a loop and want to own that scratch buffer explicitly, every entry has a `_with` twin that takes a `&mut Workspace` as its first argument and reuses it across calls.
 
 ```rust
-use gemmkit::{Parallelism, Workspace};
-use gemmkit_faer::gemm_with;
+use gemmkit_faer::{Parallelism, Workspace, gemm_with};
 
 let mut ws = Workspace::new();
 for (a, b, mut c) in problems {

@@ -6,20 +6,21 @@ nalgebra's natural layout is column-major, which is also gemmkit's preferred ori
 
 ## Adding it to a project
 
-Three crates go into `Cargo.toml`. The adapter re-exports the epilogue and pack types it needs, but `Parallelism` and `Workspace` come from `gemmkit` itself, so you depend on the core crate as well.
+Two crates go into `Cargo.toml`. The adapter re-exports everything its own signatures name, so a direct `gemmkit` dependency is not part of the normal setup.
 
 ```toml
 [dependencies]
 gemmkit-nalgebra = "0.1"
-gemmkit = "0.1" # for the Parallelism and Workspace arguments, which are not re-exported
 nalgebra = "0.35"
 ```
+
+What comes back out of `gemmkit_nalgebra` is: the `Parallelism` selector and the `Workspace` every `_with` variant takes; the fused selectors `Bias` and `Activation`; the prepacked handles `PackedLhs` and `PackedRhs`; the requantization parameters `Requantize` and `RequantScale`; the element-type bounds `GemmScalar`, `FusedScalar`, `MapScalar`, and `ComplexScalar`, which you need to name when writing a wrapper generic over an entry; the element types `f16`, `bf16`, `Complex`, `c32`, and `c64` under their features, so `half` and `num-complex` stay out of your manifest too; and the `tuning` module. Reach for `tuning` through the adapter rather than through a `gemmkit` dependency of your own — the knobs are process-global atomics, and a second, separately resolved `gemmkit` would give you a set of atomics the adapter never reads.
 
 The default feature set enables `parallel`, which turns on rayon-based threading in the engine (`gemmkit/parallel`). Every adapter feature is a thin forward to the same-named feature on `gemmkit`: `half` adds `f16`/`bf16` inputs, `complex` adds `Complex<f32>`/`Complex<f64>`, `int8` adds the `i8 -> i32` path, `epilogue` adds fused bias/activation and the per-element map, and `wasm_threads` layers `parallel` onto `wasm32-wasip1-threads`. The feature-gated entries are covered in [nalgebra Adapter Advanced Usage](nalgebra_Adapter_Advanced_Usage.md); this page stays on the always-available real-scalar surface.
 
 ## The three real-scalar entries
 
-The base surface is three functions, all generic over `gemmkit::GemmScalar` (which is `f32` and `f64` always, plus `f16` and `bf16` under the `half` feature). `gemm` is the accumulating multiply, `gemm_with` is the same call reusing a caller-owned workspace, and `dot` is a convenience wrapper that allocates its result.
+The base surface is three functions, all generic over `GemmScalar` (which is `f32` and `f64` always, plus `f16` and `bf16` under the `half` feature). `gemm` is the accumulating multiply, `gemm_with` is the same call reusing a caller-owned workspace, and `dot` is a convenience wrapper that allocates its result.
 
 Here is `gemm` verbatim, from `gemmkit-nalgebra/src/float.rs`:
 
@@ -52,7 +53,7 @@ The ten generic parameters look heavy, but they say one simple thing: `A`, `B`, 
 ## A first multiply with DMatrix
 
 ```rust
-use gemmkit::Parallelism;
+use gemmkit_nalgebra::Parallelism;
 use nalgebra::DMatrix;
 
 let a = DMatrix::from_row_slice(2, 2, &[1.0_f32, 2.0, 3.0, 4.0]);
@@ -101,14 +102,14 @@ The entries validate shapes and panic on a mismatch, with the offending dimensio
 
 ## Choosing parallelism
 
-Every call takes a `gemmkit::Parallelism` as its last argument. There are two variants: `Parallelism::Serial` runs single-threaded, and `Parallelism::Rayon(n)` runs on rayon with at most `n` threads, where `Rayon(0)` auto-detects the thread count. The `Default` is `Rayon(0)`, which is what `dot` uses internally. For small matrices, or when you are already inside a parallel region and want to avoid nested threading, pass `Parallelism::Serial`; for large multiplies on an otherwise idle machine, `Parallelism::Rayon(0)` lets the engine spread the work. The threading strategy and how the engine picks a thread count are covered in [Parallelism in Practice](../gemmkit-guide/Parallelism_in_Practice.md).
+Every call takes a `Parallelism` as its last argument. There are two variants: `Parallelism::Serial` runs single-threaded, and `Parallelism::Rayon(n)` runs on rayon with at most `n` threads, where `Rayon(0)` auto-detects the thread count. The `Default` is `Rayon(0)`, which is what `dot` uses internally. For small matrices, or when you are already inside a parallel region and want to avoid nested threading, pass `Parallelism::Serial`; for large multiplies on an otherwise idle machine, `Parallelism::Rayon(0)` lets the engine spread the work. The threading strategy and how the engine picks a thread count are covered in [Parallelism in Practice](../gemmkit-guide/Parallelism_in_Practice.md).
 
 ## Reusing a workspace
 
 The engine needs scratch space to pack blocks of `A` and `B`. By default it borrows that space from a thread-local pool, so `gemm` and `dot` allocate nothing of their own per call in the steady state. When you run many multiplies in a tight loop and want full control over that buffer, `gemm_with` takes a `&mut Workspace` you own and reuse:
 
 ```rust
-use gemmkit::{Parallelism, Workspace};
+use gemmkit_nalgebra::{Parallelism, Workspace};
 use nalgebra::DMatrix;
 
 let mut ws = Workspace::new();

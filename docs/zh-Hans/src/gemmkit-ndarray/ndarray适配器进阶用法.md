@@ -7,8 +7,7 @@
 `gemm_i8` 把 `i8` 输入乘进一个 `i32` 累加器：`C(i32) <- alpha*A(i8)*B(i8) + beta*C`，其中 `alpha`、`beta` 和 `C` 都是 `i32`。它之所以是独立于 `gemm` 的入口，正是因为输入与输出的元素类型不同。算术在溢出时回绕，这是整数 GEMM 的惯例语义。`dot_i8` 是其便捷孪生，返回一个新建的 `Array2<i32>`。
 
 ```rust
-use gemmkit::Parallelism;
-use gemmkit_ndarray::{dot_i8, gemm_i8};
+use gemmkit_ndarray::{Parallelism, dot_i8, gemm_i8};
 use ndarray::Array2;
 
 let a = Array2::<i8>::zeros((16, 12));
@@ -27,8 +26,7 @@ gemm_i8(2, &a, &b, 1, &mut acc, Parallelism::Serial);
 量化推理很少想要原始的 `i32` 累加器，它要的是一个 8 位张量。`gemm_i8_requant` 把乘法和重量化融进一趟，直接把 `i32` 累加器折叠成 `i8` 输出，全程不物化完整的 `m*n` 中间结果。它没有 `alpha`（折进 scale）也没有 `beta`（累加进量化输出没有良好定义）。参数装在一个 `Requantize` 里：
 
 ```rust
-use gemmkit::Parallelism;
-use gemmkit_ndarray::{RequantScale, Requantize, gemm_i8_requant, gemm_i8_requant_u8};
+use gemmkit_ndarray::{Parallelism, RequantScale, Requantize, gemm_i8_requant, gemm_i8_requant_u8};
 use ndarray::Array2;
 
 let a = Array2::<i8>::zeros((16, 12));
@@ -63,8 +61,7 @@ gemm_i8_requant_u8(
 复数乘积有自己的入口，因为那两个共轭标志放不进同构的实数签名。`gemm_cplx` 计算 `C <- alpha*op(A)*op(B) + beta*C`，其中设置 `conj_a` 时 `op(A)` 为 `conj(A)`，设置 `conj_b` 时 `op(B)` 为 `conj(B)`，元素类型为 `Complex<f32>` 或 `Complex<f64>`。`dot_cplx` 是不做共轭的便捷入口。
 
 ```rust
-use gemmkit::{Complex, Parallelism};
-use gemmkit_ndarray::{dot_cplx, gemm_cplx};
+use gemmkit_ndarray::{Complex, Parallelism, dot_cplx, gemm_cplx};
 use ndarray::Array2;
 
 type C = Complex<f64>;
@@ -95,8 +92,7 @@ gemm_cplx(
 `gemm_fused` 一趟算出 `C <- act(alpha*A*B + beta*C + bias)`。偏置是可选的 `Bias::PerRow`（长度 `A.rows`）或 `Bias::PerCol`（长度 `B.cols`）；激活是可选的 `Relu` 或 `LeakyRelu(slope)`，最后施加。两者都为 `None` 时，它就是 `gemm`。
 
 ```rust
-use gemmkit::Parallelism;
-use gemmkit_ndarray::{Activation, Bias, gemm_fused, gemm_map};
+use gemmkit_ndarray::{Activation, Bias, Parallelism, gemm_fused, gemm_map};
 use ndarray::Array2;
 
 let a = Array2::<f32>::zeros((12, 9));
@@ -125,8 +121,7 @@ gemm_map(1.0, &a, &b, 0.0, &mut c2, &f, Parallelism::default());
 这是唯一没有普通 `gemm` 对应、也在同类适配器里没有对手的运算：一叠彼此独立的乘积，承载在三维 `Array3` 上，批次维在 0 轴。`a` 是 `(batch, m, k)`，`b` 是 `(batch, k, n)`，`c` 是 `(batch, m, n)`；0 轴是各操作数的批次步长，1、2 轴是元素步长。它在批次上并行，每个元素在一个 worker 上串行运行，因此结果精确复现一个 `gemm` 调用循环。
 
 ```rust
-use gemmkit::Parallelism;
-use gemmkit_ndarray::{dot_batched, gemm_batched};
+use gemmkit_ndarray::{Parallelism, dot_batched, gemm_batched};
 use ndarray::Array3;
 
 let a = Array3::<f32>::zeros((32, 8, 5)); // (batch, m, k)
@@ -149,8 +144,7 @@ gemm_batched(0.7, &a, &b, 1.3, &mut acc, Parallelism::default());
 融合孪生 `gemm_packed_b_fused` 和 `gemm_packed_a_fused` 接受同样的句柄，再加上偏置和激活，这正是固定权重的推理层。下面把一个权重矩阵作为 LHS 打包一次并在各推理步之间复用，融进一个 per-output-channel 的偏置和一个 ReLU：
 
 ```rust
-use gemmkit::Parallelism;
-use gemmkit_ndarray::{Activation, Bias, gemm_packed_a_fused, prepack_lhs};
+use gemmkit_ndarray::{Activation, Bias, Parallelism, gemm_packed_a_fused, prepack_lhs};
 use ndarray::Array2;
 
 let (out, in_features) = (256usize, 512usize);

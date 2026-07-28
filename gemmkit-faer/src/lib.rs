@@ -16,7 +16,7 @@
 //! assert_eq!(c[(1, 1)], 50.0);
 //! ```
 //!
-//! [`gemm`]/[`gemm_with`]/[`dot`] are generic over [`gemmkit::GemmScalar`]: `f32`/`f64`
+//! [`gemm`]/[`gemm_with`]/[`dot`] are generic over [`GemmScalar`]: `f32`/`f64`
 //! unconditionally, plus `f16`/`bf16` under the `half` feature. [`prepack_rhs`]/[`prepack_lhs`] pack
 //! the reused operand once for a fixed-weight loop, consumed by repeated
 //! [`gemm_packed_b`]/[`gemm_packed_a`] calls. Complex products (`Complex<f32>`/`Complex<f64>`,
@@ -49,17 +49,42 @@
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+// `MatRef`/`MatMut` unqualified in this crate are always faer's types (imported here); gemmkit
+// defines its own type of the same name for its checked slice API, but it is never imported here
 use faer::{Mat, MatMut, MatRef};
+/// The element-type bound of the complex entries, re-exported so a caller writing a wrapper
+/// generic over [`gemm_cplx`] need not depend on `gemmkit` directly to name the bound
+#[cfg(feature = "complex")]
+pub use gemmkit::ComplexScalar;
+/// The element-type bound of the plain real entries, re-exported so a caller writing a wrapper
+/// generic over [`gemm`]/[`dot`]/[`prepack_rhs`] need not depend on `gemmkit` directly to name
+/// the bound
+pub use gemmkit::GemmScalar;
+/// gemmkit's heuristic thresholds: the `tuning::set_*` setters, their getters, and the compiled
+/// defaults, re-exported so callers need not depend on `gemmkit` directly. The knobs are
+/// process-global atomics, so reaching them through a separately resolved second `gemmkit` would
+/// set a copy this adapter never reads
+#[doc(no_inline)]
+pub use gemmkit::tuning;
 /// The bias and activation selectors accepted by [`gemm_fused`] and its packed twins (`Bias`
 /// only for its complex twin), re-exported so callers need not depend on `gemmkit` directly
 #[cfg(feature = "epilogue")]
 pub use gemmkit::{Activation, Bias};
+/// The complex element type of [`gemm_cplx`] and its `c32` / `c64` aliases, re-exported so a
+/// caller need not reach for a 2nd source of them (they are the same `num_complex` types faer's
+/// own `c32` / `c64` are)
 #[cfg(feature = "complex")]
-use gemmkit::{ComplexScalar, gemm_cplx_unchecked, gemm_cplx_unchecked_with};
+#[doc(no_inline)]
+pub use gemmkit::{Complex, c32, c64};
+/// The element-type bounds of the fused entries ([`FusedScalar`] for the bias/activation form,
+/// [`MapScalar`] for [`gemm_map`]), re-exported so a caller writing a wrapper generic over them
+/// need not depend on `gemmkit` directly to name the bound
+#[cfg(feature = "epilogue")]
+pub use gemmkit::{FusedScalar, MapScalar};
 use gemmkit::{
-    GemmProblem, GemmScalar, gemm_batched_ptr_unchecked, gemm_packed_a_unchecked,
-    gemm_packed_a_unchecked_with, gemm_packed_b_unchecked, gemm_packed_b_unchecked_with,
-    gemm_unchecked, gemm_unchecked_with, prepack_lhs_unchecked, prepack_rhs_unchecked,
+    GemmProblem, gemm_batched_ptr_unchecked, gemm_packed_a_unchecked, gemm_packed_a_unchecked_with,
+    gemm_packed_b_unchecked, gemm_packed_b_unchecked_with, gemm_unchecked, gemm_unchecked_with,
+    prepack_lhs_unchecked, prepack_rhs_unchecked,
 };
 /// The handles produced by [`prepack_rhs`]/[`prepack_lhs`] and consumed by the `gemm_packed_*`
 /// entries, re-exported so callers need not depend on `gemmkit` directly
@@ -72,16 +97,21 @@ pub use gemmkit::{Parallelism, Workspace};
 /// callers need not depend on `gemmkit` directly
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 pub use gemmkit::{RequantScale, Requantize};
-// `MatRef`/`MatMut` unqualified in this crate are always faer's types (imported above); gemmkit
-// defines its own type of the same name for its checked slice API, but it is never imported here
-#[cfg(feature = "epilogue")]
-use gemmkit::{
-    FusedScalar, MapScalar, gemm_fused_unchecked, gemm_fused_unchecked_with, gemm_map_unchecked,
-    gemm_map_unchecked_with, gemm_packed_a_fused_unchecked, gemm_packed_a_fused_unchecked_with,
-    gemm_packed_b_fused_unchecked, gemm_packed_b_fused_unchecked_with,
-};
+/// The narrow float element types of the `half`-gated entries, re-exported so callers need not
+/// depend on `half` directly ([`faer`] exposes neither). Both accumulate in `f32`
+#[cfg(feature = "half")]
+#[doc(no_inline)]
+pub use gemmkit::{bf16, f16};
 #[cfg(all(feature = "complex", feature = "epilogue"))]
 use gemmkit::{gemm_cplx_fused_unchecked, gemm_cplx_fused_unchecked_with};
+#[cfg(feature = "complex")]
+use gemmkit::{gemm_cplx_unchecked, gemm_cplx_unchecked_with};
+#[cfg(feature = "epilogue")]
+use gemmkit::{
+    gemm_fused_unchecked, gemm_fused_unchecked_with, gemm_map_unchecked, gemm_map_unchecked_with,
+    gemm_packed_a_fused_unchecked, gemm_packed_a_fused_unchecked_with,
+    gemm_packed_b_fused_unchecked, gemm_packed_b_fused_unchecked_with,
+};
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 use gemmkit::{
     gemm_i8_requant_u8_unchecked, gemm_i8_requant_u8_unchecked_with, gemm_i8_requant_unchecked,

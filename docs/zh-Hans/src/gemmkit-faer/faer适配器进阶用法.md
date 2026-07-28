@@ -2,7 +2,7 @@
 
 除了 `gemm` 与 `dot`，faer 适配器还镜像了 gemmkit 其余的接口：额外的元素类型族、融合尾部运算、基于切片的批量 GEMM，以及预打包操作数。每一项都由 feature 门控，每一项都直接从 faer 视图里读出原始指针与步长，因此转置、子矩阵和反转操作数的表现，与普通路径上完全一致。本页逐一走过这些类型族，最后给出一段坦诚的说明：在 faer 已自带高性能 matmul 的前提下，何时才该动用这个适配器。
 
-[入门页](在faer中使用gemmkit.md)介绍了安装、零拷贝机制、`gemm`/`gemm_with`/`dot`、并行度以及工作区模式；本页在其之上展开。与普通路径一样，每个入口也都有一个复用调用方持有的 `gemmkit::Workspace` 的 `_with` 孪生版本。
+[入门页](在faer中使用gemmkit.md)介绍了安装、零拷贝机制、`gemm`/`gemm_with`/`dot`、并行度以及工作区模式；本页在其之上展开。与普通路径一样，每个入口也都有一个复用调用方持有的 `Workspace` 的 `_with` 孪生版本。
 
 ## 整数 GEMM（`int8`）
 
@@ -10,8 +10,7 @@
 
 ```rust
 use faer::Mat;
-use gemmkit::Parallelism;
-use gemmkit_faer::{dot_i8, gemm_i8};
+use gemmkit_faer::{Parallelism, dot_i8, gemm_i8};
 
 let a = Mat::<i8>::from_fn(16, 12, |i, j| ((i + j) as i8 % 7) - 3);
 let b = Mat::<i8>::from_fn(12, 10, |i, j| ((i * 2 + j) as i8 % 5) - 2);
@@ -34,8 +33,7 @@ gemm_i8(3, a.as_dyn_stride(), b.as_dyn_stride(), -2, acc.as_dyn_stride_mut(), Pa
 
 ```rust
 use faer::Mat;
-use gemmkit::Parallelism;
-use gemmkit_faer::{gemm_i8_requant, RequantScale, Requantize};
+use gemmkit_faer::{Parallelism, RequantScale, Requantize, gemm_i8_requant};
 
 let (m, n) = (17, 13);
 let bias: Vec<i32> = (0..m as i32).map(|i| 40 * i - 200).collect();
@@ -52,14 +50,13 @@ gemm_i8_requant(a.as_dyn_stride(), b.as_dyn_stride(), req, c.as_dyn_stride_mut()
 
 ## 复数 GEMM（`complex`）
 
-在 `complex` feature 下，`gemm_cplx`、`gemm_cplx_with` 与 `dot_cplx` 作用于复数矩阵，可对每个操作数分别选择是否共轭。元素类型 `T` 是 `Complex<f32>` 或 `Complex<f64>`。这并非 faer 之外的另一套表示：faer 0.24 的 `c32` 与 `c64` 就是 `num_complex::Complex<f32>` 与 `num_complex::Complex<f64>` 的类型别名，与 gemmkit 重新导出为 `gemmkit::Complex`、并作为 `ComplexScalar` 约束的类型完全相同。因此一个 faer 复数 `Mat` 抵达适配器时不需要任何转换，就像实数一样。
+在 `complex` feature 下，`gemm_cplx`、`gemm_cplx_with` 与 `dot_cplx` 作用于复数矩阵，可对每个操作数分别选择是否共轭。元素类型 `T` 是 `Complex<f32>` 或 `Complex<f64>`。这并非 faer 之外的另一套表示：faer 0.24 的 `c32` 与 `c64` 就是 `num_complex::Complex<f32>` 与 `num_complex::Complex<f64>` 的类型别名，与本 crate 重新导出的 `Complex`（以及同名的 `c32` / `c64` 别名）、并作为 `ComplexScalar` 约束的类型完全相同。因此一个 faer 复数 `Mat` 抵达适配器时不需要任何转换，就像实数一样。
 
 `gemm_cplx` 之所以独立于 `gemm`，是因为共轭标志放不进同质接口。它计算 `C <- alpha*op(A)*op(B) + beta*C`，其中当 `conj_a` 置位时 `op(A) = conj(A)`，当 `conj_b` 置位时 `op(B) = conj(B)`。`cplx.rs` 里的实现取出与实数路径相同的原始部件，并把两个 `bool` 标志一路传给 `gemm_cplx_unchecked`；除此之外没有区别，所以转置、子矩阵和反转视图表现一致。`dot_cplx` 是非共轭 `A*B` 的便捷接口。
 
 ```rust
 use faer::Mat;
-use gemmkit::{Complex, Parallelism};
-use gemmkit_faer::gemm_cplx;
+use gemmkit_faer::{Complex, Parallelism, gemm_cplx};
 
 type C = Complex<f64>;
 let a = Mat::<C>::from_fn(12, 9, |i, j| C::new(i as f64, j as f64));
@@ -83,8 +80,7 @@ gemm_cplx(
 在 `epilogue` 下，`gemm_fused` 一趟计算 `C <- act(alpha*A*B + beta*C + bias)`。可选的 `Bias` 是 `PerRow` 或 `PerCol`；可选的 `Activation` 是 `Relu` 或 `LeakyRelu(slope)`，最后应用。两者都传 `None` 就恰好是 `gemm`。两个选择子都由 crate 重新导出。
 
 ```rust
-use gemmkit::Parallelism;
-use gemmkit_faer::{gemm_fused, Activation, Bias};
+use gemmkit_faer::{Activation, Bias, Parallelism, gemm_fused};
 
 let bias: Vec<f64> = (0..m).map(|i| 0.5 * i as f64 - 2.0).collect();
 // C <- relu(1.3 * A*B - 0.7 * C + 逐行偏置)
@@ -107,8 +103,7 @@ faer 没有三维数组类型，所以批量 GEMM 以切片表达：`gemm_batche
 
 ```rust
 use faer::Mat;
-use gemmkit::Parallelism;
-use gemmkit_faer::gemm_batched;
+use gemmkit_faer::{Parallelism, gemm_batched};
 
 let a = Mat::from_fn(2, 2, |i, j| [[1.0_f64, 2.0], [3.0, 4.0]][i][j]);
 let b = Mat::from_fn(2, 2, |i, j| [[5.0_f64, 6.0], [7.0, 8.0]][i][j]);
@@ -129,8 +124,7 @@ gemm_batched(1.0, &ab, 0.0, &mut c, Parallelism::Serial);
 当一个操作数在多次调用间固定（权重对着一串激活值）时，把它预打包一次，就能省掉每次调用的重打包。`prepack_rhs` 把一个 `B` 变成可复用的 `PackedRhs`，由 `gemm_packed_b` 消费；`prepack_lhs` 把一个 `A` 变成 `PackedLhs`，由 `gemm_packed_a` 消费。两个句柄都由 crate 重新导出。
 
 ```rust
-use gemmkit::Parallelism;
-use gemmkit_faer::{gemm_packed_b, prepack_rhs};
+use gemmkit_faer::{Parallelism, gemm_packed_b, prepack_rhs};
 
 let packed = prepack_rhs(weights.as_dyn_stride()); // 把固定的 B 打包一次
 for (act, mut out) in stream {

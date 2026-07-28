@@ -6,20 +6,21 @@ nalgebra 的自然布局是列主序，这也正是 gemmkit 偏好的朝向，�
 
 ## 加入项目
 
-`Cargo.toml` 里需要三个 crate。适配器会重新导出它所需的 epilogue 类型和打包类型，但 `Parallelism` 和 `Workspace` 来自 `gemmkit` 本身，所以你还要依赖核心 crate。
+`Cargo.toml` 里需要两个 crate。适配器把自己签名里出现的东西都重新导出了，所以常规配置中并不需要直接依赖 `gemmkit`。
 
 ```toml
 [dependencies]
 gemmkit-nalgebra = "0.1"
-gemmkit = "0.1" # 用于 Parallelism 和 Workspace 参数，它们未被重新导出
 nalgebra = "0.35"
 ```
+
+从 `gemmkit_nalgebra` 里能拿到的有：`Parallelism` 选择器和每个 `_with` 变体所需的 `Workspace`；fused 选择器 `Bias` 与 `Activation`；预打包句柄 `PackedLhs` 与 `PackedRhs`；重量化参数 `Requantize` 与 `RequantScale`；元素类型约束 `GemmScalar`、`FusedScalar`、`MapScalar`、`ComplexScalar`——当你要写一个对某个入口泛型的封装时需要命名它们；对应 feature 下的元素类型 `f16`、`bf16`、`Complex`、`c32`、`c64`，于是 `half` 和 `num-complex` 也不必进入你的 manifest；以及 `tuning` 模块。请通过适配器去用 `tuning`，而不是自己再依赖一份 `gemmkit`——这些 knob 是进程级全局原子量，第二份单独解析出来的 `gemmkit` 会给你一组适配器根本不会读的原子量。
 
 默认 feature 集启用 `parallel`，它打开引擎里基于 rayon 的线程化（`gemmkit/parallel`）。适配器的每个 feature 都是对 `gemmkit` 上同名 feature 的一层薄转发：`half` 增加 `f16`/`bf16` 输入，`complex` 增加 `Complex<f32>`/`Complex<f64>`，`int8` 增加 `i8 -> i32` 路径，`epilogue` 增加融合的偏置/激活以及逐元素映射，`wasm_threads` 则在 `wasm32-wasip1-threads` 上叠加 `parallel`。这些 feature 门控的入口在 [nalgebra 适配器进阶用法](nalgebra适配器进阶用法.md) 中讲解；本页只谈始终可用的实数标量接口。
 
 ## 三个实数标量入口
 
-基础接口是三个函数，都对 `gemmkit::GemmScalar` 泛型（它始终是 `f32` 和 `f64`，在 `half` feature 下另加 `f16` 和 `bf16`）。`gemm` 是做累加的乘法，`gemm_with` 是复用调用方持有的工作区的同一调用，`dot` 则是一个自行分配结果的便捷封装。
+基础接口是三个函数，都对 `GemmScalar` 泛型（它始终是 `f32` 和 `f64`，在 `half` feature 下另加 `f16` 和 `bf16`）。`gemm` 是做累加的乘法，`gemm_with` 是复用调用方持有的工作区的同一调用，`dot` 则是一个自行分配结果的便捷封装。
 
 下面是 `gemm` 的原样签名，摘自 `gemmkit-nalgebra/src/float.rs`：
 
@@ -52,7 +53,7 @@ pub fn gemm<T, R1, C1, S1, R2, C2, S2, RC, CC, SC>(
 ## 用 DMatrix 做第一次乘法
 
 ```rust
-use gemmkit::Parallelism;
+use gemmkit_nalgebra::Parallelism;
 use nalgebra::DMatrix;
 
 let a = DMatrix::from_row_slice(2, 2, &[1.0_f32, 2.0, 3.0, 4.0]);
@@ -101,14 +102,14 @@ let c = gemmkit_nalgebra::dot(&a34, &b); // -> DMatrix<f64>，形状 3x2
 
 ## 选择并行方式
 
-每个调用都以一个 `gemmkit::Parallelism` 作为最后一个参数。它有两个变体：`Parallelism::Serial` 单线程运行，`Parallelism::Rayon(n)` 在 rayon 上以至多 `n` 个线程运行，其中 `Rayon(0)` 自动探测线程数。`Default` 是 `Rayon(0)`，也正是 `dot` 内部所用。对于小矩阵，或当你已身处一个并行区域、想避免嵌套线程化时，就传 `Parallelism::Serial`；对于空闲机器上的大乘法，`Parallelism::Rayon(0)` 让引擎去铺开工作。线程化策略以及引擎如何挑选线程数，见 [并行实践](../gemmkit-guide/并行实践.md)。
+每个调用都以一个 `Parallelism` 作为最后一个参数。它有两个变体：`Parallelism::Serial` 单线程运行，`Parallelism::Rayon(n)` 在 rayon 上以至多 `n` 个线程运行，其中 `Rayon(0)` 自动探测线程数。`Default` 是 `Rayon(0)`，也正是 `dot` 内部所用。对于小矩阵，或当你已身处一个并行区域、想避免嵌套线程化时，就传 `Parallelism::Serial`；对于空闲机器上的大乘法，`Parallelism::Rayon(0)` 让引擎去铺开工作。线程化策略以及引擎如何挑选线程数，见 [并行实践](../gemmkit-guide/并行实践.md)。
 
 ## 复用工作区
 
 引擎需要暂存空间来打包 `A` 和 `B` 的分块。默认它从一个线程局部的池子借用这块空间，因此在稳态下 `gemm` 和 `dot` 每次调用不会自行分配。当你在紧凑循环里做很多次乘法、想完全掌控那块缓冲区时，`gemm_with` 接收一个你自己持有并复用的 `&mut Workspace`：
 
 ```rust
-use gemmkit::{Parallelism, Workspace};
+use gemmkit_nalgebra::{Parallelism, Workspace};
 use nalgebra::DMatrix;
 
 let mut ws = Workspace::new();

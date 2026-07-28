@@ -20,14 +20,15 @@ pub(crate) fn dims_strides<T, S: Data<Elem = T>>(
 
 ## 加入项目
 
-适配器重新导出了 fused 选择器（`Bias`、`Activation`），但不重新导出 `Parallelism` 和 `Workspace`，所以一个典型项目会同时依赖两个 crate：
+是两个 crate，不是三个。适配器把自己签名里出现的东西都重新导出了，所以常规配置中并不需要直接依赖 `gemmkit`：
 
 ```toml
 [dependencies]
 gemmkit-ndarray = "0.1"
-gemmkit = "0.1" # 需要 Parallelism 和 Workspace
 ndarray = "0.17.1"
 ```
+
+从 `gemmkit_ndarray` 里能拿到的有：`Parallelism` 选择器和每个 `_with` 变体所需的 `Workspace`；fused 选择器 `Bias` 与 `Activation`；预打包句柄 `PackedLhs` 与 `PackedRhs`；重量化参数 `Requantize` 与 `RequantScale`；元素类型约束 `GemmScalar`、`FusedScalar`、`MapScalar`、`ComplexScalar`——当你要写一个对某个入口泛型的封装时需要命名它们；对应 feature 下的元素类型 `f16`、`bf16`、`Complex`、`c32`、`c64`，于是 `half` 和 `num-complex` 也不必进入你的 manifest；以及 `tuning` 模块。请通过适配器去用 `tuning`，而不是自己再依赖一份 `gemmkit`——这些 knob 是进程级全局原子量，第二份单独解析出来的 `gemmkit` 会给你一组适配器根本不会读的原子量。
 
 `gemmkit-ndarray` 上的每个 feature 都直接转发到 `gemmkit` 中的同名 feature，因此你在这里打开某项能力，对应的入口点就会随之启用：
 
@@ -76,7 +77,7 @@ where
 输出约束为 `SC: DataMut`，所以 `C` 是 `&mut Array2` 或 `ArrayViewMut2`，并且和输入一样可以是任意布局。下面 `A` 是一块行主序缓冲区，被无拷贝地转置成列主序视图，乘法以单线程运行：
 
 ```rust
-use gemmkit::Parallelism;
+use gemmkit_ndarray::Parallelism;
 use ndarray::{Array2, array};
 
 // 行主序存储，无拷贝地转置成列主序视图
@@ -103,14 +104,14 @@ assert_eq!(c, array![[4.0, 4.0], [6.0, 6.0]]);
 
 ## 选择并行度
 
-`Parallelism` 来自 `gemmkit`。`Parallelism::Serial` 在调用线程上运行；`Parallelism::Rayon(n)` 使用一个至多 `n` 线程的 rayon 线程池，而 `Rayon(0)` 会自动探测机器的核数。`Parallelism::default()` 就是 `Rayon(0)`，也是 `dot` 所用的，因此 `dot` 开箱即并行。并行路径需要 `parallel` feature（默认开启）；关掉它后，可把每次调用都当作串行。gemmkit 让串行与并行的运行在固定输入和配置下逐位可复现，所以切换 `par` 从不改变数值。线程数背后的取舍见[并行实践](../gemmkit-guide/并行实践.md)。
+`Parallelism` 由适配器重新导出。`Parallelism::Serial` 在调用线程上运行；`Parallelism::Rayon(n)` 使用一个至多 `n` 线程的 rayon 线程池，而 `Rayon(0)` 会自动探测机器的核数。`Parallelism::default()` 就是 `Rayon(0)`，也是 `dot` 所用的，因此 `dot` 开箱即并行。并行路径需要 `parallel` feature（默认开启）；关掉它后，可把每次调用都当作串行。gemmkit 让串行与并行的运行在固定输入和配置下逐位可复现，所以切换 `par` 从不改变数值。线程数背后的取舍见[并行实践](../gemmkit-guide/并行实践.md)。
 
 ## 复用工作区
 
 每个会分配的入口在调用期间都从 gemmkit 的内部线程本地池借用临时空间，所以单次 `gemm` 绝不会把一次分配泄漏进你的稳态。当你跑一个形状相近的热循环时，`_with` 变体让你转而自己持有这块临时空间：把一个 `&mut Workspace` 作为首个参数传入，它会一次性增长到循环所需的最大尺寸，之后被复用而不再分配。
 
 ```rust
-use gemmkit::{Parallelism, Workspace};
+use gemmkit_ndarray::{Parallelism, Workspace};
 use ndarray::Array2;
 
 let mut ws = Workspace::new();

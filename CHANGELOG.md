@@ -30,6 +30,23 @@ once with per-crate subsections where a change is crate-specific.
   non-zero value still pins one flat width, now bypassing the ladder. gemv output
   remains bit-identical across worker counts
 
+### gemmkit-ndarray, gemmkit-nalgebra, gemmkit-faer
+
+#### Added
+
+- Each adapter now re-exports every gemmkit item its own signatures name, so an
+  adapter user no longer needs a direct `gemmkit` dependency. New in this release:
+  the `GemmScalar`, `FusedScalar`, `MapScalar`, and `ComplexScalar` element-type
+  bounds, which appear in the adapters' own public signatures and previously could
+  not be named from outside — a caller could call `gemm` but not write a wrapper
+  generic over it; the feature-gated element types `f16` / `bf16` (`half`) and
+  `Complex` / `c32` / `c64` (`complex`), so `half` and `num-complex` also stay out
+  of the caller's manifest; and the `tuning` module. Reaching `tuning` through the
+  adapter is the correct route rather than merely the convenient one: the knobs are
+  process-global atomics, so a `set_*` call made through a separately resolved
+  second `gemmkit` writes a copy the adapter never reads, which fails silently as a
+  knob that appears set but has no effect
+
 ### gemmkit-tune
 
 #### Changed

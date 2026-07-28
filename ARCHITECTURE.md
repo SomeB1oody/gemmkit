@@ -71,6 +71,20 @@ engine, since neither library has a rank-3 type). Each adapter feature
 (default `parallel`, plus `wasm_threads`, `half`, `complex`, `int8`,
 `epilogue`) forwards to the same-named gemmkit feature.
 
+Each adapter re-exports every gemmkit item its own signatures name, so an
+adapter user never needs a direct `gemmkit` dependency: the `Parallelism` /
+`Workspace` arguments, the `Bias` / `Activation` / `Requantize` /
+`RequantScale` epilogue selectors, the `PackedLhs` / `PackedRhs` handles, the
+`GemmScalar` / `FusedScalar` / `MapScalar` / `ComplexScalar` element-type
+bounds (nameable so a caller can write a wrapper generic over an entry), the
+feature-gated element types (`f16` / `bf16` / `Complex` / `c32` / `c64`, so
+`half` and `num-complex` also stay out of the caller's manifest), and the
+`tuning` module. `tuning` is on that list for correctness, not only
+convenience: the knobs are process-global atomics, so a setter reached through
+a separately resolved second `gemmkit` would write a copy the adapter never
+reads. A new gemmkit type appearing in an adapter signature must be added to
+that crate's re-exports in the same change.
+
 ## Layer map
 
 Module docs in the core crate carry explicit layer labels; the map below lists
@@ -530,6 +544,13 @@ for `--save-baseline` regression tracking.
   dispatch resolves the pinned kernel in an isolated process; the write
   overrides an inherited pin, so the SDE/pinned CI jobs still exercise these
   routes.
+- **Adapter re-export surface** (`gemmkit-{ndarray,nalgebra,faer}/tests/reexports.rs`):
+  one binary per adapter that may not name a `gemmkit::` path, reaching every
+  gemmkit item through the adapter as a downstream crate would. It writes the
+  generic wrapper a caller writes over each entry family, so a gemmkit type
+  reaching a public signature without being re-exported fails to compile there.
+  Every other adapter test binary imports from `gemmkit::` directly and so
+  cannot observe an incomplete adapter surface.
 - **Miri**: CI runs the scalar-path correctness suite and the complex
   negative-stride entry under Miri; `cfg(miri)` detours exist only where Miri
   cannot interpret hardware conversions.

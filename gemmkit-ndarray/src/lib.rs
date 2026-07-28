@@ -13,7 +13,7 @@
 //! assert_eq!(c, array![[19.0, 22.0], [43.0, 50.0]]);
 //! ```
 //!
-//! [`gemm`]/[`gemm_with`]/[`dot`] are generic over [`gemmkit::GemmScalar`]: `f32`/`f64` always,
+//! [`gemm`]/[`gemm_with`]/[`dot`] are generic over [`GemmScalar`]: `f32`/`f64` always,
 //! plus `f16`/`bf16` under the `half` feature. [`gemm_batched`]/[`gemm_batched_with`]/
 //! [`dot_batched`] extend the same idea to a stack of matrices (a 3-D array with the batch on
 //! axis 0), and [`prepack_rhs`]/[`prepack_lhs`] (with their [`gemm_packed_b`]/[`gemm_packed_a`]
@@ -42,24 +42,35 @@
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+/// The element-type bound of the complex entries, re-exported so a caller writing a wrapper
+/// generic over [`gemm_cplx`] need not depend on `gemmkit` directly to name the bound
+#[cfg(feature = "complex")]
+pub use gemmkit::ComplexScalar;
+/// The element-type bound of the plain real entries, re-exported so a caller writing a wrapper
+/// generic over [`gemm`] / [`dot`] / [`prepack_rhs`] need not depend on `gemmkit` directly to
+/// name the bound
+pub use gemmkit::GemmScalar;
+/// gemmkit's heuristic thresholds: the `tuning::set_*` setters, their getters, and the compiled
+/// defaults, re-exported so callers need not depend on `gemmkit` directly. The knobs are
+/// process-global atomics, so reaching them through a separately resolved second `gemmkit` would
+/// set a copy this adapter never reads
+#[doc(no_inline)]
+pub use gemmkit::tuning;
 /// The bias and activation selectors for the fused entries, re-exported so callers of
 /// [`gemm_fused`] need not depend on `gemmkit` directly
 #[cfg(feature = "epilogue")]
 pub use gemmkit::{Activation, Bias};
+/// The complex element type of [`gemm_cplx`] and its `c32` / `c64` aliases, re-exported so
+/// callers need not depend on `num-complex` directly ([`ndarray`] supplies no complex type of
+/// its own)
 #[cfg(feature = "complex")]
-use gemmkit::{ComplexScalar, gemm_cplx_unchecked, gemm_cplx_unchecked_with};
+#[doc(no_inline)]
+pub use gemmkit::{Complex, c32, c64};
+/// The element-type bounds of the fused entries ([`FusedScalar`] for the bias/activation form,
+/// [`MapScalar`] for [`gemm_map`]), re-exported so a caller writing a wrapper generic over them
+/// need not depend on `gemmkit` directly to name the bound
 #[cfg(feature = "epilogue")]
-use gemmkit::{
-    FusedScalar, MapScalar, gemm_batched_fused_unchecked, gemm_batched_fused_unchecked_with,
-    gemm_fused_unchecked, gemm_fused_unchecked_with, gemm_map_unchecked, gemm_map_unchecked_with,
-    gemm_packed_a_fused_unchecked, gemm_packed_a_fused_unchecked_with,
-    gemm_packed_b_fused_unchecked, gemm_packed_b_fused_unchecked_with,
-};
-use gemmkit::{
-    GemmScalar, gemm_batched_unchecked, gemm_batched_unchecked_with, gemm_packed_a_unchecked,
-    gemm_packed_a_unchecked_with, gemm_packed_b_unchecked, gemm_packed_b_unchecked_with,
-    gemm_unchecked, gemm_unchecked_with, prepack_lhs_unchecked, prepack_rhs_unchecked,
-};
+pub use gemmkit::{FusedScalar, MapScalar};
 /// The prepacked-operand handles, re-exported so callers of [`prepack_rhs`] / [`prepack_lhs`]
 /// need not depend on `gemmkit` directly
 pub use gemmkit::{PackedLhs, PackedRhs};
@@ -71,8 +82,27 @@ pub use gemmkit::{Parallelism, Workspace};
 /// `gemmkit` directly
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 pub use gemmkit::{RequantScale, Requantize};
+/// The narrow float element types of the `half`-gated entries, re-exported so callers need not
+/// depend on `half` directly. Both accumulate in `f32`
+#[cfg(feature = "half")]
+#[doc(no_inline)]
+pub use gemmkit::{bf16, f16};
+#[cfg(feature = "epilogue")]
+use gemmkit::{
+    gemm_batched_fused_unchecked, gemm_batched_fused_unchecked_with, gemm_fused_unchecked,
+    gemm_fused_unchecked_with, gemm_map_unchecked, gemm_map_unchecked_with,
+    gemm_packed_a_fused_unchecked, gemm_packed_a_fused_unchecked_with,
+    gemm_packed_b_fused_unchecked, gemm_packed_b_fused_unchecked_with,
+};
+use gemmkit::{
+    gemm_batched_unchecked, gemm_batched_unchecked_with, gemm_packed_a_unchecked,
+    gemm_packed_a_unchecked_with, gemm_packed_b_unchecked, gemm_packed_b_unchecked_with,
+    gemm_unchecked, gemm_unchecked_with, prepack_lhs_unchecked, prepack_rhs_unchecked,
+};
 #[cfg(all(feature = "complex", feature = "epilogue"))]
 use gemmkit::{gemm_cplx_fused_unchecked, gemm_cplx_fused_unchecked_with};
+#[cfg(feature = "complex")]
+use gemmkit::{gemm_cplx_unchecked, gemm_cplx_unchecked_with};
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 use gemmkit::{
     gemm_i8_requant_u8_unchecked, gemm_i8_requant_u8_unchecked_with, gemm_i8_requant_unchecked,

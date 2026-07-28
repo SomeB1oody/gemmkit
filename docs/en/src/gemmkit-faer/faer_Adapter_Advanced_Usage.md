@@ -2,7 +2,7 @@
 
 Beyond `gemm` and `dot`, the faer adapter mirrors the rest of gemmkit's surface: the extra element families, the fused epilogues, batched GEMM over a slice, and prepacked operands. Each is feature-gated and each reads raw pointers and strides straight out of faer's views, so transposed, sub-matrix, and reversed operands keep working exactly as they do on the plain path. This page walks the families one at a time and closes with an honest note on when the adapter earns its place next to faer's own matmul.
 
-The [introductory page](Using_gemmkit_with_faer.md) covers installation, the zero-copy mechanism, `gemm`/`gemm_with`/`dot`, parallelism, and the workspace pattern; everything here builds on it. As on the plain path, every entry also has a `_with` twin that reuses a caller-owned `gemmkit::Workspace`.
+The [introductory page](Using_gemmkit_with_faer.md) covers installation, the zero-copy mechanism, `gemm`/`gemm_with`/`dot`, parallelism, and the workspace pattern; everything here builds on it. As on the plain path, every entry also has a `_with` twin that reuses a caller-owned `Workspace`.
 
 ## Integer GEMM (`int8`)
 
@@ -10,8 +10,7 @@ With the `int8` feature, `gemm_i8` and `dot_i8` take `i8` inputs and accumulate 
 
 ```rust
 use faer::Mat;
-use gemmkit::Parallelism;
-use gemmkit_faer::{dot_i8, gemm_i8};
+use gemmkit_faer::{Parallelism, dot_i8, gemm_i8};
 
 let a = Mat::<i8>::from_fn(16, 12, |i, j| ((i + j) as i8 % 7) - 3);
 let b = Mat::<i8>::from_fn(12, 10, |i, j| ((i * 2 + j) as i8 % 5) - 2);
@@ -34,8 +33,7 @@ The parameters come in a `Requantize`, re-exported from the crate so you need no
 
 ```rust
 use faer::Mat;
-use gemmkit::Parallelism;
-use gemmkit_faer::{gemm_i8_requant, RequantScale, Requantize};
+use gemmkit_faer::{Parallelism, RequantScale, Requantize, gemm_i8_requant};
 
 let (m, n) = (17, 13);
 let bias: Vec<i32> = (0..m as i32).map(|i| 40 * i - 200).collect();
@@ -52,14 +50,13 @@ The output is `C[i,j] = clamp(zero_point + round_ne(scale * (sum_k A*B + bias[i]
 
 ## Complex GEMM (`complex`)
 
-With the `complex` feature, `gemm_cplx`, `gemm_cplx_with`, and `dot_cplx` operate on complex matrices with optional per-operand conjugation. The element type `T` is `Complex<f32>` or `Complex<f64>`. This is not a separate representation from faer's: faer 0.24's `c32` and `c64` are type aliases for `num_complex::Complex<f32>` and `num_complex::Complex<f64>`, the same types gemmkit re-exports as `gemmkit::Complex` and constrains its `ComplexScalar` bound over. So a faer complex `Mat` reaches the adapter with no conversion, just like a real one.
+With the `complex` feature, `gemm_cplx`, `gemm_cplx_with`, and `dot_cplx` operate on complex matrices with optional per-operand conjugation. The element type `T` is `Complex<f32>` or `Complex<f64>`. This is not a separate representation from faer's: faer 0.24's `c32` and `c64` are type aliases for `num_complex::Complex<f32>` and `num_complex::Complex<f64>`, the same types this crate re-exports as `Complex` (with the same `c32` / `c64` aliases) and constrains its `ComplexScalar` bound over. So a faer complex `Mat` reaches the adapter with no conversion, just like a real one.
 
 `gemm_cplx` is a separate entry from `gemm` because the conjugation flags do not fit the homogeneous surface. It computes `C <- alpha*op(A)*op(B) + beta*C` where `op(A) = conj(A)` when `conj_a` is set and `op(B) = conj(B)` when `conj_b` is set. The implementation in `cplx.rs` pulls the same raw parts as the real path and threads the two `bool` flags through to `gemm_cplx_unchecked`; nothing else differs, so transposed, sub-matrix, and reversed views work identically. `dot_cplx` is the non-conjugated `A*B` convenience.
 
 ```rust
 use faer::Mat;
-use gemmkit::{Complex, Parallelism};
-use gemmkit_faer::gemm_cplx;
+use gemmkit_faer::{Complex, Parallelism, gemm_cplx};
 
 type C = Complex<f64>;
 let a = Mat::<C>::from_fn(12, 9, |i, j| C::new(i as f64, j as f64));
@@ -83,8 +80,7 @@ Under `complex` + `epilogue` there is `gemm_cplx_fused`, which adds an optional 
 With `epilogue`, `gemm_fused` computes `C <- act(alpha*A*B + beta*C + bias)` in a single pass. The optional `Bias` is `PerRow` or `PerCol`; the optional `Activation` is `Relu` or `LeakyRelu(slope)`, applied last. Passing `None` for both is exactly `gemm`. Both selectors are re-exported from the crate.
 
 ```rust
-use gemmkit::Parallelism;
-use gemmkit_faer::{gemm_fused, Activation, Bias};
+use gemmkit_faer::{Activation, Bias, Parallelism, gemm_fused};
 
 let bias: Vec<f64> = (0..m).map(|i| 0.5 * i as f64 - 2.0).collect();
 // C <- relu(1.3 * A*B - 0.7 * C + rowbias)
@@ -107,8 +103,7 @@ faer has no rank-3 array type, so batched GEMM is expressed over slices: `gemm_b
 
 ```rust
 use faer::Mat;
-use gemmkit::Parallelism;
-use gemmkit_faer::gemm_batched;
+use gemmkit_faer::{Parallelism, gemm_batched};
 
 let a = Mat::from_fn(2, 2, |i, j| [[1.0_f64, 2.0], [3.0, 4.0]][i][j]);
 let b = Mat::from_fn(2, 2, |i, j| [[5.0_f64, 6.0], [7.0, 8.0]][i][j]);
@@ -129,8 +124,7 @@ Element shapes may differ (a heterogeneous batch) as long as each element's own 
 When one operand is fixed across many calls (weights against a stream of activations), pre-pack it once and skip the per-call repack. `prepack_rhs` turns a `B` into a reusable `PackedRhs`, consumed by `gemm_packed_b`; `prepack_lhs` turns an `A` into a `PackedLhs`, consumed by `gemm_packed_a`. Both handles are re-exported from the crate.
 
 ```rust
-use gemmkit::Parallelism;
-use gemmkit_faer::{gemm_packed_b, prepack_rhs};
+use gemmkit_faer::{Parallelism, gemm_packed_b, prepack_rhs};
 
 let packed = prepack_rhs(weights.as_dyn_stride()); // pack the fixed B once
 for (act, mut out) in stream {

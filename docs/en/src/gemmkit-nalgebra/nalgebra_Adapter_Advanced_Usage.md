@@ -11,15 +11,14 @@ Beyond the real-scalar `gemm`/`gemm_with`/`dot` covered in [Using gemmkit with n
 | `int8` + `epilogue` | `gemm_i8_requant`, `gemm_i8_requant_u8` |
 | `complex` + `epilogue` | `gemm_cplx_fused` |
 
-The re-exported helper types (`Bias`, `Activation`, `RequantScale`, `Requantize`, `PackedLhs`, `PackedRhs`) come from the adapter crate itself, so you do not need to name `gemmkit` to use them. `Parallelism`, `Workspace`, and `Complex` still come from `gemmkit`.
+Every helper type these entries name comes from the adapter crate itself, so you do not need to name `gemmkit` to use them: `Bias`, `Activation`, `RequantScale`, `Requantize`, `PackedLhs`, `PackedRhs`, `Parallelism`, `Workspace`, and `Complex` (with its `c32` / `c64` aliases).
 
 ## Integer GEMM
 
 Under `int8`, `gemm_i8` multiplies two `i8` matrices into an `i32` output. The inputs are `i8`; `alpha`, `beta`, and `C` are `i32`, since an `i8*i8` product needs the wider accumulator. Arithmetic wraps on overflow, the conventional integer-GEMM semantics. It is a separate entry from `gemm` precisely because the input and output element types differ.
 
 ```rust
-use gemmkit::Parallelism;
-use gemmkit_nalgebra::{dot_i8, gemm_i8};
+use gemmkit_nalgebra::{Parallelism, dot_i8, gemm_i8};
 use nalgebra::DMatrix;
 
 let a = DMatrix::from_row_slice(2, 3, &[1_i8, 2, 3, 4, 5, 6]);
@@ -41,8 +40,7 @@ assert_eq!(acc, c);
 Requantization folds the dequantize-scale-round-clamp step of quantized inference into the GEMM, so the `m*n` `i32` accumulator never has to be materialized in full. `gemm_i8_requant` takes `i8` inputs and writes an `i8` output; `gemm_i8_requant_u8` writes an unsigned `u8` output (the ONNX QLinearMatMul convention). Both need `int8` + `epilogue`. There is no `alpha` (it folds into the scale) and no `beta` (accumulating into a quantized `C` is ill-defined). The parameters ride in a re-exported `Requantize`:
 
 ```rust
-use gemmkit::Parallelism;
-use gemmkit_nalgebra::{RequantScale, Requantize, gemm_i8_requant};
+use gemmkit_nalgebra::{Parallelism, RequantScale, Requantize, gemm_i8_requant};
 use nalgebra::DMatrix;
 
 let a = DMatrix::from_row_slice(2, 3, &[10_i8, -4, 7, 3, 8, -2]);
@@ -65,8 +63,7 @@ gemm_i8_requant(&a, &b, req, &mut c, Parallelism::Serial);
 Under `complex`, `gemm_cplx` computes `C <- alpha*op(A)*op(B) + beta*C` for `T = Complex<f32>` or `Complex<f64>`, where `op(A) = conj(A)` when the `conj_a` flag is set and likewise for `conj_b`. The conjugation flags are why complex needs its own entry: they do not fit the homogeneous real-scalar signature. `dot_cplx(a, b)` is the non-conjugated `A*B` convenience form; for a conjugated product use `gemm_cplx` directly.
 
 ```rust
-use gemmkit::{Complex, Parallelism};
-use gemmkit_nalgebra::{dot_cplx, gemm_cplx};
+use gemmkit_nalgebra::{Complex, Parallelism, dot_cplx, gemm_cplx};
 use nalgebra::DMatrix;
 
 type C = Complex<f64>;
@@ -91,8 +88,7 @@ gemm_cplx(C::new(1.0, 0.0), &a, true, &b, false,
 The `epilogue` feature adds `gemm_fused`, which computes `C <- act(alpha*A*B + beta*C + bias)` in a single pass over `f32`/`f64` (and `f16`/`bf16` when `half` is on, with the epilogue evaluated in `f32` before the one narrowing store). The optional `Bias` is `PerRow` (length `A.rows`) or `PerCol` (length `B.cols`); the optional `Activation` is `Relu` or `LeakyRelu(slope)`, applied last. Passing `None` for both is bit-for-bit identical to plain `gemm`.
 
 ```rust
-use gemmkit::Parallelism;
-use gemmkit_nalgebra::{Activation, Bias, gemm_fused};
+use gemmkit_nalgebra::{Activation, Bias, Parallelism, gemm_fused};
 use nalgebra::DMatrix;
 
 let a = DMatrix::<f32>::from_element(12, 9, 0.5);
@@ -111,8 +107,7 @@ The fused pass is not just a convenience: it avoids a second sweep over `C` and 
 For epilogues that do not fit a bias-plus-activation shape, `gemm_map` applies an arbitrary closure to each finished output element: `C[r, c] <- f(alpha*A*B + beta*C, r, c)`, fired exactly once per element, with `(r, c)` in the user frame of `C`. `T` is `f32`/`f64` only. The closure is `&(dyn Fn(T, usize, usize) -> T + Sync)`, so it must be `Sync` to run in parallel and can close over data by reference.
 
 ```rust
-use gemmkit::Parallelism;
-use gemmkit_nalgebra::gemm_map;
+use gemmkit_nalgebra::{Parallelism, gemm_map};
 use nalgebra::DMatrix;
 
 let a = DMatrix::<f64>::from_element(8, 6, 0.3);
@@ -131,8 +126,7 @@ Prefer `gemm_fused` for a plain bias or ReLU, since it vectorizes; `gemm_map` is
 When one operand is fixed across many multiplies, for example a weight matrix served against a stream of activations, prepacking it once removes the per-call repack. `prepack_rhs(b) -> PackedRhs<T>` packs a right operand; `gemm_packed_b` then consumes the handle in place of `B`. `prepack_lhs`/`gemm_packed_a` do the mirror for a fixed left operand.
 
 ```rust
-use gemmkit::Parallelism;
-use gemmkit_nalgebra::{gemm_packed_b, prepack_rhs};
+use gemmkit_nalgebra::{Parallelism, gemm_packed_b, prepack_rhs};
 use nalgebra::DMatrix;
 
 let weights = DMatrix::<f32>::from_fn(64, 32, |i, j| 0.01 * (i as f32 - j as f32));
@@ -152,8 +146,7 @@ There is an orientation constraint. `gemm_packed_b` needs a column-major-ish `C`
 nalgebra has no rank-3 array type, so batched GEMM does not take a 3-D tensor the way the ndarray adapter does. Instead `gemm_batched` takes the batch as a slice of per-element `(&A, &B)` input pairs alongside a slice of `&mut C` outputs, matched positionally, and runs `C_e <- alpha*A_e*B_e + beta*C_e` for every element in one call over gemmkit's pointer-array engine. The `alpha`, `beta`, and `par` arguments are shared by the whole batch.
 
 ```rust
-use gemmkit::Parallelism;
-use gemmkit_nalgebra::gemm_batched;
+use gemmkit_nalgebra::{Parallelism, gemm_batched};
 use nalgebra::DMatrix;
 
 let a = DMatrix::from_row_slice(2, 2, &[1.0_f32, 2.0, 3.0, 4.0]);

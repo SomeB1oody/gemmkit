@@ -11,15 +11,14 @@
 | `int8` + `epilogue` | `gemm_i8_requant`、`gemm_i8_requant_u8` |
 | `complex` + `epilogue` | `gemm_cplx_fused` |
 
-被重新导出的辅助类型（`Bias`、`Activation`、`RequantScale`、`Requantize`、`PackedLhs`、`PackedRhs`）来自适配器 crate 本身，所以你无需点名 `gemmkit` 即可使用它们。`Parallelism`、`Workspace` 和 `Complex` 仍来自 `gemmkit`。
+这些入口用到的每个辅助类型都来自适配器 crate 本身，所以你无需点名 `gemmkit` 即可使用它们：`Bias`、`Activation`、`RequantScale`、`Requantize`、`PackedLhs`、`PackedRhs`、`Parallelism`、`Workspace`，以及 `Complex`（及其 `c32` / `c64` 别名）。
 
 ## 整数 GEMM
 
 在 `int8` 下，`gemm_i8` 把两个 `i8` 矩阵相乘成一个 `i32` 输出。输入是 `i8`；`alpha`、`beta` 和 `C` 是 `i32`，因为 `i8*i8` 的乘积需要更宽的累加器。算术在溢出时回绕，这是整数 GEMM 的惯例语义。它之所以是独立于 `gemm` 的入口，正是因为输入与输出的元素类型不同。
 
 ```rust
-use gemmkit::Parallelism;
-use gemmkit_nalgebra::{dot_i8, gemm_i8};
+use gemmkit_nalgebra::{Parallelism, dot_i8, gemm_i8};
 use nalgebra::DMatrix;
 
 let a = DMatrix::from_row_slice(2, 3, &[1_i8, 2, 3, 4, 5, 6]);
@@ -41,8 +40,7 @@ assert_eq!(acc, c);
 重量化把量化推理里“反量化—缩放—取整—夹取”这一步折进 GEMM，于是那个 `m*n` 的 `i32` 累加器从不必被完整物化。`gemm_i8_requant` 接收 `i8` 输入、写出 `i8` 输出；`gemm_i8_requant_u8` 写出无符号的 `u8` 输出（ONNX QLinearMatMul 的约定）。两者都需要 `int8` + `epilogue`。没有 `alpha`（它折进 scale）也没有 `beta`（往一个量化后的 `C` 上累加是没有良好定义的）。参数装在一个被重新导出的 `Requantize` 里：
 
 ```rust
-use gemmkit::Parallelism;
-use gemmkit_nalgebra::{RequantScale, Requantize, gemm_i8_requant};
+use gemmkit_nalgebra::{Parallelism, RequantScale, Requantize, gemm_i8_requant};
 use nalgebra::DMatrix;
 
 let a = DMatrix::from_row_slice(2, 3, &[10_i8, -4, 7, 3, 8, -2]);
@@ -65,8 +63,7 @@ gemm_i8_requant(&a, &b, req, &mut c, Parallelism::Serial);
 在 `complex` 下，`gemm_cplx` 对 `T = Complex<f32>` 或 `Complex<f64>` 计算 `C <- alpha*op(A)*op(B) + beta*C`，其中当置起 `conj_a` 标志时 `op(A) = conj(A)`，`conj_b` 同理。这两个共轭标志正是复数需要独立入口的原因：它们塞不进同质的实数标量签名。`dot_cplx(a, b)` 是不做共轭的 `A*B` 便捷形式；要做共轭乘积就直接用 `gemm_cplx`。
 
 ```rust
-use gemmkit::{Complex, Parallelism};
-use gemmkit_nalgebra::{dot_cplx, gemm_cplx};
+use gemmkit_nalgebra::{Complex, Parallelism, dot_cplx, gemm_cplx};
 use nalgebra::DMatrix;
 
 type C = Complex<f64>;
@@ -91,8 +88,7 @@ gemm_cplx(C::new(1.0, 0.0), &a, true, &b, false,
 `epilogue` feature 增加了 `gemm_fused`，它在 `f32`/`f64` 上以单趟计算 `C <- act(alpha*A*B + beta*C + bias)`（开启 `half` 时也支持 `f16`/`bf16`，其 epilogue 在 `f32` 中求值、之后只做一次收窄存储）。可选的 `Bias` 是 `PerRow`（长度 `A.rows`）或 `PerCol`（长度 `B.cols`）；可选的 `Activation` 是 `Relu` 或 `LeakyRelu(slope)`，最后施加。两者都传 `None` 时，逐位等同于普通 `gemm`。
 
 ```rust
-use gemmkit::Parallelism;
-use gemmkit_nalgebra::{Activation, Bias, gemm_fused};
+use gemmkit_nalgebra::{Activation, Bias, Parallelism, gemm_fused};
 use nalgebra::DMatrix;
 
 let a = DMatrix::<f32>::from_element(12, 9, 0.5);
@@ -111,8 +107,7 @@ gemm_fused(1.3, &a, &b, -0.7, &mut c,
 对于套不进“偏置加激活”形状的 epilogue，`gemm_map` 把一个任意闭包施加到每个算完的输出元素上：`C[r, c] <- f(alpha*A*B + beta*C, r, c)`，每个元素恰好触发一次，其中 `(r, c)` 处于 `C` 的用户坐标系。`T` 只能是 `f32`/`f64`。闭包是 `&(dyn Fn(T, usize, usize) -> T + Sync)`，所以它必须是 `Sync` 才能并行运行，并且可以按引用捕获数据。
 
 ```rust
-use gemmkit::Parallelism;
-use gemmkit_nalgebra::gemm_map;
+use gemmkit_nalgebra::{Parallelism, gemm_map};
 use nalgebra::DMatrix;
 
 let a = DMatrix::<f64>::from_element(8, 6, 0.3);
@@ -131,8 +126,7 @@ gemm_map(1.0, &a, &b, 0.0, &mut c, &sigmoid, Parallelism::Serial);
 当某个操作数在许多次乘法中固定不变——例如一个权重矩阵对着一串激活服务时——把它预打包一次就能免掉每次调用的重打包。`prepack_rhs(b) -> PackedRhs<T>` 打包右操作数；`gemm_packed_b` 随后以该句柄代替 `B`。`prepack_lhs`/`gemm_packed_a` 对固定的左操作数做镜像。
 
 ```rust
-use gemmkit::Parallelism;
-use gemmkit_nalgebra::{gemm_packed_b, prepack_rhs};
+use gemmkit_nalgebra::{Parallelism, gemm_packed_b, prepack_rhs};
 use nalgebra::DMatrix;
 
 let weights = DMatrix::<f32>::from_fn(64, 32, |i, j| 0.01 * (i as f32 - j as f32));
@@ -152,8 +146,7 @@ for step in 0..100 {
 nalgebra 没有三维数组类型，所以批量 GEMM 不像 ndarray 适配器那样接收一个三维张量。取而代之，`gemm_batched` 以一个逐元素 `(&A, &B)` 输入对的切片，搭配一个 `&mut C` 输出的切片，按位置配对，在一次调用里对每个元素运行 `C_e <- alpha*A_e*B_e + beta*C_e`，走 gemmkit 的指针数组引擎。`alpha`、`beta`、`par` 由整个批次共享。
 
 ```rust
-use gemmkit::Parallelism;
-use gemmkit_nalgebra::gemm_batched;
+use gemmkit_nalgebra::{Parallelism, gemm_batched};
 use nalgebra::DMatrix;
 
 let a = DMatrix::from_row_slice(2, 2, &[1.0_f32, 2.0, 3.0, 4.0]);
