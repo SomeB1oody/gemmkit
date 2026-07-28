@@ -236,6 +236,45 @@ fn sweep(
 // Per-shape-family sweep helpers: each shape gets its own freshly filled, identically seeded
 // buffers, so every candidate value sees the same input data
 
+/// One GFLOP/s `Stat` per `(m, k, n)` probe shape: fresh seeded operands (A optionally
+/// row-major, B/C always column-major), `gemm` at `alpha = 1, beta = 0`. Split out from
+/// [`sweep_sgemm`] so a knob that governs more than the compute path can fold these into a
+/// wider score (see [`sweep_sgemm_gemv`])
+fn sgemm_stats(
+    t: &Timing,
+    shapes: &[(usize, usize, usize)],
+    par: Parallelism,
+    row_major_a: bool,
+) -> Vec<Stat> {
+    shapes
+        .iter()
+        .map(|&(m, k, n)| {
+            let a = fill(m * k, 1);
+            let b = fill(k * n, 2);
+            let mut c = vec![0.0f32; m * n];
+            let am = if row_major_a {
+                MatRef::from_row_major(&a, m, k)
+            } else {
+                MatRef::from_col_major(&a, m, k)
+            };
+            measure(
+                t,
+                || {
+                    gemm(
+                        1.0,
+                        am,
+                        MatRef::from_col_major(&b, k, n),
+                        0.0,
+                        MatMut::from_col_major(&mut c, m, n),
+                        par,
+                    );
+                },
+                gflops(m, k, n),
+            )
+        })
+        .collect()
+}
+
 /// GEMM (f32) sweep helper: for each `(m, k, n)` probe shape, fills fresh seeded operands (A
 /// optionally row-major, B/C always column-major), runs `gemm` at `alpha = 1, beta = 0`, and
 /// folds the per-shape GFLOP/s into one geomean `Stat` via [`sweep`]
@@ -251,34 +290,7 @@ fn sweep_sgemm(
     row_major_a: bool,
 ) -> KnobResult {
     sweep(env, set, default, extras, "GFLOP/s", shapes.len(), || {
-        let stats: Vec<Stat> = shapes
-            .iter()
-            .map(|&(m, k, n)| {
-                let a = fill(m * k, 1);
-                let b = fill(k * n, 2);
-                let mut c = vec![0.0f32; m * n];
-                let am = if row_major_a {
-                    MatRef::from_row_major(&a, m, k)
-                } else {
-                    MatRef::from_col_major(&a, m, k)
-                };
-                measure(
-                    t,
-                    || {
-                        gemm(
-                            1.0,
-                            am,
-                            MatRef::from_col_major(&b, k, n),
-                            0.0,
-                            MatMut::from_col_major(&mut c, m, n),
-                            par,
-                        );
-                    },
-                    gflops(m, k, n),
-                )
-            })
-            .collect();
-        geomean(&stats)
+        geomean(&sgemm_stats(t, shapes, par, row_major_a))
     })
 }
 
@@ -296,29 +308,60 @@ fn sweep_gemv(
     par: Parallelism,
 ) -> KnobResult {
     sweep(env, set, default, extras, "GB/s", shapes.len(), || {
-        let stats: Vec<Stat> = shapes
-            .iter()
-            .map(|&(m, k)| {
-                let a = fill(m * k, 1);
-                let x = fill(k, 2);
-                let mut y = vec![0.0f32; m];
-                let bytes = (m * k + k + m) * 4;
-                measure(
-                    t,
-                    || {
-                        gemm(
-                            1.0,
-                            MatRef::from_col_major(&a, m, k),
-                            MatRef::from_col_major(&x, k, 1),
-                            0.0,
-                            MatMut::from_col_major(&mut y, m, 1),
-                            par,
-                        );
-                    },
-                    gbps(bytes),
-                )
-            })
-            .collect();
+        geomean(&gemv_stats(t, shapes, par))
+    })
+}
+
+/// One GB/s `Stat` per `(m, k)` gemv probe shape; the body [`sweep_gemv`] used to inline. Split
+/// out for the same reason as [`sgemm_stats`]
+fn gemv_stats(t: &Timing, shapes: &[(usize, usize)], par: Parallelism) -> Vec<Stat> {
+    shapes
+        .iter()
+        .map(|&(m, k)| {
+            let a = fill(m * k, 1);
+            let x = fill(k, 2);
+            let mut y = vec![0.0f32; m];
+            let bytes = (m * k + k + m) * 4;
+            measure(
+                t,
+                || {
+                    gemm(
+                        1.0,
+                        MatRef::from_col_major(&a, m, k),
+                        MatRef::from_col_major(&x, k, 1),
+                        0.0,
+                        MatMut::from_col_major(&mut y, m, 1),
+                        par,
+                    );
+                },
+                gbps(bytes),
+            )
+        })
+        .collect()
+}
+
+/// Sweep helper for a knob that governs the compute path AND the bandwidth-bound gemv path:
+/// scores one geomean over both probe families together, so a value that wins one path and loses
+/// the other cannot score as a wash. The knob!s are swept independently of each other by
+/// construction, so a cross-path interaction is invisible unless one knob's own score sees both
+/// paths - which is exactly the `POOL_CLASSES` case (its tiers are both the compute pools and the
+/// gemv ladder rungs). Mixing GFLOP/s and GB/s makes the absolute score meaningless, but [`sweep`]
+/// only ever compares candidates to each other, and every candidate is scored the same way
+#[allow(clippy::too_many_arguments)]
+fn sweep_sgemm_gemv(
+    env: &'static str,
+    set: fn(usize),
+    default: usize,
+    extras: &[usize],
+    t: &Timing,
+    gemm_shapes: &[(usize, usize, usize)],
+    gemv_shapes: &[(usize, usize)],
+    par: Parallelism,
+) -> KnobResult {
+    let shapes = gemm_shapes.len() + gemv_shapes.len();
+    sweep(env, set, default, extras, "mixed", shapes, || {
+        let mut stats = sgemm_stats(t, gemm_shapes, par, false);
+        stats.extend(gemv_stats(t, gemv_shapes, par));
         geomean(&stats)
     })
 }
@@ -846,19 +889,26 @@ fn main() {
         )
     );
     // Exact-fit size-class pool tiers: 0 (disabled), 1 (half width only), or 3 (adds eighth
-    // width). The probes span tier-8 territory (128^3), the 8/16 crossover (256^3), and the
-    // 16-vs-full-width regime (384^3)
+    // width). Scored on BOTH paths on purpose: the tiers are the compute path's exact-fit pools
+    // AND the rungs of the bandwidth-bound gemv ladder (`bandwidth_cap`), and the 2 paths need
+    // not agree. Measured on an M4 Max (14 cores, where both 2 and 3 yield tiers [3, 7]), the
+    // sgemm probes below separate 1 from 3 by 0.2% while the low rung of 3 workers costs a gemv
+    // 30-34% across the band it owns - so scored on sgemm alone this sweep would silently
+    // reconfigure gemv on sgemm noise. The sgemm probes span tier-8 territory (128^3), the 8/16
+    // crossover (256^3), and the 16-vs-full-width regime (384^3); the gemv probes straddle the
+    // low rung's byte band, which is [floor, floor*GEMV_TIER_STEP) touched bytes - 4 and 12 MiB
+    // land inside it on both reference machines, 64 MiB above it as the control
     knob!(
         "GEMMKIT_POOL_CLASSES",
-        sweep_sgemm(
+        sweep_sgemm_gemv(
             "GEMMKIT_POOL_CLASSES",
             tuning::set_pool_classes,
             tuning::POOL_CLASSES_DEFAULT,
             &[0, 1, 3],
             &timing,
             &[(128, 128, 128), (256, 256, 256), (384, 384, 384)],
+            &[(1 << 16, 16), (1 << 16, 48), (1 << 16, 256)],
             par,
-            false,
         )
     );
     // Full-machine-width work gate: the m*n*k above which auto leaves the largest pool tier for
@@ -1060,20 +1110,28 @@ fn main() {
 
     // Output-row floor under which a column-major gemv refuses to split its rows. The probe set
     // must straddle the candidate floors or every candidate scores the same, so it holds the
-    // matrix at ~128 MiB and moves the row count across them: 1024 rows sits under every non-zero
-    // candidate, 8192 under all but 4096, and 65536 over all of them. A floor of 0 then loses on
-    // the 2 narrow probes and a floor of 65536 loses on the wide one, which is what separates
-    // them. `sweep_gemv` builds `from_col_major` operands, i.e. exactly the axpy shape this knob
-    // governs. Worth sweeping off x86 in particular, since the aarch64 default ships at 0
+    // matrix at ~128 MiB and moves the row count across them: 256 rows sits under every non-zero
+    // candidate, 1024 under all but 1024 itself, 8192 under all but 4096, and 65536 over all of
+    // them. A floor of 0 then loses on the narrow probes and a floor of 65536 loses on the wide
+    // one, which is what separates them. The 256-row probe and the 1024 candidate exist because
+    // the aarch64 crossover measured on an M4 Max sits at 1024 rows, an order of magnitude below
+    // the x86 one: without them the smallest probe sat exactly ON that crossover and no candidate
+    // could express it, so the sweep could only ever return 0 there. `sweep_gemv` builds
+    // `from_col_major` operands, i.e. exactly the axpy shape this knob governs
     knob!(
         "GEMMKIT_GEMV_AXPY_PAR_MIN_ROWS",
         sweep_gemv(
             "GEMMKIT_GEMV_AXPY_PAR_MIN_ROWS",
             tuning::set_gemv_axpy_par_min_rows,
             tuning::GEMV_AXPY_PAR_MIN_ROWS_DEFAULT,
-            &[0, 4096, 65536],
+            &[0, 1024, 4096, 65536],
             &timing,
-            &[(1 << 10, 1 << 15), (1 << 13, 1 << 12), (1 << 16, 1 << 9)],
+            &[
+                (1 << 8, 1 << 17),
+                (1 << 10, 1 << 15),
+                (1 << 13, 1 << 12),
+                (1 << 16, 1 << 9),
+            ],
             par,
         )
     );

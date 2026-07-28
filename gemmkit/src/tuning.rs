@@ -311,13 +311,9 @@ static GEMV_TIER_STEP: Threshold = Threshold::new("GEMMKIT_GEMV_TIER_STEP", GEMV
 /// a column-major gemv parallelizes on the bandwidth ladder alone as it did before
 #[cfg(not(target_arch = "aarch64"))]
 pub const GEMV_AXPY_PAR_MIN_ROWS_DEFAULT: usize = 16384;
-/// The aarch64 default. `0` (floor disabled) pending on-device validation: the regression this
-/// guards against was measured only on the x86 reference machine, and Apple's shared cluster-L2
-/// feeds a strided worker very differently from a private-L2 part, so gating there unmeasured
-/// could cost more than it saves. Sweep it on the device to calibrate, exactly as `pool_classes`
-/// stays conservative off its measured architectures
+/// The aarch64 default, calibrated on an M4 Max (10P + 4E, no L3, 16 MiB shared P-cluster L2)
 #[cfg(target_arch = "aarch64")]
-pub const GEMV_AXPY_PAR_MIN_ROWS_DEFAULT: usize = 0;
+pub const GEMV_AXPY_PAR_MIN_ROWS_DEFAULT: usize = 1024;
 static GEMV_AXPY_PAR_MIN_ROWS: Threshold = Threshold::new(
     "GEMMKIT_GEMV_AXPY_PAR_MIN_ROWS",
     GEMV_AXPY_PAR_MIN_ROWS_DEFAULT,

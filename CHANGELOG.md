@@ -33,7 +33,7 @@ once with per-crate subsections where a change is crate-specific.
 #### Added
 
 - `GEMMKIT_GEMV_AXPY_PAR_MIN_ROWS` (`set_gemv_axpy_par_min_rows`, default 16384 on
-  x86, `0` on aarch64): the output-row floor below which a column-major gemv stays
+  x86, 1024 on aarch64): the output-row floor below which a column-major gemv stays
   serial instead of splitting its rows
 
 #### Fixed
@@ -51,8 +51,15 @@ once with per-crate subsections where a change is crate-specific.
   measured 1.16-1.52x faster in parallel at every size), as is the `half` mixed
   twin (1.94-2.78x faster split, from 256 rows up). No result bit moves either
   way: the floor decides only whether the rows are split, and gemv output is
-  bit-identical across worker counts as before. The aarch64 default is `0` (floor
-  disabled) pending on-device calibration, so that target's behavior is unchanged
+  bit-identical across worker counts as before. The aarch64 default is 1024,
+  calibrated on an M4 Max (10P + 4E, no L3): the same regression appears there over
+  a much narrower band — 0.35-0.94x at 128-512 rows, 0.60-1.22x at 768, 0.86-1.68x
+  at 896 — and 1024 is the first row count that wins on every pass at every matrix
+  size from 8 MiB to 512 MiB (1.39x, 1.76x, 2.31x, 2.21x respectively). Note that on
+  that part the crossover tracks *bytes per column* (`rows * sizeof`, 4 KiB) rather
+  than the row count the knob is expressed in — an f64 sweep crosses at 512 rows and
+  matches the f32 table point for point at equal bytes per column — so the aarch64
+  default is the f32 calibration and an f64-dominated workload there wants 512
 - A gemv sweep with fewer output rows than one SIMD register no longer takes the
   axpy strategy. That strategy vectorizes over output rows, so below one register
   its vector loops were unreachable and the whole reduction ran on the scalar
