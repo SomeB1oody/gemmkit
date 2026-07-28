@@ -142,6 +142,11 @@ const KNOBS: &[Knob] = &[
         tuning::gemv_tier_step,
     ),
     (
+        "GEMMKIT_GEMV_AXPY_PAR_MIN_ROWS",
+        tuning::set_gemv_axpy_par_min_rows,
+        tuning::gemv_axpy_par_min_rows,
+    ),
+    (
         "GEMMKIT_PARALLEL_OVERSAMPLE",
         tuning::set_parallel_oversample,
         tuning::parallel_oversample,

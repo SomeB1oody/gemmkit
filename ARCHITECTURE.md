@@ -411,7 +411,13 @@ Dispatch reroutes shapes the register-tiling driver fits poorly
   forms vectorize over output rows and the dot form over `k`, so a sweep with
   fewer rows than one SIMD register yields to the dot form wherever that form
   is also legal — the single row of a pure dot product (`m == n == 1`), whose
-  strides are both 1 and which therefore fits either classification. The
+  strides are both 1 and which therefore fits either classification. Whether the
+  rows are split at all is decided separately: for a column-major matrix the
+  output-row axis is the *inner* memory axis, so a split trades the serial
+  route's one sequential pass for a strided walk per worker, and below
+  `gemv_axpy_par_min_rows` output rows that loses, so the sweep stays serial. A
+  row-major matrix hands each worker whole `k`-contiguous rows and is never
+  gated, nor is the mixed twin, which measured faster split at every size. The
   mixed-precision (`f16`/`bf16`) twin `run_mixed` reuses the same partition but
   widens each load to `f32` through the `KernelSimd` seam, accumulates in `f32`,
   and rounds to the narrow type once at the store (only the register-blocked

@@ -178,6 +178,10 @@ pub(crate) const KNOB_SETTERS: &[(&str, fn(usize))] = &[
     ("gemv_parallel_bytes", tuning::set_gemv_parallel_bytes),
     ("gemv_thread_cap", tuning::set_gemv_thread_cap),
     ("gemv_tier_step", tuning::set_gemv_tier_step),
+    (
+        "gemv_axpy_par_min_rows",
+        tuning::set_gemv_axpy_par_min_rows,
+    ),
     ("parallel_oversample", tuning::set_parallel_oversample),
     ("par_mnk_per_worker", tuning::set_par_mnk_per_worker),
     ("pool_classes", tuning::set_pool_classes),

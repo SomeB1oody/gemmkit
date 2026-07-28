@@ -1058,6 +1058,26 @@ fn main() {
         )
     );
 
+    // Output-row floor under which a column-major gemv refuses to split its rows. The probe set
+    // must straddle the candidate floors or every candidate scores the same, so it holds the
+    // matrix at ~128 MiB and moves the row count across them: 1024 rows sits under every non-zero
+    // candidate, 8192 under all but 4096, and 65536 over all of them. A floor of 0 then loses on
+    // the 2 narrow probes and a floor of 65536 loses on the wide one, which is what separates
+    // them. `sweep_gemv` builds `from_col_major` operands, i.e. exactly the axpy shape this knob
+    // governs. Worth sweeping off x86 in particular, since the aarch64 default ships at 0
+    knob!(
+        "GEMMKIT_GEMV_AXPY_PAR_MIN_ROWS",
+        sweep_gemv(
+            "GEMMKIT_GEMV_AXPY_PAR_MIN_ROWS",
+            tuning::set_gemv_axpy_par_min_rows,
+            tuning::GEMV_AXPY_PAR_MIN_ROWS_DEFAULT,
+            &[0, 4096, 65536],
+            &timing,
+            &[(1 << 10, 1 << 15), (1 << 13, 1 << 12), (1 << 16, 1 << 9)],
+            par,
+        )
+    );
+
     // Integer (i8) knobs
     // gates the VNNI -> widen small-parallel fallback, which exists only for the x86 VNNI i8
     // kernel (`small_par_fallback` is `None` for every other kernel, so elsewhere the knob is read
@@ -1556,6 +1576,7 @@ const TUNED: &[&str] = &[
     "GEMMKIT_GEMV_PARALLEL_BYTES",
     "GEMMKIT_GEMV_THREAD_CAP",
     "GEMMKIT_GEMV_TIER_STEP",
+    "GEMMKIT_GEMV_AXPY_PAR_MIN_ROWS",
     "GEMMKIT_PARALLEL_OVERSAMPLE",
     "GEMMKIT_PAR_MNK_PER_WORKER",
     "GEMMKIT_POOL_CLASSES",
@@ -1600,7 +1621,7 @@ mod knob_coverage {
     #[test]
     fn sweep_table_covers_every_knob() {
         // gemmkit-tune enables the int8 feature but not wasm_threads (see Cargo.toml), so
-        // knob_env_names() is always the 29 base knobs plus I8_VNNI_MIN_PAR_MNK, 30 total; TUNED
+        // knob_env_names() is always the 30 base knobs plus I8_VNNI_MIN_PAR_MNK, 31 total; TUNED
         // and NEVER_TUNED must partition that set exactly
         let names: BTreeSet<&str> = gemmkit::tuning::knob_env_names().iter().copied().collect();
         let tuned: BTreeSet<&str> = TUNED.iter().copied().collect();

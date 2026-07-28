@@ -30,8 +30,29 @@ once with per-crate subsections where a change is crate-specific.
   non-zero value still pins one flat width, now bypassing the ladder. gemv output
   remains bit-identical across worker counts
 
+#### Added
+
+- `GEMMKIT_GEMV_AXPY_PAR_MIN_ROWS` (`set_gemv_axpy_par_min_rows`, default 16384 on
+  x86, `0` on aarch64): the output-row floor below which a column-major gemv stays
+  serial instead of splitting its rows
+
 #### Fixed
 
+- A column-major gemv no longer splits its output rows across workers below that
+  floor. For a column-major matrix the output-row axis is the *inner*,
+  fastest-varying memory axis, so any row split gives every worker a strided walk
+  over the whole matrix while the serial route makes one sequential pass — which
+  meant parallelism was a net loss over the entire practical range. Measured on
+  the Zen5 reference machine (f32, best of 2/4/8 workers over serial, worst of 3
+  full sweeps): 0.62x at 32 rows, 0.66x at 512, 0.61x at 1024, 0.90x at 4096,
+  turning positive only at 16384 (1.14x) and reaching 1.40x at 1M. The floor
+  restores the serial route below the crossover and leaves everything above it
+  unchanged. Row-major gemv is untouched (it splits into `k`-contiguous rows and
+  measured 1.16-1.52x faster in parallel at every size), as is the `half` mixed
+  twin (1.94-2.78x faster split, from 256 rows up). No result bit moves either
+  way: the floor decides only whether the rows are split, and gemv output is
+  bit-identical across worker counts as before. The aarch64 default is `0` (floor
+  disabled) pending on-device calibration, so that target's behavior is unchanged
 - A gemv sweep with fewer output rows than one SIMD register no longer takes the
   axpy strategy. That strategy vectorizes over output rows, so below one register
   its vector loops were unreachable and the whole reduction ran on the scalar

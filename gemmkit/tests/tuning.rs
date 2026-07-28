@@ -314,6 +314,62 @@ fn gemv_thread_cap_stays_correct() {
     tuning::set_gemv_parallel_bytes(prev_floor);
 }
 
+/// `gemv_axpy_par_min_rows` is a live knob: it decides only whether a column-major gemv splits
+/// its rows across workers, never how any element is computed, so moving it across the shape's
+/// row count must leave the result bit-identical to the serial run either way. A floor above
+/// `m` forces the serial route, one below leaves the bandwidth ladder in charge, and `0` disables
+/// the floor outright
+#[test]
+fn gemv_axpy_par_min_rows_stays_correct() {
+    let _g = knob_guard();
+    let prev = tuning::gemv_axpy_par_min_rows();
+    // Drop the byte floor so this modest gemv is eligible for parallelism at all, otherwise
+    // every candidate below would trivially run serial and the knob would not be exercised
+    let prev_floor = tuning::gemv_parallel_bytes();
+    tuning::set_gemv_parallel_bytes(1);
+    let (m, k, n) = (200_000usize, 3usize, 1usize);
+    let a: Vec<f64> = (0..m * k).map(|x| (x % 29) as f64 * 0.05 - 0.6).collect();
+    let b: Vec<f64> = (0..k * n).map(|x| (x % 19) as f64 * 0.1 - 0.9).collect();
+    let cref = naive_col(&a, &b, m, k, n);
+    let serial = {
+        let mut cc = vec![0.0f64; m * n];
+        gemm(
+            1.0,
+            MatRef::from_col_major(&a, m, k),
+            MatRef::from_col_major(&b, k, n),
+            0.0,
+            MatMut::from_col_major(&mut cc, m, n),
+            Parallelism::Serial,
+        );
+        cc
+    };
+    // Straddle `m`: 0 disables the floor, m/2 leaves the route parallel, 2*m forces it serial
+    for &floor in &[0usize, m / 2, m * 2] {
+        tuning::set_gemv_axpy_par_min_rows(floor);
+        let mut cc = vec![0.0f64; m * n];
+        gemm(
+            1.0,
+            MatRef::from_col_major(&a, m, k),
+            MatRef::from_col_major(&b, k, n),
+            0.0,
+            MatMut::from_col_major(&mut cc, m, n),
+            Parallelism::Rayon(0),
+        );
+        for ((got, exp), ser) in cc.iter().zip(&cref).zip(&serial) {
+            assert!(
+                (got - exp).abs() <= 1e-10 * (1.0 + exp.abs()),
+                "floor={floor}: {got} vs {exp}"
+            );
+            assert_eq!(
+                got, ser,
+                "floor={floor}: the row-split floor must not move a result bit"
+            );
+        }
+    }
+    tuning::set_gemv_axpy_par_min_rows(prev);
+    tuning::set_gemv_parallel_bytes(prev_floor);
+}
+
 /// Output-partitioning of gemv and gevv adds no cross-thread reduction, so a parallel run
 /// reproduces the serial one exactly; checked here to a tight tolerance rather than requiring
 /// bit-for-bit equality

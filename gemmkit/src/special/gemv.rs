@@ -24,6 +24,12 @@
 //! SIMD register, so the axpy kernels would drop the whole reduction onto their scalar remainder
 //! (see [`axpy_yields_to_dot`])
 //!
+//! Whether the rows are split at all is a separate question from how they are computed. For a
+//! column-major matrix the output-row axis is the inner memory axis, so a split trades the serial
+//! route's single sequential pass for 1 strided walk per worker; below a row floor that loses, and
+//! the sweep stays serial (see [`axpy_row_split_loses`]). A row-major matrix hands each worker
+//! whole `k`-contiguous rows and is never gated
+//!
 //! Every output element is reduced over the full `k` by exactly 1 worker, so splitting the output
 //! rows across workers changes nothing about how any single element is computed: the result is
 //! reproducible, and in fact bit-identical, at any worker count
@@ -186,7 +192,13 @@ unsafe fn core_epi<T, S, E>(
         // The minimum traffic this call must move: the matrix once, the vector once, the output
         // once. `rows` caps the worker count so no worker can end up with 0 rows
         let bytes_touched = (rows.saturating_mul(k) + k + rows).saturating_mul(sizeof);
-        let n_threads = par.resolve_bandwidth(bytes_touched, rows);
+        // A column-major sweep splits the INNER memory axis, so below the row floor the split
+        // costs more sequentiality than the extra workers recover and this stays serial
+        let n_threads = if axpy && axpy_row_split_loses(rows) {
+            1
+        } else {
+            par.resolve_bandwidth(bytes_touched, rows)
+        };
 
         // Grain the partition on register-blocked panels (`MB_REG*lanes`) for the axpy path, so
         // worker boundaries land on panel edges; plain SIMD rows otherwise. Both are multiples of
@@ -266,6 +278,26 @@ unsafe fn core_epi<T, S, E>(
 #[inline]
 fn axpy_yields_to_dot(rows: usize, lanes: usize, dot_legal: bool) -> bool {
     dot_legal && rows < lanes
+}
+
+/// Whether splitting an axpy-shape sweep's output rows across workers costs more than it buys.
+/// For a column-major matrix the output-row axis is the INNER, fastest-varying memory axis, so
+/// any row split hands every worker a strided walk over the whole matrix, each consuming only its
+/// own slice of every column. The serial route makes 1 sequential pass instead ([`row_sweep`]
+/// short-circuits to a single `body(0, rows)` call with no blocking at all), and that pass already
+/// runs near the achievable single-stream rate, so there is little for the extra workers to win
+/// and a great deal of sequentiality to lose
+///
+/// Measured on the Zen5 9950X (f32, best of 2/4/8 workers over serial, worst of 3 full sweeps):
+/// `rows` = 32 0.62x, 512 0.66x, 1024 0.61x, 4096 0.90x, 16384 1.14x, 65536 1.24x, 1048576 1.40x.
+/// Hence [`crate::tuning::gemv_axpy_par_min_rows`], defaulting to the first row count that won on
+/// every sweep. The dot form is never gated - its workers own whole `k`-contiguous rows and stay
+/// sequential, and it measured 1.16-1.52x faster in parallel at every size - and neither is the
+/// mixed twin, which gains 1.94-2.78x from 256 rows up
+#[inline]
+fn axpy_row_split_loses(rows: usize) -> bool {
+    let floor = crate::tuning::gemv_axpy_par_min_rows();
+    floor != 0 && rows < floor
 }
 
 /// Whether an axpy-shape gemv should use the register-blocked output strategy instead of the
@@ -723,6 +755,11 @@ unsafe fn core_mixed<N, S>(
         // axpy form always register-blocks (see its own doc), so there is no output-size gate
         // here the way there is in the float core; the short-sweep yield to the dot form is the
         // same one, over the f32 accumulator lane count the panel is held in
+        //
+        // The float core's `axpy_row_split_loses` serial floor is deliberately NOT applied here.
+        // The widening axpy is compute-bound enough to scale across workers even though it walks
+        // the same column-major stream: measured on the Zen5 9950X it gains 1.94-2.78x at every
+        // row count from 256 up, where the float core loses at everything under 16384
         let dot_legal = mat_cs == 1 && vec_s == 1;
         let axpy = mat_rs == 1 && out_s == 1 && !axpy_yields_to_dot(rows, lanes, dot_legal);
         let dot = !axpy && dot_legal;
@@ -1050,7 +1087,7 @@ unsafe fn strided_rows_mixed<N, S>(
 // that picks between them
 #[cfg(test)]
 mod tests {
-    use super::{DOT_RB, MB_REG, axpy_yields_to_dot};
+    use super::{DOT_RB, MB_REG, axpy_row_split_loses, axpy_yields_to_dot};
     use crate::simd::{ScalarTok, SimdOps};
 
     /// The axpy form vectorizes over output rows, so a sweep too short to fill 1 SIMD register
@@ -1075,6 +1112,35 @@ mod tests {
         }
         // The scalar token's axpy loop always runs, so a 1-lane build never changes route
         assert!(!axpy_yields_to_dot(1, 1, true));
+    }
+
+    /// The column-major serial floor tracks its knob exactly, and `0` disables it so the route
+    /// falls back to the bandwidth ladder alone. Serialized against the other knob-mutating tests
+    /// in this module's binary by running the whole sweep under 1 test
+    #[test]
+    fn axpy_row_split_floor_follows_its_knob() {
+        let prev = crate::tuning::gemv_axpy_par_min_rows();
+
+        crate::tuning::set_gemv_axpy_par_min_rows(0);
+        for rows in [0usize, 1, 16, 4096, usize::MAX] {
+            assert!(
+                !axpy_row_split_loses(rows),
+                "a 0 floor must never gate (rows={rows})"
+            );
+        }
+
+        for floor in [1usize, 16, 4096, 16384] {
+            crate::tuning::set_gemv_axpy_par_min_rows(floor);
+            for rows in [0usize, 1, 15, 16, 4095, 4096, 16383, 16384, usize::MAX] {
+                assert_eq!(
+                    axpy_row_split_loses(rows),
+                    rows < floor,
+                    "floor={floor} rows={rows}"
+                );
+            }
+        }
+
+        crate::tuning::set_gemv_axpy_par_min_rows(prev);
     }
 
     /// Builds a per-float-type checker for [`super::axpy_regblocked`]: a row count chosen to hit

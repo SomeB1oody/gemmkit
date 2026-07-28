@@ -290,6 +290,39 @@ static GEMV_THREAD_CAP: Threshold =
 pub const GEMV_TIER_STEP_DEFAULT: usize = 0;
 static GEMV_TIER_STEP: Threshold = Threshold::new("GEMMKIT_GEMV_TIER_STEP", GEMV_TIER_STEP_DEFAULT);
 
+// Output-row floor below which a COLUMN-MAJOR (axpy-shape) gemv refuses to split its rows across
+// workers at all, whatever width the bandwidth ladder above asked for. For a column-major matrix
+// the output-row axis is the INNER, fastest-varying memory axis, so cutting it gives every worker
+// a strided walk over the whole matrix, consuming only its own slice of each column; the serial
+// route instead makes 1 sequential pass (`row_sweep` short-circuits to a single `body(0, rows)`
+// call). Only once each worker's per-column run is long enough does splitting pay for the
+// sequentiality it gives up. A row-major matrix is unaffected: its workers own whole `k`-
+// contiguous rows and stay sequential, so this knob is deliberately not consulted on that route
+//
+// Measured on the Zen5 9950X, f32, best of 2/4/8 workers against serial, worst of 3 full sweeps:
+// rows = 32 0.62x, 512 0.66x, 1024 0.61x, 4096 0.90x, 16384 1.14x, 65536 1.24x, 1048576 1.40x.
+// 16384 is the first row count that wins on every sweep, and 4096 still loses on some, hence the
+// floor between them. The f64 crossover tracks the row count rather than the byte run, so this is
+// a row threshold and not a byte one. The mixed-precision twin is EXCLUDED by measurement, not by
+// oversight: its register-blocked axpy is compute-bound enough to scale, gaining 1.94-2.78x at
+// every row count from 256 up on the same machine, so `core_mixed` never consults this
+/// Compiled default for [`gemv_axpy_par_min_rows`]: overridden by
+/// `GEMMKIT_GEMV_AXPY_PAR_MIN_ROWS` or [`set_gemv_axpy_par_min_rows`]; `0` disables the floor, so
+/// a column-major gemv parallelizes on the bandwidth ladder alone as it did before
+#[cfg(not(target_arch = "aarch64"))]
+pub const GEMV_AXPY_PAR_MIN_ROWS_DEFAULT: usize = 16384;
+/// The aarch64 default. `0` (floor disabled) pending on-device validation: the regression this
+/// guards against was measured only on the x86 reference machine, and Apple's shared cluster-L2
+/// feeds a strided worker very differently from a private-L2 part, so gating there unmeasured
+/// could cost more than it saves. Sweep it on the device to calibrate, exactly as `pool_classes`
+/// stays conservative off its measured architectures
+#[cfg(target_arch = "aarch64")]
+pub const GEMV_AXPY_PAR_MIN_ROWS_DEFAULT: usize = 0;
+static GEMV_AXPY_PAR_MIN_ROWS: Threshold = Threshold::new(
+    "GEMMKIT_GEMV_AXPY_PAR_MIN_ROWS",
+    GEMV_AXPY_PAR_MIN_ROWS_DEFAULT,
+);
+
 // Dynamic-scheduling granularity for the general parallel path: the driver aims for this many
 // work chunks per worker, handed out from a shared atomic cursor on demand, so a faster core
 // (e.g. a P-core on a heterogeneous big.LITTLE layout) pulls proportionally more chunks than a
@@ -568,7 +601,7 @@ static I8_VNNI_MIN_PAR_MNK: Threshold =
 // in - `I8_VNNI_MIN_PAR_MNK` under the `int8` feature and `WASM_THREADS` under
 // `wasm32 + wasm_threads`. Declaring a `Threshold` here without adding its name to one of these 2
 // lists is a small diff away from being caught: the consumer sync tests assert against the count
-const KNOB_ENV_NAMES_BASE: [&str; 29] = [
+const KNOB_ENV_NAMES_BASE: [&str; 30] = [
     "GEMMKIT_PARALLEL_THRESHOLD",
     "GEMMKIT_RHS_PACK_THRESHOLD",
     "GEMMKIT_LHS_PACK_THRESHOLD",
@@ -582,6 +615,7 @@ const KNOB_ENV_NAMES_BASE: [&str; 29] = [
     "GEMMKIT_GEMV_PARALLEL_BYTES",
     "GEMMKIT_GEMV_THREAD_CAP",
     "GEMMKIT_GEMV_TIER_STEP",
+    "GEMMKIT_GEMV_AXPY_PAR_MIN_ROWS",
     "GEMMKIT_PARALLEL_OVERSAMPLE",
     "GEMMKIT_PAR_MNK_PER_WORKER",
     "GEMMKIT_POOL_CLASSES",
@@ -780,6 +814,19 @@ pub fn gemv_tier_step() -> usize {
 /// Override the gemv/gevv worker ladder's byte spacing (`0` restores the auto value)
 pub fn set_gemv_tier_step(v: usize) {
     GEMV_TIER_STEP.set(v);
+}
+
+/// Get the output-row floor below which a column-major (axpy-shape) gemv stays serial no matter
+/// what width the bandwidth ladder asked for, since splitting that shape's rows cuts the inner
+/// memory axis and costs more sequentiality than the extra workers buy back. `0` disables the
+/// floor. Consulted only on the column-major float route: a row-major matrix, and the
+/// mixed-precision twin, both scale and are never gated
+pub fn gemv_axpy_par_min_rows() -> usize {
+    GEMV_AXPY_PAR_MIN_ROWS.get()
+}
+/// Override the column-major gemv serial floor (`0` disables it, restoring the plain ladder)
+pub fn set_gemv_axpy_par_min_rows(v: usize) {
+    GEMV_AXPY_PAR_MIN_ROWS.set(v);
 }
 
 /// Get the parallel dynamic-scheduling oversample factor (target chunks per worker). Always
