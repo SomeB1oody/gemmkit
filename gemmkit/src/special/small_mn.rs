@@ -14,9 +14,14 @@
 //! a time. All-row-major fails `rsb`, and all-column-major fails `csa`. When this happens,
 //! [`prepack_operands`] copies the failing operand into a flat, `k`-contiguous scratch
 //! buffer, and the same kernel runs over it with unit strides. When both operands already
-//! qualify, the pre-pack step does nothing and every pointer passes through unchanged. The
-//! `m*k` (or `n*k`) copy cost stays small next to the `m*n*k` dot work it unlocks. This
-//! route still beats falling back to the driver's padded microtile
+//! qualify, the pre-pack step does nothing and every pointer passes through unchanged
+//!
+//! In *flops* the `m*k` (or `n*k`) copy is a small fraction of the `m*n*k` dot work it unlocks.
+//! Flops are the wrong unit for it. The copy does no arithmetic per byte it moves, where the
+//! dots do about 2, so the copy has less to hide memory latency behind. On a long `k` it is not
+//! a small fraction of the *time*. It therefore runs across workers of its own
+//! ([`pack_k_contiguous_par`]), splitting depth rather than the tiny `lead` axis the tile sweep
+//! splits. This route still beats a fall back to the driver's padded microtile
 //!
 //! Output is tiled `MT x NT` at a time. A full tile keeps `MT*NT` accumulators live across
 //! the whole `k`-sweep. Each A-row and B-column loads once per depth step, shared across
@@ -106,9 +111,9 @@ fn packed_line_stride<T>(k: usize) -> usize {
     odd_lines * lane
 }
 
-/// Copy one strided operand into a flat, `k`-contiguous scratch layout. For each of the
-/// `lead` lines (A rows or B columns), `dst[l*dst_stride + t] = src[l*lead_stride +
-/// t*depth_stride]` for `t in 0..k`. `dst_stride` is [`packed_line_stride`] so consecutive
+/// Copy the depth range `[t_begin, t_end)` of one strided operand into a flat, `k`-contiguous
+/// scratch layout. For each of the `lead` lines (A rows or B columns), `dst[l*dst_stride + t] =
+/// src[l*lead_stride + t*depth_stride]`. `dst_stride` is [`packed_line_stride`] so consecutive
 /// lines never alias the same L1 set
 ///
 /// The operand packed here is exactly the one whose `k` axis is strided in memory, meaning
@@ -120,24 +125,30 @@ fn packed_line_stride<T>(k: usize) -> usize {
 /// in `dst` are the same values in the same per-line order, so the dot afterward reads
 /// identical numbers in identical order
 ///
+/// Every index is absolute. A caller may therefore cover the depth with any set of disjoint
+/// ranges and land the same bytes in the same places. [`pack_k_contiguous_par`] uses that
+/// property to split the copy across workers
+///
 /// # Safety
 /// `src` must be valid for the `lead x k` region at `lead`/`depth`. `dst` must be valid for
-/// `lead*dst_stride` writes
+/// `lead*dst_stride` writes. `t_end` must not exceed that region's depth
 #[inline]
+#[allow(clippy::too_many_arguments)]
 unsafe fn pack_k_contiguous<T: Copy>(
     dst: *mut T,
     src: *const T,
     lead: usize,
-    k: usize,
+    t_begin: usize,
+    t_end: usize,
     dst_stride: usize,
     lead_stride: isize,
     depth_stride: isize,
 ) {
     unsafe {
         let tile = crate::tuning::pack_transpose_tile();
-        let mut t0 = 0;
-        while t0 < k {
-            let te = core::cmp::min(t0 + tile, k);
+        let mut t0 = t_begin;
+        while t0 < t_end {
+            let te = core::cmp::min(t0 + tile, t_end);
             for t in t0..te {
                 // Depth line `t`. The inner sweep over `lead` then reads it unit-stride
                 let col = src.offset(t as isize * depth_stride);
@@ -148,6 +159,93 @@ unsafe fn pack_k_contiguous<T: Copy>(
             t0 = te;
         }
     }
+}
+
+/// Cover the whole depth with [`pack_k_contiguous`], splitting the copy across workers once it
+/// is large enough to pay for the fork. It returns the worker count it resolved. A test can then
+/// tell a forked run from a serial one, rather than infer it from the gate arithmetic
+///
+/// The split axis is **depth**, not `lead`, and that is the whole design. `lead` is `m` or `n`,
+/// which this route holds at or below `small_mn_dim`. It therefore offers almost no parallelism.
+/// A `lead` split would also take 1 element per depth step out of each `lead`-element line,
+/// instead of reading the line whole. A depth split keeps every worker's reads whole lines. It
+/// keeps each worker's writes to 1 contiguous span inside each of the `lead` destination lines
+///
+/// A depth split also lets the copy run wider than the compute that follows it. The `MT x NT`
+/// output grid caps the tile sweep, and a small `m,n` makes that grid tiny. The depth caps the
+/// copy, and a long `k` makes the depth large. The 2 resolve separately for exactly that reason
+///
+/// The chunking comes from `k` and the worker count, not from
+/// [`crate::tuning::pack_transpose_tile`]. That knob sizes the inner cache blocking. A job space
+/// derived from it would quietly turn a cache knob into a parallelism knob
+///
+/// A pack is a pure reorder with no reduction. Whichever worker draws a chunk writes each
+/// `(l, t)` cell once, with the value the serial copy writes. The packed bytes, and therefore the
+/// dot products over them, are identical at any worker count
+///
+/// # Safety
+/// As [`pack_k_contiguous`], over the full `0..k` depth
+#[allow(clippy::too_many_arguments)]
+unsafe fn pack_k_contiguous_par<T: Copy>(
+    dst: *mut T,
+    src: *const T,
+    lead: usize,
+    k: usize,
+    dst_stride: usize,
+    lead_stride: isize,
+    depth_stride: isize,
+    par: Parallelism,
+) -> usize {
+    // The traffic a copy moves: the operand read once and written once. Gated by the same
+    // cache-derived byte floor every bandwidth-bound route uses, so a copy too small to escape
+    // one core's private cache never forks. The depth is the unit count, since every depth step
+    // is independent
+    let bytes = lead
+        .saturating_mul(k)
+        .saturating_mul(2)
+        .saturating_mul(core::mem::size_of::<T>());
+    let n_threads = par.resolve_bandwidth(bytes, k);
+    if n_threads <= 1 {
+        // SAFETY: the caller's whole-depth precondition, covered in 1 range
+        unsafe {
+            pack_k_contiguous::<T>(dst, src, lead, 0, k, dst_stride, lead_stride, depth_stride)
+        };
+        return 1;
+    }
+    // Oversample the workers so a heterogeneous part can pull proportionally more, the same trade
+    // `job_grain` makes for the driver, but expressed directly in depth steps
+    let n_chunks = k.min(
+        n_threads
+            .saturating_mul(crate::tuning::parallel_oversample())
+            .max(1),
+    );
+    let chunk = k.div_ceil(n_chunks.max(1));
+    let (dst, src) = (Ptr(dst), Ptr(src as *mut T));
+    let cur = JobCursor::new(n_chunks, 1);
+    parallel::for_each_worker(n_threads, |_tid| {
+        let (dst, src) = (dst, src);
+        while let Some((s, e)) = cur.next_chunk() {
+            let t_begin = s * chunk;
+            let t_end = core::cmp::min(e * chunk, k);
+            // SAFETY: chunks tile `0..n_chunks` exactly (JobCursor's invariant) and `chunk` is
+            // the same for every worker, so the depth ranges are disjoint, cover `0..k`, and stay
+            // inside it via the `min(k)` clamp. Workers therefore write disjoint cells of the
+            // caller's scratch and never read each other's
+            unsafe {
+                pack_k_contiguous::<T>(
+                    dst.0,
+                    src.0 as *const T,
+                    lead,
+                    t_begin,
+                    t_end,
+                    dst_stride,
+                    lead_stride,
+                    depth_stride,
+                )
+            };
+        }
+    });
+    n_threads
 }
 
 /// Pre-pack whichever of `A`/`B` fails the unit-stride-along-`k` predicate into `ws`. Return
@@ -161,6 +259,12 @@ unsafe fn pack_k_contiguous<T: Copy>(
 /// `csa = 1`. B packs to `n` columns, each `k` contiguous elements: `rsb = 1`, new `csb` is
 /// [`packed_line_stride`]. `Workspace::regions` applies the same fail-closed element-to-byte
 /// overflow guard the driver's own pack sizing uses
+///
+/// The copy itself runs across workers when it is large enough ([`pack_k_contiguous_par`]). On a
+/// layout that needs packing, a small `m,n` and a long `k` make it a large share of this route's
+/// cost. It resolves its worker count apart from the tile sweep that follows, because the 2 have
+/// different amounts of parallelism available. The region carve runs before the fork, so every
+/// worker writes into scratch that already exists
 ///
 /// # Safety
 /// `a`/`b` must be valid for the `m x k` / `k x n` regions at their strides. The returned
@@ -178,6 +282,7 @@ unsafe fn prepack_operands<T: Copy>(
     b: *const T,
     rsb: isize,
     csb: isize,
+    par: Parallelism,
 ) -> (*const T, isize, isize, *const T, isize, isize) {
     let pack_a = csa != 1;
     let pack_b = rsb != 1;
@@ -195,14 +300,14 @@ unsafe fn prepack_operands<T: Copy>(
         let (mut b, mut rsb, mut csb) = (b, rsb, csb);
         if pack_a {
             // A[i, :] -> dst[i*stride + t]: rows are the lead axis, k the (strided) depth
-            pack_k_contiguous::<T>(r.a_base, a, m, k, stride, rsa, csa);
+            pack_k_contiguous_par::<T>(r.a_base, a, m, k, stride, rsa, csa, par);
             a = r.a_base;
             rsa = stride as isize;
             csa = 1;
         }
         if pack_b {
             // B[:, j] -> dst[j*stride + t]: cols are the lead axis, k the (strided) depth
-            pack_k_contiguous::<T>(r.b_base, b, n, k, stride, csb, rsb);
+            pack_k_contiguous_par::<T>(r.b_base, b, n, k, stride, csb, rsb, par);
             b = r.b_base;
             rsb = 1;
             csb = stride as isize;
@@ -255,7 +360,7 @@ pub unsafe fn run_epi<T, S, E>(
     unsafe {
         // No-op when both operands already stream unit-stride along k
         let (a, rsa, csa, b, rsb, csb) =
-            prepack_operands::<T>(ws, m, k, n, a, rsa, csa, b, rsb, csb);
+            prepack_operands::<T>(ws, m, k, n, a, rsa, csa, b, rsb, csb, par);
         debug_assert!(
             csa == 1 && rsb == 1,
             "small_mn kernel requires A rows / B cols unit-stride along k"
@@ -500,7 +605,7 @@ pub unsafe fn run_mixed_epi<N, S, E>(
         // No-op when both operands already stream unit-stride along k. The narrow (N-byte)
         // operand is packed as-is, still widened on load the same as before
         let (a, rsa, csa, b, rsb, csb) =
-            prepack_operands::<N>(ws, m, k, n, a, rsa, csa, b, rsb, csb);
+            prepack_operands::<N>(ws, m, k, n, a, rsa, csa, b, rsb, csb, par);
         debug_assert!(
             csa == 1 && rsb == 1,
             "small_mn kernel requires A rows / B cols unit-stride along k"
@@ -749,7 +854,7 @@ pub unsafe fn run_int<S>(
         // No-op when both operands already stream unit-stride along k. i8 packs as-is
         // (byte copy), and a pure reorder cannot change a wrapping-i32 result
         let (a, rsa, csa, b, rsb, csb) =
-            prepack_operands::<i8>(ws, m, k, n, a, rsa, csa, b, rsb, csb);
+            prepack_operands::<i8>(ws, m, k, n, a, rsa, csa, b, rsb, csb, par);
         debug_assert!(
             csa == 1 && rsb == 1,
             "small_mn kernel requires A rows / B cols unit-stride along k"
@@ -945,5 +1050,132 @@ unsafe fn cell_dot_int<S>(
             beta.wrapping_mul(*cp)
         };
         *cp = alpha.wrapping_mul(dot).wrapping_add(ov);
+    }
+}
+
+// Checks on the k-contiguous pre-pack: the range decomposition its parallel form rests on, and
+// that the parallel form itself lands the serial bytes
+#[cfg(test)]
+mod tests {
+    use super::{pack_k_contiguous, packed_line_stride};
+
+    /// A strided `lead x k` source and the packed buffer a whole-depth serial copy produces
+    fn fixture(lead: usize, k: usize) -> (Vec<f32>, usize, Vec<f32>) {
+        let depth_stride = lead as isize; // column-major source: k is the outer axis
+        let src: Vec<f32> = (0..lead * k).map(|i| i as f32 * 0.25 - 3.0).collect();
+        let stride = packed_line_stride::<f32>(k);
+        let mut whole = vec![f32::NAN; lead * stride];
+        // SAFETY: `src` holds the full `lead x k` region and `whole` the full packed extent
+        unsafe {
+            pack_k_contiguous::<f32>(
+                whole.as_mut_ptr(),
+                src.as_ptr(),
+                lead,
+                0,
+                k,
+                stride,
+                1,
+                depth_stride,
+            )
+        };
+        (src, stride, whole)
+    }
+
+    /// Any set of disjoint ranges that covers the depth must land exactly the bytes 1 whole-depth
+    /// call lands. This property is what makes the copy splittable. The parallel form hands each
+    /// worker a range and never synchronizes. If range coverage were not equivalent to the whole,
+    /// a forked pack would differ from a serial one without any warning. The cases below include
+    /// ranges that do not align to the transpose strip
+    #[test]
+    fn depth_ranges_compose_to_the_whole_copy() {
+        for &(lead, k) in &[(1usize, 33usize), (4, 37), (5, 64), (16, 100), (3, 7)] {
+            let (src, stride, whole) = fixture(lead, k);
+            let splits: [&[usize]; 4] = [
+                &[0, k],
+                &[0, 1, k],
+                &[0, 1, 7, 20.min(k), k],
+                &[0, 16.min(k), 32.min(k), 48.min(k), k],
+            ];
+            for cuts in splits {
+                let mut got = vec![f32::NAN; lead * stride];
+                for w in cuts.windows(2) {
+                    let (t0, t1) = (w[0], w[1]);
+                    if t0 >= t1 {
+                        continue; // a clamped, empty range
+                    }
+                    // SAFETY: as `fixture`, over a sub-range of the same depth
+                    unsafe {
+                        pack_k_contiguous::<f32>(
+                            got.as_mut_ptr(),
+                            src.as_ptr(),
+                            lead,
+                            t0,
+                            t1,
+                            stride,
+                            1,
+                            lead as isize,
+                        )
+                    };
+                }
+                // Compare the live cells only: the stride pads past `k` and is never written
+                for l in 0..lead {
+                    let (a, b) = (&got[l * stride..][..k], &whole[l * stride..][..k]);
+                    assert_eq!(a, b, "lead={lead} k={k} cuts={cuts:?} line {l}");
+                }
+            }
+        }
+    }
+
+    /// The parallel copy must land the serial bytes exactly. The probe reads the live bandwidth
+    /// floor, so the fork does happen. It then asserts on the worker count the copy *reports*, not
+    /// on the gate arithmetic. A probe may not infer "this must have forked" from the numbers the
+    /// gate itself reads. Such a probe passes in exactly the case it exists to catch
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn parallel_copy_matches_the_serial_one() {
+        use super::pack_k_contiguous_par;
+        use crate::parallel::Parallelism;
+
+        let lead = 4usize;
+        let floor = crate::cache::gemv_parallel_floor_bytes();
+        // `pack_k_contiguous_par` gates on `lead * k * 2 * sizeof`, so take 2x the floor rather
+        // than the bare minimum
+        let k_want = floor / (lead * 2 * 4) * 2 + 64;
+        let k = k_want.clamp(64, 1 << 20);
+        let (src, stride, whole) = fixture(lead, k);
+        let mut forked = false;
+        for par in [
+            Parallelism::Serial,
+            Parallelism::Rayon(0),
+            Parallelism::Rayon(4),
+        ] {
+            let mut got = vec![f32::NAN; lead * stride];
+            // SAFETY: as `fixture`, over the whole depth
+            let width = unsafe {
+                pack_k_contiguous_par::<f32>(
+                    got.as_mut_ptr(),
+                    src.as_ptr(),
+                    lead,
+                    k,
+                    stride,
+                    1,
+                    lead as isize,
+                    par,
+                )
+            };
+            forked |= width > 1;
+            for l in 0..lead {
+                let (a, b) = (&got[l * stride..][..k], &whole[l * stride..][..k]);
+                assert_eq!(a, b, "{par:?} width={width} k={k} line {l}");
+            }
+        }
+        // The whole point of the probe. 2 machines legitimately never fork: one too narrow to
+        // fork at all, and one whose floor exceeds the cap on `k` above. In any other case this
+        // test has stopped covering the parallel path
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        assert!(
+            forked || cores <= 1 || k != k_want,
+            "no arm forked: the parallel copy is going untested (k={k} floor={floor})"
+        );
     }
 }

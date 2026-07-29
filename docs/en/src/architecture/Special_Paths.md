@@ -76,7 +76,15 @@ The kernel needs both operands unit-stride along `k`. It wants A's rows contiguo
 
 The copy touches `m*k` (or `n*k`) elements, against the `m*n*k` work of the dot itself. This is a small tax next to the horizontal kernel's win, so a strided small-`m,n` shape still beats falling back to the driver's padded microtiles. The scratch buffer rounds each line up to an *odd* number of cache lines (`packed_line_stride`). A natural stride of exactly `k` would map every packed line to the same L1 set whenever `k` is a power of 2. That collapses the benefit of the re-reads, so the odd-line rounding avoids it.
 
-The pre-pack step is a pure reorder: the same values, in the same per-line order. So the packed route stays bit-identical to the eligible-layout route. This route has 2 siblings. One is mixed (`f16`/`bf16`, widen to `f32`, round once per cell). The other is integer (`i8 -> i32`, wrapping, and therefore bit-exact against the driver). Both share the same tiling, the same pre-pack helper, and the same reproducibility argument.
+That tax is small in *flops*, but flops are the wrong unit for it. The copy does no arithmetic per byte it moves. The dots do about 2. The copy therefore has less to hide memory latency behind. On a long `k` it takes a far larger share of the *time* than of the work. On the calling thread it dominated the route.
+
+The copy now runs across workers itself. It forks after its traffic clears the cache-derived byte floor that the bandwidth-bound routes share (`GEMMKIT_GEMV_PARALLEL_BYTES`). Below that floor the copy stays serial. It resolves its own worker count, apart from the tile sweep that follows. The 2 axes offer different amounts of parallelism. The `MT x NT` output grid caps the sweep, and a small `m, n` makes that grid tiny. The depth caps the copy, and a long `k` makes the depth large.
+
+The copy splits the depth, never the `lead` axis. A contiguous `t` range lets each worker read whole depth lines, `lead` consecutive elements per step. A split of the few `lead` lines would instead take a single element per step from each line, across the whole operand.
+
+Measured on the Zen5 reference machine (f32, auto width, column-major `A`): `8x8x524288` 3.1x, `16x16x262144` 2.0x, `4x4x1048576` 1.8x, `8x8x2097152` 1.7x, `16x16x1048576` 1.1x. Footprint is the one trend that holds across these shapes. At a fixed `m,n`, the smaller packed operand gains more. The order across `m,n` at a fixed footprint is not monotonic. This page therefore claims no mechanism beyond the copy's share of the serial time.
+
+The pre-pack step is a pure reorder: the same values, in the same per-line order. So the packed route stays bit-identical to the eligible-layout route. Each worker writes every cell once, with the value a serial copy writes. A split of the copy across workers therefore moves no byte either. This route has 2 siblings. One is mixed (`f16`/`bf16`, widen to `f32`, round once per cell). The other is integer (`i8 -> i32`, wrapping, and therefore bit-exact against the driver). Both share the same tiling, the same pre-pack helper, and the same reproducibility argument.
 
 ## batched: orchestration, not a kernel
 

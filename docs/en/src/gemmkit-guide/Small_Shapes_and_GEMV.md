@@ -45,6 +45,10 @@ The 2 most common layouts each miss exactly one side. An all-row-major pair fail
 
 That is a fraction of about `1/n` (or `1/m`) of the `m*n*k` work in the product itself. It costs far less than what the horizontal route saves, so a strided small-`m,n` shape still beats falling back to the driver's padded microtile.
 
+A flop count understates that copy. The copy does no arithmetic per byte it moves. The dots do about 2. The copy therefore has less to hide memory latency behind, and it takes a much larger share of the *time* than of the work.
+
+The copy runs across workers on its own, apart from the dots. A small `m, n` leaves a tiny output grid for the dots to split. The copy splits the depth instead, and a deep contraction makes the depth long. You configure nothing. On the reference machine, a column-major small-`m,n` shape with a deep contraction got 1.1-3.1x faster (f32, auto width). The larger gains land where the packed operand still fits cache.
+
 The pre-pack tier engages once `k` clears its own knob, `small_mn_pack_min_k` (default 16), separate from the zero-copy tier's `small_k_threshold`. This path is likewise bit-identical to the serial run at any worker count. It computes each output as one fixed-order reduction on a disjoint tile.
 
 ## Practical guidance

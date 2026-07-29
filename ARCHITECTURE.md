@@ -536,6 +536,22 @@ and all are tunable:
   falling through to the driver. The same kernel then runs over the packed
   operand. The pack is a pure reorder, so the packed route is bit-identical
   to the already-eligible layout.
+
+  The copy also runs across workers. It forks after its traffic clears the
+  cache-derived byte floor that the bandwidth-bound routes share
+  (`GEMMKIT_GEMV_PARALLEL_BYTES`). Below that floor it stays on the
+  calling thread.
+
+  The copy resolves its own worker count, apart from the tile sweep that
+  follows. The 2 axes give different amounts of parallelism. The `MT x NT`
+  output grid caps the sweep, and a small `m, n` makes that grid tiny. The
+  depth caps the copy, and a long `k` makes the depth large.
+
+  The copy splits the depth, not the `lead` axis. Each worker then reads
+  whole depth lines. A `lead` split would instead take 1 element per step
+  from every line. A pack writes each cell once, with the value a serial
+  copy writes. The split therefore moves no byte. The route stays
+  bit-identical at any worker count.
 - **batched** (`batched.rs`): `gemm_batched*` orchestrates the single-GEMM
   engine over a batch. `Parallelism::resolve_batch` picks among 3
   policies:

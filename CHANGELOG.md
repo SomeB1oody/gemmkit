@@ -16,8 +16,27 @@ once, with per-crate subsections where a change is crate-specific.
 
 - `GEMMKIT_GEMV_TIER_STEP` (`set_gemv_tier_step`, default auto): the byte spacing
   between the rungs of the new gemv/gevv worker ladder
+- `GEMMKIT_GEMV_AXPY_PAR_MIN_ROWS` (`set_gemv_axpy_par_min_rows`, default 16384 on
+  x86, 1024 on aarch64): the output-row floor below which a column-major gemv stays
+  serial instead of splitting its rows
 
 #### Changed
+
+- The small-`m,n` route's pre-pack copy now runs across workers. Before, it ran on
+  the calling thread. The copy resolves its own worker count, apart from the tile
+  sweep that follows. The 2 axes offer different amounts of parallelism. The
+  `MT x NT` output grid caps the sweep, and a small `m, n` makes that grid tiny.
+  The depth caps the copy, and a long `k` makes the depth large. The copy splits
+  the depth, not the few `lead` lines, so each worker reads whole depth lines.
+  Below the cache-derived byte floor that the bandwidth-bound routes share
+  (`GEMMKIT_GEMV_PARALLEL_BYTES`), the copy still runs on the calling thread.
+  Measured on the Zen5 reference machine, f32 at the auto width, with a
+  column-major `A`: `8x8x524288` 3.1x, `16x16x262144` 2.0x, `4x4x1048576` 1.8x,
+  `8x8x2097152` 1.7x, `16x16x1048576` 1.1x. The gain tracks the copy's share of
+  the route's serial time. Footprint is the one trend that holds across these
+  shapes. At a fixed `m,n`, the smaller packed operand gains more. A pack writes
+  each cell once, with the value a serial copy writes. No result bit moves, and
+  the route stays bit-identical across worker counts
 
 - The auto worker count for a bandwidth-bound gemv/gevv is now a ladder over the
   touched bytes, not a flat fraction of the core count. Its rungs are the
@@ -27,12 +46,6 @@ once, with per-crate subsections where a change is crate-specific.
   largest tier instead of the full machine width. `GEMMKIT_GEMV_THREAD_CAP` is
   unchanged. A non-zero value still pins one flat width, now bypassing the ladder.
   gemv output remains bit-identical across worker counts
-
-#### Added
-
-- `GEMMKIT_GEMV_AXPY_PAR_MIN_ROWS` (`set_gemv_axpy_par_min_rows`, default 16384 on
-  x86, 1024 on aarch64): the output-row floor below which a column-major gemv stays
-  serial instead of splitting its rows
 
 #### Fixed
 
