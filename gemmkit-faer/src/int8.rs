@@ -4,13 +4,14 @@ use crate::common::{filled_mat, ref_parts};
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 use gemmkit::adapter::{requant_bias, requant_scale};
 
-/// Integer `C(i32) <- alpha*A(i8)*B(i8) + beta*C`, the faer adapter over gemmkit's
-/// [`gemmkit::gemm_i8`]. `i8` inputs accumulate into an `i32` output (`alpha`/`beta`/`C` are also
-/// `i32`); arithmetic wraps on overflow, the conventional integer-GEMM semantics. Input and output
-/// element types differ, so this needs its own entry rather than riding [`gemm`]; faer's view types
-/// are generic over an arbitrary element, so an `i8`/`i32` `MatRef`/`MatMut` pair needs no special
-/// handling here. Reads pointers/strides directly, so transposed, reversed, and general-stride
-/// views all work without copying
+/// Integer `C(i32) <- alpha*A(i8)*B(i8) + beta*C`. This is the faer adapter over gemmkit's
+/// [`gemmkit::gemm_i8`]. `i8` inputs accumulate into an `i32` output (`alpha`, `beta`, and `C`
+/// are all `i32`). Arithmetic wraps on overflow, the usual integer-GEMM semantics
+///
+/// The input and output element types differ, so this needs its own entry rather than riding
+/// [`gemm`]. faer's view types are generic over an arbitrary element, so an `i8`/`i32`
+/// `MatRef`/`MatMut` pair needs no special handling here. This function reads the pointer and
+/// strides directly, so a transposed, reversed, or general-stride view works without copying
 ///
 /// # Panics
 /// If the inner dimensions disagree
@@ -26,8 +27,9 @@ pub fn gemm_i8(
     gemm_i8_common(None, alpha, a, b, beta, c, par);
 }
 
-/// [`gemm_i8`], threading a caller-owned [`Workspace`] through instead of the thread-local pool
-/// (the fixed-cost path for a quantized-inference loop)
+/// Like [`gemm_i8`] but reuses a caller-owned [`Workspace`] instead of the thread-local pool.
+/// The caller-owned workspace avoids a fixed allocation cost in a repeated quantized-inference
+/// loop
 ///
 /// # Panics
 /// Same conditions as [`gemm_i8`]
@@ -64,9 +66,9 @@ fn gemm_i8_common(
     assert_eq!(n, cn, "gemmkit-faer: B.cols ({n}) != C.cols ({cn})");
     let (rsc, csc) = (c.row_stride(), c.col_stride());
     let cp = c.as_ptr_mut();
-    // SAFETY: dims validated above; faer guarantees valid in-bounds layouts; `c` (a `MatMut<i32>`
-    // exclusive borrow) can't alias `a`/`b` (`MatRef<i8>`): distinct element types over distinct
-    // storage
+    // SAFETY: the dims are validated above, and faer guarantees valid in-bounds layouts. `c` is
+    // a `MatMut<i32>` exclusive borrow, so it cannot alias `a` or `b` (`MatRef<i8>`). The
+    // element types differ, so the 2 views address distinct storage
     unsafe {
         match ws {
             Some(ws) => gemm_i8_unchecked_with(
@@ -90,19 +92,23 @@ pub fn dot_i8(a: MatRef<'_, i8>, b: MatRef<'_, i8>) -> Mat<i32> {
     c
 }
 
-/// Requantizing integer GEMM: `i8` inputs multiplied into an `i32` accumulator, then requantized to
-/// an `i8` output in 1 fused pass, the faer adapter over gemmkit's [`gemmkit::gemm_i8_requant`]. The
-/// [`Requantize`] carries the per-tensor or per-row `scale`, the `zero_point`, and an optional
-/// per-row `i32` bias; there is no `alpha` (it folds into `scale`) and no `beta` (accumulating into
-/// an already-quantized C is ill-defined). Reads the pointers/strides directly and forwards to
-/// gemmkit's raw engine, so transposed, sub-matrix, and reversed (negative-stride) views all work
-/// without copying
+/// Requantizing integer GEMM: `i8` inputs multiplied into an `i32` accumulator, then
+/// requantized to an `i8` output in 1 fused pass. This is the faer adapter over gemmkit's
+/// [`gemmkit::gemm_i8_requant`]. The [`Requantize`] carries the per-tensor or per-row `scale`,
+/// the `zero_point`, and an optional per-row `i32` bias. There is no `alpha`, because it folds
+/// into `scale`. There is no `beta`, because `C` already holds quantized output, which cannot
+/// accumulate further
+///
+/// This function reads the pointer and strides directly and forwards to gemmkit's raw engine,
+/// so a transposed, sub-matrix, or reversed (negative-stride) view works without copying
 ///
 /// # Panics
-/// If the inner dimensions disagree, or on the requant parameters the adapter rejects (a non-finite
-/// or non-positive `scale`, whether per-tensor or any per-row element; a per-row scale slice whose
-/// length is not `A.rows` or which overlaps `C`; a `zero_point` outside `[-128, 127]`; or a bias
-/// whose length is not `A.rows` or which overlaps `C`)
+/// If the inner dimensions disagree, or on a requant parameter the adapter rejects:
+///
+/// - a non-finite or non-positive `scale`, per-tensor or any per-row element
+/// - a per-row scale slice whose length is not `A.rows`, or which overlaps `C`
+/// - a `zero_point` outside `[-128, 127]`
+/// - a bias whose length is not `A.rows`, or which overlaps `C`
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 pub fn gemm_i8_requant(
     a: MatRef<'_, i8>,
@@ -114,8 +120,9 @@ pub fn gemm_i8_requant(
     gemm_i8_requant_common(None, a, b, req, c, par);
 }
 
-/// [`gemm_i8_requant`], threading a caller-owned [`Workspace`] through instead of the thread-local
-/// pool (the fixed-cost path for a quantized-inference loop)
+/// Like [`gemm_i8_requant`] but reuses a caller-owned [`Workspace`] instead of the
+/// thread-local pool. The caller-owned workspace avoids a fixed allocation cost in a repeated
+/// quantized-inference loop
 ///
 /// # Panics
 /// Same conditions as [`gemm_i8_requant`]
@@ -148,9 +155,10 @@ fn gemm_i8_requant_common(
     assert_eq!(n, cn, "gemmkit-faer: B.cols ({n}) != C.cols ({cn})");
     let (rsc, csc) = (c.row_stride(), c.col_stride());
     let cp = c.as_ptr_mut();
-    // Requantize validation, matching gemmkit's checked entry (same panic wording): a finite,
-    // positive per-tensor or per-row scale (per-row length A.rows, disjoint from C); zero_point in
-    // the i8 band; a per-row bias of length A.rows, disjoint from C
+    // Validates the requant parameters the same way gemmkit's checked entry does, with the
+    // same panic wording. The scale (per-tensor or per-row) is finite and positive, and a
+    // per-row scale has length `A.rows` and does not overlap `C`. The `zero_point` sits inside
+    // the i8 band. A per-row bias has length `A.rows` and does not overlap `C`
     let (scale, row_scales, has_row_scales) =
         requant_scale(m, cp, &[(cm, rsc), (cn, csc)], req.scale);
     assert!(
@@ -160,9 +168,10 @@ fn gemm_i8_requant_common(
     );
     let (bias_ptr, has_bias) = requant_bias(m, cp, &[(cm, rsc), (cn, csc)], req.bias);
 
-    // SAFETY: dims validated above; faer guarantees valid in-bounds layouts; `c` (a `MatMut<i8>`
-    // exclusive borrow) can't alias `a`/`b`, and the bias was validated disjoint from C above
-    // Reversed strides forward straight through, exactly as the plain entry
+    // SAFETY: the dims are validated above, and faer guarantees valid in-bounds layouts. `c` is
+    // a `MatMut<i8>` exclusive borrow, so it cannot alias `a` or `b`, and the bias was
+    // validated disjoint from `C` above. A reversed stride forwards straight through, exactly
+    // as the plain entry does
     unsafe {
         match ws {
             Some(ws) => gemm_i8_requant_unchecked_with(
@@ -212,16 +221,18 @@ fn gemm_i8_requant_common(
     }
 }
 
-/// Requantizing integer GEMM with an **unsigned `u8` output** (ONNX-QLinearMatMul-style
-/// activation), the faer adapter over gemmkit's [`gemmkit::gemm_i8_requant_u8`]. The `u8`-output
-/// twin of [`gemm_i8_requant`], differing only in the output domain `[0, 255]` and the matching
-/// `zero_point` range
+/// Requantizing integer GEMM with an unsigned `u8` output (ONNX-QLinearMatMul-style
+/// activation). This is the faer adapter over gemmkit's [`gemmkit::gemm_i8_requant_u8`], the
+/// `u8`-output twin of [`gemm_i8_requant`]. It differs only in the output domain `[0, 255]` and
+/// the matching `zero_point` range
 ///
 /// # Panics
-/// If the inner dimensions disagree, or on the requant parameters the adapter rejects (a non-finite
-/// or non-positive `scale`, whether per-tensor or any per-row element; a per-row scale slice whose
-/// length is not `A.rows` or which overlaps `C`; a `zero_point` outside `[0, 255]`; or a bias whose
-/// length is not `A.rows` or which overlaps `C`)
+/// If the inner dimensions disagree, or on a requant parameter the adapter rejects:
+///
+/// - a non-finite or non-positive `scale`, per-tensor or any per-row element
+/// - a per-row scale slice whose length is not `A.rows`, or which overlaps `C`
+/// - a `zero_point` outside `[0, 255]`
+/// - a bias whose length is not `A.rows`, or which overlaps `C`
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 pub fn gemm_i8_requant_u8(
     a: MatRef<'_, i8>,
@@ -233,7 +244,7 @@ pub fn gemm_i8_requant_u8(
     gemm_i8_requant_u8_common(None, a, b, req, c, par);
 }
 
-/// [`gemm_i8_requant_u8`], threading a caller-owned [`Workspace`] through instead of the
+/// Like [`gemm_i8_requant_u8`] but reuses a caller-owned [`Workspace`] instead of the
 /// thread-local pool
 ///
 /// # Panics
@@ -267,9 +278,10 @@ fn gemm_i8_requant_u8_common(
     assert_eq!(n, cn, "gemmkit-faer: B.cols ({n}) != C.cols ({cn})");
     let (rsc, csc) = (c.row_stride(), c.col_stride());
     let cp = c.as_ptr_mut();
-    // Requantize validation, matching gemmkit's checked entry (same panic wording): a finite,
-    // positive per-tensor or per-row scale (per-row length A.rows, disjoint from C); zero_point in
-    // the u8 band; a per-row bias of length A.rows, disjoint from C
+    // Validates the requant parameters the same way gemmkit's checked entry does, with the
+    // same panic wording. The scale (per-tensor or per-row) is finite and positive, and a
+    // per-row scale has length `A.rows` and does not overlap `C`. The `zero_point` sits inside
+    // the u8 band. A per-row bias has length `A.rows` and does not overlap `C`
     let (scale, row_scales, has_row_scales) =
         requant_scale(m, cp, &[(cm, rsc), (cn, csc)], req.scale);
     assert!(
@@ -279,9 +291,10 @@ fn gemm_i8_requant_u8_common(
     );
     let (bias_ptr, has_bias) = requant_bias(m, cp, &[(cm, rsc), (cn, csc)], req.bias);
 
-    // SAFETY: dims validated above; faer guarantees valid in-bounds layouts; `c` (a `MatMut<u8>`
-    // exclusive borrow) can't alias `a`/`b`, and the bias was validated disjoint from C above
-    // Reversed strides forward straight through, exactly as the plain entry
+    // SAFETY: the dims are validated above, and faer guarantees valid in-bounds layouts. `c` is
+    // a `MatMut<u8>` exclusive borrow, so it cannot alias `a` or `b`, and the bias was
+    // validated disjoint from `C` above. A reversed stride forwards straight through, exactly
+    // as the plain entry does
     unsafe {
         match ws {
             Some(ws) => gemm_i8_requant_u8_unchecked_with(

@@ -5,24 +5,27 @@
 [![crates.io](https://img.shields.io/crates/v/gemmkit-nalgebra.svg)](https://crates.io/crates/gemmkit-nalgebra) [![docs.rs](https://img.shields.io/docsrs/gemmkit-nalgebra)](https://docs.rs/gemmkit-nalgebra)
 
 Zero-copy [nalgebra](https://crates.io/crates/nalgebra) 0.35 adapter over the
-[gemmkit](https://crates.io/crates/gemmkit) GEMM engine. Input operands are taken as
-`&Matrix<T, R, C, S>` for any storage `S: RawStorage<T, R, C>`, so `DMatrix`, static
-`SMatrix`, and every view type are accepted; the output is a `&mut Matrix` whose storage
-is `RawStorageMut`. The adapter reads the pointer and strides straight out of the matrix
-and forwards them to gemmkit's raw engine, so column-major (nalgebra's natural layout),
-row-major, and general-stride views all work without copying.
+[gemmkit](https://crates.io/crates/gemmkit) GEMM engine. Input operands take the form
+`&Matrix<T, R, C, S>` for any storage `S: RawStorage<T, R, C>`. This accepts `DMatrix`,
+static `SMatrix`, and every view type. The output is a `&mut Matrix` whose storage is
+`RawStorageMut`. The adapter reads the pointer and strides straight out of the matrix and
+forwards them to gemmkit's raw engine. Column-major (nalgebra's natural layout),
+row-major, and general-stride views therefore all work without copying.
 
 The exposed surface mirrors the core engine. Real-scalar `gemm`, `gemm_with`, and `dot`
 are generic over `GemmScalar` (`f32`/`f64`, plus `f16`/`bf16` under the `half`
 feature). `prepack_lhs`/`prepack_rhs` build a reused pack handle for the
 `gemm_packed_a`/`gemm_packed_b` fixed-operand loop. Feature-gated families add integer
-(`gemm_i8`/`dot_i8`, `i8 -> i32`) and complex (`gemm_cplx`/`dot_cplx`) entries, and the
-`epilogue` feature adds fused entries: `gemm_fused` (bias plus activation), the
-per-element `gemm_map`, requantizing `gemm_i8_requant`/`gemm_i8_requant_u8`
-(`int8` + `epilogue`), and the bias-only `gemm_cplx_fused` (`complex` + `epilogue`).
-nalgebra has no rank-3 array type, so batched GEMM (`gemm_batched`) takes the batch as a
-slice of per-element `(&A, &B)` inputs paired with a slice of `&mut C` outputs (over
-gemmkit's pointer-array batched engine), with heterogeneous per-element shapes.
+(`gemm_i8`/`dot_i8`, `i8 -> i32`) and complex (`gemm_cplx`/`dot_cplx`) entries. The
+`epilogue` feature adds fused entries too. These are `gemm_fused` (bias plus
+activation), the per-element `gemm_map`, the requantizing
+`gemm_i8_requant`/`gemm_i8_requant_u8` (`int8` + `epilogue`), and the bias-only
+`gemm_cplx_fused` (`complex` + `epilogue`).
+
+nalgebra has no rank-3 array type. Batched GEMM (`gemm_batched`) instead takes the batch
+as a slice of per-element `(&A, &B)` inputs, paired with a slice of `&mut C` outputs. This
+runs over gemmkit's pointer-array batched engine. Each element in the batch may have its
+own shape.
 
 A step-by-step guide for this adapter lives in the
 [gemmkit Guide](https://someb1oody.github.io/gemmkit/en/gemmkit-nalgebra/Using_gemmkit_with_nalgebra.html).
@@ -57,7 +60,7 @@ Each flag forwards to the same-named feature on `gemmkit`.
 | Feature | Default | Effect |
 | --- | --- | --- |
 | `parallel` | Yes | rayon-based parallelism (`gemmkit/parallel`). |
-| `wasm_threads` | No | Enables `parallel` and `gemmkit/wasm_threads` for `wasm32-wasip1-threads`. |
+| `wasm_threads` | No | Threading on `wasm32-wasip1-threads`. Implies `parallel`. |
 | `half` | No | `f16`/`bf16` inputs with `f32` accumulation. |
 | `complex` | No | `Complex<f32>`/`Complex<f64>` entries with optional conjugation. |
 | `int8` | No | `i8 -> i32` integer entries. |
@@ -65,10 +68,10 @@ Each flag forwards to the same-named feature on `gemmkit`.
 
 ## Supported element types
 
-The real `f32` and `f64` paths are always built; the rest are gated behind the
-features above. Each type is read straight out of the nalgebra matrix, so
-column-major (nalgebra's natural layout), row-major, and general-stride views all
-work without conversion.
+The real `f32` and `f64` paths are always built. The features above gate the rest.
+The adapter reads each type straight out of the nalgebra matrix, so column-major
+(nalgebra's natural layout), row-major, and general-stride views all work without
+conversion.
 
 | Element type | Feature | Computes | Entry points |
 | --- | --- | --- | --- |
@@ -78,9 +81,9 @@ work without conversion.
 | `i8` (requantized) | `int8` + `epilogue` | `i8 * i8 ->` `i8` or `u8` | `gemm_i8_requant`, `gemm_i8_requant_u8` |
 | `Complex<f32>`, `Complex<f64>` | `complex` | same, optional `conj(A)` / `conj(B)` | `gemm_cplx`, `dot_cplx`, `gemm_cplx_fused` |
 
-Each entry also has a `_with` variant that reuses a caller-owned `Workspace`, and
-the prepacked (`gemm_packed_a` / `gemm_packed_b`) and batched (`gemm_batched`, over
-a slice of per-element inputs) paths carry the same element types.
+Each entry also has a `_with` variant that reuses a caller-owned `Workspace`. The
+prepacked (`gemm_packed_a` / `gemm_packed_b`) and batched (`gemm_batched`, over a slice
+of per-element inputs) paths carry the same element types.
 
 ## Related crates
 

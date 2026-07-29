@@ -4,10 +4,10 @@ use crate::common::dims_strides;
 #[cfg(feature = "epilogue")]
 use gemmkit::adapter::lower_bias;
 
-/// Complex `C <- alpha*op(A)*op(B) + beta*C`, with `op(A) = conj(A)` when `conj_a` (resp.
-/// `conj(B)` when `conj_b`). `T` is `Complex<f32>`/`Complex<f64>`; needs the `complex` feature.
-/// Like [`gemm`], it reads the pointer/strides directly, so transposed, F-order, and
-/// negative-stride views work without copying
+/// Complex `C <- alpha*op(A)*op(B) + beta*C`. `op(A)` is `conj(A)` when `conj_a` is true, and
+/// `op(B)` is `conj(B)` when `conj_b` is true. `T` is `Complex<f32>` or `Complex<f64>`, and this
+/// function needs the `complex` feature. Like [`gemm`], it reads the pointer and strides
+/// directly, so transposed, F-order, and negative-stride views work without copying
 ///
 /// # Panics
 /// If the inner dimensions disagree
@@ -84,8 +84,8 @@ fn gemm_cplx_common<T, S1, S2, SC>(
     let (rsc, csc) = (cs[0], cs[1]);
     let cp = c.as_mut_ptr();
 
-    // SAFETY: dims validated above; ndarray guarantees the pointer/strides are in-bounds, and
-    // `c` (a `&mut` borrow) cannot alias `a`/`b`
+    // SAFETY: the dims are validated above. ndarray guarantees the pointer/strides are in-bounds,
+    // and `c` (a `&mut` borrow) cannot alias `a`/`b`
     unsafe {
         match ws {
             Some(ws) => gemm_cplx_unchecked_with(
@@ -157,18 +157,18 @@ where
     c
 }
 
-/// Complex `C <- alpha*op(A)*op(B) + beta*C + bias` in 1 fused pass, with `op(A) = conj(A)` when
-/// `conj_a` (resp. `conj(B)` when `conj_b`): the ndarray adapter over gemmkit's
-/// [`gemmkit::gemm_cplx_fused`]. The optional [`Bias`] is [`Bias::PerRow`] (length `A.rows`) or
-/// [`Bias::PerCol`] (length `B.cols`), added verbatim (never conjugated); `bias == None` is
-/// exactly [`gemm_cplx`]. There is **no** activation parameter: an ordering activation is
-/// undefined on complex numbers. Like [`gemm_cplx`], it reads the pointer/strides directly and
-/// forwards to gemmkit's raw engine, so transposed and reversed (negative-stride) views all work
-/// without copying
+/// Complex `C <- alpha*op(A)*op(B) + beta*C + bias` in 1 fused pass. `op(A)` is `conj(A)` when
+/// `conj_a` is true, and `op(B)` is `conj(B)` when `conj_b` is true. This is the ndarray adapter
+/// over gemmkit's [`gemmkit::gemm_cplx_fused`]. The optional [`Bias`] is [`Bias::PerRow`]
+/// (length `A.rows`) or [`Bias::PerCol`] (length `B.cols`), added verbatim and never conjugated.
+/// `bias == None` is exactly [`gemm_cplx`]. There is no activation parameter, because an ordering
+/// activation is undefined on complex numbers. Like [`gemm_cplx`], it reads the pointer and
+/// strides directly and forwards to gemmkit's raw engine. Transposed and reversed
+/// (negative-stride) views all work without copying
 ///
 /// # Panics
-/// If the inner dimensions disagree, or on a bias the adapter rejects (a `PerRow`/`PerCol` bias of
-/// the wrong length, or a bias slice overlapping `C`)
+/// If the inner dimensions disagree, or on a bias the adapter rejects: a wrong-length
+/// `PerRow`/`PerCol` bias, or a bias slice that overlaps `C`
 #[cfg(all(feature = "complex", feature = "epilogue"))]
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_cplx_fused<T, S1, S2, SC>(
@@ -244,12 +244,13 @@ fn gemm_cplx_fused_common<T, S1, S2, SC>(
     let cs = c.strides();
     let (rsc, csc) = (cs[0], cs[1]);
     let cp = c.as_mut_ptr();
-    // Bias validation matching gemmkit's checked-entry wording: the bias length matches its axis
-    // and does not overlap C (raw pointer math only). No activation to check: complex has none
+    // Bias validation mirrors gemmkit's checked-entry rules: the bias length matches its axis
+    // and does not overlap C, checked by raw pointer math only. There is no activation to check,
+    // because complex numbers have none
     let (bias_ptr, bias_dim, has_bias) = lower_bias(bias, m, n, cp, &[(cm, rsc), (cn, csc)]);
 
-    // SAFETY: dims validated above; ndarray guarantees the pointer/strides are in-bounds and `c`
-    // (a `&mut` borrow) can't alias `a`/`b`; the bias was validated disjoint from C above
+    // SAFETY: the dims are validated above. ndarray guarantees the pointer/strides are in-bounds,
+    // and `c` (a `&mut` borrow) cannot alias `a`/`b`. The bias was validated disjoint from C above
     unsafe {
         match ws {
             Some(ws) => gemm_cplx_fused_unchecked_with(

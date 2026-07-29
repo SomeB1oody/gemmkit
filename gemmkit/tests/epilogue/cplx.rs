@@ -545,6 +545,7 @@ fn cplx_fused_degenerate() {
 
 // validation panics
 
+// a PerRow bias whose length does not match A.rows must panic
 #[test]
 #[should_panic(expected = "PerRow bias length")]
 fn cplx_fused_bias_row_wrong_len() {
@@ -568,6 +569,7 @@ fn cplx_fused_bias_row_wrong_len() {
     );
 }
 
+// a PerCol bias whose length does not match B.cols must panic
 #[test]
 #[should_panic(expected = "PerCol bias length")]
 fn cplx_fused_bias_col_wrong_len() {
@@ -591,6 +593,7 @@ fn cplx_fused_bias_col_wrong_len() {
     );
 }
 
+// a bias slice aliasing C must panic before any element is touched
 #[test]
 #[should_panic(expected = "bias slice overlaps C")]
 fn cplx_fused_bias_overlaps_c() {

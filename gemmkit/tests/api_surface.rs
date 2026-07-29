@@ -49,7 +49,8 @@ fn workspace_constructors_and_unchecked_with() {
         Parallelism::Serial,
     );
 
-    // default() and with_capacity(0) both construct empty; with_capacity(0) must not itself allocate
+    // default() and with_capacity(0) both construct empty; with_capacity(0) must not itself
+    // allocate
     let mut ws_default = Workspace::default();
     let _ws_zero = Workspace::with_capacity(0);
     // Primed above what this shape needs, so the run below never grows it

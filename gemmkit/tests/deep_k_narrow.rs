@@ -1,22 +1,15 @@
 //! Deep-contraction narrow-twin route parity (feature `half`)
 //!
-//! A narrow-output family (f16/bf16, `OUT_IS_ACC = false`) runs a whole contraction as 1 depth
-//! panel (`kc = k`), so a large-`k` micropanel can outgrow L2. Above the `GEMMKIT_DEEP_KC_BYTES`
-//! engage gate, dispatch instead re-blocks through the family's f32-output twin (`OUT_IS_ACC =
-//! true`), which multi-slices the contraction at the cache-model `kc` into an f32 scratch buffer
-//! and narrows only once at the end. The twin continues the single panel's ascending-k
-//! accumulation across slice boundaries, so for `beta in {0, 1}` deep-k is byte-for-byte the
-//! single-panel route; for a general `beta` it only has to hold to tolerance, since the single
-//! panel fuses `beta*C + AB` on full tiles but not on edge tiles and no single sweep can match
-//! both. Serial and parallel stay bit-identical either way: the twin's blocking does not depend
-//! on the thread count, and the final narrowing sweep is a plain elementwise pass
+//! Above the `GEMMKIT_DEEP_KC_BYTES` engage gate, a narrow-output f16/bf16 GEMM re-blocks its
+//! contraction through an f32-output twin instead of running it as 1 depth panel. The twin must
+//! match the single-panel route byte-for-byte for `beta in {0, 1}`, and to a tight tolerance for
+//! a general `beta` (the single panel's edge-tile combine is unfused, so no 1 rounding order
+//! matches both). Serial and parallel stay bit-identical either way
 //!
-//! Platform-independent: the route is toggled purely by the runtime `GEMMKIT_DEEP_KC_BYTES` knob
-//! (`1` forces the twin at any `k`, `usize::MAX` forces the single panel), so this exercises
-//! whichever ISA the host actually selects. The x86 `avx512f` / `avx512bf16` pins that isolate the
-//! widen (`MixedGemm`) bf16 twin from the dot (`Bf16DotGemm`) one live in the separate
-//! `env_isa_avx512f` and `env_isa_bf16` binaries, since a memoized ISA choice needs its own process
-//! to force
+//! Toggled purely by the runtime `GEMMKIT_DEEP_KC_BYTES` knob (`1` forces the twin, `usize::MAX`
+//! forces the single panel), so this exercises whichever ISA the host selects. The x86 `avx512f`
+//! / `avx512bf16` ISA pins for this route live in the separate `env_isa_avx512f` and
+//! `env_isa_bf16` binaries, since a memoized ISA choice needs its own process to force
 #![cfg(all(
     feature = "half",
     feature = "std",
@@ -189,12 +182,12 @@ fn bit_identity_case<N: gemmkit::NarrowFloat + gemmkit::GemmScalar + Copy>(label
     tuning::set_deep_kc_bytes(restore);
 }
 
-/// For a general `beta` (neither 0 nor 1), deep-k is only guaranteed to match the single panel to
-/// a tight relative tolerance, not bit-for-bit: the single panel fuses `beta*C + AB` on full tiles
-/// but not edge tiles, so no single rounding order matches both. Swept over a unit-stride C (`rsc ==
-/// 1`, the twin's vectorized narrowing sweep) and a strided C (`rsc == 2`, its scalar per-element
-/// sweep); [`bit_identity_case`] only exercises that scalar sweep's `beta in {0, 1}` arms, so this
-/// is the only coverage of its general-`beta` `BetaStatus::Other` arm
+/// For a general `beta` (neither 0 nor 1), deep-k is only guaranteed to match the single panel
+/// to a tight relative tolerance, not bit-for-bit: the single panel fuses `beta*C + AB` on full
+/// tiles but not edge tiles, so no single rounding order matches both. Swept over a unit-stride
+/// C (`rsc == 1`, the twin's vectorized narrowing sweep) and a strided C (`rsc == 2`, its scalar
+/// per-element sweep); [`bit_identity_case`] only exercises that scalar sweep's `beta in {0, 1}`
+/// arms, so this is the only coverage of its general-`beta` `BetaStatus::Other` arm
 fn tolerance_case<N: gemmkit::NarrowFloat + gemmkit::GemmScalar + Copy>(
     label: &str,
     to: fn(u16) -> N,
@@ -258,21 +251,25 @@ fn tolerance_case<N: gemmkit::NarrowFloat + gemmkit::GemmScalar + Copy>(
     tuning::set_deep_kc_bytes(restore);
 }
 
+/// See [`bit_identity_case`]: f16
 #[test]
 fn deep_k_bit_identical_f16() {
     bit_identity_case::<f16>("f16");
 }
 
+/// See [`bit_identity_case`]: bf16
 #[test]
 fn deep_k_bit_identical_bf16() {
     bit_identity_case::<bf16>("bf16");
 }
 
+/// See [`tolerance_case`]: f16
 #[test]
 fn deep_k_tolerance_f16() {
     tolerance_case::<f16>("f16", f16_from_bits);
 }
 
+/// See [`tolerance_case`]: bf16
 #[test]
 fn deep_k_tolerance_bf16() {
     tolerance_case::<bf16>("bf16", bf16_from_bits);

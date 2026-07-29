@@ -2,17 +2,18 @@
 use super::*;
 use crate::common::dims_strides;
 
-/// `C[r, c] <- f(alpha*A*B + beta*C, r, c)` in **1 fused pass**: the nalgebra adapter over
-/// gemmkit's [`gemmkit::gemm_map`]. The closure `f(value, row, col)` runs on each output element's
-/// final value exactly once, with `(row, col)` in the **user** frame of `C`. `T` is `f32`/`f64`
-/// only. As with [`gemm`], the pointer/strides are read directly and forwarded to gemmkit's raw
-/// engine, so column-major, transposed (`.transpose()`), and general-stride (`.rows_with_step()`)
+/// `C[r, c] <- f(alpha*A*B + beta*C, r, c)` in 1 fused pass: the nalgebra adapter over gemmkit's
+/// [`gemmkit::gemm_map`]. The closure `f(value, row, col)` runs on each output element's final
+/// value exactly once, with `(row, col)` in the user frame of `C`. `T` is `f32`/`f64` only. As
+/// with [`gemm`], the pointer and strides are read directly and forwarded to gemmkit's raw
+/// engine. Column-major, transposed (`.transpose()`), and general-stride (`.rows_with_step()`)
 /// views all work without copying
 ///
-/// For a bias / activation, prefer [`gemm_fused`] instead (it vectorizes); `gemm_map` is the
-/// general per-element extension point (GELU, sigmoid, clamps, position-dependent transforms), at
-/// the cost of 1 indirect call per output element. For `f32`/`f64`, the result is bit-identical to
-/// running [`gemm`] and then mapping each `C[r, c]` through `f(C[r, c], r, c)`, for every shape
+/// For a bias or activation, prefer [`gemm_fused`] instead, because it vectorizes. `gemm_map` is
+/// the general per-element extension point (GELU, sigmoid, clamps, position-dependent
+/// transforms), at the cost of 1 indirect call per output element. For `f32`/`f64`, the result is
+/// bit-identical, for every shape, to running [`gemm`] and then mapping each `C[r, c]` through
+/// `f(C[r, c], r, c)`
 ///
 /// # Panics
 /// If the inner dimensions disagree (same conditions as [`gemm`])
@@ -104,9 +105,9 @@ fn gemm_map_common<T, R1, C1, S1, R2, C2, S2, RC, CC, SC>(
     let (rsc, csc) = (cs.0 as isize, cs.1 as isize);
     let cp = c.as_mut_ptr();
 
-    // SAFETY: dims checked above; nalgebra guarantees the pointer/strides describe a valid
-    // in-bounds layout and `c` (a `&mut` borrow) can't alias `a`/`b`; `f` is total, so it accepts
-    // every element the engine stores
+    // SAFETY: dims are checked above. nalgebra guarantees the pointer and strides describe a
+    // valid in-bounds layout, and `c` (a `&mut` borrow) cannot alias `a` or `b`. `f` is total, so
+    // it accepts every element the engine stores
     unsafe {
         match ws {
             Some(ws) => gemm_map_unchecked_with(

@@ -1,8 +1,6 @@
 //! Every `_with` adapter (the caller-owned-[`Workspace`] twin of an allocating entry) must produce
-//! the same result as that allocating entry, already checked without a workspace in `adapter.rs`:
-//! plain gemm, batched, prepacked-operand, and (feature-gated) i8, complex, fused, batched-fused,
-//! i8-requant, and complex-fused. This also drives the `Some(ws)` match arm of every adapter's
-//! `_common` helper and, transitively, gemmkit's own `_unchecked_with` core entries
+//! the same result as that allocating entry: plain gemm, batched, prepacked-operand, and
+//! (feature-gated) i8, complex, fused, batched-fused, i8-requant, and complex-fused
 
 use approx::assert_relative_eq;
 use ndarray::{Array2, Array3, Axis, ShapeBuilder};

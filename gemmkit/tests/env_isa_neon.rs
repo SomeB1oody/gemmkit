@@ -14,6 +14,8 @@ mod isa_dtypes;
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
+// Off aarch64 every dtype ladder panics under this pin; on aarch64 every ladder succeeds
+
 #[test]
 fn neon_pin_sweeps_every_dtype_ladder() {
     // SAFETY: the only test in this binary, so no other thread reads the environment

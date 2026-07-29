@@ -6,16 +6,17 @@ use gemmkit::adapter::lower_bias;
 
 /// `C <- act(alpha*A*B + beta*C + bias)` in 1 fused pass: the nalgebra adapter over gemmkit's
 /// [`gemmkit::gemm_fused`]. The optional [`Bias`] is [`Bias::PerRow`] (length `A.rows`) or
-/// [`Bias::PerCol`] (length `B.cols`), added after the product; the optional [`Activation`] is
-/// applied last. `bias == None && act == None` behaves exactly like [`gemm`]. `T` is `f32`/`f64`
-/// (plus `f16`/`bf16` under `half`, whose epilogue runs in `f32` before the single narrowing back
-/// to the output type). As with [`gemm`], the pointer/strides are read directly and forwarded to
-/// gemmkit's raw engine, so column-major, row-major, and general-stride views all work without
-/// copying
+/// [`Bias::PerCol`] (length `B.cols`), added after the product. The optional [`Activation`] is
+/// applied last, and `bias == None && act == None` behaves exactly like [`gemm`]. `T` is
+/// `f32`/`f64` (plus `f16`/`bf16` under `half`, whose epilogue runs in `f32` before the single
+/// narrowing back to the output type). As with [`gemm`], the pointer and strides are read
+/// directly and forwarded to gemmkit's raw engine. Column-major, row-major, and general-stride
+/// views all work without copying
 ///
 /// # Panics
-/// If the inner dimensions disagree, or on a bias/activation the adapter rejects (a `PerRow`/`PerCol`
-/// bias of the wrong length, a bias slice overlapping `C`, or a non-finite `LeakyRelu` slope)
+/// If the inner dimensions disagree, this panics. It also panics on a rejected bias or
+/// activation. The adapter rejects a `PerRow`/`PerCol` bias of the wrong length, a bias slice
+/// overlapping `C`, or a non-finite `LeakyRelu` slope
 #[cfg(feature = "epilogue")]
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_fused<T, R1, C1, S1, R2, C2, S2, RC, CC, SC>(
@@ -107,16 +108,16 @@ fn gemm_fused_common<T, R1, C1, S1, R2, C2, S2, RC, CC, SC>(
     let (rsc, csc) = (cs.0 as isize, cs.1 as isize);
     let cp = c.as_mut_ptr();
 
-    // Checks the bias length against its axis and rejects an overlap with C, then a finite
-    // LeakyRelu slope, matching the core checked entry's wording
+    // Checks the bias length against its axis, rejects an overlap with C, then checks the
+    // LeakyRelu slope is finite
     let (bias_ptr, bias_dim, has_bias) = lower_bias(bias, m, n, cp, &[(cm, rsc), (cn, csc)]);
     if let Some(Activation::LeakyRelu(s)) = &act {
         assert!(T::finite(*s), "gemmkit: LeakyRelu slope must be finite");
     }
 
-    // SAFETY: dims checked above; nalgebra guarantees the pointer/strides describe a valid
-    // in-bounds layout and `c` (a `&mut` borrow) can't alias `a`/`b`; the bias was checked disjoint
-    // from C above
+    // SAFETY: dims are checked above. nalgebra guarantees the pointer and strides describe a
+    // valid in-bounds layout, and `c` (a `&mut` borrow) cannot alias `a` or `b`. The bias was
+    // checked disjoint from `C` above
     unsafe {
         match ws {
             Some(ws) => gemm_fused_unchecked_with(

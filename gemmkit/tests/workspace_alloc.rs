@@ -32,11 +32,11 @@ static GA: Counting = Counting;
 /// Both allocation-accounting phases live in this **single** test on purpose: `ALLOCS` is a
 /// process-global counter, so a 2nd `#[test]` in this binary would let libtest record that
 /// test's result on the main thread (an allocation) concurrently with a measured window here,
-/// forging a false positive. One test => no inter-test concurrency, the only robust design for a
+/// forging a false positive. 1 test => no inter-test concurrency, the only robust design for a
 /// global-allocation assertion
 #[test]
 fn workspace_allocation_behavior() {
-    // Phase 1: reusing one workspace across same-size calls is zero-alloc
+    // Phase 1: reusing 1 workspace across same-size calls is zero-alloc
     {
         let (m, k, n) = (96usize, 80, 64);
         let a = vec![0.5f32; m * k];

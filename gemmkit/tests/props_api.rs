@@ -97,6 +97,8 @@ proptest! {
     }
 }
 
+// f16/bf16 instances of the oracle check above
+
 #[cfg(feature = "half")]
 proptest! {
     #![proptest_config(ProptestConfig { cases: cases(80), ..ProptestConfig::default() })]
@@ -373,6 +375,8 @@ proptest! {
         beta_zero_overwrites::<f64>(m, k, n, la, lc, al, seed);
     }
 }
+
+// f16/bf16 instances of the beta == 0 overwrite check above
 
 #[cfg(feature = "half")]
 proptest! {
@@ -824,15 +828,12 @@ proptest! {
     }
 }
 
-/// Regression: on the mixed-precision (f16/bf16) path the depth panel spans the whole `k`, and a
-/// broadcast (zero-stride) operand passes shape/bounds validation regardless of how large `k`
-/// logically is. Pack sizing must therefore fail closed rather than silently wrap into an
-/// undersized workspace that the pack then writes past. `k = isize::MAX` overflows the pack
-/// element-count product for every tile geometry, so the "too large" guard fires on every ISA;
-/// the narrower band where the element count fits `usize` but the element-to-byte conversion
-/// overflows is covered tile-independently by the `workspace::region_bytes` unit tests instead,
-/// since an end-to-end `k` landing in that band is tile-size-dependent (a smaller tile would just
-/// request a huge-but-representable allocation: a safe OOM abort, not this checked panic)
+/// Regression: the mixed (f16/bf16) path packs the whole `k` in a single depth panel, and a
+/// broadcast operand clears shape/bounds validation regardless of how large `k` is, so pack
+/// sizing must fail closed instead of wrapping into an undersized workspace. `k = isize::MAX`
+/// overflows the pack element-count product on every tile geometry, so the "too large" guard
+/// always fires here; the narrower usize-fits/byte-overflows band is tile-size-dependent and
+/// covered instead by the `workspace::region_bytes` unit tests
 #[cfg(feature = "half")]
 #[test]
 fn mixed_huge_k_fails_closed() {

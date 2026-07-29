@@ -1,12 +1,12 @@
 //! The floating-point GEMM family: `Lhs = Rhs = Acc = Out`, the plain `f32`/`f64` case
 //!
-//! 1 generic function (`microkernel_impl`) covers every ISA and every tile size:
-//! the instruction set varies only through [`SimdOps`]/[`KernelSimd`], and the tile
-//! shape only through the `MR_REG`/`NR` const generics, so there is no macro and no
-//! per-ISA copy of the kernel body. [`FloatGemm`] wires it in via
-//! [`KernelFamily::microkernel_epi`], the fused entry the driver calls; the plain
-//! [`KernelFamily::microkernel`] is left at the trait's `unreachable!` default since
-//! this family never takes that path
+//! 1 generic function, `microkernel_impl`, covers every ISA and every tile size. The
+//! instruction set varies only through [`SimdOps`] and [`KernelSimd`]. The tile shape
+//! varies only through the `MR_REG`/`NR` const generics, so there is no macro and no
+//! per-ISA copy of the kernel body. [`FloatGemm`] wires it in through
+//! [`KernelFamily::microkernel_epi`], the fused entry the driver calls. The plain
+//! [`KernelFamily::microkernel`] is left at the trait's `unreachable!` default,
+//! because this family never takes that path
 
 use core::marker::PhantomData;
 
@@ -62,8 +62,8 @@ where
         nc: usize,
         nr: usize,
     ) {
-        // RHS panels lead on columns (stride `cs`) and step depth on rows (stride
-        // `rs`), the transpose of pack_lhs's roles: swap the strides passed to pack_panels
+        // RHS panels lead on columns (stride `cs`) and step depth on rows (stride `rs`)
+        // This is the transpose of pack_lhs's roles, so the strides passed to pack_panels swap
         unsafe {
             pack_panels(
                 dst, src, /*lead*/ cs, /*depth*/ rs, /*n_lead*/ nc, kc, nr,
@@ -127,23 +127,24 @@ where
     }
 }
 
-/// Compute one `MR x NR` output tile and store it through the fused epilogue `E`: the shared
-/// body behind [`FloatGemm::microkernel_epi`], generic over the ISA token `S` and the tile
-/// shape `MR_REG`/`NR`
+/// Compute one `MR x NR` output tile and store it through the fused epilogue `E`. This is
+/// the shared body behind [`FloatGemm::microkernel_epi`], generic over the ISA token `S`
+/// and the tile shape `MR_REG`/`NR`
 ///
-/// Every epilogue application is gated on `!E::IS_IDENTITY`, and every `const` involved
-/// (`E::IS_IDENTITY`, `E::VECTOR`) is known at monomorphization time, so with `E = Identity`
-/// the guards fold to `false` before codegen, `row0`/`col0`/`last_k` become dead arguments, and
-/// the emitted code matches a kernel with no epilogue seam at all. With a `VECTOR` epilogue the
-/// fast path applies `E` directly to the register the store would otherwise have written
-/// unchanged, so a fused GEMM equals plain `gemm()` followed by a scalar map, bit-for-bit
+/// Every epilogue application is gated on `!E::IS_IDENTITY`, a const known at
+/// monomorphization time. With `E = Identity` the guards fold to `false` before codegen.
+/// `row0`, `col0`, and `last_k` become dead arguments, and the emitted code matches a
+/// kernel with no epilogue seam at all. With a `VECTOR` epilogue the fast path applies `E`
+/// directly to the register the store would otherwise have written unchanged. A fused GEMM
+/// then equals plain `gemm()` followed by a scalar map, bit-for-bit
 ///
-/// The index loops over `acc[j][i]` are bounded by the const generics `MR_REG`/`NR` rather than
-/// written as iterators, so the compiler fully unrolls them and keeps every accumulator in a
-/// register instead of spilling to the stack
+/// The index loops over `acc[j][i]` use the const generics `MR_REG`/`NR` as bounds instead
+/// of iterators, so the compiler fully unrolls them. This keeps every accumulator in a
+/// register instead of spilling it to the stack
 ///
 /// # Safety
-/// As [`KernelFamily::microkernel_epi`]; run inside `S`'s [`crate::simd::Simd::vectorize`]
+///
+/// As [`KernelFamily::microkernel_epi`]. Run inside `S`'s [`crate::simd::Simd::vectorize`]
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 #[inline(always)]
 unsafe fn microkernel_impl<T, S, E, const MR_REG: usize, const NR: usize>(
@@ -177,16 +178,16 @@ unsafe fn microkernel_impl<T, S, E, const MR_REG: usize, const NR: usize>(
         let lanes = <S as SimdOps<T>>::LANES;
         let mr = MR_REG * lanes;
 
-        // acc[j][i]: column j, rows [i*lanes, (i+1)*lanes)
+        // acc[j][i] holds column j, rows [i*lanes, (i+1)*lanes)
         let mut acc: [[<S as SimdOps<T>>::Reg; MR_REG]; NR] = [[simd.zero(); MR_REG]; NR];
 
         if nr_eff == NR {
-            // Full tile: the hot kc-loop, via the overridable accumulate_tile seam so an
-            // ISA can substitute its own schedule without touching this function
+            // Full tile: run the hot kc-loop through the overridable accumulate_tile seam,
+            // so an ISA can substitute its own schedule without touching this function
             simd.accumulate_tile::<MR_REG, NR>(kc, a, a_cs, b, b_rs, b_cs, &mut acc);
         } else {
-            // Edge tile: bound the column loop to nr_eff so an unpacked B is never read
-            // past its last real column; acc[nr_eff..] stays zero, dropped below
+            // Edge tile: bound the column loop to nr_eff so an unpacked B is never read past
+            // its last real column. acc[nr_eff..] stays zero and is dropped below
             for p in 0..kc {
                 let pa = a.offset(p as isize * a_cs);
                 let a_regs: [<S as SimdOps<T>>::Reg; MR_REG] =
@@ -201,7 +202,7 @@ unsafe fn microkernel_impl<T, S, E, const MR_REG: usize, const NR: usize>(
             }
         }
 
-        // fold alpha into the accumulators; skip the multiply entirely when alpha == 1
+        // Fold alpha into the accumulators. Skip the multiply entirely when alpha == 1
         if alpha_status == AlphaStatus::Other {
             let av = simd.splat(alpha);
             for j in 0..NR {
@@ -211,15 +212,12 @@ unsafe fn microkernel_impl<T, S, E, const MR_REG: usize, const NR: usize>(
             }
         }
 
-        // A scalar-only epilogue (VECTOR == false) has no apply_reg, so it must take the
-        // scratch route below for every tile; Identity and any VECTOR epilogue can take
-        // the vector route whenever the tile itself is full and column-major
+        // A scalar-only epilogue has no apply_reg, so it always takes the scratch route
+        // below. Identity and any VECTOR epilogue can take the vector route on a full,
+        // column-major tile
         if (E::IS_IDENTITY || E::VECTOR) && mr_eff == mr && nr_eff == NR && rsc == 1 {
-            // Vector load/store of the full tile, in 3 passes over `acc`: fold beta in,
-            // apply the epilogue, store. The epilogue goes through the whole-tile
-            // `apply_tile` hook rather than per register, because these loops are unrolled
-            // by the const generics and a per-register hook replicates whatever the
-            // epilogue branches on once per accumulator (see `Epilogue::apply_tile`)
+            // Vector load/store of the full tile in 3 passes over `acc`: fold beta in, apply
+            // the epilogue through the whole-tile `apply_tile` hook, then store
             match beta_status {
                 BetaStatus::Zero => {}
                 BetaStatus::One => {
@@ -237,7 +235,7 @@ unsafe fn microkernel_impl<T, S, E, const MR_REG: usize, const NR: usize>(
                         let col = c.offset(j as isize * csc);
                         for i in 0..MR_REG {
                             let cv = simd.loadu(col.add(i * lanes));
-                            // beta*C + alpha*AB, one fused multiply-add
+                            // beta*C + alpha*AB, 1 fused multiply-add
                             acc[j][i] = simd.mul_add(cv, bv, acc[j][i]);
                         }
                     }
@@ -254,8 +252,8 @@ unsafe fn microkernel_impl<T, S, E, const MR_REG: usize, const NR: usize>(
                 }
             }
         } else {
-            // Edge or non-unit-stride tile: drain to contiguous column-major scratch,
-            // then copy back element by element under the tile's real strides
+            // Edge or non-unit-stride tile: drain to contiguous column-major scratch, then
+            // copy back element by element under the tile's real strides
             for j in 0..NR {
                 for i in 0..MR_REG {
                     simd.storeu(scratch.add(j * mr + i * lanes), acc[j][i]);
@@ -270,7 +268,7 @@ unsafe fn microkernel_impl<T, S, E, const MR_REG: usize, const NR: usize>(
                         BetaStatus::One => *cp + v,
                         BetaStatus::Other => beta.mul_add(*cp, v), // beta*C + alpha*AB
                     };
-                    // apply on the last depth panel only, matching the vector path above
+                    // Apply on the last depth panel only, matching the vector path above
                     *cp = if !E::IS_IDENTITY && last_k {
                         epi.apply(out, row0 + i, col0 + j)
                     } else {

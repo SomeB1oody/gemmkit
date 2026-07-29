@@ -1,7 +1,7 @@
 //! Scalar (1-element) ISA token: no target features, no intrinsics, compiles anywhere
 //!
 //! `LANES = 1` for every `SimdOps` impl here, so a "register" is just the element
-//! itself. This is the portability floor and the Miri-checkable reference: the same
+//! itself. This is the portability floor and the Miri-checkable reference. The same
 //! generic microkernel that runs on AVX-512 runs unchanged on this token, one lane
 //! at a time
 
@@ -58,8 +58,8 @@ macro_rules! impl_scalar_ops {
             }
             #[inline(always)]
             unsafe fn mul_add(self, a: Self::Reg, b: Self::Reg, c: Self::Reg) -> Self::Reg {
-                // Plain multiply-then-add: the reference `mul_add` every vector token's
-                // true FMA is checked against
+                // Plain multiply-then-add: the reference `mul_add` that every vector
+                // token's true FMA is checked against
                 a * b + c
             }
             #[inline(always)]
@@ -89,8 +89,8 @@ macro_rules! impl_scalar_ops {
 impl_scalar_ops!(f32);
 impl_scalar_ops!(f64);
 
-// Mixed precision (scalar fallback): f16/bf16 widen to f32 on load and round back
-// to f16/bf16 on store, one element at a time; `Reg` here is a bare `f32`
+// Mixed precision (scalar fallback): f16 and bf16 widen to f32 on load and round to
+// f16 or bf16 on store, one element at a time. `Reg` here is a bare `f32`
 #[cfg(feature = "half")]
 impl KernelSimd<f16, f16, f32, f16> for ScalarTok {
     #[inline(always)]

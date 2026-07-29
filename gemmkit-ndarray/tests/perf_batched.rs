@@ -82,6 +82,7 @@ fn bench(batch: usize, m: usize, k: usize, n: usize) {
     );
 }
 
+// prints gemm_batched vs a naive per-element gemm loop, in GFLOP/s, across 3 batch/shape points
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
 fn perf_batched() {

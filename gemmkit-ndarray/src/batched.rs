@@ -1,5 +1,6 @@
-//! Batched ndarray GEMM entries: the batch dimension is axis 0 of a 3-D array, with every
-//! element's dims/strides read straight out of the array (any layout, not just C-order)
+//! Batched ndarray GEMM entries: the batch dimension is axis 0 of a 3-D array. Each entry
+//! reads every element's dims and strides straight out of the array, for any layout, not
+//! just C-order
 use super::*;
 #[cfg(feature = "epilogue")]
 use gemmkit::adapter::lower_bias;
@@ -13,11 +14,12 @@ fn dims_strides3<T, S: Data<Elem = T>>(
     (b, r, c, s[0], s[1], s[2])
 }
 
-/// Batched `C_e <- alpha*A_e*B_e + beta*C_e` for every element `e`, batch on **axis 0**: `a` is
-/// `(batch, m, k)`, `b` is `(batch, k, n)`, `c` is `(batch, m, n)`. The axis-0 stride is each
-/// operand's batch stride and axes 1/2 the element strides, read directly, so C-order, F-order,
-/// and general-stride 3-D views all work without copying. The batch is parallelized (each
-/// element runs wholly on 1 worker), so the result reproduces a loop of [`gemm`] calls
+/// Batched `C_e <- alpha*A_e*B_e + beta*C_e` for every element `e`, batch on axis 0. `a` is
+/// `(batch, m, k)`, `b` is `(batch, k, n)`, and `c` is `(batch, m, n)`. The axis-0 stride is
+/// each operand's batch stride. Axes 1 and 2 are the element strides, read directly, so
+/// C-order, F-order, and general-stride 3-D views all work without copying. The batch is
+/// parallelized (each element runs wholly on 1 worker), so the result reproduces a loop of
+/// [`gemm`] calls
 ///
 /// # Panics
 /// If the batch sizes or inner dimensions disagree
@@ -91,8 +93,8 @@ fn gemm_batched_common<T, S1, S2, SC>(
     assert_eq!(n, cn, "gemmkit-ndarray: B.cols ({n}) != C.cols ({cn})");
     let cp = c.as_mut_ptr();
 
-    // SAFETY: ndarray guarantees each element's pointer/strides are in-bounds; `c` (a `&mut`
-    // borrow) can't alias `a`/`b`, and its batch elements are pairwise-disjoint axis-0 slices of
+    // SAFETY: ndarray guarantees each element's pointer/strides are in-bounds. `c` (a `&mut`
+    // borrow) cannot alias `a`/`b`, and its batch elements are pairwise-disjoint axis-0 slices of
     // 1 real array
     unsafe {
         match ws {
@@ -159,19 +161,21 @@ where
     c
 }
 
-/// Batched `C_e <- act(alpha*A_e*B_e + beta*C_e + bias)`, batch on **axis 0**, with **1 shared**
-/// [`Bias`]/[`Activation`] applied to every element (the batched-linear-layer case): the ndarray
-/// adapter over gemmkit's [`gemmkit::gemm_batched_fused`]. Shapes match [`gemm_batched`] (`a` is
-/// `(batch, m, k)`, `b` is `(batch, k, n)`, `c` is `(batch, m, n)`); the bias is sized for a
-/// **single** element (`PerRow` length `m`, `PerCol` length `n`), not the whole batch. Each
+/// Batched `C_e <- act(alpha*A_e*B_e + beta*C_e + bias)`, batch on axis 0. It applies 1 shared
+/// [`Bias`] or [`Activation`] to every element, the batched-linear-layer case. This is the
+/// ndarray adapter over gemmkit's [`gemmkit::gemm_batched_fused`]. Shapes match [`gemm_batched`]
+/// (`a` is `(batch, m, k)`, `b` is `(batch, k, n)`, `c` is `(batch, m, n)`). The bias is sized
+/// for a single element (`PerRow` length `m`, `PerCol` length `n`), not the whole batch. Each
 /// element reproduces a [`gemm_fused`] call, so `bias == None && act == None` is exactly
-/// [`gemm_batched`]. Reads the pointers/strides directly and forwards to gemmkit's raw engine, so
-/// general-stride and reversed (negative-stride) 3-D views all work without copying
+/// [`gemm_batched`]. It reads the pointers and strides directly and forwards to gemmkit's raw
+/// engine, so general-stride and reversed (negative-stride) 3-D views all work without copying
 ///
 /// # Panics
-/// If the batch sizes or inner dimensions disagree, or on a bias/activation the adapter rejects (a
-/// `PerRow`/`PerCol` bias of the wrong length, a bias slice overlapping `C`, or a non-finite
-/// `LeakyRelu` slope)
+/// If the batch sizes or inner dimensions disagree, or on a bias/activation the adapter rejects:
+///
+/// - a `PerRow`/`PerCol` bias of the wrong length
+/// - a bias slice that overlaps `C`
+/// - a non-finite `LeakyRelu` slope
 #[cfg(feature = "epilogue")]
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_batched_fused<T, S1, S2, SC>(
@@ -251,18 +255,19 @@ fn gemm_batched_fused_common<T, S1, S2, SC>(
     assert_eq!(n, cn, "gemmkit-ndarray: B.cols ({n}) != C.cols ({cn})");
     let cp = c.as_mut_ptr();
 
-    // Bias/activation validation matching gemmkit's checked-entry wording: the 1 shared bias is
-    // sized for a single element (length m or n, not batch*axis) and must not overlap C's
-    // whole-stack footprint (raw pointer math only, over all 3 axes); a LeakyRelu slope is finite
+    // Bias/activation validation mirrors gemmkit's checked-entry rules. The 1 shared bias is
+    // sized for a single element (length m or n, not batch*axis). It must not overlap C's
+    // whole-stack footprint over all 3 axes, checked by raw pointer math only. A LeakyRelu
+    // slope must be finite
     let (bias_ptr, bias_dim, has_bias) =
         lower_bias(bias, m, n, cp, &[(cb, cs0), (cm, cs1), (cn, cs2)]);
     if let Some(Activation::LeakyRelu(s)) = &act {
         assert!(T::finite(*s), "gemmkit: LeakyRelu slope must be finite");
     }
 
-    // SAFETY: dims validated above; ndarray guarantees each element's layout is in-bounds and `c`
-    // (a `&mut` borrow) can't alias `a`/`b`, its batch elements being pairwise-disjoint axis-0
-    // slices; the shared bias was validated disjoint from C above
+    // SAFETY: the dims are validated above. ndarray guarantees each element's layout is
+    // in-bounds, and `c` (a `&mut` borrow) cannot alias `a`/`b`, and its batch elements are
+    // pairwise-disjoint axis-0 slices. The shared bias was validated disjoint from C above
     unsafe {
         match ws {
             Some(ws) => gemm_batched_fused_unchecked_with(

@@ -14,12 +14,12 @@ use gemmkit::{
     prepack_rhs, prepack_rhs_i8,
 };
 
-// generic differential drivers (shared across the fuzz_gemm/fuzz_knobs targets)
+// generic differential drivers, shared across the fuzz_gemm, fuzz_knobs, fuzz_batched,
+// fuzz_prepack, and fuzz_prepack_i8 targets
 
-/// Run a fixed 16x16x16 problem through a caller-owned `Workspace` before the plan's
-/// own problem, so the workspace's buffers have to grow or shrink to the plan's shape
-/// on reuse: the `tests/workspace_alloc.rs` axis, which a fresh thread-local pool alone
-/// never exercises
+/// Runs a fixed 16x16x16 problem through a caller-owned `Workspace` before the plan's own
+/// problem. The buffers then must grow or shrink to fit the plan's shape. This exercises the
+/// `tests/workspace_alloc.rs` reuse path that a fresh thread-local pool alone never triggers
 fn warm_ws<T: RealElem>(ws: &mut Workspace) {
     let (m, k, n) = (16usize, 16usize, 16usize);
     let mut rr = Rng::new(0xA11CE);
@@ -130,8 +130,8 @@ pub(crate) fn differential_gemm_i8(
     let mut rc = Rng::new(c_seed);
     let (abuf, rsa, csa) = build_operand::<i8>(m, k, la, 0, || ra.next_i8());
     let (bbuf, rsb, csb) = build_operand::<i8>(k, n, lb, 0, || rb.next_i8());
-    // C0 in [-128, 127] (an i8-range i32), same magnitude as A/B, so the epilogue term
-    // does not dwarf the product and hide a wrapping bug in one or the other
+    // C0 stays in [-128, 127], an i8-range i32, matching A and B in magnitude. This keeps
+    // the epilogue term from hiding a wrapping bug in either operand
     let (mut cbuf, rsc, csc) =
         build_operand::<i32>(m, n, lc, i32::SENTINEL, || rc.next_i8() as i32);
 
@@ -153,11 +153,12 @@ pub(crate) fn differential_gemm_i8(
     assert_no_gap_writes(&cbuf, m, n, rsc, csc, ctx);
 }
 
-/// Prepacked-i8-RHS round trip: `prepack_rhs_i8(B)`, then `gemm_i8_packed_b` over a
-/// column-major-ish C (the only orientation the packed-B entry accepts). Integer GEMM is
-/// exact, so unlike the float prepack drivers below this gates EXACTLY: the packed output
-/// must equal both the wrapping-i32 reference and a plain `gemm_i8` call bit-for-bit,
-/// which is the packed-B API's documented guarantee
+/// Runs a prepacked-i8-RHS round trip: `prepack_rhs_i8(B)`, then `gemm_i8_packed_b` over a
+/// column-major-ish C, the only orientation the packed-B entry accepts
+///
+/// Integer GEMM is exact, so this gates exactly. The packed output must equal both the
+/// wrapping-i32 reference and a plain `gemm_i8` call, bit for bit, which is the packed-B
+/// API's documented guarantee
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn differential_prepack_i8(
     m: usize,
@@ -178,13 +179,13 @@ pub(crate) fn differential_prepack_i8(
     let mut rc = Rng::new(c_seed);
     let (abuf, rsa, csa) = build_operand::<i8>(m, k, la, 0, || ra.next_i8());
     let (bbuf, rsb, csb) = build_operand::<i8>(k, n, lb, 0, || rb.next_i8());
-    // ColIsh with il=1 gives (rsc, csc) = (1, m+1), so |csc| >= |rsc| always holds here,
-    // satisfying gemm_i8_packed_b's column-major-ish requirement
+    // ColIsh with il=1 gives (rsc, csc) = (1, m+1), so |csc| >= |rsc| always holds here. This
+    // satisfies gemm_i8_packed_b's column-major-ish requirement
     let lc = LayoutPlan::ColIsh { il: 1, pad: 1 };
     let (mut cbuf, rsc, csc) =
         build_operand::<i32>(m, n, lc, i32::SENTINEL, || rc.next_i8() as i32);
-    // Same C0 (gap slots included) so the plain-gemm_i8 cross-check below starts from
-    // the identical buffer the packed call did
+    // `cplain` clones `cbuf` including gap slots, so the plain-gemm_i8 cross-check below
+    // starts from the same buffer state as the packed call
     let mut cplain = cbuf.clone();
 
     let da = dense_i32_from_i8(&abuf, m, k, rsa, csa);
@@ -219,8 +220,8 @@ pub(crate) fn differential_prepack_i8(
         par,
     );
 
-    // Exact vs the independent reference, then exact vs the plain path over the whole
-    // buffer (gap slots included, so both must also leave the sentinel untouched there)
+    // The output must match the independent reference, then match the plain path, over the
+    // whole buffer including gap slots. Both must leave the sentinel untouched in the gaps
     i8_gate(&cbuf, rsc, csc, m, n, &cref, ctx);
     if cbuf != cplain {
         panic!("{ctx}: prepacked i8 output differs from plain gemm_i8 (bit-identity broken)");
@@ -287,10 +288,11 @@ pub(crate) fn differential_gemm_cplx<T: CplxElem>(
     assert_no_gap_writes(&cbuf, m, n, rsc, csc, ctx);
 }
 
-/// Prepacked-RHS round trip: `prepack_rhs(B)`, then `gemm_packed_b` over a column-major-ish
-/// C (the only orientation the packed-B entry accepts). Gates at tolerance, not bit-exact,
-/// since the API only promises to reproduce plain `gemm` up to the last ULP for tiny or
-/// gemv-shaped products
+/// Runs a prepacked-RHS round trip: `prepack_rhs(B)`, then `gemm_packed_b` over a
+/// column-major-ish C, the only orientation the packed-B entry accepts
+///
+/// This gates at tolerance, not bit-exact. The API only promises to reproduce plain `gemm`
+/// up to the last ULP for a tiny or gemv-shaped product
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn differential_packed_b_real<T: RealElem>(
     m: usize,
@@ -349,9 +351,9 @@ pub(crate) fn differential_packed_b_real<T: RealElem>(
     assert_no_gap_writes(&cbuf, m, n, rsc, csc, ctx);
 }
 
-/// Prepacked-LHS round trip: `prepack_lhs(A)`, then `gemm_packed_a` over a row-major-ish
-/// C (the only orientation the packed-A entry accepts). Same tolerance gate as
-/// `differential_packed_b_real`
+/// Runs a prepacked-LHS round trip: `prepack_lhs(A)`, then `gemm_packed_a` over a
+/// row-major-ish C, the only orientation the packed-A entry accepts. Uses the same
+/// tolerance gate as `differential_packed_b_real`
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn differential_packed_a_real<T: RealElem>(
     m: usize,
@@ -410,9 +412,9 @@ pub(crate) fn differential_packed_a_real<T: RealElem>(
     assert_no_gap_writes(&cbuf, m, n, rsc, csc, ctx);
 }
 
-/// Strided-batched GEMM (`gemm_batched`) over 1 big buffer per operand, sized and
-/// strided so every batch element is valid by construction, plus a `gemm_batched_slice`
-/// cross-check over separate per-element buffers (`batched_slice_real`, below)
+/// Runs a strided-batched GEMM (`gemm_batched`) over 1 big buffer per operand, sized and
+/// strided so every batch element is valid by construction. Then it cross-checks
+/// `gemm_batched_slice` over separate per-element buffers, in `batched_slice_real` below
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn differential_batched_real<T: RealElem>(
     batch: usize,
@@ -441,8 +443,8 @@ pub(crate) fn differential_batched_real<T: RealElem>(
     let ea = extent_of(m, k, rsa, csa);
     let eb = extent_of(k, n, rsb, csb);
     let ec = extent_of(m, n, rsc, csc);
-    // A/B batch stride 0 broadcasts the same element across the batch (read-only, so
-    // safe); C never broadcasts, and must clear at least 1 element's extent
+    // A/B batch stride 0 broadcasts the same element across the batch, which is read-only, so
+    // it is safe. C never broadcasts and must clear at least 1 element's extent
     let a_bs = if a_broadcast { 0 } else { ea + a_bs_pad };
     let b_bs = if b_broadcast { 0 } else { eb + b_bs_pad };
     let c_bs = ec + c_bs_pad;

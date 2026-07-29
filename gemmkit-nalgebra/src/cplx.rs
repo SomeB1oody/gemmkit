@@ -4,12 +4,15 @@ use crate::common::{dims_strides, filled_dmatrix};
 #[cfg(feature = "epilogue")]
 use gemmkit::adapter::lower_bias;
 
-/// Complex `C <- alpha*op(A)*op(B) + beta*C`, where `op(A) = conj(A)` when `conj_a` is set (resp.
-/// `op(B) = conj(B)` when `conj_b` is set). `T` is `Complex<f32>`/`Complex<f64>`; needs the
-/// `complex` feature. As with [`gemm`], the pointer/strides are read directly off `a`/`b`/`c`, so
-/// transposed, row-major, and general-stride views all work without copying
+/// Complex `C <- alpha*op(A)*op(B) + beta*C`
+///
+/// `op(A)` is `conj(A)` when `conj_a` is set, and `op(B)` is `conj(B)` when `conj_b` is set.
+/// `T` is `Complex<f32>` or `Complex<f64>` and needs the `complex` feature. As with [`gemm`],
+/// the pointer and strides come directly from `a`, `b`, and `c`, so a transposed, row-major,
+/// or general-stride view works without copying
 ///
 /// # Panics
+///
 /// If the inner dimensions disagree
 #[cfg(feature = "complex")]
 #[allow(clippy::too_many_arguments)]
@@ -40,6 +43,7 @@ pub fn gemm_cplx<T, R1, C1, S1, R2, C2, S2, RC, CC, SC>(
 /// As [`gemm_cplx`], but reuses a caller-owned [`Workspace`] instead of the thread-local pool
 ///
 /// # Panics
+///
 /// If the inner dimensions disagree
 #[cfg(feature = "complex")]
 #[allow(clippy::too_many_arguments)]
@@ -102,8 +106,8 @@ fn gemm_cplx_common<T, R1, C1, S1, R2, C2, S2, RC, CC, SC>(
     let (rsc, csc) = (cs.0 as isize, cs.1 as isize);
     let cp = c.as_mut_ptr();
 
-    // SAFETY: dims checked above; nalgebra guarantees the storage's pointer/strides describe a
-    // valid in-bounds layout, and `c` (a `&mut` borrow) can't alias `a`/`b`
+    // SAFETY: dims are checked above. nalgebra guarantees the storage's pointer and strides
+    // describe a valid in-bounds layout, and `c` (a `&mut` borrow) cannot alias `a` or `b`
     unsafe {
         match ws {
             Some(ws) => gemm_cplx_unchecked_with(
@@ -149,8 +153,8 @@ fn gemm_cplx_common<T, R1, C1, S1, R2, C2, S2, RC, CC, SC>(
     }
 }
 
-/// Non-conjugated complex `A*B` into a fresh column-major [`DMatrix`]: the complex analogue of
-/// [`dot`]. For a conjugated product use [`gemm_cplx`] directly. Needs the `complex` feature
+/// Non-conjugated complex `A*B` into a fresh column-major [`DMatrix`], the complex analogue of
+/// [`dot`]. For a conjugated product, use [`gemm_cplx`] directly. Needs the `complex` feature
 #[cfg(feature = "complex")]
 pub fn dot_cplx<T, R1, C1, S1, R2, C2, S2>(
     a: &Matrix<T, R1, C1, S1>,
@@ -167,7 +171,7 @@ where
 {
     let (m, _) = a.shape();
     let (_, n) = b.shape();
-    // beta = 0, so gemm_cplx overwrites every cell; the fill value is never read
+    // beta = 0, so gemm_cplx overwrites every cell. The fill value is never read
     let mut c = filled_dmatrix(m, n, T::ZERO);
     gemm_cplx(
         T::ONE,
@@ -182,18 +186,21 @@ where
     c
 }
 
-/// Complex `C <- alpha*op(A)*op(B) + beta*C + bias` in 1 fused pass, where `op(A) = conj(A)` when
-/// `conj_a` is set (resp. `op(B) = conj(B)` when `conj_b` is set): the nalgebra adapter over
-/// gemmkit's [`gemmkit::gemm_cplx_fused`]. The optional [`Bias`] is [`Bias::PerRow`] (length
-/// `A.rows`) or [`Bias::PerCol`] (length `B.cols`), added verbatim without conjugation;
-/// `bias == None` behaves exactly like [`gemm_cplx`]. There is **no** activation parameter: an
-/// ordering activation (`Relu`, `LeakyRelu`) is undefined on complex numbers. As with [`gemm_cplx`],
-/// pointer/strides are read directly and forwarded to gemmkit's raw engine, so transposed and
-/// general-stride views all work without copying
+/// Complex `C <- alpha*op(A)*op(B) + beta*C + bias` in 1 fused pass
+///
+/// `op(A)` is `conj(A)` when `conj_a` is set, and `op(B)` is `conj(B)` when `conj_b` is set.
+/// This is the nalgebra adapter over gemmkit's [`gemmkit::gemm_cplx_fused`]. The optional
+/// [`Bias`] is [`Bias::PerRow`] (length `A.rows`) or [`Bias::PerCol`] (length `B.cols`), added
+/// verbatim without conjugation. `bias == None` behaves exactly like [`gemm_cplx`]. There is no
+/// activation parameter, because an ordering activation such as `Relu` or `LeakyRelu` is
+/// undefined on complex numbers. As with [`gemm_cplx`], the pointer and strides are forwarded
+/// directly to gemmkit's raw engine, so a transposed or general-stride view works without
+/// copying
 ///
 /// # Panics
-/// If the inner dimensions disagree, or on a bias the adapter rejects (a `PerRow`/`PerCol` bias of
-/// the wrong length, or a bias slice overlapping `C`)
+///
+/// If the inner dimensions disagree, or on a bias the adapter rejects: a `PerRow` or `PerCol`
+/// bias of the wrong length, or a bias slice that overlaps `C`
 #[cfg(all(feature = "complex", feature = "epilogue"))]
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_cplx_fused<T, R1, C1, S1, R2, C2, S2, RC, CC, SC>(
@@ -224,6 +231,7 @@ pub fn gemm_cplx_fused<T, R1, C1, S1, R2, C2, S2, RC, CC, SC>(
 /// As [`gemm_cplx_fused`], but reuses a caller-owned [`Workspace`] instead of the thread-local pool
 ///
 /// # Panics
+///
 /// Same conditions as [`gemm_cplx_fused`]
 #[cfg(all(feature = "complex", feature = "epilogue"))]
 #[allow(clippy::too_many_arguments)]
@@ -288,12 +296,12 @@ fn gemm_cplx_fused_common<T, R1, C1, S1, R2, C2, S2, RC, CC, SC>(
     let (rsc, csc) = (cs.0 as isize, cs.1 as isize);
     let cp = c.as_mut_ptr();
     // Checks the bias length against its axis and rejects an overlap with C, matching the core
-    // checked entry's wording; no slope check since complex has no activation parameter
+    // checked entry's wording. Complex has no activation parameter, so there is no slope check
     let (bias_ptr, bias_dim, has_bias) = lower_bias(bias, m, n, cp, &[(cm, rsc), (cn, csc)]);
 
-    // SAFETY: dims checked above; nalgebra guarantees the pointer/strides describe a valid
-    // in-bounds layout and `c` (a `&mut` borrow) can't alias `a`/`b`; the bias was checked disjoint
-    // from C above
+    // SAFETY: dims are checked above. nalgebra guarantees the pointer and strides describe a
+    // valid in-bounds layout, `c` (a `&mut` borrow) cannot alias `a` or `b`, and the bias was
+    // checked disjoint from C above
     unsafe {
         match ws {
             Some(ws) => gemm_cplx_fused_unchecked_with(

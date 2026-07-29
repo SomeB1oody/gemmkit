@@ -296,9 +296,7 @@ fn perf_small_mn_pack() {
 
 /// `perf_small_mn` row for **f16** (the f32-accumulate mixed horizontal kernel): the
 /// horizontal route against the register-tiling driver, plus the `gemm` crate (same
-/// f16-in-f32-accumulate convention), in the fast-path layout (row-major A, column-major B).
-/// Confirms the widen-load horizontal path beats the driver's padded microtile the same way
-/// it does for f32
+/// f16-in-f32-accumulate convention), in the fast-path layout (row-major A, column-major B)
 #[cfg(all(feature = "half", not(target_family = "wasm")))]
 fn bench_small_mn_f16(m: usize, n: usize, k: usize, par: Parallelism) {
     use gemmkit::f16;

@@ -1,5 +1,5 @@
-//! GEMM entries for gemmkit's homogeneous scalar types: f32/f64 unconditionally, plus f16/bf16
-//! under the half feature
+//! GEMM entries for gemmkit's homogeneous scalar types: `f32`/`f64` unconditionally, plus
+//! `f16`/`bf16` under the `half` feature
 use super::*;
 use crate::common::{filled_mat, ref_parts};
 
@@ -54,9 +54,10 @@ fn gemm_common<T: GemmScalar>(
     let (rsc, csc) = (c.row_stride(), c.col_stride());
     let cp = c.as_ptr_mut();
 
-    // SAFETY: dims validated above; faer's `MatRef`/`MatMut` guarantee the pointer + element-unit
-    // `isize` strides describe a valid in-bounds layout (possibly negative for a reversed view,
-    // which gemmkit's unchecked path handles), and `c` (a `MatMut` exclusive borrow) can't alias A/B
+    // SAFETY: dims validated above. faer's `MatRef`/`MatMut` guarantee the pointer and
+    // element-unit `isize` strides describe a valid in-bounds layout, possibly negative for a
+    // reversed view, which gemmkit's unchecked path handles. The `MatMut` exclusive borrow means
+    // `c` cannot alias A or B
     unsafe {
         match ws {
             Some(ws) => gemm_unchecked_with(

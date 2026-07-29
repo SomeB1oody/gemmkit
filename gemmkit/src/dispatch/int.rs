@@ -1,7 +1,8 @@
-//! Integer GEMM dispatch: the plain `i8 -> i32` path (`IntTask`, `execute_int`) and,
-//! under `epilogue`, the fused requantizing path (`RequantTask`, output `i8`/`u8`).
-//! Each has a plain and a prepacked-RHS entry, with its own per-ISA wrappers, memoized
-//! descriptor, and selection ladder
+//! Integer GEMM dispatch. The plain `i8 -> i32` path uses `IntTask` and `execute_int`.
+//! Under the `epilogue` feature, a fused requantizing path uses `RequantTask` and outputs
+//! `i8` or `u8`. The plain path has a direct entry and a prepacked-RHS entry. They share
+//! one per-ISA memoized descriptor and selection ladder, but each entry calls its own
+//! per-ISA wrapper functions. The requantizing path has only the direct entry
 
 #[cfg(feature = "std")]
 use std::sync::OnceLock;
@@ -36,10 +37,10 @@ use crate::special::{small_k, small_mn};
 use crate::tuning;
 use crate::workspace::Workspace;
 
-/// A heterogeneous **integer** GEMM problem: `i8` inputs, `i32` accumulator and output
-/// (`alpha`, `beta`, `C` all `i32`). The homogeneous [`Task`] / [`GemmScalar`] machinery
-/// assumes `Lhs == Out`, which `i8 -> i32` breaks, so integer GEMM gets its own task type
-/// and dispatch path instead
+/// A heterogeneous integer GEMM problem: `i8` inputs, `i32` accumulator and output (`alpha`,
+/// `beta`, `C` all `i32`). The homogeneous [`Task`] / [`GemmScalar`] machinery assumes
+/// `Lhs == Out`, which `i8 -> i32` breaks, so integer GEMM uses its own task type and
+/// dispatch path
 #[cfg(feature = "int8")]
 #[derive(Copy, Clone)]
 pub(crate) struct IntTask {
@@ -59,11 +60,11 @@ pub(crate) struct IntTask {
     pub csc: isize,
 }
 
-/// An **integer** GEMM whose RHS is already prepacked into the selected kernel family's
+/// An integer GEMM whose RHS is already prepacked into the selected kernel family's
 /// micropanel layout: `C(i32) <- alpha*A(i8)*(prepacked B) + beta*C`. The heterogeneous
-/// (`i8 -> i32`) twin of [`crate::dispatch::PackedConsume`]: it carries the blocking geometry
-/// (`nr`, `kc`, `nc`) the buffer was packed for, so the consuming call reads panels with the
-/// exact tiling the pack step used rather than re-deriving it
+/// (`i8 -> i32`) twin of [`crate::dispatch::PackedConsume`]. It carries the blocking geometry
+/// (`nr`, `kc`, `nc`) the buffer was packed for. The consuming call then reads panels with
+/// that exact tiling, instead of deriving it again
 #[cfg(feature = "int8")]
 pub(crate) struct IntPackedConsume {
     /// Row count of A and C
@@ -92,14 +93,16 @@ pub(crate) struct IntPackedConsume {
     pub csc: isize,
 }
 
-// Plain i8 -> i32 GEMM: a dedicated heterogeneous dispatch path, since `GemmScalar` assumes Lhs == Out
+// Plain i8 -> i32 GEMM: a dedicated heterogeneous dispatch path, since `GemmScalar` assumes
+// Lhs == Out
 
 /// Choose between the memoized kernel and its small-parallel fallback, shared by the plain and
-/// requantizing entries (`F` is `IntFn` / `RequantFn`, both `Copy` fn pointers). Falls back only
-/// when `small_par_fallback` is `Some` (only the auto-VNNI selection ever sets it), `par` is
-/// genuinely multi-threaded (`Rayon(n)` with `n != 1`), and `mnk` is below
-/// `tuning::i8_vnni_min_par_mnk()`; every other case returns `run` unchanged. Centralizing the
-/// gate here keeps [`execute_int`] and [`execute_int_requant`] from calibrating it separately
+/// requantizing entries (`F` is `IntFn` or `RequantFn`, both `Copy` fn pointers). The fallback
+/// runs only when `small_par_fallback` is `Some`, which only the auto-VNNI selection sets. It
+/// also requires `par` to be genuinely multi-threaded (`Rayon(n)` with `n != 1`) and `mnk`
+/// below `tuning::i8_vnni_min_par_mnk()`. Every other case returns `run` unchanged. This
+/// centralizes the gate so [`execute_int`] and [`execute_int_requant`] do not each calibrate
+/// it separately
 #[cfg(feature = "int8")]
 #[inline]
 fn pick_int_kernel<F: Copy>(
@@ -123,7 +126,7 @@ fn pick_int_kernel<F: Copy>(
 /// vanishes) then the memoized ISA-dispatched kernel, through [`pick_int_kernel`]
 ///
 /// # Safety
-/// `t`'s pointers valid for the implied regions; `c` must not alias `a`/`b`
+/// `t`'s pointers valid for the implied regions, and `c` must not alias `a` or `b`
 #[cfg(feature = "int8")]
 pub(crate) unsafe fn execute_int(t: IntTask, par: Parallelism, ws: &mut Workspace) {
     unsafe {
@@ -141,8 +144,8 @@ pub(crate) unsafe fn execute_int(t: IntTask, par: Parallelism, ws: &mut Workspac
     }
 }
 
-/// `C <- beta*C`, `i32` wrapping on overflow; `beta == 0` overwrites with 0 rather than
-/// multiplying (`beta == 1` leaves `C` unwritten)
+/// `C <- beta*C`, with `i32` wrapping on overflow. `beta == 0` overwrites with 0 instead of
+/// multiplying, and `beta == 1` leaves `C` unwritten
 #[cfg(feature = "int8")]
 unsafe fn scale_c_int(beta: i32, c: *mut i32, m: usize, n: usize, rsc: isize, csc: isize) {
     unsafe {
@@ -182,13 +185,12 @@ unsafe fn run_typed_int<Fam, S, const MR_REG: usize, const NR: usize>(
             &mut t.m, &mut t.n, &mut t.a, &mut t.rsa, &mut t.csa, &mut t.b, &mut t.rsb, &mut t.csb,
             &mut t.rsc, &mut t.csc,
         );
-        // Small m,n with long k: a direct i8 -> i32 widening SIMD dot per output, instead of
-        // packing the tiny tile up to a full MR x NR microtile (mostly padding). Contiguous-along-k
-        // operands read in place; a strided one copies to k-contiguous scratch first. Shares the
-        // dims-level small_mn_eligible_dims / small_mn_pack_eligible_dims gates with float/mixed so
-        // the 3 never drift apart, and fires even under a forced ISA, so a forced-VNNI tiny shape
-        // widens here rather than paying VNNI's pack barrier. Bit-exact vs every other route: i32
-        // wraparound sums are associative regardless of accumulation order
+        // Small m, n with long k use a direct i8 -> i32 widening SIMD dot per output. This
+        // avoids packing the tiny tile into a full MR x NR microtile that is mostly padding. A
+        // contiguous-along-k operand reads in place, and a strided one copies to k-contiguous
+        // scratch first. The eligibility gates match float/mixed, and fire even under a forced
+        // ISA. i32 wraparound sums are associative, so this route stays bit-exact with every
+        // other route
         if super::small_mn_eligible_dims(t.m, t.n, t.k, t.csa, t.rsb)
             || super::small_mn_pack_eligible_dims(t.m, t.n, t.k, t.csa, t.rsb)
         {
@@ -198,8 +200,8 @@ unsafe fn run_typed_int<Fam, S, const MR_REG: usize, const NR: usize>(
             );
             return;
         }
-        // Low-depth shape: always the widen IntGemm (never IntGemmVnni), since VNNI's mandatory
-        // quad-pack barrier never amortizes at tiny k; bit-exact with every other route
+        // Low-depth shape: always the widen IntGemm, never IntGemmVnni, since VNNI's mandatory
+        // quad-pack barrier never amortizes at tiny k. Bit-exact with every other route
         if t.k <= tuning::small_k_threshold() {
             small_k::run::<IntGemm, S, MR_REG, NR>(
                 simd, t.m, t.k, t.n, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb, t.beta, t.c,
@@ -245,8 +247,8 @@ unsafe fn gemm_i8_simd128(t: IntTask, par: Parallelism, ws: &mut Workspace) {
 }
 
 /// Prepacked-RHS integer driver entry for a concrete `(family, ISA, tile)`. No gemv route, no
-/// small_mn / small_k reroute, and **no orientation swap**: the API guarantees column-major-ish
-/// C, so the prepacked buffer is always the genuine RHS. The heterogeneous mirror of the float
+/// small_mn / small_k reroute, and no orientation swap: the API guarantees column-major-ish C,
+/// so the prepacked buffer is always the genuine RHS. The heterogeneous mirror of the float
 /// `run_packed_typed`
 ///
 /// # Safety
@@ -263,7 +265,7 @@ unsafe fn run_packed_typed_int<Fam, S, const MR_REG: usize, const NR: usize>(
     S: KernelSimd<i8, i8, i32, i32>,
 {
     unsafe {
-        // NR is structural (the panel width is this kernel's NR); one process's memoized ISA
+        // NR is structural: the panel width is this kernel's NR. One process's memoized ISA
         // choice guarantees it matches what packed the buffer
         debug_assert_eq!(NR, req.nr, "prepacked RHS panel width != kernel NR");
         driver::run_packed_rhs::<Fam, S, MR_REG, NR>(
@@ -273,8 +275,8 @@ unsafe fn run_packed_typed_int<Fam, S, const MR_REG: usize, const NR: usize>(
     }
 }
 
-// prepacked-RHS integer entry points: one per (ISA, family), same tiles as the plain wrappers
-// The widen ISAs consume a plain-panel buffer (IntGemm); the VNNI entry consumes the
+// Prepacked-RHS integer entry points: 1 per (ISA, family), same tiles as the plain wrappers. The
+// widen ISAs consume a plain-panel buffer (IntGemm). The VNNI entry consumes the
 // k-quad-interleaved buffer (IntGemmVnni). Each is cfg-gated exactly like its plain sibling
 
 #[cfg(feature = "int8")]
@@ -291,7 +293,7 @@ unsafe fn gemm_i8_avx512f_packed(r: IntPackedConsume, par: Parallelism, ws: &mut
 }
 #[cfg(all(feature = "int8", any(target_arch = "x86", target_arch = "x86_64")))]
 unsafe fn gemm_i8_avx512vnni_packed(r: IntPackedConsume, par: Parallelism, ws: &mut Workspace) {
-    // The buffer is k-quad-interleaved, so only the VNNI family can read it; the widen
+    // The buffer is k-quad-interleaved, so only the VNNI family can read it. The widen
     // small-parallel fallback would misread that layout, so the packed path never applies it
     unsafe { run_packed_typed_int::<IntGemmVnni, Avx512Vnni, 2, 12>(Avx512Vnni, r, par, ws) }
 }
@@ -305,7 +307,8 @@ unsafe fn gemm_i8_simd128_packed(r: IntPackedConsume, par: Parallelism, ws: &mut
 }
 
 /// Pack a full `(k, n)` RHS into the widen (`IntGemm`) micropanel layout: plain panels,
-/// `DEPTH_MULTIPLE = 1`, the same [`driver::pack_rhs_full`] the per-call widen driver runs
+/// `DEPTH_MULTIPLE = 1`. Uses the same [`driver::pack_rhs_full`] the per-call widen driver
+/// runs
 ///
 /// # Safety
 /// As [`driver::pack_rhs_full`]
@@ -326,8 +329,9 @@ unsafe fn pack_rhs_i8_widen(
 }
 
 /// Pack a full `(k, n)` RHS into the VNNI (`IntGemmVnni`) k-quad-interleaved layout
-/// (`DEPTH_MULTIPLE = 4`; identity transform, since the `+128` signedness bias lives only on
-/// the LHS pack), the same [`driver::pack_rhs_full`] the per-call VNNI driver runs
+/// (`DEPTH_MULTIPLE = 4`). This is an identity transform, since the `+128` signedness bias
+/// lives only on the LHS pack. Uses the same [`driver::pack_rhs_full`] the per-call VNNI
+/// driver runs
 ///
 /// # Safety
 /// As [`driver::pack_rhs_full`]
@@ -353,29 +357,27 @@ type IntFn = unsafe fn(IntTask, Parallelism, &mut Workspace);
 /// A per-ISA prepacked-RHS integer consume entry (`Copy`, a fn pointer)
 #[cfg(feature = "int8")]
 type IntPackedFn = unsafe fn(IntPackedConsume, Parallelism, &mut Workspace);
-/// Packs a full RHS into the selected family's micropanel layout (`pack_rhs_full` bound to
-/// `IntGemm` / `IntGemmVnni`); a `Copy` fn pointer carried by the descriptor
+/// Packs a full RHS into the selected family's micropanel layout, bound to `IntGemm` or
+/// `IntGemmVnni` (a `Copy` fn pointer carried by the descriptor)
 #[cfg(feature = "int8")]
 type IntPackFn = unsafe fn(*mut i8, *const i8, isize, isize, usize, usize, usize, usize, usize);
 
 /// Memoized integer dispatch slot (the heterogeneous mirror of `Dispatched`): the plain
 /// kernel, the prepacked-RHS kernel, the RHS packer, and the microtile geometry they share
 ///
-/// `small_par_fallback` replaces `run` for an *auto-selected, multi-threaded, small* problem.
-/// Only the VNNI auto selection sets it: VNNI's mandatory RHS-pack barrier (the quad layout
-/// cannot be read in place) outweighs the compute saving on a small parallel problem, so the
-/// in-place widen kernel wins there; a serial or large-parallel run keeps VNNI. `None` for every
-/// other selection, and for a *forced* VNNI pin (a forced ISA has to run exactly that kernel).
-/// Bit-identical to VNNI regardless (exact `i32`), so the swap never perturbs results
+/// `small_par_fallback` replaces `run` for an auto-selected, multi-threaded, small problem. Only
+/// the auto-VNNI selection sets it, never a forced VNNI pin. VNNI's mandatory RHS-pack barrier
+/// outweighs its compute saving on a small parallel problem, so the in-place widen kernel wins
+/// there. A serial or large-parallel run keeps VNNI instead. Both kernels produce the exact
+/// same `i32` result, so the swap never changes the output
 ///
-/// `run_packed` / `pack_rhs` serve the fixed-weight prepacked-RHS path and are always the
-/// memoized family's own (VNNI's when auto-VNNI is selected), never the widen
-/// `small_par_fallback`: the prepacked buffer's micropanel layout is family-specific
-/// (VNNI k-quad-interleave vs plain panels), so a buffer packed by `pack_rhs` is consumable only
-/// by the matching `run_packed`. [`execute_int_packed`] therefore bypasses the dynamic
-/// small-parallel gate [`execute_int`] applies (the pack barrier that gate hedges against is
-/// already amortized once at prepack time). `mr`/`nr`/`depth_multiple` mirror the tile constants
-/// and feed [`prepack_rhs_i8`](crate::prepack_rhs_i8), so the buffer and the consuming call agree
+/// `run_packed` and `pack_rhs` always belong to the memoized family, VNNI's own when auto-VNNI
+/// is selected, never the widen `small_par_fallback`. A buffer's micropanel layout is
+/// family-specific (VNNI's k-quad-interleave versus plain panels), so only the matching
+/// `run_packed` can read a buffer that `pack_rhs` packed. This makes [`execute_int_packed`]
+/// skip the small-parallel gate [`execute_int`] applies, because prepacking already pays that
+/// pack barrier once. `mr`, `nr`, and `depth_multiple` mirror the tile constants and feed
+/// [`prepack_rhs_i8`](crate::prepack_rhs_i8), so the packed buffer and the consuming call agree
 /// on the blocking geometry
 #[cfg(feature = "int8")]
 #[derive(Copy, Clone)]
@@ -451,10 +453,10 @@ const DISP_I8_SIMD128: IntDispatched = IntDispatched {
     depth_multiple: 1,
 };
 
-/// `i8` ISA selection: auto-selects the VNNI dot kernel first (falling back to the widen
-/// kernel on a small parallel problem), then the same widen-path feature gates `select_f32`
-/// uses (`avx512f`, then `avx2 + fma`), since the widen-and-multiply kernel needs no feature
-/// beyond what f32 needs
+/// `i8` ISA selection auto-selects the VNNI dot kernel first, then falls back to the widen
+/// kernel on a small parallel problem. It otherwise follows the same feature gates
+/// `select_f32` uses (`avx512f`, then `avx2 + fma`), since the widen-and-multiply kernel needs
+/// no feature beyond what f32 needs
 #[cfg(feature = "int8")]
 fn select_i8() -> IntDispatched {
     match forced_isa() {
@@ -503,9 +505,9 @@ fn select_i8() -> IntDispatched {
     }
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
-        // VNNI dot kernel first: vpdpbusd is a structural win over widen-and-multiply, except on
-        // a small parallel problem, where small_par_fallback hands off to the widen kernel so
-        // VNNI's mandatory pack barrier does not dominate
+        // VNNI's vpdpbusd dot kernel is a structural win over widen-and-multiply. On a small
+        // parallel problem, small_par_fallback hands off to the widen kernel instead, so VNNI's
+        // mandatory pack barrier does not dominate
         if x86_isa_detected!("avx512vnni")
             && x86_isa_detected!("avx512bw")
             && x86_isa_detected!("avx512f")
@@ -554,9 +556,9 @@ memoized_select!(
 );
 
 /// The memoized integer kernel's microtile `(mr, nr) = (MR_REG*LANES, NR)`, read by
-/// [`prepack_rhs_i8`](crate::prepack_rhs_i8) to block a prepacked buffer against the *same*
-/// ISA choice the consuming call will make (the heterogeneous mirror of
-/// [`GemmScalar::rhs_tile`](crate::dispatch::GemmScalar))
+/// [`prepack_rhs_i8`](crate::prepack_rhs_i8) to block a prepacked buffer against the same ISA
+/// choice the consuming call makes. The heterogeneous mirror of
+/// [`GemmScalar::rhs_tile`](crate::dispatch::GemmScalar)
 #[cfg(feature = "int8")]
 pub(crate) fn i8_rhs_tile() -> (usize, usize) {
     let d = dispatched_i8();
@@ -593,10 +595,10 @@ pub(crate) unsafe fn pack_rhs_full_i8(
 }
 
 /// Top-level prepacked-RHS integer entry: the degenerate cases (the `A*B` term vanishes, so
-/// `C <- beta*C` without ever touching the packed buffer) then the memoized prepacked kernel.
-/// Runs the buffer's own family unconditionally, deliberately bypassing the `small_par_fallback`
-/// gate [`execute_int`] applies: a quad-interleaved VNNI buffer is not consumable by the widen
-/// fallback, and the pack barrier that gate hedges against was already amortized at prepack time
+/// `C <- beta*C` without touching the packed buffer) then the memoized prepacked kernel. It
+/// runs the buffer's own family unconditionally, and does not apply the `small_par_fallback`
+/// gate [`execute_int`] uses. The widen fallback cannot read a quad-interleaved VNNI buffer,
+/// and prepacking already paid the pack barrier that gate guards against
 ///
 /// # Safety
 /// As [`execute_int`], plus `req.packed` valid for the recorded geometry and not aliasing `c`
@@ -618,21 +620,21 @@ pub(crate) unsafe fn execute_int_packed(
     }
 }
 
-// Integer requantizing GEMM (i8 * i8 -> O, O in {i8, u8}): IntGemmQ<O> / IntGemmVnniQ<O> fused
-// with the KRequantize epilogue (per-tensor or per-row/per-col scale, zero-point, optional i32
-// bias). A dedicated task/dispatch, like IntTask, since the output is a quantized byte (not i32)
-// and carries the quantization parameters. Task, descriptor, and every wrapper are generic over
-// the output byte O; requant_dispatch! stamps the wrappers/consts/ladder/memoized slot once per
-// O, and RequantOut maps O to its memoized descriptor at the top entry
+// Integer requantizing GEMM: i8 * i8 -> O, where O is i8 or u8. IntGemmQ<O> and
+// IntGemmVnniQ<O> fuse with the KRequantize epilogue (per-tensor or per-row/per-col scale,
+// zero-point, optional i32 bias). This gets its own task and dispatch, like IntTask, since
+// the output is a quantized byte, not i32, with its own quantization parameters. Task,
+// descriptor, and every wrapper are generic over the output byte O, and requant_dispatch!
+// stamps the per-O wrappers, consts, ladder, and memoized slot
 
 /// A fully described integer requantizing GEMM: `i8` inputs, `i32` accumulator, `O` output
 /// (`i8` signed `[-128, 127]` or `u8` `[0, 255]`). No `alpha` (folded into `scale`) and no
 /// `beta` (accumulating into a quantized C is ill-defined). The output scale is per-tensor
 /// (`scale`, used when `has_row_scales == false`) or per-row / per-col (`row_scales`, an `f32`
 /// vector enabled by `has_row_scales`, the per-channel quantized-inference convention). `bias`
-/// is an optional per-row / per-col `i32` vector. `bias_dim` selects the shared per-row / per-col
-/// axis of BOTH `row_scales` and `bias` (length `m` for `PerRow`, `n` for `PerCol`); the dispatch
-/// flips it on an orientation swap
+/// is an optional per-row / per-col `i32` vector. `bias_dim` selects the shared per-row /
+/// per-col axis of both `row_scales` and `bias` (length `m` for `PerRow`, `n` for `PerCol`).
+/// The dispatch flips it on an orientation swap
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 #[derive(Copy, Clone)]
 pub(crate) struct RequantTask<O> {
@@ -657,13 +659,14 @@ pub(crate) struct RequantTask<O> {
     pub bias_dim: BiasDim,
 }
 
-/// Top-level requantizing entry (generic over the output byte `O`): the degenerate `k == 0`
-/// case (fill `C` with the requantized bias / zero-point) then the memoized ISA-dispatched fused
-/// kernel, through `O::dispatched()` and [`pick_int_kernel`]. Unlike [`execute_int`] there is no
-/// `alpha == 0` degenerate case: `RequantTask` has no `alpha` field (it is folded into `scale`)
+/// Top-level requantizing entry, generic over the output byte `O`. It handles the degenerate
+/// `k == 0` case, filling `C` with the requantized bias or zero-point. It then calls the
+/// memoized ISA-dispatched fused kernel through `O::dispatched()` and [`pick_int_kernel`].
+/// Unlike [`execute_int`] there is no `alpha == 0` case, since `RequantTask` has no `alpha`
+/// field, folded into `scale` instead
 ///
 /// # Safety
-/// `t`'s pointers valid; `c` not aliasing `a`/`b`, and `bias` (if `has_bias`) valid for the
+/// `t`'s pointers valid, `c` not aliasing `a` or `b`, and `bias` (if `has_bias`) valid for the
 /// oriented axis and disjoint from `c` (the API validates this)
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 pub(crate) unsafe fn execute_int_requant<O: RequantOut>(
@@ -691,7 +694,7 @@ pub(crate) unsafe fn execute_int_requant<O: RequantOut>(
 
 /// Build the `KRequantize` bias spec from a task's (already axis-flipped) bias fields:
 /// `has_bias == false` maps to `BiasSpec::None`, else the `Row` / `Col` variant `bias_dim`
-/// selects. Shared by both construction sites so the encoding lives in exactly one place
+/// selects. Shared by both construction sites so the encoding lives in exactly 1 place
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 #[inline]
 fn requant_bias_spec<O>(t: &RequantTask<O>) -> BiasSpec<i32> {
@@ -706,10 +709,10 @@ fn requant_bias_spec<O>(t: &RequantTask<O>) -> BiasSpec<i32> {
     }
 }
 
-/// Build the `KRequantize` scale spec from a task's (already axis-flipped) scale fields:
+/// Build the `KRequantize` scale spec from a task's (already axis-flipped) scale fields.
 /// `has_row_scales == false` maps to the per-tensor `Tensor(scale)`, else the `Row` / `Col`
-/// variant `bias_dim` selects (the scales share the bias's user axis, so the same flipped
-/// `bias_dim` picks both). Shared by both construction sites so the encoding lives in one place
+/// variant `bias_dim` selects. The scales share the bias's user axis, so the same flipped
+/// `bias_dim` picks both. Shared by both construction sites so the encoding lives in 1 place
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 #[inline]
 fn requant_scale_spec<O>(t: &RequantTask<O>) -> ScaleSpec {
@@ -726,8 +729,8 @@ fn requant_scale_spec<O>(t: &RequantTask<O>) -> ScaleSpec {
 
 /// `k == 0` fill: `C[i,j] = clamp(zp + round_ne(scale*bias[i or j]), O::LO, O::HI)`, which
 /// collapses to `zp` clamped into the output band when there is no bias. Uses the same
-/// `KRequantize::apply` as the kernel, applied to a zero accumulator, so it is bit-identical to
-/// a `k > 0` run whose products are all zero
+/// `KRequantize::apply` as the kernel, applied to a zero accumulator. This makes it
+/// bit-identical to a `k > 0` run whose products are all zero
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 unsafe fn requant_degenerate<O: QuantOut>(t: &RequantTask<O>) {
     let epi = KRequantize {
@@ -739,7 +742,7 @@ unsafe fn requant_degenerate<O: QuantOut>(t: &RequantTask<O>) {
         for j in 0..t.n {
             for i in 0..t.m {
                 // UFCS: KRequantize implements Epilogue for every Acc = i32, Out = O family, so
-                // the bare `apply` would be ambiguous. Any of them gives the same scalar map;
+                // the bare `apply` would be ambiguous. Any of them gives the same scalar map, and
                 // IntGemmQ<O> is the one always available for this output byte
                 let out = <KRequantize as Epilogue<IntGemmQ<O>>>::apply(&epi, 0, i, j);
                 *t.c.offset(i as isize * t.rsc + j as isize * t.csc) = out;
@@ -748,10 +751,10 @@ unsafe fn requant_degenerate<O: QuantOut>(t: &RequantTask<O>) {
     }
 }
 
-/// Requantizing driver entry for a concrete `(family, ISA, tile, output byte)`: the orientation
-/// swap (which **flips the bias axis**), build the `KRequantize` epilogue, then the general
-/// driver. No gemv / small_mn / small_k reroute: `Fam::OUT_IS_ACC == false` already forces
-/// `kc = k` in the driver, so there is no dedicated-path win left to chase at any `k`. The
+/// Requantizing driver entry for a concrete `(family, ISA, tile, output byte)`. It does the
+/// orientation swap, which flips the bias axis, builds the `KRequantize` epilogue, then calls
+/// the general driver. There is no gemv, small_mn, or small_k reroute. `Fam::OUT_IS_ACC ==
+/// false` already forces `kc = k` in the driver, so no dedicated path wins at any `k`. The
 /// generic param order is `<Fam, S, O, MR_REG, NR>`, so the wrapper turbofish provides all 5
 ///
 /// # Safety
@@ -800,9 +803,10 @@ unsafe fn run_typed_int_requant<Fam, S, O, const MR_REG: usize, const NR: usize>
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 type RequantFn<O> = unsafe fn(RequantTask<O>, Parallelism, &mut Workspace);
 
-/// Memoized requantizing dispatch slot (mirror of [`IntDispatched`]), parametrized by the output
-/// byte `O`: `small_par_fallback` swaps auto-VNNI to the widen `IntGemmQ<O>` kernel on a small
-/// parallel problem (bit-identical). One instantiation exists per output type (`i8` / `u8`)
+/// Memoized requantizing dispatch slot, the mirror of [`IntDispatched`], parametrized by the
+/// output byte `O`. `small_par_fallback` swaps auto-VNNI to the widen `IntGemmQ<O>` kernel on a
+/// small parallel problem, and the result is bit-identical. 1 instantiation exists per output
+/// type (`i8` / `u8`)
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 #[derive(Copy, Clone)]
 pub(crate) struct IntRequantDispatched<O> {
@@ -810,11 +814,11 @@ pub(crate) struct IntRequantDispatched<O> {
     small_par_fallback: Option<RequantFn<O>>,
 }
 
-/// Stamps the per-ISA wrapper fns, descriptor consts, ISA-selection ladder, and memoized slot for
-/// one output byte `$O` (`i8` / `u8`). The 2 invocations differ only in `$O` and the item names:
-/// same tiles, same cfg gates, and the same VNNI-first auto ladder (with the widen kernel as the
-/// small-parallel fallback) as [`select_i8`]. Every wrapper is a thin
-/// `run_typed_int_requant::<Family<$O>, Token, $O, MR, NR>` call
+/// Stamps the per-ISA wrapper fns, descriptor consts, ISA-selection ladder, and memoized slot
+/// for 1 output byte `$O` (`i8` / `u8`). The 2 invocations differ only in `$O` and the item
+/// names. Both use the same tiles, the same cfg gates, and the same VNNI-first auto ladder as
+/// [`select_i8`], with the widen kernel as the small-parallel fallback. Every wrapper is a
+/// thin `run_typed_int_requant::<Family<$O>, Token, $O, MR, NR>` call
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 macro_rules! requant_dispatch {
     (
@@ -858,7 +862,7 @@ macro_rules! requant_dispatch {
             unsafe { run_typed_int_requant::<IntGemmQ<$O>, Simd128, $O, 2, 4>(Simd128, t, par, ws) }
         }
 
-        // descriptor consts (one per ISA)
+        // descriptor consts (1 per ISA)
         #[cfg(feature = "int8")]
         const $d_scalar: IntRequantDispatched<$O> = IntRequantDispatched {
             run: $w_scalar,
@@ -1029,10 +1033,10 @@ requant_dispatch!(
 );
 
 /// Maps an output byte `O` to its memoized per-`O` requant dispatch descriptor. Implemented for
-/// the 2 quantized outputs (`i8` / `u8`); [`execute_int_requant`] is generic over
+/// the 2 quantized outputs (`i8` / `u8`). [`execute_int_requant`] is generic over
 /// `O: RequantOut` and calls `O::dispatched()` to pick the matching memoized slot without a
-/// runtime branch. Restricted to `i8`/`u8` since those are `QuantOut`'s only implementors and
-/// `QuantOut` itself is `pub(crate)`
+/// runtime branch. This stays restricted to `i8`/`u8`, since those are `QuantOut`'s only
+/// implementors, and `QuantOut` itself is `pub(crate)`
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 pub(crate) trait RequantOut: QuantOut {
     /// The memoized ISA descriptor for this output byte

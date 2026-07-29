@@ -2,11 +2,11 @@
 //! store the plain kernel would perform, so `C <- act(alpha*A*B + beta*C + bias)` costs 1 pass
 //! over `C` instead of a GEMM followed by a separate scalar map
 //!
-//! [`Bias`] and [`Activation`] select the epilogue; [`gemm_fused`] / [`gemm_fused_with`] are the
-//! checked entries over [`MatRef`]/[`MatMut`], and [`gemm_fused_unchecked`] /
-//! [`gemm_fused_unchecked_with`] the raw pointer + `isize`-stride equivalents. With no bias and
-//! no activation, the checked entries fall back to the plain, unfused engine; the raw entries
-//! instead run the fused engine with a no-op epilogue
+//! [`Bias`] and [`Activation`] select the epilogue. [`gemm_fused`] / [`gemm_fused_with`] are
+//! the checked entries over [`MatRef`]/[`MatMut`], and [`gemm_fused_unchecked`] /
+//! [`gemm_fused_unchecked_with`] are the raw pointer + `isize`-stride equivalents. With no bias
+//! and no activation, the checked entries fall back to the plain, unfused engine. The raw
+//! entries instead run the fused engine with a no-op epilogue
 use super::*;
 use crate::dispatch::FusedScalar;
 use crate::kernel::epilogue::{BiasDim, FusedEpi};
@@ -24,34 +24,38 @@ pub enum Bias<'a, T> {
 /// The activation a [`gemm_fused`] call applies last, after the bias add
 #[derive(Copy, Clone, Debug)]
 pub enum Activation<T> {
-    /// `max(v, 0)`; NaN maps to 0
+    /// `max(v, 0)`. NaN maps to 0
     Relu,
-    /// `max(v, 0) + slope*min(v, 0)`; NaN maps to 0, negative zero maps to positive zero
+    /// `max(v, 0) + slope*min(v, 0)`. NaN maps to 0, negative zero maps to positive zero
     LeakyRelu(T),
 }
 
 /// `C <- act(alpha*A*B + beta*C + bias)` in 1 pass over safe slice views, using the
 /// thread-local workspace pool. `bias == None && act == None` delegates to plain [`gemm`]
 ///
-/// The fused kernel takes the same route plain `gemm` would for the same shape (the general
-/// register-blocked driver, gemv for `m == 1` / `n == 1`, the small-`m,n` horizontal path, or
-/// the small-`k` path) and applies the epilogue to the very register or scratch value the plain
-/// store would otherwise have written. So for `f32`/`f64` the result is bit-identical, for
-/// every shape, to `gemm()` followed by the same scalar map, and it stays deterministic across
-/// thread counts
+/// The fused kernel takes the same route plain `gemm` would for the same shape. That route may
+/// be the general register-blocked driver, gemv for `m == 1` or `n == 1`, the small-`m,n`
+/// horizontal path, or the small-`k` path. It applies the epilogue to the register or scratch
+/// value the plain store would otherwise write. For `f32`/`f64`, the result is bit-identical,
+/// for every shape, to `gemm()` followed by the same scalar map. Serial and parallel runs also
+/// agree bit-for-bit today, though the crate's reproducibility contract covers only a fixed
+/// configuration
 ///
-/// Under the `half` feature `T` may also be `f16`/`bf16`. The bias vector and `LeakyRelu` slope
-/// are then the narrow type, widened exactly to `f32` (a narrow value is a strict subset of
-/// `f32`), and the epilogue runs in `f32` on the accumulator before a single
-/// round-to-nearest-even narrowing to the output. That is more precise than `gemm()` followed
-/// by a separate narrow map, which would round to the narrow type, widen back, then round
-/// again, so for `f16`/`bf16` the result is not bitwise-equal to `gemm`-then-map (the
-/// `f32`/`f64` bitwise contract above does not extend to them). Determinism (serial ==
-/// parallel, bit-for-bit) holds regardless
+/// Under the `half` feature, `T` may also be `f16`/`bf16`. The bias vector and `LeakyRelu`
+/// slope are then the narrow type, widened exactly to `f32`, since a narrow value is a strict
+/// subset of `f32`. The epilogue runs in `f32` on the accumulator, then narrows once to the
+/// output with round-to-nearest-even rounding
+///
+/// A separate `gemm()` call followed by a narrow map instead rounds to the narrow type, widens
+/// back, then rounds again. The fused path skips that extra rounding, so for `f16`/`bf16` it is
+/// more precise, though its result is not bitwise-equal to `gemm`-then-map. The `f32`/`f64`
+/// bitwise contract above does not extend to these narrow types. Serial and parallel runs
+/// still agree bit-for-bit for these types today, under the same fixed-configuration
+/// reproducibility contract
 ///
 /// # Panics
-/// Same conditions as [`gemm`], plus: a `PerRow` bias whose length is not `A.rows` (or a
-/// `PerCol` bias not `B.cols`); a bias slice that overlaps `C`; or a non-finite `LeakyRelu`
+/// Same conditions as [`gemm`], plus a `PerRow` bias whose length is not `A.rows` (or a
+/// `PerCol` bias not `B.cols`), a bias slice that overlaps `C`, or a non-finite `LeakyRelu`
 /// slope
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_fused<T: FusedScalar>(
@@ -102,7 +106,7 @@ pub fn gemm_fused_with<T: FusedScalar>(
 
     let epi = to_fused_epi(bias, act);
 
-    // SAFETY: shapes, bounds, and non-aliasing validated above; the bias (if any) is in-bounds
+    // SAFETY: shapes, bounds, and non-aliasing validated above. The bias (if any) is in-bounds
     // and disjoint from C, and its borrow outlives this execute_fused call
     unsafe {
         dispatch::execute_fused(
@@ -133,14 +137,14 @@ pub fn gemm_fused_with<T: FusedScalar>(
 /// strides, with no bounds, alias, or shape checks. `bias` is a `(ptr, dim)` pair, read only
 /// when `has_bias`. Uses the thread-local workspace pool
 ///
-/// Accepts `f32`/`f64` and, under `half`, `f16`/`bf16`; narrow types get the same pre-narrow
+/// Accepts `f32`/`f64` and, under `half`, `f16`/`bf16`. Narrow types get the same pre-narrow
 /// `f32` epilogue precision as [`gemm_fused`], so the result is not bitwise-equal to
 /// `gemm`-then-map for those types (unlike `f32`/`f64`)
 ///
 /// # Safety
 /// As [`gemm_unchecked`], plus: when `has_bias`, `bias` is valid for reads of `m` (`PerRow`)
-/// or `n` (`PerCol`) elements and does not alias `c`; a non-finite `LeakyRelu` slope is the
-/// caller's responsibility (the checked API rejects it)
+/// or `n` (`PerCol`) elements and does not alias `c`. A non-finite `LeakyRelu` slope is the
+/// caller's responsibility, since the checked API rejects it
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn gemm_fused_unchecked<T: FusedScalar>(
     m: usize,

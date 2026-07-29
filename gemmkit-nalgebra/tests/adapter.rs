@@ -1,8 +1,7 @@
-//! Correctness tests for the gemmkit-nalgebra adapter: `dot`/`gemm`, the packed (`prepack_rhs`/
-//! `prepack_lhs` + `gemm_packed_b`/`gemm_packed_a`), i8, f16, complex, fused, map, and requantize
-//! entries, checked against naive scalar references across owned `DMatrix`, static `SMatrix`,
-//! contiguous views, row-major (strided) views, and non-contiguous stepped views. Dimension
-//! mismatches and a prepacked operand paired with the wrong C orientation panic
+//! Correctness tests for the gemmkit-nalgebra adapter: `dot`/`gemm` and the packed, i8, f16,
+//! complex, fused, map, and requantize entries against naive scalar references, across owned,
+//! static, contiguous, and strided nalgebra views; also covers dimension-mismatch and
+//! wrong-orientation panics
 
 use approx::assert_relative_eq;
 use gemmkit::Parallelism;
@@ -56,6 +55,7 @@ where
     }
 }
 
+// dot() matches a naive triple-loop reference across a spread of m, k, n shapes
 #[test]
 fn dot_matches_naive() {
     for &(m, k, n) in &[
@@ -71,27 +71,29 @@ fn dot_matches_naive() {
     }
 }
 
+// dot() on a fixed 2x2 case matches the hand-worked product exactly, the same inputs as the
+// crate-level doc example
 #[test]
 fn dot_small_exact() {
-    // Same numbers as the crate's doc example: [[1,2],[3,4]] * [[5,6],[7,8]] = [[19,22],[43,50]]
     let a = DMatrix::from_row_slice(2, 2, &[1.0, 2.0, 3.0, 4.0]);
     let b = DMatrix::from_row_slice(2, 2, &[5.0, 6.0, 7.0, 8.0]);
     let c = dot(&a, &b);
     assert_eq!(c, DMatrix::from_row_slice(2, 2, &[19.0, 22.0, 43.0, 50.0]));
 }
 
+// dot() gives the same result whether operands are owned matrices or full-span views over them
 #[test]
 fn accepts_view_and_owned() {
     let a = rand2(8, 6, 3);
     let b = rand2(6, 5, 4);
     let c1 = dot(&a, &b);
-    // views spanning the whole matrix must give the same result as the owned matrices
     let av = a.view((0, 0), (8, 6));
     let bv = b.view((0, 0), (6, 5));
     let c2 = dot(&av, &bv);
     assert_close(&c1, &c2, 1e-12);
 }
 
+// dot() and gemm() read correctly through a row-major-strided A view, with no copy
 #[test]
 fn row_major_strided_view() {
     let (m, k, n) = (16usize, 12, 10);
@@ -131,6 +133,7 @@ fn row_major_strided_view() {
     assert_close(&c, &exp, 1e-10);
 }
 
+// dot() reads correctly through a stepped, non-contiguous A view with a nonzero row offset
 #[test]
 fn non_contiguous_stepped_view() {
     let (m, k, n) = (10usize, 8, 6);
@@ -143,6 +146,7 @@ fn non_contiguous_stepped_view() {
     assert_close(&dot(&a, &b), &naive_ref(&a, &b), 1e-10);
 }
 
+// dot() works over nalgebra's static SMatrix operands, and allows mixing static with dynamic
 #[test]
 fn static_smatrix_inputs() {
     // static A times static B
@@ -155,6 +159,7 @@ fn static_smatrix_inputs() {
     assert_close(&dot(&a, &bd), &naive_ref(&a, &bd), 1e-10);
 }
 
+// gemm() combines alpha*A*B with beta*C rather than overwriting C
 #[test]
 fn accumulate_with_beta() {
     let a = rand2(12, 9, 11);
@@ -171,6 +176,7 @@ fn accumulate_with_beta() {
     assert_close(&c, &exp, 1e-10);
 }
 
+// gemm() panics when A's column count does not match B's row count
 #[test]
 #[should_panic(expected = "A.cols")]
 fn inner_dim_mismatch_panics() {
@@ -180,6 +186,7 @@ fn inner_dim_mismatch_panics() {
     gemm(1.0, &a, &b, 0.0, &mut c, Parallelism::Serial);
 }
 
+// gemm() panics when C's row count does not match A's row count
 #[test]
 #[should_panic(expected = "C.rows")]
 fn output_rows_mismatch_panics() {
@@ -199,7 +206,8 @@ fn packed_b_matches_dot() {
     let exp = naive_ref(&a, &b);
     let packed = prepack_rhs(&b);
     for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
-        let mut c = DMatrix::<f64>::zeros(m, n); // column-major: the orientation gemm_packed_b requires
+        // column-major: the orientation gemm_packed_b requires
+        let mut c = DMatrix::<f64>::zeros(m, n);
         gemm_packed_b(1.0, &a, &packed, 0.0, &mut c, par);
         assert_close(&c, &exp, 1e-10);
     }
@@ -233,7 +241,8 @@ fn packed_b_row_major_c_panics() {
     let b = rand2(k, n, 72);
     let packed = prepack_rhs(&b);
     let mut data = vec![0.0f64; m * n];
-    let mut c = DMatrixViewMut::from_slice_with_strides_mut(&mut data, m, n, n, 1); // row-major: rejected orientation
+    // row-major: rejected orientation
+    let mut c = DMatrixViewMut::from_slice_with_strides_mut(&mut data, m, n, n, 1);
     gemm_packed_b(1.0, &a, &packed, 0.0, &mut c, Parallelism::Serial);
 }
 
@@ -701,7 +710,8 @@ fn packed_b_fused_matches_packed_then_map() {
     let (m, k, n) = (100usize, 64, 80);
     let a = rand2(m, k, 251);
     let b = rand2(k, n, 252);
-    let c0 = rand2(m, n, 253); // column-major: DMatrix's default layout, and gemm_packed_b's required orientation
+    // column-major: DMatrix's default layout, and gemm_packed_b's required orientation
+    let c0 = rand2(m, n, 253);
     let bias: Vec<f64> = (0..m).map(|i| 0.5 * i as f64 - 2.0).collect();
     let (alpha, beta) = (1.3f64, -0.7);
     let packed = prepack_rhs(&b);

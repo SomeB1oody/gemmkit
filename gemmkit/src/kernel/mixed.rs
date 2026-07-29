@@ -1,12 +1,12 @@
 //! The mixed-precision GEMM families: narrow (`f16`/`bf16`) inputs, `f32` accumulator,
 //! narrow or `f32` output
 //!
-//! [`MixedGemm`]/[`Bf16DotGemm`] are structurally close to [`super::float::FloatGemm`], but
-//! every input reaches the kernel through the [`KernelSimd`] widen-load seam (A and B widen
-//! to `f32` on load, products accumulate in `f32`) and the store narrows once, on the way
-//! out. [`MixedGemmF32`]/[`Bf16DotGemmF32`] are the `Out = f32` twins that back the
-//! deep-contraction dispatch route: same pack layout and accumulate, but `Out == Acc` lets
-//! the driver's normal multi-slice K blocking apply
+//! [`MixedGemm`] and [`Bf16DotGemm`] are structurally close to [`super::float::FloatGemm`].
+//! Every input reaches the kernel through the [`KernelSimd`] widen-load seam. A and B widen
+//! to `f32` on load, products accumulate in `f32`, and the store narrows once on the way out.
+//! [`MixedGemmF32`] and [`Bf16DotGemmF32`] are the `Out = f32` twins that back the
+//! deep-contraction dispatch route. They share the pack layout and accumulate step, but
+//! `Out == Acc` lets the driver run its normal multi-slice K blocking
 
 use core::marker::PhantomData;
 
@@ -16,19 +16,17 @@ use crate::pack::{pack_kgroup_panels, pack_panels};
 use crate::scalar::NarrowFloat;
 use crate::simd::{KernelSimd, SimdOps};
 
-/// Widen-load A/B and fold `MR_REG x NR` products into `acc` over `kc` depth steps
+/// Widen-load A and B and fold `MR_REG x NR` products into `acc` over `kc` depth steps
 ///
-/// Shared by [`MixedGemm::microkernel_epi`] and [`MixedGemmF32::microkernel_epi`], the
-/// hot loop factored out of both. `acc` is not zeroed here: the narrow-output family always
-/// hands it a fresh zero, but the `f32`-output twin may hand it a seed loaded from the
-/// running partial `C`, so this function just continues whatever chain the caller started.
-/// Generic over the `KernelSimd` output type `O` so both callers drive it: only
-/// `load_lhs`/`splat_rhs` are used, which widen `N -> f32` identically regardless of `O`
-/// (the `f32`-output impls forward to the narrow ones), so the 2 callers accumulate bit-for-bit
-/// the same value
+/// Shared by [`MixedGemm::microkernel_epi`] and [`MixedGemmF32::microkernel_epi`]. `acc` is
+/// not zeroed here. The narrow-output family passes a fresh zero, and the `f32`-output twin
+/// passes a seed loaded from the running partial `C`. The output type `O` only affects
+/// `load_lhs` and `splat_rhs`. Both widen `N` to `f32` the same way for every `O`, so both
+/// callers accumulate the same value
 ///
 /// # Safety
-/// As [`KernelFamily::microkernel`]; run inside `S`'s [`crate::simd::Simd::vectorize`]
+///
+/// As [`KernelFamily::microkernel`]. Run inside `S`'s [`crate::simd::Simd::vectorize`]
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 #[inline(always)]
 unsafe fn mixed_accumulate<N, S, O, const MR_REG: usize, const NR: usize>(
@@ -63,8 +61,8 @@ unsafe fn mixed_accumulate<N, S, O, const MR_REG: usize, const NR: usize>(
                 }
             }
         } else {
-            // Edge tile: bound the column loop to nr_eff so an unpacked B is never read
-            // past its last real column; acc[nr_eff..] stays whatever the caller seeded
+            // Edge tile: bound the column loop to nr_eff so an unpacked B is never read past
+            // its last real column. acc[nr_eff..] stays whatever the caller seeded
             for p in 0..kc {
                 let pa = a.offset(p as isize * a_cs);
                 let a_regs: [<S as SimdOps<f32>>::Reg; MR_REG] =
@@ -83,16 +81,16 @@ unsafe fn mixed_accumulate<N, S, O, const MR_REG: usize, const NR: usize>(
 
 /// Fold `alpha` into `acc`, apply the fused epilogue `E`, and store to the narrow `Out = N`
 ///
-/// Shared verbatim by [`MixedGemm`] (widen-and-FMA) and [`Bf16DotGemm`] (`vdpbf16ps` dot):
-/// the 2 differ only in how `acc` is produced, so the identical `f32`-acc / narrow-`Out`
-/// store logic lives here once. Both families are `OUT_IS_ACC = false`, so the driver runs a
-/// single depth panel (`kc = k`) and `E` applies unconditionally here, once per element, with
-/// no `last_k` check needed. With `E = Identity` every epilogue hook const-folds away, so the
-/// call is byte-for-byte the pre-epilogue kernel
+/// Shared by [`MixedGemm`] (widen-and-FMA) and [`Bf16DotGemm`] (`vdpbf16ps` dot). The 2
+/// families differ only in how `acc` is produced, so the identical store logic lives here
+/// once. Both are `OUT_IS_ACC = false`, so the driver runs a single depth panel (`kc = k`).
+/// `E` applies once per element with no `last_k` check needed. With `E = Identity` every
+/// epilogue hook const-folds away, so the call matches the pre-epilogue kernel exactly
 ///
 /// # Safety
-/// As [`KernelFamily::microkernel`]; run inside `S`'s [`crate::simd::Simd::vectorize`]. `E`'s
-/// interior pointers must be valid for the problem's `m`/`n`
+///
+/// As [`KernelFamily::microkernel`]. Run inside `S`'s [`crate::simd::Simd::vectorize`].
+/// `E`'s interior pointers must be valid for the problem's `m` and `n`
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 #[inline(always)]
 unsafe fn mixed_epilogue<Fam, N, S, E, const MR_REG: usize, const NR: usize>(
@@ -121,7 +119,7 @@ unsafe fn mixed_epilogue<Fam, N, S, E, const MR_REG: usize, const NR: usize>(
         let lanes = <S as SimdOps<f32>>::LANES;
         let mr = MR_REG * lanes;
 
-        // fold alpha into the f32 accumulators; skip the multiply entirely when alpha == 1
+        // Fold alpha into the f32 accumulators. Skip the multiply when alpha == 1
         if alpha_status == AlphaStatus::Other {
             let av = simd.splat(alpha);
             for j in 0..NR {
@@ -131,15 +129,13 @@ unsafe fn mixed_epilogue<Fam, N, S, E, const MR_REG: usize, const NR: usize>(
             }
         }
 
-        // A scalar-only epilogue has no apply_reg, so it must take the scratch route below
-        // for every tile; Identity and any VECTOR epilogue can take the vector route
-        // whenever the tile itself is full and column-major
+        // A scalar-only epilogue has no apply_reg, so it always takes the scratch route below
+        // Identity and any VECTOR epilogue take the vector route when the tile is full and
+        // column-major
         if (E::IS_IDENTITY || E::VECTOR) && mr_eff == mr && nr_eff == NR && rsc == 1 {
-            // Vector widen-load / store of the full tile, in 3 passes over `acc`: fold
-            // beta in, apply the epilogue, store. apply_tile transforms the f32 registers
-            // and store_out performs the single narrowing to N. The epilogue goes through
-            // the whole-tile hook rather than per register for the register-allocation
-            // reason spelled out at `Epilogue::apply_tile`
+            // Vector path for a full, column-major tile. Fold beta into acc, apply the
+            // epilogue to the whole tile at once (see `Epilogue::apply_tile`), then narrow
+            // and store to N
             match beta_status {
                 BetaStatus::Zero => {}
                 BetaStatus::One => {
@@ -173,8 +169,8 @@ unsafe fn mixed_epilogue<Fam, N, S, E, const MR_REG: usize, const NR: usize>(
                 }
             }
         } else {
-            // Edge or non-unit-stride tile: drain f32 acc to scratch, then copy back
-            // element by element, widening the read of C and narrowing the write
+            // Edge or non-unit-stride tile. This drains the f32 acc to scratch, then copies it
+            // back element by element. The copy widens the read of C and narrows the write
             for j in 0..NR {
                 for i in 0..MR_REG {
                     simd.storeu(scratch.add(j * mr + i * lanes), acc[j][i]);
@@ -189,7 +185,7 @@ unsafe fn mixed_epilogue<Fam, N, S, E, const MR_REG: usize, const NR: usize>(
                         BetaStatus::One => (*cp).widen() + v,
                         BetaStatus::Other => beta * (*cp).widen() + v,
                     };
-                    // apply narrows to N itself; the identity branch narrows out directly
+                    // apply narrows to N itself. The identity branch narrows out directly
                     *cp = if !E::IS_IDENTITY {
                         epi.apply(out, row0 + i, col0 + j)
                     } else {
@@ -202,7 +198,7 @@ unsafe fn mixed_epilogue<Fam, N, S, E, const MR_REG: usize, const NR: usize>(
 }
 
 /// The widen-and-FMA mixed-precision GEMM family: `Lhs = Rhs = Out = N` (a [`NarrowFloat`],
-/// i.e. `f16` or `bf16`), `Acc = f32`
+/// either `f16` or `bf16`), with `Acc = f32`
 pub struct MixedGemm<N>(PhantomData<N>);
 
 impl<N> Clone for MixedGemm<N> {
@@ -221,9 +217,9 @@ where
     type Acc = f32;
     type Out = N;
 
-    // Out (N) is narrower than Acc (f32): rounding a running partial through C at every
-    // panel boundary would lose precision, so this forces the driver to kc = k and the
-    // whole contraction stays in f32 registers, narrowing to N exactly once
+    // A running partial that rounds through C at every panel boundary loses precision
+    // This forces the driver to set kc = k, so the whole contraction stays in f32
+    // registers and narrows to N exactly once
     const OUT_IS_ACC: bool = false;
 
     #[inline]
@@ -236,7 +232,7 @@ where
         kc: usize,
         mr: usize,
     ) {
-        // Plain micropanel copy of the narrow elements; widening happens on load
+        // Plain micropanel copy of the narrow elements. Widening happens on load
         unsafe {
             pack_panels(
                 dst, src, /*lead*/ rs, /*depth*/ cs, /*n_lead*/ mc, kc, mr,
@@ -289,8 +285,8 @@ where
         S: KernelSimd<N, N, f32, N>,
         E: Epilogue<Self>,
     {
-        // OUT_IS_ACC = false means the driver always runs a single depth panel (kc = k),
-        // so last_k is structurally always true here
+        // OUT_IS_ACC = false means the driver always runs a single depth panel (kc = k), so
+        // last_k is always true here
         debug_assert!(
             last_k,
             "mixed families are single-panel (kc = k); last_k must be true"
@@ -322,24 +318,24 @@ where
     }
 }
 
-/// The bf16 dot GEMM family: `Lhs = Rhs = Out = bf16`, `Acc = f32`, accumulated via
+/// The bf16 dot GEMM family: `Lhs = Rhs = Out = bf16`, `Acc = f32`, accumulated with
 /// AVX-512 BF16 `vdpbf16ps` (2 bf16 depth steps folded per instruction) instead of
 /// [`MixedGemm`]'s widen-and-FMA
 ///
-/// A sibling of `MixedGemm<bf16>`, not a branch inside it: `pack_lhs`/`pack_rhs` take no
-/// ISA parameter, so the differing k-pair interleave has to be a distinct family. 2 things
+/// A sibling of `MixedGemm<bf16>`, not a branch inside it. `pack_lhs` and `pack_rhs` take
+/// no ISA parameter, so the differing k-pair interleave needs a distinct family. 2 things
 /// change versus `MixedGemm<bf16>`:
 ///
-/// * Pack layout (`DEPTH_MULTIPLE = 2`): A and B are k-pair-interleaved, 2 consecutive
-///   depth steps stored contiguous per row/column (a `__m512bh` pair) so one `vdpbf16ps`
-///   reads a whole pair. Depth pads to a multiple of 2 with bf16 `0`; both operands are
-///   always packed (`FORCE_PACK_*`) since the interleave needs the packed layout
+/// * Pack layout (`DEPTH_MULTIPLE = 2`): A and B are k-pair-interleaved. 2 consecutive
+///   depth steps sit contiguous per row or column (a `__m512bh` pair), so one `vdpbf16ps`
+///   reads a whole pair. Depth pads to a multiple of 2 with bf16 `0`. Both operands are
+///   always packed (`FORCE_PACK_*`) because the interleave needs the packed layout
 /// * Inner loop: `dot_accumulate` replaces the widen-FMA loop. `OUT_IS_ACC = false` still
 ///   keeps `kc = k`, so the whole contraction accumulates in `f32` and narrows to bf16
-///   once; alpha fold and the narrow epilogue reuse `mixed_epilogue` unchanged
+///   once. Alpha fold and the narrow epilogue reuse `mixed_epilogue` unchanged
 ///
-/// `vdpbf16ps`'s fused 2-term dot rounds differently from the widen-FMA path, so the result
-/// is only tolerance-equal to `MixedGemm<bf16>`, not bitwise. It is still fully
+/// `vdpbf16ps`'s fused 2-term dot rounds differently from the widen-FMA path, so the
+/// result is only tolerance-equal to `MixedGemm<bf16>`, not bitwise. It is still fully
 /// deterministic: serial, parallel, and prepacked runs all drive the same kernel and pack
 /// layout, so they reproduce each other exactly
 #[derive(Clone, Copy)]
@@ -361,8 +357,9 @@ impl KernelFamily for Bf16DotGemm {
     const FORCE_PACK_RHS: bool = true;
     const DEPTH_MULTIPLE: usize = Self::Q;
 
-    /// Pack the `mc x kc` LHS k-pair-interleaved: 2 contiguous depth bf16 values per row (a
-    /// `__m512bh` pair), values left unchanged. A padded row (past `mc` or `kc`) packs as bf16 `0`
+    /// Pack the `mc x kc` LHS k-pair-interleaved. 2 contiguous depth bf16 values sit per
+    /// row (a `__m512bh` pair), values unchanged. A padded row past `mc` or `kc` packs
+    /// as bf16 `0`
     #[inline]
     unsafe fn pack_lhs(
         dst: *mut half::bf16,
@@ -379,9 +376,9 @@ impl KernelFamily for Bf16DotGemm {
         }
     }
 
-    /// Pack one `kc x nr` RHS panel k-pair-interleaved: 2 contiguous depth bf16 values per
-    /// column, so each pair reads back as one `i32` for a single broadcast. Values are left
-    /// unchanged; a padded column or depth step packs as bf16 `0`
+    /// Pack one `kc x nr` RHS panel k-pair-interleaved. 2 contiguous depth bf16 values sit
+    /// per column, so each pair reads back as one `i32` for a single broadcast. Values stay
+    /// unchanged. A padded column or depth step packs as bf16 `0`
     #[inline]
     unsafe fn pack_rhs(
         dst: *mut half::bf16,
@@ -426,8 +423,8 @@ impl KernelFamily for Bf16DotGemm {
         S: KernelSimd<half::bf16, half::bf16, f32, half::bf16>,
         E: Epilogue<Self>,
     {
-        // OUT_IS_ACC = false means the driver always runs a single depth panel (kc = k),
-        // so last_k is structurally always true here
+        // OUT_IS_ACC = false means the driver always runs a single depth panel (kc = k), so
+        // last_k is always true here
         debug_assert!(
             last_k,
             "mixed families are single-panel (kc = k); last_k must be true"
@@ -459,21 +456,23 @@ impl KernelFamily for Bf16DotGemm {
 
 /// Seed the `f32` accumulator registers for one deep-k twin tile
 ///
-/// On an accumulate slice (`BetaStatus::One`) this loads the running partial from the `f32`
-/// scratch `C`, so the caller's [`mixed_accumulate`]/`dot_accumulate` continues the
-/// ascending-k chain instead of summing the slice from zero and adding `C` afterward:
-/// storing and reloading an `f32` is exact, so the multi-slice result matches the
-/// single-panel one bit-for-bit. On the 1st slice (`BetaStatus::Zero`) it returns zeroed
-/// accumulators without reading `C` (which may still be uninitialized there).
-/// `BetaStatus::Other` never reaches this function: the twin always runs with `beta` in `{0, 1}`
+/// On an accumulate slice (`BetaStatus::One`), this loads the running partial from the
+/// `f32` scratch `C`. The caller's [`mixed_accumulate`] or `dot_accumulate` then continues
+/// the ascending-k chain instead of summing the slice from zero and adding `C` afterward.
+/// A stored and reloaded `f32` value is exact, so the multi-slice result matches the
+/// single-panel result bit-for-bit. On the 1st slice (`BetaStatus::Zero`), it returns
+/// zeroed accumulators without reading `C`, which may still be uninitialized there.
+/// `BetaStatus::Other` never reaches this function, since the twin always runs with
+/// `beta` in `{0, 1}`
 ///
-/// The full-tile fast path vector-loads `C` directly; the edge path builds a zero-padded
-/// seed in `scratch` and loads that instead, since a partial vector load of `C` could read
-/// past the live rows
+/// The full-tile fast path vector-loads `C` directly. The edge path builds a zero-padded
+/// seed in `scratch` and loads it, because a partial vector load of `C` could read past
+/// the live rows
 ///
 /// # Safety
-/// `c` valid for the live tile at `rsc`/`csc`; `scratch` holds at least `NR * mr` `f32`; run inside
-/// `S`'s [`crate::simd::Simd::vectorize`]
+///
+/// `c` is valid for the live tile at `rsc` and `csc`. `scratch` holds at least `NR * mr`
+/// `f32` values. Run inside `S`'s [`crate::simd::Simd::vectorize`]
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 #[inline(always)]
 unsafe fn twin_seed<S, const MR_REG: usize, const NR: usize>(
@@ -502,9 +501,9 @@ where
                     }
                 }
             } else {
-                // Zero-pad a full NR x mr seed tile, fill in the live sub-tile from C, then load
-                // it: the dead lanes seed to 0 and, since each accumulator is independent, never
-                // perturb a live output
+                // Zero-pad a full NR x mr seed tile, fill the live sub-tile from C, then load it
+                // Each accumulator is independent, so the zeroed dead lanes never affect a
+                // live output
                 for x in 0..NR * mr {
                     *scratch.add(x) = 0.0;
                 }
@@ -524,14 +523,16 @@ where
     }
 }
 
-/// Store one deep-k twin tile's `f32` accumulators back to the `f32` scratch `C`: the running
-/// partial for the next slice, or the final sum the narrowing sweep consumes
+/// Store one deep-k twin tile's `f32` accumulators back to the `f32` scratch `C`. This is
+/// either the running partial for the next slice or the final sum the narrowing sweep
+/// consumes
 ///
-/// Mirrors [`twin_seed`]: the full-tile fast path stores whole vectors column-major; the
-/// edge path drains to `scratch` and copies out only the live `mr_eff x nr_eff` sub-tile
-/// under the tile's real strides
+/// Mirrors [`twin_seed`]. The full-tile fast path stores whole vectors column-major.
+/// The edge path drains to `scratch` and copies out only the live `mr_eff x nr_eff`
+/// sub-tile under the tile's real strides
 ///
 /// # Safety
+///
 /// As [`twin_seed`], with `c` writable
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 #[inline(always)]
@@ -572,16 +573,18 @@ unsafe fn twin_store<S, const MR_REG: usize, const NR: usize>(
     }
 }
 
-/// The `f32`-output twin of [`MixedGemm`]: `Lhs = Rhs = N` (a [`NarrowFloat`]), `Acc = Out = f32`
+/// The `f32`-output twin of [`MixedGemm`]: `Lhs = Rhs = N` (a [`NarrowFloat`]), with
+/// `Acc = Out = f32`
 ///
-/// Exists solely for the deep-contraction dispatch route: `MixedGemm` runs a single depth
-/// panel (`kc = k`), which at large `k` streams an L2-overflowing RHS micropanel from
-/// L3/DRAM. This twin re-blocks the same contraction into an `f32` scratch instead; since
-/// `Out == Acc` here, the driver's ordinary multi-slice K blocking applies (`OUT_IS_ACC`
-/// stays at its `true` default), keeping every slice's panels L2-resident, and the dispatch
-/// narrows the scratch to `N` once at the end. Pack layout and widen-FMA accumulate are
-/// `MixedGemm`'s verbatim; the only difference is the epilogue, which seeds from `C` and
-/// stores raw `f32` so the accumulation continues correctly across slices
+/// This type exists for the deep-contraction dispatch route. `MixedGemm` runs a single
+/// depth panel (`kc = k`), which at large `k` streams an L2-overflowing RHS micropanel
+/// from L3 or DRAM. This twin re-blocks the same contraction into an `f32` scratch
+/// instead. Since `Out == Acc` here, the driver's ordinary multi-slice K blocking
+/// applies, and `OUT_IS_ACC` stays at its `true` default. This keeps every slice's
+/// panels L2-resident, and the dispatch narrows the scratch to `N` once at the end.
+/// Pack layout and widen-FMA accumulate match `MixedGemm` exactly. The only difference
+/// is the epilogue, which seeds from `C` and stores raw `f32` so the accumulation
+/// continues correctly across slices
 pub struct MixedGemmF32<N>(PhantomData<N>);
 
 impl<N> Clone for MixedGemmF32<N> {
@@ -600,9 +603,9 @@ where
     type Acc = f32;
     type Out = f32;
 
-    // Out == Acc == f32 here, so OUT_IS_ACC is left at its true default: the driver blocks K
-    // at the cache-model kc and round-trips the partial through the f32 scratch exactly,
-    // which is the entire point of this twin
+    // Out == Acc == f32 here, so OUT_IS_ACC is left at its true default. The driver blocks
+    // K at the cache-model kc and round-trips the partial through the f32 scratch exactly
+    // This is the entire point of this twin
 
     #[inline]
     unsafe fn pack_lhs(
@@ -614,7 +617,7 @@ where
         kc: usize,
         mr: usize,
     ) {
-        // Same narrow micropanel copy as MixedGemm; widening happens on load
+        // Same narrow micropanel copy as MixedGemm. Widening happens on load
         unsafe { pack_panels(dst, src, rs, cs, mc, kc, mr) }
     }
 
@@ -659,9 +662,10 @@ where
         S: KernelSimd<N, N, f32, f32>,
         E: Epilogue<Self>,
     {
-        // A deep-k internal call, never a user-facing fused GEMM: alpha=1, beta in {0, 1},
-        // and always the Identity epilogue, so this just accumulates raw f32 partials; the
-        // dispatch layer applies the real alpha/beta and narrows once outside this function
+        // A deep-k internal call, never a user-facing fused GEMM. alpha = 1, beta is in
+        // {0, 1}, and the epilogue is always Identity, so this just accumulates raw f32
+        // partials. The dispatch layer applies the real alpha and beta, and narrows once,
+        // outside this function
         assert!(E::IS_IDENTITY, "deep-k twin does not fuse epilogues");
         debug_assert!(
             alpha_status == AlphaStatus::One,
@@ -683,14 +687,16 @@ where
     }
 }
 
-/// The `f32`-output twin of [`Bf16DotGemm`]: `Lhs = Rhs = bf16`, `Acc = Out = f32`, `vdpbf16ps` dot
+/// The `f32`-output twin of [`Bf16DotGemm`]: `Lhs = Rhs = bf16`, `Acc = Out = f32`,
+/// `vdpbf16ps` dot
 ///
 /// The deep-contraction sibling of `Bf16DotGemm`, exactly as [`MixedGemmF32`] is of
-/// [`MixedGemm`]: same k-pair-interleaved pack (`DEPTH_MULTIPLE = 2`, both operands
-/// force-packed) and the same `dot_accumulate`, but `Out = f32` so the driver multi-slices.
-/// The driver rounds every interior slice's `kc` up to `DEPTH_MULTIPLE`, so a k-pair never
-/// straddles a slice boundary and the multi-slice dot matches the single-panel one
-/// bit-for-bit; only the final short tail is depth-padded, same as the single-panel case
+/// [`MixedGemm`]. It shares the k-pair-interleaved pack (`DEPTH_MULTIPLE = 2`, both
+/// operands force-packed) and the same `dot_accumulate`, but `Out = f32`, so the driver
+/// multi-slices. The driver rounds every interior slice's `kc` up to `DEPTH_MULTIPLE`, so
+/// a k-pair never straddles a slice boundary. The multi-slice dot matches the single-panel
+/// one bit-for-bit, and only the final short tail is depth-padded, the same as in the
+/// single-panel case
 #[derive(Clone, Copy)]
 pub struct Bf16DotGemmF32(PhantomData<()>);
 
@@ -700,7 +706,7 @@ impl KernelFamily for Bf16DotGemmF32 {
     type Acc = f32;
     type Out = f32;
 
-    // Out == Acc == f32, so OUT_IS_ACC stays at its true default and K multi-slices; the
+    // Out == Acc == f32, so OUT_IS_ACC stays at its true default and K multi-slices. The
     // k-pair pack still needs both operands force-packed regardless
     const FORCE_PACK_LHS: bool = true;
     const FORCE_PACK_RHS: bool = true;

@@ -135,6 +135,7 @@ fn reference(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f64> {
     c
 }
 
+/// `NaiveFloat` drives through the unchanged `driver::run` generic and matches an f64 reference
 #[test]
 fn second_kernel_family_drives_unchanged() {
     let (m, k, n) = (40usize, 33, 28);

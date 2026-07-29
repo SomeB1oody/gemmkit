@@ -30,7 +30,7 @@ const REPS: usize = 9;
 const BATCH_SECS: f64 = 0.07;
 
 /// Median GFLOP/s over `REPS` runs, with `iters` auto-calibrated to hit `BATCH_SECS` per rep (the
-/// same measurement scheme as the core crate's bench harness, duplicated here since it isn't
+/// same measurement scheme as the core crate's bench harness, duplicated here since it is not
 /// importable across crates). `flops` is the whole-batch `2*batch*m*k*n`
 fn measure<F: FnMut()>(flops: f64, mut f: F) -> f64 {
     for _ in 0..3 {
@@ -83,6 +83,7 @@ fn bench(batch: usize, m: usize, k: usize, n: usize) {
     );
 }
 
+// prints gemm_batched vs a naive per-element gemm loop, in GFLOP/s, across 3 batch/shape points
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
 fn perf_batched() {

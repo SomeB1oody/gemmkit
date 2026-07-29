@@ -1,9 +1,10 @@
 //! Complex GEMM entries (`c32`/`c64`, feature `complex`): `C <- alpha*op(A)*op(B) + beta*C`,
-//! where `op` optionally conjugates an operand. [`gemm_cplx`] / [`gemm_cplx_with`] are the
-//! checked entries over [`MatRef`]/[`MatMut`]; [`gemm_cplx_unchecked`] /
-//! [`gemm_cplx_unchecked_with`] the raw pointer + `isize`-stride equivalents. Under feature
-//! `epilogue`, [`gemm_cplx_fused`] and its siblings add a fused per-row / per-col bias (no
-//! activation: an ordering-based activation is undefined on complex numbers)
+//! where `op` optionally conjugates an operand. [`gemm_cplx`] and [`gemm_cplx_with`] are the
+//! checked entries over [`MatRef`]/[`MatMut`]. [`gemm_cplx_unchecked`] and
+//! [`gemm_cplx_unchecked_with`] are the raw pointer and `isize`-stride equivalents. Under
+//! feature `epilogue`, [`gemm_cplx_fused`] and its siblings add a fused per-row or per-col
+//! bias. Complex numbers have no activation, because an ordering-based activation has no
+//! definition there
 use super::*;
 use crate::dispatch::ComplexScalar;
 #[cfg(feature = "epilogue")]
@@ -14,9 +15,9 @@ use crate::kernel::epilogue::BiasDim;
 /// `Complex<f32>` or `Complex<f64>` (re-exported as [`crate::c32`] / [`crate::c64`]). Uses the
 /// thread-local workspace pool
 ///
-/// Complex is a homogeneous element type, so `conj_a = conj_b = false` could ride plain
-/// [`gemm`]; this entry exists to carry the conjugation flags through the same dispatch and
-/// validation path
+/// Complex numbers dispatch through a path of their own, since `ComplexScalar` does not
+/// extend `GemmScalar`. This entry exists to carry the conjugation flags through that path,
+/// whether or not either operand is conjugated
 ///
 /// # Panics
 /// Same shape / bounds / aliasing conditions as [`gemm`]
@@ -54,7 +55,7 @@ pub fn gemm_cplx_with<T: ComplexScalar>(
 ) {
     validate_gemm_views(&a, &b, &c);
 
-    // SAFETY: shapes, bounds, and non-aliasing validated above; C addresses each (i,j) uniquely
+    // SAFETY: shapes, bounds, and non-aliasing validated above. C addresses each (i,j) uniquely
     unsafe {
         dispatch::execute_complex(
             conj_a,
@@ -86,17 +87,19 @@ pub fn gemm_cplx_with<T: ComplexScalar>(
 /// as in [`gemm_cplx`]. `T` is `Complex<f32>` or `Complex<f64>`. Uses the thread-local
 /// workspace pool
 ///
-/// The bias is [`Bias::PerRow`] (length `A.rows`) or [`Bias::PerCol`] (length `B.cols`), added
-/// by 1 complex add to every element of that row / column after the `alpha*op(A)*op(B) +
-/// beta*C` combine; it is added verbatim, never conjugated. There is no activation parameter:
-/// an ordering-based activation such as ReLU has no definition on complex numbers, so bias is
-/// the only fusible complex epilogue. `bias == None` delegates to plain [`gemm_cplx`]
+/// The bias is [`Bias::PerRow`] (length `A.rows`) or [`Bias::PerCol`] (length `B.cols`). It is
+/// added by 1 complex add to every element of that row or column, after the
+/// `alpha*op(A)*op(B) + beta*C` combine. It is added verbatim, never conjugated. There is no
+/// activation parameter. An ordering-based activation such as ReLU has no definition on
+/// complex numbers, so bias is the only fusible complex epilogue. `bias == None` delegates to
+/// plain [`gemm_cplx`]
 ///
 /// The kernel stores exactly the bits plain `gemm_cplx` would and applies the bias in a
-/// tile-local post-pass on the final depth panel, so the result is bit-identical to
-/// [`gemm_cplx`] followed by the same element-wise bias add, for every shape and every conj
-/// combination, on both the real and imaginary parts. It is likewise deterministic across
-/// thread counts (serial == parallel, bit-for-bit)
+/// tile-local post-pass on the final depth panel. The result is bit-identical to
+/// [`gemm_cplx`] followed by the same element-wise bias add. This holds for every shape, every
+/// conj combination, and both the real and imaginary parts. Serial and parallel runs also
+/// agree bit-for-bit today, though the crate's reproducibility contract covers only a fixed
+/// configuration
 ///
 /// # Panics
 /// Same conditions as [`gemm_cplx`], plus: a `PerRow` bias whose length is not `A.rows` (or a
@@ -149,10 +152,11 @@ pub fn gemm_cplx_fused_with<T: ComplexScalar>(
     // Bias length matches its axis and stays clear of C
     validate_bias(&Some(bias), a.rows, b.cols, &c);
 
-    // No activation on complex (ordering-based activations are undefined there); act stays None
+    // Complex numbers have no activation, because an ordering-based activation has no
+    // definition there. act stays None
     let epi = to_fused_epi(Some(bias), None);
 
-    // SAFETY: shapes, bounds, and non-aliasing validated above; the bias is in-bounds and
+    // SAFETY: shapes, bounds, and non-aliasing validated above. The bias is in-bounds and
     // disjoint from C, and its borrow outlives this execute_complex_fused call
     unsafe {
         dispatch::execute_complex_fused(
@@ -183,9 +187,10 @@ pub fn gemm_cplx_fused_with<T: ComplexScalar>(
 
 /// The raw complex fused engine: `C <- alpha*op(A)*op(B) + beta*C + bias` over pointers and
 /// `isize` strides, with no bounds, alias, or shape checks: the raw-parts form of
-/// [`gemm_cplx_fused`]. `op` conjugates an operand when its `conj_*` flag is set; `bias` is a
+/// [`gemm_cplx_fused`]. `op` conjugates an operand when its `conj_*` flag is set. `bias` is a
 /// `(ptr, dim)` pair, read only when `has_bias`, and added verbatim, never conjugated. There is
-/// no activation parameter (undefined on complex numbers). Uses the thread-local workspace pool
+/// no activation parameter, since it has no definition on complex numbers. Uses the
+/// thread-local workspace pool
 ///
 /// # Safety
 /// As [`gemm_cplx_unchecked`], plus: when `has_bias`, `bias` is valid for reads of `m`
@@ -292,8 +297,8 @@ pub unsafe fn gemm_cplx_fused_unchecked_with<T: ComplexScalar>(
 ///
 /// # Safety
 /// The caller guarantees `a`/`b` valid for reads and `c` for read+write over every
-/// `(i,j)` implied by the dimensions and strides; `c` does not alias `a`/`b`; and
-/// when `beta == 0`, `c` need not be initialized
+/// `(i,j)` implied by the dimensions and strides. `c` does not alias `a`/`b`. When
+/// `beta == 0`, `c` need not be initialized
 #[cfg(feature = "complex")]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn gemm_cplx_unchecked<T: ComplexScalar>(

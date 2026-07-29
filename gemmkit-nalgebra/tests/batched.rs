@@ -1,8 +1,8 @@
-//! Correctness tests for `gemm_batched`: 1 call over a slice of per-element `(&A, &B)` inputs
-//! paired with a slice of `&mut C` outputs must reproduce a per-element loop of `gemm` bit-for-bit,
-//! across a heterogeneous batch of shapes and mixed column-major (F-order) / row-major (C-order)
-//! layouts, and stay bit-identical between serial and parallel. Count and inner-dimension
-//! mismatches panic; an empty batch is a no-op
+//! `gemm_batched`: 1 call over a slice of per-element `(&A, &B)` inputs paired with a slice of
+//! `&mut C` outputs must reproduce a per-element loop of `gemm` bit-for-bit, across a heterogeneous
+//! batch of shapes and mixed column-major (F-order) / row-major (C-order) layouts, and stay
+//! bit-identical between serial and parallel. Count/inner-dimension mismatches panic; an empty
+//! batch is a no-op
 
 use gemmkit::Parallelism;
 use nalgebra::{DMatrix, DMatrixView, DMatrixViewMut};
@@ -104,6 +104,8 @@ fn run(par: Parallelism) -> Vec<Vec<f64>> {
     c_bat
 }
 
+// gemm_batched under Serial and Rayon(0) each match a gemm(par) loop (checked inside run()) and
+// produce identical output across the two parallelism modes
 #[test]
 fn gemm_batched_matches_gemm_loop_and_par_reproducible() {
     let serial = run(Parallelism::Serial);
@@ -114,21 +116,23 @@ fn gemm_batched_matches_gemm_loop_and_par_reproducible() {
     );
 }
 
+// 1 A/B pair but 0 C outputs panics with a message naming "count"
 #[test]
 #[should_panic(expected = "count")]
 fn gemm_batched_count_mismatch_panics() {
     let a = DMatrix::from_element(2, 2, 1.0f64);
     let b = DMatrix::from_element(2, 2, 1.0f64);
     let ab = [(&a, &b)];
-    let mut c: Vec<DMatrix<f64>> = Vec::new(); // 1 A/B pair, 0 C outputs: count mismatch
+    let mut c: Vec<DMatrix<f64>> = Vec::new();
     gemm_batched(1.0, &ab, 0.0, &mut c, Parallelism::Serial);
 }
 
+// A.cols=4 != B.rows=5 panics with a message naming "A.cols"
 #[test]
 #[should_panic(expected = "A.cols")]
 fn gemm_batched_inner_dim_mismatch_panics() {
     let a = DMatrix::from_element(3, 4, 1.0f64);
-    let b = DMatrix::from_element(5, 2, 1.0f64); // A.cols=4 != B.rows=5
+    let b = DMatrix::from_element(5, 2, 1.0f64);
     let ab = [(&a, &b)];
     let mut c = vec![DMatrix::<f64>::zeros(3, 2)];
     gemm_batched(1.0, &ab, 0.0, &mut c, Parallelism::Serial);

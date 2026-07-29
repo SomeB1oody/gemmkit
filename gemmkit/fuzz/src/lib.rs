@@ -1,16 +1,17 @@
-//! Shared harness for the gemmkit fuzz targets: the 6 `fuzz_target!` binaries under
-//! `fuzz_targets/` are thin wrappers (`fuzz_target!(|p| run_x(p))`) that decode an
-//! `Arbitrary` plan and hand it to a driver defined here, so the differential-oracle
-//! logic lives in 1 testable place. 5 of the 6 feed valid-by-construction problems and
-//! treat any panic as a bug; `fuzz_api_validation` instead drives adversarial geometry
-//! into the checked APIs and only accepts a documented `gemmkit:` panic
+//! Shared harness for the gemmkit fuzz targets. The 6 `fuzz_target!` binaries under
+//! `fuzz_targets/` decode an `Arbitrary` plan and hand it to a driver defined here.
+//! This keeps the differential-oracle logic in 1 testable place. 5 of the 6 are thin
+//! wrappers (`fuzz_target!(|p| run_x(p))`) that feed valid-by-construction problems
+//! and treat any panic as a bug. `fuzz_api_validation` instead drives adversarial
+//! geometry into the checked APIs, catches the panic, and accepts only a message with
+//! a documented `gemmkit:` prefix
 //!
-//! The accuracy bars mirror `gemmkit/tests/correctness/`: the `8*k*EPS` / `16*k*EPS`
-//! relative-Frobenius gates, the `beta == 0` "C is not read" rule, and the exact
-//! wrapping-i32 reference for i8. Every `Plan` is built by a manual `Arbitrary` impl
-//! (so its fields are already bounded/resolved) and derives `Debug`, so a crash
-//! artifact decoded with `cargo fuzz fmt` prints as a literal ready to paste into a
-//! stable regression test
+//! The accuracy bars mirror `gemmkit/tests/correctness/`. They are the `8*k*EPS` and
+//! `16*k*EPS` relative-Frobenius gates, the `beta == 0` "C is not read" rule, and the
+//! exact wrapping-i32 reference for i8. Every `Plan` comes from a manual `Arbitrary`
+//! impl, so its fields are already bounded and resolved. Each `Plan` derives `Debug`,
+//! so a crash artifact decoded with `cargo fuzz fmt` prints as a literal ready to
+//! paste into a stable regression test
 
 // Adversarial-geometry plan and driver behind fuzz_api_validation
 mod api_validation;
@@ -18,7 +19,8 @@ mod api_validation;
 mod common;
 // Differential drivers: run a gemmkit entry point and gate it against the reference
 mod differential;
-// Valid-by-construction plans/entries for fuzz_gemm, fuzz_knobs, fuzz_batched, fuzz_prepack, fuzz_prepack_i8
+// Valid-by-construction plans and entries for fuzz_gemm, fuzz_knobs, fuzz_batched,
+// fuzz_prepack, and fuzz_prepack_i8
 mod plans;
 // Triple-loop references and the tolerance/exact gates the drivers check output against
 mod reference;

@@ -5,16 +5,16 @@
 [![crates.io](https://img.shields.io/crates/v/gemmkit-tune.svg)](https://crates.io/crates/gemmkit-tune)
 
 Install-time autotuner for the [`gemmkit`](https://crates.io/crates/gemmkit) GEMM
-engine. It runs on the machine that will run your gemmkit application, sweeps
+engine. It runs on the machine that will run your gemmkit application. It sweeps
 gemmkit's runtime `GEMMKIT_*` tuning knobs by measuring a representative set of matrix
-shapes for each, and writes a shell profile of `export GEMMKIT_*=...` lines. Source
-that profile before launching your gemmkit binary to retune it for the host with no
-recompile.
+shapes for each knob. It then writes a shell profile of `export GEMMKIT_*=...` lines.
+Source that profile before you launch your gemmkit binary, to retune it for the host
+with no rebuild.
 
-Run it on the deploy machine, not in a `build.rs`: the build host is usually not the
-deploy host, and the knobs are calibrated against the CPU that executes the work.
-gemmkit's compiled-in defaults were calibrated on one machine (a Ryzen 9950X), so on
-that same machine a run re-discovers essentially the same values; the payoff is on a
+Run it on the deploy machine, not in a `build.rs`. The build host is usually not the
+deploy host. It calibrates the knobs against the CPU that executes the work.
+gemmkit's compiled-in defaults were calibrated on one machine, a Ryzen 9950X. On that
+same machine, a run re-discovers essentially the same values. The payoff appears on a
 different machine.
 
 A fuller guide, including how the sweep works inside, lives in the
@@ -37,14 +37,14 @@ source gemmkit-tune.env
 ./your-gemmkit-app
 ```
 
-The generated file is a list of `export GEMMKIT_*=<value>` lines with a header comment
-recording the host and the worker count it was tuned for. gemmkit reads those variables
-at runtime, so no rebuild is needed. The tool also prints a report to the terminal
-showing, per knob, the swept default, the value it chose, and which knobs were skipped
-and why.
+The generated file is a list of `export GEMMKIT_*=<value>` lines with a header comment.
+The comment records the host and the worker count it was tuned for. gemmkit reads
+those variables at runtime, so no rebuild is needed. The tool also prints a report to
+the terminal. For each knob, it shows the swept default, the value it chose, and which
+knobs were skipped, with the reason.
 
-Any `GEMMKIT_*` variables should be unset in the tuning shell: they influence the
-measured baseline, and the tool warns when it finds any.
+Unset any `GEMMKIT_*` variables in the tuning shell before you run it. They influence
+the measured baseline. The tool warns when it finds any.
 
 ## Options
 
@@ -62,8 +62,8 @@ measured baseline, and the tool warns when it finds any.
 
 ## Feature flags
 
-None. `gemmkit-tune` is a binary crate with no Cargo features of its own; it builds
-against `gemmkit` with the `complex`, `half`, and `int8` families enabled so every
+None. `gemmkit-tune` is a binary crate with no Cargo features of its own. It builds
+against `gemmkit` with the `complex`, `half`, and `int8` families enabled, so every
 element type can be probed.
 
 ## Related crates

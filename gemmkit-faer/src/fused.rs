@@ -6,15 +6,17 @@ use gemmkit::adapter::lower_bias;
 
 /// `C <- act(alpha*A*B + beta*C + bias)` in 1 fused pass, the faer adapter over gemmkit's
 /// [`gemmkit::gemm_fused`]. The optional [`Bias`] is [`Bias::PerRow`] (length `A.rows`) or
-/// [`Bias::PerCol`] (length `B.cols`), added before the optional [`Activation`], which runs last;
-/// `bias == None && act == None` behaves exactly like [`gemm`]. `T` is `f32`/`f64`, plus `f16`/`bf16`
-/// under `half` (whose epilogue runs in `f32`, narrowing to the output type only once, after the
-/// activation). Like [`gemm`], it reads the pointer/strides directly and forwards to gemmkit's raw
-/// engine, so transposed, sub-matrix, and reversed (negative-stride) views all work without copying
+/// [`Bias::PerCol`] (length `B.cols`), added before the optional [`Activation`]. The activation
+/// runs last, and `bias == None && act == None` behaves exactly like [`gemm`]. `T` is `f32`/`f64`,
+/// plus `f16`/`bf16` under `half`, whose epilogue runs in `f32` and narrows to the output type
+/// only once, after the activation. Like [`gemm`], it reads the pointer and strides directly and
+/// forwards to gemmkit's raw engine. Transposed, sub-matrix, and reversed (negative-stride) views
+/// all work without copying
 ///
 /// # Panics
-/// If the inner dimensions disagree, or on a bias/activation the adapter rejects (a `PerRow`/`PerCol`
-/// bias of the wrong length, a bias slice overlapping `C`, or a non-finite `LeakyRelu` slope)
+/// If the inner dimensions disagree, or if the adapter rejects the bias or activation. Rejection
+/// conditions are a `PerRow`/`PerCol` bias of the wrong length, a bias slice that overlaps `C`, or
+/// a non-finite `LeakyRelu` slope
 #[cfg(feature = "epilogue")]
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_fused<T: FusedScalar>(
@@ -72,17 +74,17 @@ fn gemm_fused_common<T: FusedScalar>(
     let (rsc, csc) = (c.row_stride(), c.col_stride());
     let cp = c.as_ptr_mut();
 
-    // Bias/activation validation, matching gemmkit's checked entry (same panic wording): the bias
-    // length matches its axis and doesn't overlap C, and a LeakyRelu slope is finite
+    // Bias/activation validation matches gemmkit's checked entry, with the same panic wording. The
+    // bias length matches its axis and does not overlap C, and a LeakyRelu slope must be finite
     let (bias_ptr, bias_dim, has_bias) = lower_bias(bias, m, n, cp, &[(cm, rsc), (cn, csc)]);
     if let Some(Activation::LeakyRelu(s)) = &act {
         assert!(T::finite(*s), "gemmkit: LeakyRelu slope must be finite");
     }
 
-    // SAFETY: dims validated above; faer guarantees the pointer + element-unit `isize` strides
-    // describe a valid in-bounds layout (negative for a reversed view, which the raw engine
-    // handles), `c` (a `MatMut` exclusive borrow) can't alias `a`/`b`, and the bias was validated
-    // disjoint from C above
+    // SAFETY: dims validated above. faer guarantees the pointer and element-unit `isize` strides
+    // describe a valid in-bounds layout, negative for a reversed view, which the raw engine
+    // handles. The `MatMut` exclusive borrow means `c` cannot alias `a` or `b`, and the bias was
+    // validated disjoint from C above
     unsafe {
         match ws {
             Some(ws) => gemm_fused_unchecked_with(

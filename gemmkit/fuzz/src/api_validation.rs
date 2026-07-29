@@ -1,6 +1,7 @@
-//! Adversarial-geometry plan and driver for fuzz_api_validation: builds shapes/strides
-//! from edge-case classes rather than valid-by-construction views, then runs a checked
-//! gemmkit entry point and expects either a clean run or a documented `gemmkit:` panic
+//! Adversarial-geometry plan and driver for fuzz_api_validation. The plan builds shapes
+//! and strides from edge-case classes instead of valid-by-construction views. The driver
+//! then runs a checked gemmkit entry point and expects either a clean run or a documented
+//! `gemmkit:` panic
 
 use arbitrary::{Arbitrary, Result, Unstructured};
 
@@ -13,8 +14,8 @@ use gemmkit::{
 // fuzz_api_validation
 
 /// Dimension-size classes for validation fuzzing, weighted toward the boundaries of the
-/// checked API's extent computation: `P33` and above push `isize`-mul overflow inside
-/// `extent()`, `HalfMax`/`Max` land at the largest representable sizes
+/// checked API's extent computation. `P33` and above push `isize` multiplication overflow
+/// inside `extent()`. `HalfMax` and `Max` land at the largest representable sizes
 #[derive(Debug, Clone, Copy)]
 pub enum DimClass {
     Zero,
@@ -53,8 +54,8 @@ impl DimClass {
     }
 }
 
-/// Stride classes for validation fuzzing; `IMin`/`IMax` and `+/-2^33` are sized to drive
-/// the checked-mul inside `extent()` to overflow
+/// Stride classes for validation fuzzing. `IMin`, `IMax`, and `+/-2^33` are sized to
+/// overflow the checked multiplication inside `extent()`
 #[derive(Debug, Clone, Copy)]
 pub enum StrideClass {
     Zero,
@@ -179,15 +180,15 @@ impl<'a> Arbitrary<'a> for ValidationPlan {
     }
 }
 
-/// Cap on the work a plan that WOULD pass validation is allowed to do: 2^24 elements or
-/// MACs. Without it, a plan that is a legitimate accept could still demand billions of
-/// MACs or a multi-gigabyte alloc under ASan, turning into a timeout/OOM that has nothing
-/// to do with a memory-safety bug
+/// Cap on the work a plan that would pass validation is allowed to do: 2^24 elements or
+/// MACs. Without it, a plan that legitimately passes could still demand billions of MACs
+/// or a multi-gigabyte allocation under ASan. That turns a correct run into a timeout or
+/// an out-of-memory failure unrelated to a memory-safety bug
 const WORK_CAP: usize = 1 << 24;
 
-/// Mirror of `api.rs::extent`: highest slice offset (exclusive) of a `rows x cols` view,
-/// or `None` if the strides are negative or the view is too large to address (both of
-/// which the checked API rejects)
+/// Mirror of `api.rs::extent`. Returns the highest slice offset, exclusive, of a
+/// `rows x cols` view. Returns `None` when the strides are negative or the view is too
+/// large to address, both of which the checked API rejects
 fn mirror_extent(rows: usize, cols: usize, rs: isize, cs: isize) -> Option<usize> {
     if rows == 0 || cols == 0 {
         return Some(0);
@@ -209,8 +210,9 @@ fn mirror_extent(rows: usize, cols: usize, rs: isize, cs: isize) -> Option<usize
     }
 }
 
-/// Mirror of `api.rs::self_aliases`: true if 2 distinct `(i,j)` in a `rows x cols`
-/// strided view land on the same offset, which the checked API rejects for C
+/// Mirror of `api.rs::self_aliases`. Returns true when 2 distinct `(i,j)` pairs in a
+/// `rows x cols` strided view land on the same offset. The checked API rejects that
+/// case for C
 fn mirror_self_aliases(rows: usize, cols: usize, rs: isize, cs: isize) -> bool {
     if rows == 0 || cols == 0 {
         return false;
@@ -235,11 +237,13 @@ fn sat3(a: usize, b: usize, c: usize) -> usize {
     a.saturating_mul(b).saturating_mul(c)
 }
 
-/// The raw driver behind `fuzz_api_validation`: builds operands per `p.entry`'s dimension
-/// and stride classes and calls the matching gemmkit entry point directly. Either panics
-/// with a documented `gemmkit:` message (accepted by the target's `catch_unwind`) or runs
-/// cleanly; a plan is only skipped when it would fully pass validation and then run
-/// unbounded work (see `WORK_CAP`)
+/// The raw driver behind `fuzz_api_validation`
+///
+/// It builds operands from `p.entry`'s dimension and stride classes, then calls the
+/// matching gemmkit entry point directly. It either panics with a documented `gemmkit:`
+/// message, which the target's `catch_unwind` accepts, or runs cleanly. A plan is
+/// skipped only when it would fully pass validation and then run unbounded work (see
+/// `WORK_CAP`)
 pub fn drive_validation(p: &ValidationPlan) {
     let (m, k, n) = (p.m.get(), p.k.get(), p.n.get());
     let (mc, nc) = (p.mc.get(), p.nc.get());
@@ -310,8 +314,9 @@ pub fn drive_validation(p: &ValidationPlan) {
             let a_bs = p.a_bs.get();
             let b_bs = p.b_bs.get();
             let c_bs = p.c_bs.get();
-            // Bound is (extent + (batch-1)*bs), mirroring check_batched_view. A negative
-            // batch stride with batch > 1 is a documented reject, so it can't "would_pass"
+            // Bound is extent plus (batch - 1) times bs, mirroring check_batched_view
+            // A negative batch stride with batch > 1 is a documented reject, so
+            // would_pass never becomes true for it
             let batched_ok = |rows, cols, rs, cs, bs: isize, len: usize| -> bool {
                 let Some(e) = mirror_extent(rows, cols, rs, cs) else {
                     return false;
@@ -335,7 +340,7 @@ pub fn drive_validation(p: &ValidationPlan) {
                 && !mirror_self_aliases(mc, nc, rsc, csc)
                 && (batch <= 1 || (c_bs >= 0 && ec.map(|e| (c_bs as usize) >= e).unwrap_or(false)));
             // gemm_batched still loops `batch` times even when each element is empty
-            // (m*n == 0), so cap the raw batch count too, or it can time out on its own
+            // (m*n == 0). So cap the raw batch count too, or it can time out on its own
             if would_pass && (batch > WORK_CAP || batch.saturating_mul(sat3(m, n, k)) > WORK_CAP) {
                 return;
             }
@@ -356,11 +361,10 @@ pub fn drive_validation(p: &ValidationPlan) {
             );
         }
         EntryKind::PrepackB => {
-            // Only the "representable but huge" middle band is skipped: a would-pass
-            // pack whose ~n*k element count fits in usize yet clears WORK_CAP would OOM
-            // on entirely correct behavior. Everything else stays fuzzed: an empty
-            // operand short-circuits inside prepack, and a size that overflows usize
-            // panics with a documented "too large" message
+            // Skip only the representable-but-huge middle band, where n*k fits in usize
+            // yet clears WORK_CAP: that band would OOM on entirely correct behavior
+            // Every other case stays fuzzed, including an empty operand and a size that
+            // overflows usize
             let would_pass = in_bounds(k, n, rsb, csb, p.len_b);
             let expensive = n != 0
                 && k != 0

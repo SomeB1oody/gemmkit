@@ -1,16 +1,13 @@
 //! L0 SIMD-vocabulary conformance: every ISA token's [`SimdOps`] primitives, the homogeneous
-//! [`KernelSimd`] `L == A` blanket impl, and the portable default `fma_bvec` must all agree
-//! with a plain scalar computation, for every element type the token supports. A product
-//! kernel only ever calls a subset of these primitives per token (loadu/storeu + mul_add +
-//! zero/splat, plus the dot seam), so this is the only place the integer `reduce_sum`/`fnma`,
-//! the mixed-precision widen seam, and the lane-FMA fallback are exercised at all
+//! [`KernelSimd`] `L == A` blanket impl, and the portable default `fma_bvec` must all agree with
+//! a plain scalar computation, for every element type the token supports. A product kernel only
+//! ever calls a subset of these per token, so this is the only place the integer
+//! `reduce_sum`/`fnma`, the mixed-precision widen seam, and the lane-FMA fallback are exercised
 //!
-//! Each token is constructed directly here, bypassing dispatch, and guarded behind its own
-//! runtime feature probe, so the suite silently runs whatever subset the host actually
-//! supports; it does not read `GEMMKIT_REQUIRE_ISA`. Every check compares against a scalar
-//! reference computed in this file, never a platform-specific constant, so the same test runs
-//! on wasm too (no proptest dependency there), which is how the compile-time `simd128` token
-//! gets conformance-tested; the scalar token itself covers any host
+//! Each token is constructed directly here, bypassing dispatch (and `GEMMKIT_REQUIRE_ISA`),
+//! behind its own runtime feature probe, so the suite silently runs whatever subset the host
+//! supports. The oracle is always a scalar reference computed in this file, never a
+//! platform-specific constant, so the same test runs on wasm too
 #![cfg(not(miri))]
 // The lane loops index parallel scratch buffers by lane and print the lane on failure; an
 // explicit index reads clearer here than an enumerate
@@ -18,7 +15,7 @@
 
 use gemmkit::simd::{KernelSimd, ScalarTok, SimdOps};
 
-/// Generates a conformance check for one floating element type: every `SimdOps<$t>`
+/// Generates a conformance check for 1 floating element type: every `SimdOps<$t>`
 /// primitive plus the `KernelSimd<$t,$t,$t,$t>` blanket, validated lane-by-lane against a
 /// scalar reference at a per-type tolerance (mul_add/fnma fuse a single rounding step, so
 /// the comparison cannot be bitwise)
@@ -372,6 +369,7 @@ where
     }
 }
 
+/// `ScalarTok` covers every element type and both narrow twin seams on any host
 #[test]
 fn scalar_token_conformance() {
     conform_f32(ScalarTok, "scalar/f32");
@@ -385,6 +383,8 @@ fn scalar_token_conformance() {
     }
 }
 
+/// Every x86 SIMD token this host's runtime feature probes admit (Fma, Avx512F, Avx512Vnni,
+/// Avx512Bf16), skipping a token the CPU lacks rather than failing
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[test]
 fn x86_token_conformance() {

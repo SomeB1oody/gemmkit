@@ -3,10 +3,10 @@
 All notable changes to the gemmkit workspace are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
-project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The five
+project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The 5
 workspace crates (`gemmkit`, `gemmkit-ndarray`, `gemmkit-nalgebra`, `gemmkit-faer`,
-`gemmkit-tune`) share one version and release in lockstep, so releases are recorded
-once with per-crate subsections where a change is crate-specific.
+`gemmkit-tune`) share one version and release in lockstep. So releases are recorded
+once, with per-crate subsections where a change is crate-specific.
 
 ## [Unreleased]
 
@@ -20,15 +20,13 @@ once with per-crate subsections where a change is crate-specific.
 #### Changed
 
 - The auto worker count for a bandwidth-bound gemv/gevv is now a ladder over the
-  touched bytes instead of one flat fraction of the core count. Its rungs are the
-  exact-fit thread-pool tiers the compute path already snaps to, so a gemv width
-  always has a pool sized to it, and it climbs one tier per `GEMMKIT_GEMV_TIER_STEP`
-  factor of bytes above the serial floor, stopping at the largest tier rather than
-  the full machine width. Measured on the Zen5 reference machine, a repeatedly
-  scanned 2-4 MiB matrix gains 30-50% and a DRAM-cold 2 MiB one 11%, with no
-  measured regression at any other size. `GEMMKIT_GEMV_THREAD_CAP` is unchanged: a
-  non-zero value still pins one flat width, now bypassing the ladder. gemv output
-  remains bit-identical across worker counts
+  touched bytes, not a flat fraction of the core count. Its rungs are the
+  exact-fit thread-pool tiers that the compute path already snaps to, so a gemv
+  width always has a pool sized to it. It climbs one tier per
+  `GEMMKIT_GEMV_TIER_STEP` factor of bytes above the serial floor, and stops at the
+  largest tier instead of the full machine width. `GEMMKIT_GEMV_THREAD_CAP` is
+  unchanged. A non-zero value still pins one flat width, now bypassing the ladder.
+  gemv output remains bit-identical across worker counts
 
 #### Added
 
@@ -39,66 +37,65 @@ once with per-crate subsections where a change is crate-specific.
 #### Fixed
 
 - A column-major gemv no longer splits its output rows across workers below that
-  floor. For a column-major matrix the output-row axis is the *inner*,
-  fastest-varying memory axis, so any row split gives every worker a strided walk
-  over the whole matrix while the serial route makes one sequential pass — which
-  meant parallelism was a net loss over the entire practical range. Measured on
-  the Zen5 reference machine (f32, best of 2/4/8 workers over serial, worst of 3
-  full sweeps): 0.62x at 32 rows, 0.66x at 512, 0.61x at 1024, 0.90x at 4096,
-  turning positive only at 16384 (1.14x) and reaching 1.40x at 1M. The floor
-  restores the serial route below the crossover and leaves everything above it
-  unchanged. Row-major gemv is untouched (it splits into `k`-contiguous rows and
-  measured 1.16-1.52x faster in parallel at every size), as is the `half` mixed
-  twin (1.94-2.78x faster split, from 256 rows up). No result bit moves either
-  way: the floor decides only whether the rows are split, and gemv output is
-  bit-identical across worker counts as before. The aarch64 default is 1024,
-  calibrated on an M4 Max (10P + 4E, no L3): the same regression appears there over
-  a much narrower band — 0.35-0.94x at 128-512 rows, 0.60-1.22x at 768, 0.86-1.68x
-  at 896 — and 1024 is the first row count that wins on every pass at every matrix
-  size from 8 MiB to 512 MiB (1.39x, 1.76x, 2.31x, 2.21x respectively). Note that on
-  that part the crossover tracks *bytes per column* (`rows * sizeof`, 4 KiB) rather
-  than the row count the knob is expressed in — an f64 sweep crosses at 512 rows and
-  matches the f32 table point for point at equal bytes per column — so the aarch64
-  default is the f32 calibration and an f64-dominated workload there wants 512
+  floor. For a column-major matrix, the output-row axis is the *inner*,
+  fastest-varying memory axis. So any row split gives every worker a strided walk
+  over the whole matrix, while the serial route makes one sequential pass. That
+  made parallelism a net loss over most of the practical range. The floor restores
+  the serial route below the crossover, and leaves everything above it unchanged.
+
+  Row-major gemv is untouched. It splits into `k`-contiguous rows, and stays faster
+  in parallel at every size. So does the `half` mixed twin. No result bit moves
+  either way. The floor decides only whether the rows are split, and gemv output
+  is bit-identical across worker counts, as before. The aarch64 default is 1024,
+  an order of magnitude below the x86 one, because the same regression covers a
+  much narrower band there. On that target the crossover also follows the bytes in
+  one column rather than the row count, so an `f64`-dominated workload there
+  wants 512
 - A gemv sweep with fewer output rows than one SIMD register no longer takes the
   axpy strategy. That strategy vectorizes over output rows, so below one register
-  its vector loops were unreachable and the whole reduction ran on the scalar
-  remainder. It only ever arose where both classifications fit at once — a
-  single-row matrix, whose row and column strides are both 1 — which is the pure
-  dot-product shape `m == n == 1`, and which is how the column-major libraries
-  (nalgebra, faer) naturally describe a row vector, so the adapters hit it by
-  default. Such a sweep now takes the dot strategy, which vectorizes over `k`.
-  Measured on the Zen5 reference machine: 5.7x at `k = 16M` and 13x at `k = 1M`
-  (10.3 GB/s to 59-134 GB/s), and the dot form's wider accumulator tree is also
-  the more accurate of the 2. The affected shapes change bits, since the summation
-  order changes; gemv output remains bit-identical across worker counts, and no
-  other shape changes route. The same fix applies to the `half` mixed-precision
-  twin
+  its vector loops were unreachable, and the whole reduction ran on the scalar
+  remainder instead.
+
+  This case only ever arose where both classifications fit at once: a single-row
+  matrix, whose row and column strides are both 1. That is the pure dot-product
+  shape `m == n == 1`. It is also how the column-major libraries (nalgebra, faer)
+  naturally describe a row vector, so the adapters hit it by default. Such a sweep
+  now takes the dot strategy instead, which vectorizes over `k`. The dot form's
+  wider accumulator tree is also the more accurate of the 2.
+
+  The affected shapes change bits, since the summation order changes. gemv output
+  remains bit-identical across worker counts, and no other shape changes route.
+  The same fix applies to the `half` mixed-precision twin
 
 ### gemmkit-ndarray, gemmkit-nalgebra, gemmkit-faer
 
 #### Added
 
-- Each adapter now re-exports every gemmkit item its own signatures name, so an
-  adapter user no longer needs a direct `gemmkit` dependency. New in this release:
-  the `GemmScalar`, `FusedScalar`, `MapScalar`, and `ComplexScalar` element-type
-  bounds, which appear in the adapters' own public signatures and previously could
-  not be named from outside — a caller could call `gemm` but not write a wrapper
-  generic over it; the feature-gated element types `f16` / `bf16` (`half`) and
-  `Complex` / `c32` / `c64` (`complex`), so `half` and `num-complex` also stay out
-  of the caller's manifest; and the `tuning` module. Reaching `tuning` through the
-  adapter is the correct route rather than merely the convenient one: the knobs are
-  process-global atomics, so a `set_*` call made through a separately resolved
-  second `gemmkit` writes a copy the adapter never reads, which fails silently as a
-  knob that appears set but has no effect
+- Each adapter now re-exports every gemmkit item that its own signatures name, so
+  an adapter user no longer needs a direct `gemmkit` dependency. New in this
+  release:
+  - the `GemmScalar`, `FusedScalar`, `MapScalar`, and `ComplexScalar` element-type
+    bounds, which appear in the adapters' own public signatures. A caller could
+    not name them from outside before this. So a caller could call `gemm`, but
+    could not write a wrapper generic over it
+  - the feature-gated element types `f16`/`bf16` (`half`) and `Complex`/`c32`/`c64`
+    (`complex`), so `half` and `num-complex` also stay out of the caller's
+    manifest
+  - the `tuning` module
+
+  Reaching `tuning` through the adapter is the correct route, not only the
+  convenient one. The knobs are process-global atomics. A `set_*` call made
+  through a separately resolved second `gemmkit` writes a copy that the adapter
+  never reads. That failure is silent: the knob appears set, but has no effect
 
 ### gemmkit-tune
 
 #### Changed
 
-- The `GEMMKIT_GEMV_THREAD_CAP` sweep gained a small cache-resident probe shape. Its
-  2 previous shapes both touched about 134 MiB, so the sweep could not observe the
-  size-dependent behavior it is meant to calibrate
+- The `GEMMKIT_GEMV_THREAD_CAP` sweep gained a small cache-resident probe shape.
+  Its 2 previous shapes both touched a working set too large to fit in cache. So
+  the sweep could not observe the size-dependent behavior it is meant to
+  calibrate
 
 ## [0.1.1] - 2026-07-24
 
@@ -106,21 +103,21 @@ once with per-crate subsections where a change is crate-specific.
 
 #### Changed
 
-- Recalibrated the bandwidth-bound (gemv/gevv) parallelism defaults on the Zen5
-  reference machine: the serial floor dropped from half the per-core L3 to the
-  per-core private L2, so a repeatedly scanned matrix in the L2-to-L3 band now
-  parallelizes instead of running single-threaded, and the auto worker cap rose
-  from a quarter to half the logical core count. Both stay auto-derived and
-  overridable with `GEMMKIT_GEMV_PARALLEL_BYTES` and `GEMMKIT_GEMV_THREAD_CAP`;
-  gemv output remains bit-identical across worker counts
+- Recalibrated the bandwidth-bound (gemv/gevv) parallelism defaults. The serial
+  floor dropped from half the per-core L3 to the per-core private L2. So a
+  repeatedly scanned matrix in the L2-to-L3 band now parallelizes, instead of
+  running single-threaded. The auto worker cap rose from a quarter to half the
+  logical core count. Both stay auto-derived, and overridable with
+  `GEMMKIT_GEMV_PARALLEL_BYTES` and `GEMMKIT_GEMV_THREAD_CAP`. gemv output
+  remains bit-identical across worker counts
 
 ### gemmkit-ndarray, gemmkit-nalgebra, gemmkit-faer
 
 #### Added
 
-- Re-export `Parallelism` and `Workspace` from each adapter, so callers no longer
-  need a direct `gemmkit` dependency to name the parallelism argument every entry
-  takes or the workspace the `*_with` variants reuse
+- Re-export `Parallelism` and `Workspace` from each adapter. Callers no longer
+  need a direct `gemmkit` dependency to name the parallelism argument that every
+  entry takes, or the workspace that the `*_with` variants reuse
 
 ## [0.1.0] - 2026-07-24
 
@@ -130,46 +127,50 @@ Initial release.
 
 #### Added
 
-- f32/f64 GEMM (`C <- alpha*A*B + beta*C`) over strided views, in 3 API tiers:
+- f32/f64 GEMM (`C <- alpha*A*B + beta*C`) over strided views. 3 API tiers:
   checked slice entries (`gemm`), explicit-workspace variants (`*_with`), and raw
-  pointer entries accepting negative strides (`*_unchecked`, `*_unchecked_with`)
-- Runtime ISA dispatch with a portable scalar fallback: x86-64 FMA and AVX-512F
-  (plus AVX-512 VNNI `vpdpbusd` for `int8` and AVX-512 BF16 `vdpbf16ps` for
-  `half`), aarch64 NEON, and wasm32 `simd128` (compile-time feature); the
-  `GEMMKIT_REQUIRE_ISA` env knob pins or forbids a kernel end to end
-- Element-type families behind cargo features: `half` (`f16`/`bf16` with f32
-  accumulation), `int8` (`i8 -> i32` with documented wrapping semantics), and
-  `complex` (`c32`/`c64` split-layout kernel with per-operand conjugation)
-- `epilogue` feature: fused bias + activation (`gemm_fused*`, batched and
-  prepacked variants), integer requantization to `i8`/`u8` with per-tensor or
-  per-row scales (`gemm_i8_requant*`), a user-supplied per-element closure
-  (`gemm_map*`), and bias-only complex fusion (`gemm_cplx_fused*`); fused
-  entries are bitwise-identical to the equivalent unfused call followed by a
-  map, except the `f16`/`bf16` ones, which apply the epilogue before the final
-  narrowing (one rounding, more precise; documented on the entries)
+  pointer entries that accept negative strides (`*_unchecked`, `*_unchecked_with`)
+- Runtime ISA dispatch with a portable scalar fallback. It covers x86-64 FMA and
+  AVX-512F, aarch64 NEON, and wasm32 `simd128` (a compile-time feature). AVX-512F
+  also adds AVX-512 VNNI `vpdpbusd` for `int8` and AVX-512 BF16 `vdpbf16ps` for
+  `half`. The `GEMMKIT_REQUIRE_ISA` env knob pins or forbids a kernel end to end
+- Element-type families behind cargo features:
+  - `half` (`f16`/`bf16` with f32 accumulation)
+  - `int8` (`i8 -> i32` with documented wrapping semantics)
+  - `complex` (`c32`/`c64` split-layout kernel with per-operand conjugation)
+- `epilogue` feature, adding:
+  - fused bias plus activation (`gemm_fused*`, batched and prepacked variants)
+  - integer requantization to `i8`/`u8` with per-tensor or per-row scales
+    (`gemm_i8_requant*`)
+  - a user-supplied per-element closure (`gemm_map*`)
+  - bias-only complex fusion (`gemm_cplx_fused*`)
+
+  Fused entries are bitwise-identical to the equivalent unfused call followed by
+  a map. The exception is the `f16`/`bf16` entries, which apply the epilogue
+  before the final narrowing step, for one rounding instead of two (documented
+  on the entries)
 - Prepacked operand reuse: `prepack_rhs`/`prepack_lhs` with
   `gemm_packed_b`/`gemm_packed_a` consumers for fixed-weight inner loops, plus
-  the `int8` twin `prepack_rhs_i8`/`gemm_i8_packed_b` (bit-identical to plain
-  `gemm_i8`; the layout is pinned to the selected integer kernel, so the VNNI
-  `vpdpbusd` path skips its otherwise-mandatory per-call RHS repack)
-- Deep-contraction reblocking for `f16`/`bf16`: at large `k` the narrow single
-  depth panel (`kc = k`) streams an L2-overflowing RHS micropanel from L3/DRAM,
-  so above an auto-derived engage gate (`GEMMKIT_DEEP_KC_BYTES`, default half the
-  detected L2) the dispatch runs an f32-output twin (`MixedGemmF32`/
-  `Bf16DotGemmF32`) that re-blocks `K` at the cache-model `kc` into an f32 scratch
-  and narrows once. Byte-for-byte the single panel for `beta in {0, 1}`, held to
-  tolerance otherwise; measured 2.8x-3.6x (`f16`) and up to +32% (`bf16`) at
-  `k = 32768`/`65536` on the Zen5 9950X, with shallow `k` unchanged
+  the `int8` twin `prepack_rhs_i8`/`gemm_i8_packed_b`. It is bit-identical to
+  plain `gemm_i8`. Its layout is pinned to the selected integer kernel, so the
+  VNNI `vpdpbusd` path skips its otherwise-mandatory per-call RHS repack
+- Deep-contraction reblocking for `f16`/`bf16`. At large `k`, the narrow single
+  depth panel (`kc = k`) streams an L2-overflowing RHS micropanel from L3 or
+  DRAM. Above an auto-derived engage gate (`GEMMKIT_DEEP_KC_BYTES`, default half
+  the detected L2), the dispatch instead runs an f32-output twin
+  (`MixedGemmF32`/`Bf16DotGemmF32`). That twin re-blocks `K` at the cache-model
+  `kc` into an f32 scratch, and narrows once. It is byte-for-byte the single
+  panel for `beta in {0, 1}`, and held to tolerance otherwise. Shallow `k` is
+  unchanged
 - Batched GEMM (`gemm_batched*`) with an internal per-batch parallel policy
 - Bandwidth-bound special paths (gemv/gevv, small-k, and the small-m,n
-  inner-product route) selected automatically behind the same entry points. The
-  small-m,n route also covers strided layouts (all-row-major, all-col-major):
-  above `GEMMKIT_SMALL_MN_PACK_MIN_K` it copies only the operand strided along
-  `k` into a padded `k`-contiguous scratch and runs the same horizontal dot,
-  bit-identical to the unit-stride layout and measured 1.4x-6.8x over the driver
-  fallback it replaces (Zen5 9950X, `4x4`-`16x16`)
-- `parallel` feature (rayon; default) with reproducible run-to-run results for a
-  fixed input/config, plus `wasm_threads` for `wasm32-wasip1-threads`
+  inner-product route), selected automatically behind the same entry points. The
+  small-m,n route also covers strided layouts (all-row-major, all-col-major).
+  Above `GEMMKIT_SMALL_MN_PACK_MIN_K`, it copies only the operand strided along
+  `k` into a padded, `k`-contiguous scratch, and runs the same horizontal dot.
+  That packed route is bit-identical to the unit-stride layout
+- `parallel` feature (rayon, default), with reproducible run-to-run results for a
+  fixed input and configuration, plus `wasm_threads` for `wasm32-wasip1-threads`
 - `no_std` operation with default features off (needs only `core` + `alloc`)
 - Cache-topology detection (x86 CPUID, Linux sysfs) feeding BLIS-style
   analytical blocking, `GEMMKIT_*` env tuning knobs, and reusable packing
@@ -180,13 +181,15 @@ Initial release.
 #### Added
 
 - Zero-copy adapters over each library's native matrix views (C-order, F-order,
-  general and reversed strides), mirroring the full core surface including the
-  `half`/`int8`/`complex` families and the `epilogue` fused entries; batched
-  GEMM is exposed in the shape each library's types allow: the ndarray adapter's
-  3-D strided `gemm_batched`/`dot_batched` (and the fused twin), and the
-  nalgebra/faer `gemm_batched` over a slice of per-element `(A, B)` inputs paired
-  with a slice of `&mut C` outputs (gemmkit's pointer-array batched engine, with
-  heterogeneous per-element shapes; neither library has a rank-3 type)
+  general and reversed strides). They mirror the full core surface, including
+  the `half`/`int8`/`complex` families and the `epilogue` fused entries.
+
+  Batched GEMM is exposed in the shape each library's types allow. The ndarray
+  adapter has a 3-D strided `gemm_batched`/`dot_batched` (and the fused twin).
+  The nalgebra and faer adapters instead take `gemm_batched` over a slice of
+  per-element `(A, B)` inputs, paired with a slice of `&mut C` outputs. That form
+  runs over gemmkit's pointer-array batched engine, with heterogeneous
+  per-element shapes, since neither library has a rank-3 type
 
 ### gemmkit-tune
 

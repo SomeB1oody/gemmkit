@@ -13,6 +13,8 @@ mod isa_dtypes;
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
+// Every dtype's select_* ladder panics under this pin on a native (non-wasm) target
+
 #[test]
 fn wasm_pin_sweeps_every_dtype_ladder() {
     // SAFETY: the only test in this binary, so no other thread reads the environment

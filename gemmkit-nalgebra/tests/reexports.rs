@@ -1,9 +1,7 @@
-//! Guard on the adapter's re-export surface. Nothing here may name a `gemmkit::` path: every
-//! gemmkit item is reached through `gemmkit_nalgebra`, exactly as a downstream crate that depends
-//! on this adapter alone would reach it. A gemmkit type that lands in a public signature without
-//! being re-exported therefore fails to compile in this binary. The other test binaries in this
-//! crate all import from `gemmkit::` directly and so cannot catch that, which is how the scalar
-//! bounds stayed unexported while every entry taking them was already covered by tests
+//! Guard on the adapter's re-export surface: nothing here may name a `gemmkit::` path, only
+//! `gemmkit_nalgebra`, matching what a downstream crate depending on this adapter alone would
+//! reach. A gemmkit type that lands in a public signature without being re-exported fails to
+//! compile here, a gap the other test binaries (which import `gemmkit::` directly) cannot catch
 
 use gemmkit_nalgebra::{
     GemmScalar, PackedRhs, Parallelism, Workspace, gemm, gemm_packed_b, gemm_with, prepack_rhs,
@@ -25,6 +23,8 @@ fn wrap_packed<T: GemmScalar>(a: &DMatrix<T>, b: &DMatrix<T>, c: &mut DMatrix<T>
     gemm_packed_b(T::ONE, a, &packed, T::ZERO, c, Parallelism::Serial);
 }
 
+// GemmScalar is generic enough to instantiate wrap_gemm at f32 and f64, and wrap_packed
+// (Workspace + PackedRhs) at f32, matching the expected products
 #[test]
 fn generic_over_the_real_bound() {
     let a = DMatrix::from_row_slice(2, 2, &[1.0_f32, 2.0, 3.0, 4.0]);
@@ -77,6 +77,8 @@ mod epilogue {
         gemm_map(T::ONE, a, b, T::ZERO, c, f, Parallelism::Serial);
     }
 
+    // FusedScalar (bias + relu) and MapScalar (a closure epilogue) are both reachable
+    // generically through wrap_fused/wrap_map, at f32
     #[test]
     fn generic_over_the_fused_bounds() {
         let a = DMatrix::from_row_slice(2, 2, &[1.0_f32, 2.0, 3.0, 4.0]);
@@ -102,6 +104,7 @@ mod complex {
         gemm_cplx(T::ONE, a, false, b, false, T::ZERO, c, Parallelism::Serial);
     }
 
+    // ComplexScalar is generic enough to instantiate wrap_cplx at both c32 and c64
     #[test]
     fn generic_over_the_complex_bound() {
         // (i) * (i) = -1 summed over 2 terms, at both precisions, so the aliases are named too
@@ -117,6 +120,7 @@ mod complex {
     }
 }
 
+// GemmScalar covers f16 and bf16 too, both reachable through wrap_gemm
 #[cfg(feature = "half")]
 #[test]
 fn generic_over_the_narrow_element_types() {
@@ -133,6 +137,8 @@ fn generic_over_the_narrow_element_types() {
     assert_eq!(c[(0, 0)], bf16::from_f32(4.0));
 }
 
+// tuning re-exports (parallel_threshold, PARALLEL_THRESHOLD_DEFAULT, knob_env_names) are
+// reachable and return sane values
 #[test]
 fn the_knob_surface_is_reachable() {
     // Read-only: the knobs are process-global atomics, so the setters stay in the binaries that

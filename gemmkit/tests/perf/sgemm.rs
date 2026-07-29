@@ -173,6 +173,8 @@ fn bench_native_equal_isa(s: usize) {
     );
 }
 
+/// f32 square GEMM, gemmkit's auto-selected ISA vs the `gemm` crate and `matrixmultiply`,
+/// serial and parallel, plus an equal-ISA variant that pins both sides to the same token
 #[cfg(not(target_family = "wasm"))]
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
@@ -230,6 +232,8 @@ fn bench_call_latency(m: usize, k: usize, n: usize, par: Parallelism) {
     );
 }
 
+/// Per-call GFLOP/s and derived microseconds/call at and just above the parallel work
+/// gate, serial and parallel
 #[cfg(not(target_family = "wasm"))]
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
@@ -467,6 +471,8 @@ fn bench_scaling(s: usize) {
     );
 }
 
+/// gemmkit's parallel thread-scaling (plus `gemm`'s, for reference) at a fixed size across
+/// a thread-count ladder, to locate where scaling stalls
 #[cfg(not(target_family = "wasm"))]
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]

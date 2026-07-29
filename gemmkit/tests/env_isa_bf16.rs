@@ -1,9 +1,10 @@
 //! `GEMMKIT_REQUIRE_ISA=avx512bf16` pin: forces the `vdpbf16ps` dot kernel `Bf16DotGemm`, so its
 //! multi-slice deep-k twin `Bf16DotGemmF32` gets exercised (`kc` rounded up to `DEPTH_MULTIPLE =
-//! 2` there, so a k-pair never straddles a slice boundary). Pins through [`env_isa_common::pin`]
-//! (a single `set_var` under a `Once`, before any dispatch; the shared write also overrides an
-//! inherited pin). The multi-slice route must be byte-for-byte the single depth panel for
-//! `beta in {0, 1}`. Skips when the host lacks `avx512bf16`
+//! 2` there, so a k-pair never straddles a slice boundary). A separate test binary from the
+//! other `env_isa_*` pins, since a memoized ISA choice needs its own process to force. Pins
+//! through [`env_isa_common::pin`] (a single `set_var` under a `Once`, before any dispatch; the
+//! shared write also overrides an inherited pin). The multi-slice route must be byte-for-byte
+//! the single depth panel for `beta in {0, 1}`. Skips when the host lacks `avx512bf16`
 #![cfg(all(
     feature = "half",
     feature = "std",
@@ -27,6 +28,9 @@ fn fill(n: usize, seed: u64) -> Vec<bf16> {
         })
         .collect()
 }
+
+// bf16 dot deep-k route matches the single depth panel for beta in {0, 1}, checked at k on
+// and 1 past a slice boundary, serial and parallel
 
 #[test]
 fn deep_k_bf16_dot_under_avx512bf16_pin() {

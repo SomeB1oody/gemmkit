@@ -1,7 +1,7 @@
-//! Shared dims/strides extraction for the entry modules. The bias/requant validation the
-//! epilogue-gated entries need lives once in gemmkit's `adapter` module (a raw-pointer-level
-//! surface shared with gemmkit's own checked entries), which those modules import and reuse
-//! rather than keeping a local copy
+//! Shared dims/strides extraction for the entry modules. The epilogue-gated entries need
+//! bias/requant validation. That validation lives once in gemmkit's `adapter` module, a
+//! raw-pointer-level surface shared with gemmkit's own checked entries. Each entry module
+//! imports and reuses it instead of keeping a local copy
 use super::*;
 
 #[inline]

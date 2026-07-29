@@ -71,8 +71,8 @@ fn gemm_common<T, S1, S2, SC>(
     let (rsc, csc) = (cs[0], cs[1]);
     let cp = c.as_mut_ptr();
 
-    // SAFETY: dims validated above; ndarray guarantees the pointer/strides are in-bounds, and
-    // `c` (a `&mut` borrow) cannot alias `a`/`b`
+    // SAFETY: dims are validated above. ndarray guarantees the pointer and strides are
+    // in-bounds. `c` (a `&mut` borrow) cannot alias `a` or `b`
     unsafe {
         match ws {
             Some(ws) => gemm_unchecked_with(

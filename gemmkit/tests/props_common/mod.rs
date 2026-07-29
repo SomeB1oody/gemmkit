@@ -1,19 +1,16 @@
 //! Shared proptest strategies, oracle references, and accuracy gates for the
 //! property-based test suite (props_api, props_packed, props_knobs)
 //!
-//! Pulled in via `mod props_common;` from each `tests/props_*.rs` crate root, all of which
-//! are gated `cfg(all(not(miri), not(target_family = "wasm")))`; this module is therefore
-//! never compiled under Miri or wasm, and is never itself a test target (cargo only builds
-//! top-level `tests/*.rs` and `tests/*/main.rs`). Each including binary uses a different
-//! subset of the helpers here, so `#![allow(dead_code)]` applies, same as every other
-//! `tests/*_common` module
+//! Included via `mod props_common;` from each `tests/props_*.rs` crate root, all gated
+//! `cfg(all(not(miri), not(target_family = "wasm")))`; cargo only builds top-level `tests/*.rs`
+//! and `tests/*/main.rs`, so this module is never a test target of its own, and each including
+//! binary uses only a subset of the helpers here, hence `#![allow(dead_code)]`
 //!
-//! The numeric oracle core (the `Elem`/`CElem` traits, `rand_vec`, `Mat`, the f64
-//! `reference`, the complex `ref_cplx`, and the `8*k*eps`/`16*k*eps` accuracy gates) lives
-//! once in `tests/oracle_common/mod.rs` and is re-exported below. What this module adds on
-//! top is the proptest strategies (dimension, layout, coefficient, parallelism) and the
-//! helpers only the property suite needs: the full-range i8 fill, the wrapping-i32 i8
-//! reference, `frob_norm`, and the bit-identity checks
+//! Re-exports the numeric oracle core from `tests/oracle_common/mod.rs` (`Elem`/`CElem`,
+//! `rand_vec`, `Mat`, `reference`, `ref_cplx`, the accuracy gates) and adds the proptest
+//! strategies (dimension, layout, coefficient, parallelism) plus the property-suite-only
+//! helpers: the full-range i8 fill, the wrapping-i32 i8 reference, `frob_norm`, and the
+//! bit-identity checks
 #![allow(dead_code)]
 
 use gemmkit::Parallelism;
@@ -29,14 +26,8 @@ pub use oracle_common::*;
 /// already resolves that variable into its own `cases` field, but every property block here
 /// overwrites that field explicitly with `cases(N)`, which discards whatever
 /// `..ProptestConfig::default()` would have produced; this re-reads the override directly so
-/// that precedence is not lost
-///
-/// # Parameters
-/// - `default` - tuned case count to use absent any override
-///
-/// # Returns
-/// `u32` - `PROPTEST_CASES` if set and parseable (the Intel SDE CI jobs pin it to 16); else,
-///   under `GEMMKIT_FAST_TEST`, `max(default/8, 8)`; else `default`
+/// that precedence is not lost. Returns `PROPTEST_CASES` if set and parseable (the Intel SDE
+/// CI jobs pin it to 16); else `max(default/8, 8)` under `GEMMKIT_FAST_TEST`; else `default`
 pub fn cases(default: u32) -> u32 {
     if let Some(n) = std::env::var("PROPTEST_CASES")
         .ok()
@@ -82,18 +73,9 @@ fn strides_for(rows: usize, cols: usize, l: PLayout) -> (usize, usize) {
 }
 
 /// Materialize a row-major logical `rows x cols` matrix (`vals`) into a strided buffer laid
-/// out as `l`. Generic over `Copy` rather than [`Elem`], so it also serves the i8 element
-/// path ([`fill_i8`]/[`ref_i8_wrapping`]), not just the float `Elem` types
-///
-/// # Parameters
-/// - `vals` - source values in row-major order, length `rows*cols`
-/// - `rows` - logical row count
-/// - `cols` - logical column count
-/// - `zero` - fill value for the padding gaps `l` leaves unwritten
-/// - `l` - target stride layout
-///
-/// # Returns
-/// `(Vec<T>, isize, isize)` - the strided buffer, its row stride, and its column stride
+/// out as `l`, using `zero` to fill the padding gaps `l` leaves unwritten. Generic over `Copy`
+/// rather than [`Elem`], so it also serves the i8 element path ([`fill_i8`]/[`ref_i8_wrapping`]),
+/// not just the float `Elem` types. Returns the strided buffer plus its row and column strides
 pub fn build_view_rowmajor<T: Copy>(
     vals: &[T],
     rows: usize,

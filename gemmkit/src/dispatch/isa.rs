@@ -1,11 +1,11 @@
-//! Parses the `GEMMKIT_REQUIRE_ISA` pin and provides the memoized ISA-selection
-//! plumbing (`x86_isa_detected!`, `memoized_select!`) every dispatch family's
-//! `select_*` ladder is built from
+//! Parses the `GEMMKIT_REQUIRE_ISA` pin and provides the memoized ISA-selection plumbing. Every
+//! dispatch family's `select_*` ladder builds from `x86_isa_detected!` and `memoized_select!`
 
-/// x86 feature probe shared by every `select_*` ladder: a real runtime CPUID query via
-/// `is_x86_feature_detected!` under `std`, or a compile-time `cfg!(target_feature = ...)`
-/// without it, since `is_x86_feature_detected!` itself needs `std`. A `no_std` build
-/// therefore only ever sees whatever target-features it was compiled with
+/// x86 feature probe shared by every `select_*` ladder. Under `std`, it runs a real runtime
+/// CPUID query through `is_x86_feature_detected!`. Without `std`, it falls back to a
+/// compile-time `cfg!(target_feature = ...)` check, because `is_x86_feature_detected!` itself
+/// needs `std`. A `no_std` build therefore only ever sees whatever target-features it was
+/// compiled with
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
 macro_rules! x86_isa_detected {
     ($feat:tt) => {
@@ -21,11 +21,11 @@ macro_rules! x86_isa_detected {
 
 /// An explicitly requested kernel, parsed from `GEMMKIT_REQUIRE_ISA`
 ///
-/// Only the `std` build of [`forced_isa`] ever constructs a non-`Auto` variant (it parses
-/// the env var); the `no_std` build always returns `Auto`. Every `select_*` ladder still
-/// matches on the full enum regardless of `std`, so every variant has to stay in the type;
-/// the `dead_code` allowance below silences the resulting unused-variant warning on a
-/// `no_std` build rather than `#[cfg]`-ing the variants out
+/// Only the `std` build of [`forced_isa`] ever constructs a non-`Auto` variant, because it
+/// parses the env var. The `no_std` build always returns `Auto`. Every `select_*` ladder still
+/// matches on the full enum regardless of `std`, so every variant has to stay in the type. The
+/// `dead_code` allowance below silences the resulting unused-variant warning on a `no_std` build,
+/// instead of `#[cfg]`-ing the variants out
 #[cfg_attr(not(feature = "std"), allow(dead_code))]
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub(super) enum ForcedIsa {
@@ -43,18 +43,17 @@ pub(super) enum ForcedIsa {
     Avx512Bf16,
     /// NEON, the baseline (and only) SIMD ISA on aarch64
     Neon,
-    /// WebAssembly `simd128`. Unlike `Neon` this is not automatically part of a wasm32
-    /// build: it needs the compile-time `-C target-feature=+simd128` flag, easy to forget,
-    /// so pinning it makes the build **assert** the SIMD path is live (panic if the flag
-    /// is absent) instead of silently falling back to scalar
+    /// WebAssembly `simd128`. Unlike `Neon`, this is not automatically part of a wasm32 build.
+    /// It needs the compile-time `-C target-feature=+simd128` flag, which is easy to forget.
+    /// Pinning it makes the build assert the SIMD path is live, and panic if the flag is
+    /// absent, instead of silently falling back to scalar
     Simd128,
 }
 
 /// Parse `GEMMKIT_REQUIRE_ISA` into a [`ForcedIsa`]. Unset or empty maps to
-/// [`ForcedIsa::Auto`]; an unrecognized value panics rather than silently falling back
-/// to auto-selection (so a typo in CI config fails loudly). Each dispatch type calls
-/// this at most once, since the result it feeds into `select_*` is memoized in that
-/// type's `OnceLock`
+/// [`ForcedIsa::Auto`]. An unrecognized value panics rather than silently falling back to
+/// auto-selection, so a typo in a CI config fails loudly. Each dispatch type calls this at
+/// most once, because the result it feeds into `select_*` is memoized in that type's `OnceLock`
 #[cfg(feature = "std")]
 pub(super) fn forced_isa() -> ForcedIsa {
     match std::env::var("GEMMKIT_REQUIRE_ISA") {
@@ -91,12 +90,14 @@ pub(super) fn forced_isa() -> ForcedIsa {
     ForcedIsa::Auto
 }
 
-/// Emits the memoized dispatch accessor for one element type: a `#[cfg(std)]`
-/// `OnceLock<$ty>` plus a `fn $accessor() -> $ty` that runs `$select` once via
-/// `get_or_init` under `std`, or on every call without `std` (there is no `OnceLock` to
-/// cache into). The 6-arg form adds a trailing `$feat` literal that additionally gates the
-/// accessor and its static on that crate feature (the static always still needs `std` too).
-/// Every dispatch family's `dispatched_*` slot is built through one of these 2 arms
+/// Emits the memoized dispatch accessor for one element type: a `#[cfg(feature = "std")]`
+/// `OnceLock<$ty>`, plus a `fn $accessor() -> $ty`. Under `std`, the accessor runs `$select`
+/// once via `get_or_init`. Without `std`, it runs `$select` on every call, because there is no
+/// `OnceLock` to cache into
+///
+/// The 6-arg form adds a trailing `$feat` literal that also gates the accessor and its static
+/// on that crate feature. The static still always needs `std` too. Every dispatch family's
+/// `dispatched_*` slot builds through one of these 2 arms
 macro_rules! memoized_select {
     ($static:ident, $accessor:ident, $ty:ty, $select:ident, $doc:literal) => {
         #[cfg(feature = "std")]

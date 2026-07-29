@@ -1,6 +1,9 @@
-//! `f16`/`bf16` mixed-precision dispatch, accumulating in `f32`: the narrow-output
-//! degenerate scale, the deep-contraction f32-twin route, driver entries, per-ISA
-//! wrappers, memoized descriptors, selection, and the `GemmScalar`/`FusedScalar` impls
+//! Mixed-precision dispatch for `f16` and `bf16`, accumulating in `f32`
+//!
+//! This module holds the narrow-output scale routine and the deep-contraction f32-twin
+//! route. It also holds the driver entry points, the per-ISA wrappers, the memoized
+//! descriptors, ISA selection, and the `GemmScalar` and `FusedScalar` implementations
+//! for both types
 
 #[cfg(feature = "std")]
 use std::sync::OnceLock;
@@ -40,9 +43,11 @@ use crate::tuning;
 use crate::workspace::Workspace;
 use half::{bf16, f16};
 
-/// `C <- beta*C` for a **narrow** type (`f16`/`bf16`): widen each element to `f32`, scale,
-/// and narrow back once. `beta == 0` overwrites with zero rather than multiplying, matching
-/// the mixed kernel's own epilogue precision
+/// `C <- beta*C` for a narrow type (`f16` or `bf16`)
+///
+/// The function widens each element to `f32`, scales it, and narrows it back once. When
+/// `beta` is zero, it writes zero instead of multiplying, matching the mixed kernel's own
+/// epilogue precision
 #[cfg(feature = "half")]
 unsafe fn scale_c_narrow<N: NarrowFloat>(
     beta: N,
@@ -67,15 +72,17 @@ unsafe fn scale_c_narrow<N: NarrowFloat>(
     }
 }
 
-/// Maps a narrow-output family to its f32-output **deep-k twin** (`Out = f32 = Acc`, so
-/// `OUT_IS_ACC` stays at its `true` default): the family [`run_deep_k_twin`] drives for a
-/// large-`k` narrow GEMM, since it lets the driver multi-slice K instead of running one
-/// L2-overflowing depth panel. Keyed off the family (not the ISA), so [`run_typed_mixed`] picks
-/// the right twin from the same `Fam` its wrappers already pass: `MixedGemm<N> -> MixedGemmF32<N>`,
-/// `Bf16DotGemm -> Bf16DotGemmF32`
+/// Maps a narrow-output family to its f32-output deep-k twin (`Out = f32 = Acc`, so
+/// `OUT_IS_ACC` keeps its `true` default)
+///
+/// [`run_deep_k_twin`] drives the twin family for a large-`k` narrow GEMM. This lets the
+/// driver multi-slice `k` instead of running one depth panel that overflows L2. The twin is
+/// keyed off the family, not the ISA, so [`run_typed_mixed`] can pick it from the same `Fam`
+/// its wrappers already pass. `MixedGemm<N>` maps to `MixedGemmF32<N>`, and `Bf16DotGemm`
+/// maps to `Bf16DotGemmF32`
 #[cfg(feature = "half")]
 trait DeepKTwin: KernelFamily {
-    /// The f32-output twin family: same `Lhs`/`Rhs`/`Acc`, `Out = f32`
+    /// The f32-output twin family: same `Lhs`, `Rhs`, and `Acc`, with `Out = f32`
     type Twin: KernelFamily<Lhs = Self::Lhs, Rhs = Self::Rhs, Acc = Self::Acc, Out = f32>;
 }
 #[cfg(feature = "half")]
@@ -87,31 +94,38 @@ impl DeepKTwin for Bf16DotGemm {
     type Twin = Bf16DotGemmF32;
 }
 
-/// Deep-contraction route: re-block a large-`k` narrow GEMM through its f32-output twin `Tw`, then
-/// narrow once. The single-panel narrow family (`OUT_IS_ACC = false`, `kc = k`) rounds the output
-/// only once, but at large `k` its RHS micropanel outgrows L2 and every microtile call streams it
-/// from L3/DRAM. The twin instead blocks `K` at the cache-model `kc` (panels stay L2-resident),
-/// accumulating into an `m x n` **f32 scratch** with `alpha = 1`, `beta = 0`; a single vectorized
-/// sweep then applies the real `alpha`/`beta` and narrows to `N`
+/// Deep-contraction route: reblock a large-`k` narrow GEMM through its f32-output twin `Tw`,
+/// then narrow once
 ///
-/// **Bit-identical to the single panel** for the common `beta in {0, 1}`: the twin seeds each
-/// slice's accumulators from the f32 scratch (see `kernel::mixed::twin_seed`), so every output's
-/// ascending-`k` FMA/dot chain is the single-panel one merely split at slice boundaries (an f32
-/// store/reload is exact); the dot twin's `kc` is rounded to `DEPTH_MULTIPLE` so a pair never
-/// straddles a boundary. The narrowing sweep replicates `mixed_epilogue`'s arithmetic (fold
-/// `alpha` with `mul`, combine `beta` with `add`, narrow with the same `store_out`), so the result
-/// matches the single-panel path byte-for-byte when `beta in {0, 1}`; a general `beta` is accurate
-/// only to tolerance (the single panel fuses `beta*C + AB` on a full tile but not on an edge tile,
-/// so no one sweep formula matches both cases). Serial and parallel stay bit-identical throughout
-/// (the twin driver's blocking is thread-count independent, and the sweep is elementwise)
+/// The single-panel narrow family rounds the output once (`OUT_IS_ACC = false`, `kc = k`). At
+/// large `k` its RHS micropanel outgrows L2, so every microtile call streams it from L3 or
+/// DRAM. The twin instead blocks `k` at the cache-model `kc`, so panels stay L2-resident. It
+/// accumulates into an `m x n` f32 scratch buffer with `alpha = 1` and `beta = 0`. A single
+/// vectorized sweep then applies the real `alpha` and `beta` and narrows the result to `N`
 ///
-/// The f32 scratch comes from a **dedicated `Workspace`**: deep-k is a large-`k` regime, so the
-/// single `m*n` f32 allocation is negligible next to the contraction, and this keeps the hot
-/// packing buffer (`ws`, threaded into the twin driver) pooled and reused rather than displaced.
-/// `Workspace::regions` carries the same fail-closed overflow guard as the driver's own sizing
+/// The twin matches the single panel bit-for-bit when `beta` is `0` or `1`. It seeds each
+/// slice's accumulators from the f32 scratch (see `kernel::mixed::twin_seed`). This makes the
+/// ascending-`k` FMA or dot chain for each output the same chain the single panel runs, merely
+/// split at slice boundaries. An f32 store and reload is exact, and the dot twin rounds `kc` to
+/// `DEPTH_MULTIPLE` so a pair never straddles a boundary
+///
+/// The narrowing sweep replicates `mixed_epilogue`'s arithmetic: it folds `alpha` with `mul`,
+/// combines `beta` with `add`, and narrows with the same `store_out`. This makes the result
+/// match the single-panel path byte-for-byte when `beta` is `0` or `1`. A general `beta` is
+/// accurate only to tolerance. The single panel fuses `beta*C + AB` on a full tile but not on
+/// an edge tile, so no single sweep formula matches both cases
+///
+/// Serial and parallel runs stay bit-identical throughout. The twin driver's blocking does not
+/// depend on thread count, and the sweep applies elementwise
+///
+/// The f32 scratch comes from a dedicated `Workspace`, not the caller's pooled `ws`. Deep-k is
+/// a large-`k` regime, so the single `m*n` f32 allocation is negligible next to the
+/// contraction. This keeps the hot packing buffer (`ws`, threaded into the twin driver) pooled
+/// and reused instead of displaced. `Workspace::regions` carries the same fail-closed overflow
+/// guard as the driver's own sizing
 ///
 /// # Safety
-/// As [`run_typed_mixed`]; `t` is already orientation-normalized (`c` column-major-ish)
+/// As [`run_typed_mixed`]. `t` is already orientation-normalized (`c` is column-major-ish)
 #[cfg(feature = "half")]
 #[inline]
 unsafe fn run_deep_k_twin<N, Tw, S, const MR_REG: usize, const NR: usize>(
@@ -126,23 +140,20 @@ unsafe fn run_deep_k_twin<N, Tw, S, const MR_REG: usize, const NR: usize>(
 {
     unsafe {
         let (m, n, k) = (t.m, t.n, t.k);
-        // f32 scratch, contiguous column-major m x n (rsc = 1, csc = m). A dedicated Workspace
-        // keeps the pooled `ws` free for the twin driver's own packing; `regions` fail-closes on
-        // the element -> byte overflow the same way the driver's own sizing does
+        // f32 scratch, contiguous column-major m x n (rsc = 1, csc = m). A dedicated
+        // Workspace keeps the pooled ws free for the twin driver's own packing
         let mut scratch_ws = Workspace::new();
         let scratch = scratch_ws.regions::<f32>(m.saturating_mul(n), 1, 0).a_base;
-        // Pure sum(A*B) into the scratch (alpha = 1, beta = 0). Out = f32 = Acc, so the driver
-        // multi-slices at the cache-model kc; the twin seeds each slice from the scratch, so the
-        // accumulation is the single panel's sum split at slice boundaries. The first (beta = 0)
-        // slice writes every scratch element before any later slice reads it (the pc-loop
-        // fork-joins per slice), so the scratch is never read uninitialized
+        // Sum(A*B) into the scratch (alpha = 1, beta = 0). The first slice writes every
+        // scratch element before any later slice reads it. This holds because the pc-loop
+        // fork-joins per slice, so the scratch is never read uninitialized
         driver::run::<Tw, S, MR_REG, NR>(
             simd, m, k, n, 1.0f32, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb, 0.0f32, scratch, 1,
             m as isize, par, ws,
         );
 
-        // Narrowing sweep: c = narrow(alpha*scratch + beta*widen(c_old)), replicating
-        // mixed_epilogue op-for-op so beta in {0, 1} reproduces the single panel bitwise
+        // Narrowing sweep: c = narrow(alpha*scratch + beta*widen(c_old)), matching
+        // mixed_epilogue op for op so beta in {0, 1} reproduces the single panel bitwise
         let alpha = t.alpha.widen();
         let beta = t.beta.widen();
         let ash = alpha_status(alpha);
@@ -209,30 +220,39 @@ unsafe fn run_deep_k_twin<N, Tw, S, const MR_REG: usize, const NR: usize>(
     }
 }
 
-/// The single route-priority ladder for the mixed-precision families (narrow-in / `f32`-accumulate):
-/// route one concrete `(narrow type, family, ISA, tile)` GEMM through gemv, the small-`m,n`
-/// horizontal kernel, the small-`k` panel kernel, the deep-`k` f32-twin reblocking, or the general
-/// driver, with the fused [`Epilogue`] `E` threaded into every route and `alpha`/`beta` **widened to
-/// the `f32` accumulator** before the driver call. [`run_typed_mixed`] and [`run_typed_mixed_fused`]
-/// are thin epilogue-choice wrappers over this one body, mirroring the `Identity`-wrapper pattern the
-/// special layer and driver already use. `Fam` selects the general-driver kernel (`MixedGemm<N>` for
-/// the widen path, `Bf16DotGemm` for the `vdpbf16ps` dot path), while the `small_mn` / small-`k`
-/// reroutes deliberately stay on the widen path (`MixedGemm<N>`'s `KernelSimd` seam): both bypass any
-/// dot kernel, since a tiny output folds nothing and the dot pack's `DEPTH_MULTIPLE` would be pure
-/// loss there
+/// The single route-priority ladder for the mixed-precision families (narrow input, `f32`
+/// accumulate)
 ///
-/// 2 routes fire **only on the plain (`E::IS_IDENTITY`) path** and const-fold away for a real
-/// epilogue - the gemv reroute and the deep-`k` twin - each with its own rationale at its branch. The
-/// remaining routes take the epilogue: a fused mixed call applies `E` to the `f32` accumulator
-/// **before** the single round-to-nearest-even narrowing to `N`, which is *more* precise than
-/// `gemm()` then a separate narrow map (that would round to `N`, widen back, and round again), so a
-/// fused mixed result is *not* bitwise-equal to `gemm`-then-map, unlike the `f32`/`f64` every-shape
-/// contract. Reproducibility and determinism are unaffected (serial still equals parallel bitwise on
-/// these routes). The orientation swap flips the bias axis through `on_orient_swap` (a no-op for
-/// `Identity`)
+/// This routes one concrete `(narrow type, family, ISA, tile)` GEMM through gemv, the
+/// small-`m,n` horizontal kernel, or the small-`k` panel kernel. Otherwise it uses the
+/// deep-`k` f32-twin reblocking, or falls through to the general driver. The fused
+/// [`Epilogue`] `E` threads into every route, and `alpha` and `beta` widen to the `f32`
+/// accumulator before the driver call. [`run_typed_mixed`] and [`run_typed_mixed_fused`] are
+/// thin epilogue-choice wrappers over this body, mirroring the `Identity`-wrapper pattern the
+/// special layer and driver already use
+///
+/// `Fam` selects the general-driver kernel: `MixedGemm<N>` for the widen path, `Bf16DotGemm`
+/// for the `vdpbf16ps` dot path. The `small_mn` and small-`k` reroutes deliberately stay on
+/// the widen path, through `MixedGemm<N>`'s `KernelSimd` seam. Both bypass the dot kernel,
+/// because a tiny output folds nothing and the dot pack's `DEPTH_MULTIPLE` would be pure loss
+/// there
+///
+/// 2 routes fire only on the plain path, where `E::IS_IDENTITY` is true: the gemv reroute and
+/// the deep-`k` twin. Both const-fold away for a real epilogue, and each has its own rationale
+/// at its branch
+///
+/// The remaining routes take the epilogue. A fused mixed call applies `E` to the `f32`
+/// accumulator before the single round-to-nearest-even narrowing to `N`. This is more precise
+/// than calling `gemm` and then a separate narrow map, which rounds to `N`, widens back, and
+/// rounds again. A fused mixed result is therefore not bitwise equal to `gemm`-then-map,
+/// unlike the `f32`/`f64` every-shape contract. Reproducibility and determinism are
+/// unaffected, since serial still equals parallel bitwise on these routes
+///
+/// The orientation swap flips the bias axis through `on_orient_swap`, a no-op for `Identity`
 ///
 /// # Safety
-/// As `run_typed`, plus `epi`'s interior pointers valid for the (pre-swap) problem's `m`/`n`
+/// As `run_typed`, plus `epi`'s interior pointers must be valid for the (pre-swap) problem's
+/// `m`/`n`
 #[cfg(feature = "half")]
 #[inline]
 unsafe fn run_typed_mixed_epi<N, Fam, S, const MR_REG: usize, const NR: usize, E>(
@@ -248,25 +268,19 @@ unsafe fn run_typed_mixed_epi<N, Fam, S, const MR_REG: usize, const NR: usize, E
     E: Epilogue<Fam> + Epilogue<MixedGemm<N>>,
 {
     unsafe {
-        // gemv shape (unless the dedicated path is disabled via tuning): the widen matrix*vector, in
-        // the user frame before orientation normalization (mirrors run_typed's float gate),
-        // alpha/beta widened to the f32 accumulator. An m == 1 / n == 1 shape is a bandwidth-bound
-        // matrix*vector the general driver would pad up to a full microtile (mostly zero FMAs);
-        // gemv::run_mixed reads N in place, widens each load to f32, accumulates in f32, and rounds
-        // to N once at the store
+        // gemv shape, in the user frame before orientation normalization (mirrors run_typed's
+        // float gate). gemv::run_mixed reads N in place, widens each load to f32, accumulates
+        // in f32, and rounds to N once at the store. This avoids a padded zero-FMA microtile
+        // on the general driver
         //
-        // Plain (Identity) path only: mixed fused gemv stays on the general driver deliberately. The
-        // float fused gemv fuses by re-reading each stored output and mapping it, bit-exact only
-        // because the float output IS the accumulator (OUT_IS_ACC = true); for a narrow output the
-        // store has already rounded, so re-reading and mapping would double-round. Applying the
-        // epilogue to the f32 accumulator before the single narrowing (the mixed discipline) would
-        // instead mean threading it through each widen gemv strategy kernel's f32 -> N store, a large
-        // diff for the rare fused-decode shape. The general driver already applies the epilogue in
-        // f32 before narrowing, so a fused mixed gemv rides it correctly, just without the bandwidth
-        // win
-        // E is Epilogue for 2 families here (Fam and MixedGemm<N>), so IS_IDENTITY needs a
-        // fully-qualified path; both impls agree (Identity sets it on the blanket, FusedEpi never
-        // does), so either family answers the same
+        // Plain (Identity) path only: a fused gemv stays on the general driver. The float
+        // fused gemv re-reads and maps each stored output, exact only because Out == Acc
+        // there. A narrow output has already rounded at the store, so re-reading and mapping
+        // would double-round. The general driver instead applies the epilogue in f32 before
+        // narrowing, correctly but without the gemv bandwidth win
+        //
+        // E is Epilogue for 2 families here, so IS_IDENTITY needs a fully qualified path
+        // Both impls agree, since Identity sets it on the blanket and FusedEpi never does
         if <E as Epilogue<Fam>>::IS_IDENTITY
             && (t.n == 1 || t.m == 1)
             && core::cmp::min(t.m, t.n) <= tuning::gemv_threshold()
@@ -291,21 +305,18 @@ unsafe fn run_typed_mixed_epi<N, Fam, S, const MR_REG: usize, const NR: usize, E
             );
             return;
         }
-        // Orientation normalization transposes the engine frame for the routes below (they all
-        // consume the oriented epi): a row-major-ish C computes C^T = B^T*A^T (swapping m<->n), so
-        // on_orient_swap flips a FusedEpi bias axis, same as the float run_typed_epi (a no-op for
-        // Identity)
+        // Orientation normalization transposes the frame for the routes below: a row-major-ish
+        // C computes C^T = B^T*A^T, swapping m and n. on_orient_swap flips a FusedEpi bias
+        // axis to match, same as the float run_typed_epi, and is a no-op for Identity
         if orient_transpose(&mut t) {
-            // Fully qualified for the same reason as IS_IDENTITY above: E is Epilogue for 2
-            // families, and both impls' on_orient_swap agree (FusedEpi flips the bias axis either
-            // way, Identity is the no-op default)
+            // Fully qualified for the same reason as IS_IDENTITY above. Both impls agree:
+            // FusedEpi flips the bias axis either way, and Identity stays a no-op
             <E as Epilogue<Fam>>::on_orient_swap(&mut epi);
         }
-        // Small m,n + long k: the horizontal path, widening N -> f32 on load and applying the
-        // epilogue to each f32 cell before the single narrowing (mirrors run_typed's float gate;
-        // deliberately MixedGemm<N> even on the dot path). A contiguous-along-k layout reads in
-        // place; a strided operand is packed into k-contiguous scratch first, as narrow N, widened
-        // on load
+        // Small m,n with long k: the horizontal path widens N to f32 on load. It applies the
+        // epilogue to each f32 cell before the single narrowing, deliberately through
+        // MixedGemm<N> even on the dot path. A contiguous-along-k layout reads in place. A
+        // strided operand packs into k-contiguous scratch first, as narrow N, widened on load
         if small_mn_eligible(&t) || small_mn_pack_eligible(&t) {
             small_mn::run_mixed_epi::<N, S, E>(
                 simd,
@@ -329,9 +340,9 @@ unsafe fn run_typed_mixed_epi<N, Fam, S, const MR_REG: usize, const NR: usize, E
             );
             return;
         }
-        // Skinny / low-depth shape through the widen microkernel (deliberately MixedGemm<N> even on
-        // the dot path, mirroring the small_mn reroute rationale), the epilogue applied to each f32
-        // cell before the single narrowing
+        // Skinny or low-depth shape through the widen microkernel, deliberately MixedGemm<N>
+        // even on the dot path. The epilogue applies to each f32 cell before the single
+        // narrowing
         if t.k <= tuning::small_k_threshold() {
             small_k::run_epi::<MixedGemm<N>, S, E, MR_REG, NR>(
                 simd,
@@ -355,18 +366,21 @@ unsafe fn run_typed_mixed_epi<N, Fam, S, const MR_REG: usize, const NR: usize, E
             );
             return;
         }
-        // Deep-contraction reblocking (see run_deep_k_twin): a narrow family runs kc = k (one depth
-        // panel) so the output rounds once, but at large k its RHS micropanel (nr * k * sizeof(N))
-        // outgrows L2 and every microtile call streams it from L3/DRAM. Once that micropanel exceeds
-        // the engage gate, run the f32-output twin (multi-slice, panels L2-resident) into an f32
-        // scratch and narrow once. checked_mul so an overflowing micropanel size (a broadcast operand
-        // can pass validation with a logically huge k) does NOT engage: it falls through to the
-        // single panel instead, whose pack sizing then fails closed with the "too large" guard,
-        // rather than having the twin multi-slice that k forever
+        // Deep-contraction reblocking (see run_deep_k_twin). A narrow family runs one depth
+        // panel (kc = k), so the output rounds once. At large k its RHS micropanel (nr * k *
+        // sizeof(N)) outgrows L2, so every microtile call then streams it from L3 or DRAM
+        // Once that micropanel exceeds the engage gate, the f32-output twin runs instead,
+        // multi-slicing into L2-resident panels and an f32 scratch, then narrowing once
+        //
+        // checked_mul keeps a broadcast operand's logically huge k from engaging. An
+        // overflowing micropanel size falls through to the single panel instead. Its own
+        // pack sizing fails closed with the too-large guard, rather than the twin
+        // multi-slicing that k forever
         //
         // Plain (Identity) path only: the twin narrows through a dedicated f32 sweep, not the
-        // epilogue, so a fused shape stays on the single-panel general driver below, which applies
-        // the epilogue in f32 before the single narrowing (IS_IDENTITY fully qualified as above)
+        // epilogue. A fused shape therefore stays on the single-panel general driver below,
+        // which applies the epilogue in f32 before the single narrowing. IS_IDENTITY is fully
+        // qualified as above
         if <E as Epilogue<Fam>>::IS_IDENTITY {
             let engage_deep_k = NR
                 .checked_mul(t.k)
@@ -400,11 +414,12 @@ unsafe fn run_typed_mixed_epi<N, Fam, S, const MR_REG: usize, const NR: usize, E
     }
 }
 
-/// Mixed-precision driver entry for a concrete `(narrow type, family, ISA, tile)`: the plain
-/// (`E = Identity`) choice of [`run_typed_mixed_epi`], so every epilogue hook const-folds away and
-/// the routes reduce to the raw narrowing store. `Fam` selects the general-driver kernel
-/// (`MixedGemm<N>` widen path, `Bf16DotGemm` dot path); the special-path reroutes stay on the widen
-/// path (see [`run_typed_mixed_epi`])
+/// Mixed-precision driver entry for a concrete `(narrow type, family, ISA, tile)`
+///
+/// This is the plain (`E = Identity`) choice of [`run_typed_mixed_epi`]. Every epilogue hook
+/// const-folds away, so the routes reduce to the raw narrowing store. `Fam` selects the
+/// general-driver kernel: `MixedGemm<N>` for the widen path, `Bf16DotGemm` for the dot path.
+/// The special-path reroutes stay on the widen path (see [`run_typed_mixed_epi`])
 ///
 /// # Safety
 /// As `run_typed`
@@ -423,23 +438,26 @@ unsafe fn run_typed_mixed<N, Fam, S, const MR_REG: usize, const NR: usize>(
     unsafe { run_typed_mixed_epi::<N, Fam, S, MR_REG, NR, Identity>(simd, t, Identity, par, ws) }
 }
 
-/// **Fused-epilogue** mixed-precision driver entry for a concrete `(narrow type, family, ISA,
-/// tile)`: the [`FusedEpi`] choice of [`run_typed_mixed_epi`]. The bias vector and `LeakyRelu`
-/// slope are the narrow type `N`, widened **exactly** to `f32`; the epilogue applies in `f32` to
-/// the `f32` accumulator **before** the single round-to-nearest-even narrowing to `N`. This is
-/// *more* precise than `gemm()` then a separate narrow map (which rounds to `N`, widens back, and
-/// rounds again), so it is *not* bitwise-equal to `gemm`-then-map, unlike the `f32`/`f64`
-/// every-shape contract. Reproducibility and determinism are unaffected (serial still equals
-/// parallel bitwise on these routes)
+/// Fused-epilogue mixed-precision driver entry for a concrete `(narrow type, family, ISA,
+/// tile)`
 ///
-/// There is **no gemv route** and **no deep-`k` twin** here, unlike the plain [`run_typed_mixed`]:
-/// both are gated to the `E::IS_IDENTITY` path inside [`run_typed_mixed_epi`] (the rationale for
-/// each lives at its branch there). The `small_mn` / small-`k` reroutes stay on `MixedGemm<N>`
-/// (both bypass any dot kernel), and the orientation swap flips the bias axis, same as the float
-/// `run_typed_fused`
+/// This is the [`FusedEpi`] choice of [`run_typed_mixed_epi`]. The bias vector and the
+/// `LeakyRelu` slope are the narrow type `N`, widened exactly to `f32`. The epilogue applies
+/// in `f32` to the `f32` accumulator before the single round-to-nearest-even narrowing to
+/// `N`. This is more precise than calling `gemm` and then a separate narrow map, which rounds
+/// to `N`, widens back, and rounds again. A fused result is therefore not bitwise equal to
+/// `gemm`-then-map, unlike the `f32`/`f64` every-shape contract. Reproducibility and
+/// determinism are unaffected, since serial still equals parallel bitwise on these routes
+///
+/// There is no gemv route and no deep-`k` twin here, unlike the plain [`run_typed_mixed`].
+/// Both are gated to the `E::IS_IDENTITY` path inside [`run_typed_mixed_epi`], and the
+/// rationale for each lives at its branch there. The `small_mn` and small-`k` reroutes stay on
+/// `MixedGemm<N>`, since both bypass any dot kernel. The orientation swap flips the bias axis,
+/// same as the float `run_typed_fused`
 ///
 /// # Safety
-/// As [`run_typed_mixed`], plus `epi`'s interior pointers valid for the (pre-swap) `m`/`n`
+/// As [`run_typed_mixed`], plus `epi`'s interior pointers must be valid for the (pre-swap)
+/// `m`/`n`
 #[cfg(all(feature = "half", feature = "epilogue"))]
 #[inline]
 unsafe fn run_typed_mixed_fused<N, Fam, S, const MR_REG: usize, const NR: usize>(
@@ -452,19 +470,22 @@ unsafe fn run_typed_mixed_fused<N, Fam, S, const MR_REG: usize, const NR: usize>
     N: NarrowFloat,
     Fam: KernelFamily<Lhs = N, Rhs = N, Acc = f32, Out = N> + DeepKTwin,
     S: KernelSimd<N, N, f32, N> + KernelSimd<N, N, f32, f32>,
-    // The narrow blanket Epilogue impl supplies both (for the general-driver Fam and for the
-    // MixedGemm<N> reroutes); naming them keeps the generic Fam well-formed
+    // The narrow blanket Epilogue impl supplies both bounds, for the general-driver Fam and
+    // for the MixedGemm<N> reroutes. Naming them here keeps the generic Fam well-formed
     FusedEpi<N>: Epilogue<Fam> + Epilogue<MixedGemm<N>>,
 {
     unsafe { run_typed_mixed_epi::<N, Fam, S, MR_REG, NR, FusedEpi<N>>(simd, t, epi, par, ws) }
 }
 
-/// The degenerate fused epilogue for a **narrow** type (`f16`/`bf16`): `C[i,j] <- apply(beta*C[i,j],
-/// i, j)` in the user frame, `beta*C` combined in `f32` and narrowed once by the epilogue (`apply`
-/// returns `N`). The narrow sibling of the real-float `fused_degenerate_float`
+/// The degenerate fused epilogue for a narrow type (`f16` or `bf16`): `C[i,j] <-
+/// apply(beta*C[i,j], i, j)` in the user frame
+///
+/// `beta*C` combines in `f32` and narrows once by the epilogue, since `apply` returns `N`.
+/// This is the narrow sibling of the real-float `fused_degenerate_float`
 ///
 /// # Safety
-/// `c` valid for the `m x n` region; `epi`'s bias valid for the problem's `m`/`n`
+/// `c` must be valid for the `m x n` region, and `epi`'s bias must be valid for the problem's
+/// `m`/`n`
 #[cfg(all(feature = "half", feature = "epilogue"))]
 unsafe fn fused_degenerate_mixed<N>(t: &Task<N>, epi: &FusedEpi<N>)
 where
@@ -475,7 +496,8 @@ where
         for j in 0..t.n {
             for i in 0..t.m {
                 let p = t.c.offset(i as isize * t.rsc + j as isize * t.csc);
-                // beta*C combined in f32 (beta and C widened exactly), then the epilogue narrows once
+                // beta*C combines in f32 (beta and C widened exactly), then the epilogue
+                // narrows once
                 let base: f32 = if t.beta == N::ZERO {
                     0.0
                 } else if t.beta == N::ONE {
@@ -489,8 +511,10 @@ where
     }
 }
 
-/// Prepacked-RHS mixed-precision entry (mirror of `run_packed_typed` for a narrow-in /
-/// `f32`-accumulate family `Fam`): no orientation swap, `alpha`/`beta` widened to `f32`
+/// Prepacked-RHS mixed-precision entry, the mirror of `run_packed_typed` for a narrow-input,
+/// `f32`-accumulate family `Fam`
+///
+/// There is no orientation swap here, and `alpha` and `beta` widen to `f32`
 ///
 /// # Safety
 /// As `run_packed_typed`
@@ -530,15 +554,18 @@ unsafe fn run_packed_typed_mixed<N, Fam, S, const MR_REG: usize, const NR: usize
     }
 }
 
-/// **Fused-epilogue** prepacked-RHS mixed-precision entry: the mirror of the float sibling
-/// `run_typed_packed_fused`, and of [`run_packed_typed_mixed`] with the epilogue threaded in. No
-/// orientation swap, `alpha`/`beta` widened to `f32`, the [`FusedEpi`] applied in `f32` before the
-/// single narrowing on store. No small-`m,n` / small-`k` reroute exists on the prepacked path, so
-/// only `FusedEpi<N>: Epilogue<Fam>` is needed here, not the extra `Epilogue<MixedGemm<N>>` the
-/// general-driver mixed-fused entry names for its reroutes
+/// Fused-epilogue prepacked-RHS mixed-precision entry
+///
+/// This mirrors the float sibling `run_typed_packed_fused`, and mirrors
+/// [`run_packed_typed_mixed`] with the epilogue threaded in. There is no orientation swap,
+/// `alpha` and `beta` widen to `f32`, and the [`FusedEpi`] applies in `f32` before the single
+/// narrowing on store. No small-`m,n` or small-`k` reroute exists on the prepacked path.
+/// Only `FusedEpi<N>: Epilogue<Fam>` is needed here, not the extra `Epilogue<MixedGemm<N>>`
+/// the general-driver mixed-fused entry names for its reroutes
 ///
 /// # Safety
-/// As [`run_packed_typed_mixed`], plus `epi`'s interior pointers valid for the problem's `m`/`n`
+/// As [`run_packed_typed_mixed`], plus `epi`'s interior pointers must be valid for the
+/// problem's `m`/`n`
 #[cfg(all(feature = "half", feature = "epilogue"))]
 #[inline]
 unsafe fn run_typed_mixed_packed_fused<N, Fam, S, const MR_REG: usize, const NR: usize>(
@@ -636,8 +663,8 @@ unsafe fn gemm_bf16_avx512f_packed(r: PackedConsume<bf16>, par: Parallelism, ws:
 #[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
 unsafe fn gemm_bf16_avx512bf16(t: Task<bf16>, par: Parallelism, ws: &mut Workspace) {
     // bf16 dot: f32 accumulator, same tile as plain AVX-512F (MR = 2*16 = 32, NR = 12). The
-    // Bf16DotGemm family swaps in the vdpbf16ps pack and inner loop; the shared
-    // run_typed_mixed still routes small_mn / small_k through MixedGemm<bf16>
+    // Bf16DotGemm family swaps in the vdpbf16ps pack and inner loop. The shared
+    // run_typed_mixed still routes small_mn and small_k through MixedGemm<bf16>
     unsafe { run_typed_mixed::<bf16, Bf16DotGemm, Avx512Bf16, 2, 12>(Avx512Bf16, t, par, ws) }
 }
 #[cfg(all(feature = "half", any(target_arch = "x86", target_arch = "x86_64")))]
@@ -776,7 +803,7 @@ unsafe fn gemm_bf16_avx512bf16_fused(
     par: Parallelism,
     ws: &mut Workspace,
 ) {
-    // bf16 dot family for the general driver; small_mn / small_k reroute through MixedGemm<bf16>
+    // bf16 dot family for the general driver. small_mn and small_k reroute through MixedGemm<bf16>
     unsafe {
         run_typed_mixed_fused::<bf16, Bf16DotGemm, Avx512Bf16, 2, 12>(Avx512Bf16, t, epi, par, ws)
     }
@@ -830,10 +857,10 @@ unsafe fn gemm_bf16_simd128_fused(
     }
 }
 
-// prepacked-RHS fused-epilogue mixed entry points: same tiles as the plain prepacked wrappers
-// Each is cfg-gated exactly like its plain prepacked sibling plus epilogue; the small_mn /
-// small_k reroute question does not arise on the prepacked path, so the bf16 dot variant drives
-// Bf16DotGemm throughout
+// prepacked-RHS fused-epilogue mixed entry points: same tiles as the plain prepacked
+// wrappers. Each is cfg-gated exactly like its plain prepacked sibling plus epilogue. The
+// small_mn and small_k reroute question does not arise on the prepacked path, so the bf16
+// dot variant drives Bf16DotGemm throughout
 
 #[cfg(all(feature = "half", feature = "epilogue"))]
 unsafe fn gemm_f16_scalar_packed_fused(
@@ -1135,9 +1162,11 @@ const DISP_BF16_SIMD128: Dispatched<bf16> = Dispatched {
     depth_multiple: 1,
 };
 
-/// `f16` ISA selection. The FMA path additionally needs **F16C**
-/// (`vcvtph2ps`/`vcvtps2ph`), checked here so an FMA selection on an F16C-less part falls
-/// back instead of faulting. AVX-512F covers `f16` conversion within `avx512f` itself
+/// `f16` ISA selection
+///
+/// The FMA path also needs F16C (`vcvtph2ps` and `vcvtps2ph`), checked here so an FMA
+/// selection on a part without F16C falls back instead of faulting. AVX-512F covers `f16`
+/// conversion within `avx512f` itself
 #[cfg(feature = "half")]
 fn select_f16() -> Dispatched<f16> {
     match forced_isa() {
@@ -1205,9 +1234,11 @@ fn select_f16() -> Dispatched<f16> {
     }
 }
 
-/// `bf16` ISA selection: auto-selects the `vdpbf16ps` dot kernel first (needs `avx512bf16`),
-/// then plain AVX-512F (`avx512f`), then FMA. The FMA path uses only AVX2 integer ops
-/// (shift / pack) to widen `bf16 -> f32`, so it needs no F16C, unlike the `f16` ladder
+/// `bf16` ISA selection
+///
+/// Auto mode selects the `vdpbf16ps` dot kernel first, which needs `avx512bf16`, then plain
+/// AVX-512F (`avx512f`), then FMA. The FMA path uses only AVX2 integer ops (shift and pack)
+/// to widen `bf16` to `f32`, so it needs no F16C, unlike the `f16` ladder
 #[cfg(feature = "half")]
 fn select_bf16() -> Dispatched<bf16> {
     match forced_isa() {
@@ -1380,7 +1411,7 @@ impl GemmScalar for bf16 {
         nr: usize,
     ) {
         unsafe {
-            // The dot kernel packs k-pair-interleaved; pack through *its* family so the
+            // The dot kernel packs k-pair-interleaved. Pack through its own family so the
             // prepacked layout matches what the consuming call reads. Detected via the
             // depth multiple, which is > 1 only for the bf16 dot descriptor
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -1430,9 +1461,9 @@ impl GemmScalar for bf16 {
     }
 }
 
-// FusedScalar (the fused-epilogue element bound) for the narrow floats: finite widens exactly
-// to f32 then tests; fused_degenerate combines beta*C in f32 and narrows once, the narrow
-// sibling of the real-float degenerate path
+// FusedScalar (the fused-epilogue element bound) for the narrow floats: finite widens
+// exactly to f32 then tests. fused_degenerate combines beta*C in f32 and narrows once,
+// the narrow sibling of the real-float degenerate path
 
 #[cfg(all(feature = "half", feature = "epilogue"))]
 impl FusedScalar for f16 {

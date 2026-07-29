@@ -1,14 +1,15 @@
 //! AArch64 NEON ISA token
 //!
-//! `f32` uses 128-bit registers (4 lanes), `f64` 128-bit (2 lanes). NEON is baseline on
-//! AArch64, so [`Simd::vectorize`] enables no feature beyond what is already always
-//! present; the token still follows the same `#[target_feature]`-trampoline-plus-thin-
-//! wrappers shape as the x86 tokens, for uniformity across ISAs
+//! `f32` uses 128-bit registers with 4 lanes. `f64` uses 128-bit registers with 2 lanes.
+//! NEON is baseline on AArch64, so [`Simd::vectorize`] enables no feature beyond what is
+//! already present. The token still follows the same trampoline-plus-thin-wrapper shape as
+//! the x86 tokens, for consistency across ISAs
 //!
-//! AArch64 has 32 128-bit vector registers (twice x86's 16 YMM/ZMM), so the microkernel
-//! tile here can run wider than on AVX2. `vld1q`/`vst1q` draw no aligned/unaligned
-//! distinction. Watch the operand order on `mul_add`: `vfmaq_f32(c, a, b)` computes
-//! `a*b + c`, matching this trait's `mul_add(a, b, c)` signature but not its argument order
+//! AArch64 has 32 128-bit vector registers, twice the 16 YMM registers the AVX2 token uses.
+//! The microkernel tile here spends that extra headroom on slack for the out-of-order
+//! scheduler, not on a wider tile. `vld1q`/`vst1q` draw no aligned/unaligned distinction.
+//! Watch the operand order on `mul_add`. `vfmaq_f32(c, a, b)` computes `a*b + c`, which
+//! matches this trait's `mul_add(a, b, c)` signature but not its argument order
 
 use core::arch::aarch64::*;
 
@@ -32,8 +33,8 @@ impl Simd for Neon {
         unsafe fn inner<R>(f: impl FnOnce() -> R) -> R {
             f()
         }
-        // SAFETY: NEON is mandatory on aarch64, always present; inner establishes the
-        // codegen context and f inlines into it
+        // SAFETY: NEON is mandatory on aarch64, so it is always present. inner sets up the
+        // codegen context, and f inlines into it
         unsafe { inner(f) }
     }
 }
@@ -71,19 +72,19 @@ impl SimdOps<f32> for Neon {
     }
     #[inline(always)]
     unsafe fn mul_add(self, a: Self::Reg, b: Self::Reg, c: Self::Reg) -> Self::Reg {
-        // vfmaq_f32(c, a, b) computes a*b + c, this trait's mul_add(a, b, c)
+        // vfmaq_f32(c, a, b) computes a*b + c, matching this trait's mul_add(a, b, c) order
         unsafe { vfmaq_f32(c, a, b) }
     }
     #[inline(always)]
     unsafe fn fnma(self, a: Self::Reg, b: Self::Reg, c: Self::Reg) -> Self::Reg {
-        // vfmsq_f32(c, a, b) computes c - a*b, this trait's fnma(a, b, c)
+        // vfmsq_f32(c, a, b) computes c - a*b, matching this trait's fnma(a, b, c) order
         unsafe { vfmsq_f32(c, a, b) }
     }
     #[inline(always)]
     unsafe fn max(self, a: Self::Reg, b: Self::Reg) -> Self::Reg {
-        // FMAXNM, not FMAX: returns the non-NaN operand on an unordered compare, so a
-        // NaN `a` returns `b`, the trait's NaN-in-`a` contract. Plain FMAX would
-        // propagate the NaN and desync from the scalar edge path
+        // FMAXNM, not FMAX, returns the non-NaN operand on an unordered compare, so a
+        // NaN `a` returns `b`, matching the trait's contract. Plain FMAX would propagate
+        // the NaN and break the match with the scalar edge path
         unsafe { vmaxnmq_f32(a, b) }
     }
     #[inline(always)]
@@ -101,9 +102,8 @@ impl SimdOps<f32> for Neon {
         bvec: Self::Reg,
         acc: &mut [[Self::Reg; MR_REG]],
     ) {
-        // vfmaq_laneq_f32::<L>(c, a, v) computes a*v[L] + c for a compile-time lane
-        // index L; one loaded bvec feeds all 4 output columns with no per-column
-        // broadcast load
+        // vfmaq_laneq_f32::<L>(c, a, v) computes a*v[L] + c for a compile-time lane index
+        // L. One loaded bvec feeds all 4 output columns with no per-column broadcast load
         debug_assert_eq!(acc.len(), 4);
         unsafe {
             for i in 0..MR_REG {
@@ -155,12 +155,12 @@ impl SimdOps<f64> for Neon {
     }
     #[inline(always)]
     unsafe fn mul_add(self, a: Self::Reg, b: Self::Reg, c: Self::Reg) -> Self::Reg {
-        // vfmaq_f64(c, a, b) computes a*b + c, this trait's mul_add(a, b, c)
+        // vfmaq_f64(c, a, b) computes a*b + c, matching this trait's mul_add(a, b, c) order
         unsafe { vfmaq_f64(c, a, b) }
     }
     #[inline(always)]
     unsafe fn fnma(self, a: Self::Reg, b: Self::Reg, c: Self::Reg) -> Self::Reg {
-        // vfmsq_f64(c, a, b) computes c - a*b, this trait's fnma(a, b, c)
+        // vfmsq_f64(c, a, b) computes c - a*b, matching this trait's fnma(a, b, c) order
         unsafe { vfmsq_f64(c, a, b) }
     }
     #[inline(always)]
@@ -198,31 +198,22 @@ impl SimdOps<f64> for Neon {
 
 // Mixed precision: f16/bf16 inputs, f32 accumulator, 4-wide float32x4_t
 //
-// Both widen/narrow one lane at a time in scalar code, for 2 different reasons:
-//
-// * bf16: a vector widen is possible (bf16 is the top half of an f32 bit pattern, so
-//   vshll left-shifted by 16 is exact and bit-identical to to_f32), but measured against
-//   this scalar version it showed no throughput gain: the out-of-order core already hides
-//   the per-lane widen among the surrounding FMAs. Not worth carrying the extra code for
-//   an unmeasured win
-// * f16: the native conversion (vcvt_f32_f16 over float16x4_t) itself stabilized at Rust
-//   1.94, above this crate's MSRV; loading raw f16 bytes into a float16x4_t still needs
-//   vld1_f16/vst1_f16, which take the still-unstable primitive f16 type and remain gated
-//   behind stdarch_neon_f16 (rust-lang/rust#116909, #136306) either way. A hand-rolled
-//   integer f16->f32 path is not worth the risk for a widen the OoO core already hides,
-//   same reasoning as bf16 above
-//   Revisit once those stabilize
+// Both widen and narrow one lane at a time in scalar code. NEON has a native f16
+// conversion, vcvt_f32_f16 over float16x4_t, but it stabilizes only above this crate's
+// minimum supported Rust version. Loading raw f16 bytes into that register also needs
+// vld1_f16/vst1_f16, which take the unstable primitive f16 type and stay gated behind
+// stdarch_neon_f16 regardless. bf16 also takes the same scalar path here, mirroring the
+// f16 fallback above. Revisit once stdarch_neon_f16 stabilizes
 //
 // A bf16 dot kernel via BFDOT (vbfdotq_f32) would slot into Bf16DotGemm (Q = 2) with an
-// identity pack, needing only a bf16 NEON token whose conversions delegate to Neon. That
-// is DEFERRED on a harder wall than f16: the NEON bf16 vector type (bfloat16x8_t) and
-// vbfdotq_f32 are not implemented in core::arch on any Rust channel, stable or nightly,
-// with no stdarch feature gate or tracking issue yet to build on. The matrix instruction
-// BFMMLA (vbfmmlaq_f32) is likewise absent. Revisit once stdarch grows NEON bf16 support
+// identity pack. It would need only a bf16 NEON token whose conversions delegate to
+// Neon. This is deferred on a harder wall than f16. The NEON bf16 vector type,
+// bfloat16x8_t, and vbfdotq_f32 are not implemented in core::arch on any Rust channel,
+// stable or nightly. The matrix instruction BFMMLA (vbfmmlaq_f32) is likewise absent
+// Revisit once stdarch adds NEON bf16 support
 
 /// f16 mixed precision, scalar-widen fallback: converts all 4 lanes one at a time
-/// through [`NarrowFloat`], matching the scalar token's f16 path bit-for-bit (see the
-/// note above on why the native NEON fp16 conversion is unavailable on stable Rust)
+/// through [`NarrowFloat`], matching the scalar token's f16 path bit-for-bit
 #[cfg(feature = "half")]
 impl KernelSimd<f16, f16, f32, f16> for Neon {
     #[inline(always)]
@@ -259,8 +250,7 @@ impl KernelSimd<f16, f16, f32, f16> for Neon {
     }
 }
 
-/// bf16 mixed precision, scalar-widen fallback: a mirror of the f16 impl above (a
-/// vectorized `vshll` widen was measured and showed no gain over this, per the note above)
+/// bf16 mixed precision, scalar-widen fallback: a mirror of the f16 impl above
 #[cfg(feature = "half")]
 impl KernelSimd<bf16, bf16, f32, bf16> for Neon {
     #[inline(always)]
@@ -300,25 +290,24 @@ impl KernelSimd<bf16, bf16, f32, bf16> for Neon {
 // Integer: i8 inputs, i32 accumulator, 4-wide int32x4_t
 //
 // The i32 accumulator ops below are native NEON. The i8 -> i32 widen-load (in the
-// KernelSimd impl further down) looks like a per-byte scalar loop, but rustc already lowers
+// KernelSimd impl further down) looks like a per-byte scalar loop. rustc already lowers
 // it to the optimal sequence: 1 4-byte ldr into a lane plus 2 sshll widens. An explicit
-// vmovl_s8/vmovl_s16 rewrite compiles to byte-identical code (the symbols even fold
-// together) and measures as pure noise on the M4 Max (256^3..1024^3 and deep-k, serial and
-// parallel), so the plain loop stays as the source form. A full 8-byte vld1_s8 remains out
-// of bounds regardless: pack_panels sizes the destination exactly, with no trailing slack,
-// so an 8-byte read at the last 4-wide slot of the last panel would overrun it
+// vmovl_s8/vmovl_s16 rewrite compiles to the same code, so the plain loop stays as the
+// source form. A full 8-byte vld1_s8 remains out of bounds regardless. pack_panels sizes
+// the destination exactly, with no trailing slack. An 8-byte read at the last 4-wide slot
+// of the last panel would overrun it
 //
 // A hardware i8 dot kernel via SDOT (vdotq_s32) is the NEON analogue of x86 VNNI, and
-// cleaner: signed*signed i8*i8 -> i32 is already GEMM's native op, so it needs no +128 bias
-// or column-sum correction. The arch-neutral dot seams already exist
-// (KernelFamily::DEPTH_MULTIPLE, KernelSimd::dot_accumulate, pack_kgroup_panels), so
-// adding it would mean only a dotprod token plus an identity-pack IntDotGemm family
-// (Q = 4, sibling to IntGemmVnni, which instead bakes the +128 transform into its pack),
-// bit-exact to this widen path. DEFERRED for the same reason as the native f16 path above:
-// vdotq_s32 is gated behind the unstable stdarch_neon_dotprod (rust-lang/rust#117224),
-// stable only from Rust 1.98, above this crate's MSRV. (USDOT, vusdotq_s32, would map onto
-// VNNI and reuse IntGemmVnni, but stdarch_neon_i8mm, #117223, is unstable even on
-// nightly.) Revisit once stdarch_neon_dotprod stabilizes
+// cleaner. Signed*signed i8*i8 -> i32 is already GEMM's native op, so it needs no +128
+// bias or column-sum correction. The arch-neutral dot seams already exist:
+// KernelFamily::DEPTH_MULTIPLE, KernelSimd::dot_accumulate, and pack_kgroup_panels
+// Adding SDOT support would mean only a dotprod token plus an identity-pack IntDotGemm
+// family, Q = 4. That family would be a sibling to IntGemmVnni, which instead bakes the
+// +128 transform into its pack. The result would be bit-exact to this widen path
+// This is deferred for the same reason as the f16 path above: vdotq_s32 is gated behind
+// the unstable stdarch_neon_dotprod on stable Rust. USDOT (vusdotq_s32) would map onto
+// VNNI and reuse IntGemmVnni, but its gate, stdarch_neon_i8mm, is unstable even on
+// nightly. Revisit once stdarch_neon_dotprod stabilizes
 
 #[cfg(feature = "int8")]
 impl SimdOps<i32> for Neon {
@@ -356,8 +345,8 @@ impl SimdOps<i32> for Neon {
     }
     #[inline(always)]
     unsafe fn fnma(self, a: int32x4_t, b: int32x4_t, c: int32x4_t) -> int32x4_t {
-        // vmlsq_s32(c, a, b) computes c - a*b (wrapping i32). Satisfies the trait; the
-        // integer kernel never calls it
+        // vmlsq_s32(c, a, b) computes c - a*b (wrapping i32). This satisfies the trait
+        // The integer kernel never calls it
         unsafe { vmlsq_s32(c, a, b) }
     }
     #[inline(always)]
@@ -366,18 +355,24 @@ impl SimdOps<i32> for Neon {
     }
 }
 
-/// Requantize one pair (2 `i32` lanes, sign-extended to `int64x2_t`) of an `int32x4_t`
-/// accumulator to 2 integral `i64` in `[lo, hi]`, following the scalar map exactly: widen
-/// `i64 -> f64` (exact, every `i32` fits in an `f64`), multiply by `scale` (one IEEE
-/// multiply), round to nearest-even in hardware, add `zp`, clamp to `[lo, hi]`, convert
-/// back to `i64` (exact, since the clamped value is already integral). `#[inline(always)]`
-/// so the intrinsics fold straight into the caller's `#[target_feature]` context
+/// Requantize one pair of `int32x4_t` lanes (2 `i32` values, sign-extended to
+/// `int64x2_t`) to 2 integral `i64` values in `[lo, hi]`, following the scalar map
+/// exactly:
+///
+/// 1. Widen `i64` to `f64`. This is exact because every `i32` fits in an `f64`
+/// 2. Multiply by `scale`, one IEEE multiply
+/// 3. Round to nearest-even in hardware
+/// 4. Add `zp`, then clamp to `[lo, hi]`
+/// 5. Convert back to `i64`. This is exact because the clamped value is already integral
+///
+/// `#[inline(always)]` lets the intrinsics fold straight into the caller's
+/// `#[target_feature]` context
 ///
 /// `vrndnq_f64` is FRINTN, round-to-nearest ties-to-even, the same rounding as the x86
 /// `vroundpd` reference and the scalar `round_ne_f64`. `vmaxq_f64`/`vminq_f64` (FMAX/FMIN)
-/// do the clamp: no NaN can reach them (the API validates `scale` finite and positive, and
-/// `v` is a finite `i32`), so the FMAX-vs-FMAXNM NaN distinction does not matter here and
-/// the plain min/max mirror x86's `max_pd`/`min_pd`
+/// do the clamp. No NaN can reach them because the API validates `scale` as finite and
+/// positive, and `v` as a finite `i32`. So the FMAX-vs-FMAXNM NaN distinction does not
+/// matter here, and the plain min/max mirror x86's `max_pd`/`min_pd`
 ///
 /// # Safety
 /// Run inside [`Neon`]'s `neon` [`Simd::vectorize`] context
@@ -402,17 +397,20 @@ unsafe fn requant_pair_neon(
 }
 
 /// Vectorized `i32 -> i8` requantize store for [`Neon`] (see [`KernelSimd::requant_store`]
-/// for the bit-for-bit-with-scalar contract): sign-extend the low/high `i32` pairs to 2
-/// `int64x2_t` (exact), requantize each in `f64` ([`requant_pair_neon`]), narrow both
-/// integral pairs back to one `int32x4_t` (truncating `vmovn_s64`), then gather the **low
-/// byte** of each of the 4 integral, pre-clamped lanes into 4 contiguous output bytes with
-/// a byte-table lookup (`vqtbl1q_u8`, source indices `{0, 4, 8, 12}`, the direct analogue
-/// of x86's `pshufb`). This is a TRUNCATING byte gather, not a saturating
-/// `vqmovn`/`vqmovun`: the lanes are already clamped into `[lo, hi]`, so a saturating
+/// for the bit-for-bit-with-scalar contract). It sign-extends the low and high `i32`
+/// pairs to 2 `int64x2_t` values, which is exact, and requantizes each in `f64` through
+/// [`requant_pair_neon`]. It then narrows both integral pairs back to one `int32x4_t`,
+/// truncating with `vmovn_s64`
+///
+/// It gathers the low byte of each of the 4 integral, pre-clamped lanes into 4 contiguous
+/// output bytes. The lookup uses `vqtbl1q_u8` with source indices `{0, 4, 8, 12}`, the
+/// direct analogue of x86's `pshufb`. This is a truncating byte gather, not a saturating
+/// `vqmovn`/`vqmovun`. The lanes are already clamped into `[lo, hi]`, so a saturating
 /// narrow would double-clamp and give the wrong answer for the `u8`/`[0, 255]` phase
 ///
 /// # Safety
-/// `dst` valid for 4 byte writes; run inside [`Neon`]'s `neon` [`Simd::vectorize`] context
+/// `dst` is valid for 4 byte writes. Run inside [`Neon`]'s `neon` [`Simd::vectorize`]
+/// context
 #[cfg(feature = "int8")]
 #[inline(always)]
 unsafe fn requant_store_neon(dst: *mut i8, v: int32x4_t, scale: f64, zp: i32, lo: i32, hi: i32) {
@@ -426,11 +424,11 @@ unsafe fn requant_store_neon(dst: *mut i8, v: int32x4_t, scale: f64, zp: i32, lo
         let i_lo = requant_pair_neon(vmovl_s32(vget_low_s32(v)), scale_v, zp_v, lo_v, hi_v);
         let i_hi = requant_pair_neon(vmovl_s32(vget_high_s32(v)), scale_v, zp_v, lo_v, hi_v);
         // Narrow both integral pairs back to 4 i32 lanes (truncating: each value is already
-        // in [lo, hi], so its low 32 bits are the value), lane order 0, 1, 2, 3 preserved
+        // in [lo, hi], so its low 32 bits are the value). This keeps lane order 0, 1, 2, 3
         let i32_all = vcombine_s32(vmovn_s64(i_lo), vmovn_s64(i_hi));
         // Byte-table gather of the low byte of each i32 lane {0, 4, 8, 12} into the low 4
-        // output bytes (the x86 pshufb analogue); the other 12 index slots are out of range
-        // so vqtbl1q_u8 reads them as 0
+        // output bytes (the x86 pshufb analogue). The other 12 index slots are out of
+        // range, so vqtbl1q_u8 reads them as 0
         let idx: [u8; 16] = [
             0, 4, 8, 12, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
         ];
@@ -484,20 +482,21 @@ impl KernelSimd<i8, i8, i32, i32> for Neon {
     }
 }
 
-// Complex (NEON): the real Reg is the plain float32x4_t/float64x2_t register, LANES the
-// real lane count (4 / 2). Complex GEMM routes through the shared SoA soa_microkernel, so
-// its inner loop is already vectorized for free: mul_add lowers to vfmaq_f32/vfmaq_f64 and
-// fnma to vfmsq_f32/vfmsq_f64 through the SimdOps<f32>/<f64> impls above. The complex tile
-// is MR_REG=2, NR=5 (see dispatch/complex.rs for the register-budget rationale). The
-// de-interleaving pack (pack_planar) and the C re-interleave in the epilogue stay scalar: a
-// small fraction of total runtime next to the inner FMA loop, so a vld2q/vst2q seam was not
-// worth adding, and the generic scalar path is the floor for both
+// Complex (NEON): the real Reg is the plain float32x4_t/float64x2_t register, and LANES
+// is the real lane count, 4 or 2. Complex GEMM routes through the shared SoA
+// soa_microkernel, so its inner loop is already vectorized for free. mul_add lowers to
+// vfmaq_f32/vfmaq_f64, and fnma lowers to vfmsq_f32/vfmsq_f64, through the
+// SimdOps<f32>/<f64> impls above. The complex tile is MR_REG=2, NR=5 (see
+// dispatch/complex.rs for the register-budget rationale). The de-interleaving pack
+// (pack_planar) and the C re-interleave in the epilogue stay scalar. Both run once per
+// output element, not once per depth step, so they fall outside the inner FMA loop. The
+// generic scalar path is the floor for both
 //
-// ARMv8.3 FCMLA/FCADD are deliberately unused: they are nightly-gated on stable Rust (the
-// reason this SoA path exists at all), and they fold the complex cross-terms into a single
-// rounding step, a different accumulation structure from the 4 separate real FMAs used
-// here, so they cannot interleave with this kernel without breaking the full-vs-edge
-// rounding identity, the same reason SDOT/BFMMLA are out of scope above
+// ARMv8.3 FCMLA/FCADD are deliberately unused. They are nightly-gated on stable Rust,
+// which is the reason this SoA path exists at all. They also fold the complex cross-terms
+// into a single rounding step, a different accumulation structure from the 4 separate
+// real FMAs used here. They cannot interleave with this kernel without breaking the
+// full-vs-edge rounding identity, the same reason SDOT/BFMMLA are out of scope above
 #[cfg(feature = "complex")]
 impl_complex_simd!(Neon, f32, float32x4_t, 4);
 #[cfg(feature = "complex")]

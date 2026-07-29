@@ -1,10 +1,11 @@
 //! `GEMMKIT_REQUIRE_ISA=avx512f` pin: forces the plain (widen) AVX-512F kernels, which
 //! auto-selection skips in favor of VNNI/BF16 on a host that reports those extensions, so this is
-//! the only place their dispatch code actually runs
+//! the only place their dispatch code actually runs. A separate test binary from the other
+//! `env_isa_*` pins, since a memoized ISA choice needs its own process to force
 //!
-//! Every test wants the same `avx512f` pin, so all funnel through [`env_isa_common::pin`] (a single
-//! `set_var` under a `Once`, before any dispatch; see that module for why the shared write is
-//! sound). The tests are otherwise independent, each touching a different knob (RHS-pack
+//! Every test wants the same `avx512f` pin, so all funnel through [`env_isa_common::pin`] (a
+//! single `set_var` under a `Once`, before any dispatch; see that module for why the shared write
+//! is sound). The tests are otherwise independent, each touching a different knob (RHS-pack
 //! threshold, deep-kc gate) and dtype, so none depends on another's knob state. Every test skips
 //! when the host lacks `avx512f`, since forcing the pin there would abort in `select_*` instead of
 //! testing anything
@@ -26,11 +27,9 @@ use gemmkit::{MatMut, MatRef, Parallelism, tuning};
 #[cfg(feature = "half")]
 use gemmkit::{bf16, f16, gemm};
 
-// IntGemm::pack_rhs is the widen (non-VNNI) i8 kernel's RHS packer. On a VNNI-capable host
-// auto-selection always picks the vpdpbusd dot kernel instead, which packs through
-// IntGemmVnni::pack_rhs, so the widen packer only runs once avx512f is forced. Also lowers the
-// RHS-pack threshold from its 2048 default to 1, so a small m still triggers packing without
-// needing a large (and slower) matrix
+// avx512f forces i8 GEMM through IntGemm::pack_rhs, the widen kernel's own RHS packer (a
+// VNNI-capable host would otherwise auto-select IntGemmVnni::pack_rhs instead). Lowers the
+// RHS-pack threshold to 1 so a small m still triggers packing
 
 #[cfg(feature = "int8")]
 #[test]
@@ -150,6 +149,9 @@ fn check<N: gemmkit::NarrowFloat + gemmkit::GemmScalar + Copy>(label: &str) {
         );
     }
 }
+
+// f16 and bf16 deep-k widen route matches the single depth panel for beta in {0, 1}, serial
+// and parallel
 
 #[cfg(feature = "half")]
 #[test]

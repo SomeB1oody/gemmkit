@@ -1,15 +1,17 @@
 //! The integer GEMM families: `i8` inputs, `i32` accumulator, exact or requantized output
 //!
-//! [`IntGemm`] sign-extends `i8` A/B to `i32` on load (the [`KernelSimd`] widen seam) and
-//! accumulates the products in `i32`. Since `Out == Acc == i32` the sum is exact and needs
-//! no narrowing, so the driver blocks K the normal way (`OUT_IS_ACC` stays at its `true`
-//! default) and lets `beta` round-trip a partial through `C` between panels. Overflow wraps,
-//! the conventional integer-GEMM contract
+//! [`IntGemm`] sign-extends `i8` values in A and B to `i32` on load, through the
+//! [`KernelSimd`] widen seam, and accumulates the products in `i32`. Since
+//! `Out == Acc == i32`, the sum is exact and needs no narrowing. The driver blocks K the
+//! normal way (`OUT_IS_ACC` stays at its `true` default), and lets `beta` round-trip a
+//! partial through `C` between panels. Overflow wraps, which is the conventional
+//! integer-GEMM contract
 //!
-//! [`IntGemmVnni`] computes the identical `i32` sum via the denser `vpdpbusd` instruction,
-//! which needs its own k-quad-interleaved pack layout and a `+128` bias to turn the signed
-//! LHS into the unsigned operand `vpdpbusd` requires. `IntGemmQ`/`IntGemmVnniQ` are the
-//! `i8 -> {i8, u8}` requantizing counterparts, fusing a quantize `Epilogue` into the store
+//! [`IntGemmVnni`] computes the identical `i32` sum with the denser `vpdpbusd` instruction.
+//! This needs its own k-quad-interleaved pack layout and a `+128` bias to turn the signed
+//! LHS into the unsigned operand `vpdpbusd` requires. `IntGemmQ` and `IntGemmVnniQ` are the
+//! `i8 -> {i8, u8}` requantizing counterparts, and fuse a quantize `Epilogue` into the
+//! store
 
 use core::marker::PhantomData;
 
@@ -22,12 +24,13 @@ use crate::simd::{KernelSimd, SimdOps, VNNI_A_BIAS};
 
 /// Fold `alpha` into `acc`, then store `C <- combine(alpha*A*B, beta*C)`, exactly, in `i32`
 ///
-/// Shared verbatim by [`IntGemm`] and [`IntGemmVnni`]: the 2 families differ only in how
-/// `acc` (already the finished sum `sum_k(A*B)`) is produced, so the identical `Out == Acc
-/// == i32` store logic lives here once instead of twice
+/// Shared by [`IntGemm`] and [`IntGemmVnni`]. The 2 families differ only in how `acc`
+/// (already the finished sum `sum_k(A*B)`) is produced. The identical store logic
+/// lives here once instead of twice
 ///
 /// # Safety
-/// As [`KernelFamily::microkernel`]; run inside `S`'s [`crate::simd::Simd::vectorize`]
+///
+/// As [`KernelFamily::microkernel`]. Run inside `S`'s [`crate::simd::Simd::vectorize`]
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 #[inline(always)]
 unsafe fn int32_epilogue<S, const MR_REG: usize, const NR: usize>(
@@ -50,7 +53,7 @@ unsafe fn int32_epilogue<S, const MR_REG: usize, const NR: usize>(
         let lanes = <S as SimdOps<i32>>::LANES;
         let mr = MR_REG * lanes;
 
-        // fold alpha into acc; skip the multiply entirely when alpha == 1
+        // Fold alpha into acc. Skip the multiply when alpha == 1
         if alpha_status == AlphaStatus::Other {
             let av = simd.splat(alpha);
             for j in 0..NR {
@@ -60,7 +63,7 @@ unsafe fn int32_epilogue<S, const MR_REG: usize, const NR: usize>(
             }
         }
 
-        // Out == Acc == i32 here, so store_out/load_out are plain vector load/store
+        // Out == Acc == i32 here, so store_out and load_out are plain vector load and store
         if mr_eff == mr && nr_eff == NR && rsc == 1 {
             match beta_status {
                 BetaStatus::Zero => {
@@ -116,19 +119,20 @@ unsafe fn int32_epilogue<S, const MR_REG: usize, const NR: usize>(
     }
 }
 
-/// Widen-and-multiply accumulation of one `MR_REG x NR` `i32` microtile: sign-extend `i8`
-/// A/B to `i32` on load and fold in ascending `k`
+/// Widen-and-multiply accumulation of one `MR_REG x NR` `i32` microtile. Sign-extends `i8`
+/// A and B to `i32` on load and folds in ascending `k`
 ///
-/// Factored out of [`IntGemm::microkernel`] so the requantizing family `IntGemmQ` shares the
-/// same accumulation. The 2 callers differ only in the output type `O` (`i32` for `IntGemm`,
-/// `i8`/`u8` for the requantizer), and the requant blankets forward `load_lhs`/`splat_rhs`
-/// straight to the `<i8,i8,i32,i32>` impl, so the accumulation is identical whichever `O` is
-/// selected. `load_lhs`/`splat_rhs` are called fully qualified because a requant token
-/// implements `KernelSimd` for more than one `O`, which would make an unqualified method
-/// call ambiguous
+/// Factored out of [`IntGemm::microkernel`] so the requantizing family `IntGemmQ` shares
+/// the same accumulation. The 2 callers differ only in the output type `O` (`i32` for
+/// `IntGemm`, `i8` or `u8` for the requantizer). The requant blanket forwards `load_lhs`
+/// and `splat_rhs` straight to the `<i8,i8,i32,i32>` impl, so the accumulation is
+/// identical whichever `O` is selected. `load_lhs` and `splat_rhs` are called fully
+/// qualified because a requant token implements `KernelSimd` for more than one `O`, which
+/// would make an unqualified call ambiguous
 ///
 /// # Safety
-/// As [`KernelFamily::microkernel`]; run inside `S`'s [`crate::simd::Simd::vectorize`]
+///
+/// As [`KernelFamily::microkernel`]. Run inside `S`'s [`crate::simd::Simd::vectorize`]
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 #[inline(always)]
 unsafe fn i32_accumulate<S, O, const MR_REG: usize, const NR: usize>(
@@ -185,15 +189,16 @@ unsafe fn i32_accumulate<S, O, const MR_REG: usize, const NR: usize>(
     }
 }
 
-/// Requantize a finished `i32` microtile to the output byte `O` (`i8` or `u8`): drain `acc`
-/// to `i32` scratch, then map each live element through the epilogue `E` into `C`
+/// Requantize a finished `i32` microtile to the output byte `O` (`i8` or `u8`). Drains
+/// `acc` to `i32` scratch, then maps each live element through the epilogue `E` into `C`
 ///
-/// Shared by both requantizing families ([`IntGemmQ`]/[`IntGemmVnniQ`]) and both output
-/// bytes. Both requantizing families are `OUT_IS_ACC = false`, so the driver runs a single
-/// depth panel (`kc = k`): the map below always applies, with no `last_k` gate to check
+/// Shared by both requantizing families ([`IntGemmQ`] and [`IntGemmVnniQ`]) and both
+/// output bytes. Both families are `OUT_IS_ACC = false`, so the driver runs a single depth
+/// panel (`kc = k`). The map below always applies, with no `last_k` gate to check
 ///
 /// # Safety
-/// As [`KernelFamily::microkernel_epi`]; `scratch` holds at least [`super::SCRATCH_LEN`]
+///
+/// As [`KernelFamily::microkernel_epi`]. `scratch` holds at least [`super::SCRATCH_LEN`]
 /// `i32` elements
 #[cfg(feature = "epilogue")]
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
@@ -213,7 +218,7 @@ unsafe fn requant_scratch_epilogue<F, S, E, O, const MR_REG: usize, const NR: us
 ) where
     O: QuantOut,
     F: KernelFamily<Acc = i32, Out = O>,
-    // Bounded by the exact KernelSimd this needs (not just SimdOps<i32>) so
+    // Bounded by the exact KernelSimd this needs, not just SimdOps<i32>, so
     // epi.apply_store::<S> below type-checks against it
     S: KernelSimd<F::Lhs, F::Rhs, i32, O>,
     E: Epilogue<F>,
@@ -229,8 +234,8 @@ unsafe fn requant_scratch_epilogue<F, S, E, O, const MR_REG: usize, const NR: us
         }
 
         // A full lane-run takes the vector apply_store when both the epilogue and the token
-        // support it and C is unit row stride; the row tail always falls to scalar apply, and
-        // an unqualifying tile (strided C, no vector support) takes the scalar loop wholesale
+        // support it and C has unit row stride. The row tail always falls to scalar apply
+        // An unqualifying tile (strided C, no vector support) takes the scalar loop wholesale
         if E::VECTOR_STORE && <S as KernelSimd<F::Lhs, F::Rhs, i32, O>>::REQUANT_VECTOR && rsc == 1
         {
             for j in 0..nr_eff {
@@ -277,7 +282,7 @@ impl KernelFamily for IntGemm {
         kc: usize,
         mr: usize,
     ) {
-        // Plain micropanel copy of the i8 bytes; sign-extension to i32 happens on load
+        // Plain micropanel copy of the i8 bytes. Sign-extension to i32 happens on load
         unsafe {
             pack_panels(
                 dst, src, /*lead*/ rs, /*depth*/ cs, /*n_lead*/ mc, kc, mr,
@@ -350,30 +355,32 @@ impl KernelFamily for IntGemm {
 }
 
 /// The LHS pack transform for the VNNI families ([`IntGemmVnni`] and, by delegation,
-/// `IntGemmVnniQ`): offset each byte by [`VNNI_A_BIAS`] into the unsigned domain `vpdpbusd`
-/// reads. `vnni_a_xform(0) == 128`, so a padded row contributes a constant the per-column
-/// bias correction cancels out exactly
+/// `IntGemmVnniQ`). Offsets each byte by [`VNNI_A_BIAS`] into the unsigned domain
+/// `vpdpbusd` reads. `vnni_a_xform(0) == 128`, so a padded row contributes a constant that
+/// the per-column bias correction cancels out exactly
 #[inline(always)]
 pub(crate) fn vnni_a_xform(v: i8) -> i8 {
     ((v as i32 + VNNI_A_BIAS) as u8) as i8
 }
 
-/// The VNNI integer GEMM family: `Lhs = Rhs = i8`, `Acc = Out = i32`, accumulated via
-/// `vpdpbusd` (4 depth steps folded per instruction) instead of [`IntGemm`]'s widen-and-multiply
+/// The VNNI integer GEMM family: `Lhs = Rhs = i8`, `Acc = Out = i32`, accumulated with
+/// `vpdpbusd` (4 depth steps folded per instruction) instead of [`IntGemm`]'s
+/// widen-and-multiply
 ///
 /// 2 things differ from `IntGemm`, both isolated to this family:
 ///
-/// * Pack layout (`DEPTH_MULTIPLE = 4`): A and B are k-quad-interleaved, 4 consecutive depth
-///   steps stored contiguous per row/column so one `vpdpbusd` reads a whole group. Depth pads
-///   to a multiple of 4 (A pads with `128`, B with `0`); both operands are always packed
-///   (`FORCE_PACK_*`) since the interleave cannot be read from the unpacked layout in place
-/// * Signedness: `vpdpbusd` needs an unsigned x signed operand pair, so the pack offsets A by
-///   `+128` and `dot_accumulate` subtracts the resulting per-column bias to recover the true
-///   `sum_k(A*B)`
+/// * Pack layout (`DEPTH_MULTIPLE = 4`): A and B are k-quad-interleaved. 4 consecutive
+///   depth steps sit contiguous per row or column, so one `vpdpbusd` reads a whole group.
+///   Depth pads to a multiple of 4 (A pads with `128`, B with `0`). Both operands are
+///   always packed (`FORCE_PACK_*`) because the interleave cannot be read from the
+///   unpacked layout in place
+/// * Signedness: `vpdpbusd` needs an unsigned x signed operand pair. The pack offsets A
+///   by `+128`, and `dot_accumulate` subtracts the resulting per-column bias to recover
+///   the true `sum_k(A*B)`
 ///
-/// `i32` addition is associative under wrapping, so grouping the sum by 4 and correcting the
-/// bias afterward reproduces the ascending-`k` widen sum bit-for-bit: `IntGemmVnni` and
-/// `IntGemm` always agree exactly. Alpha fold and the `i32` epilogue are the shared
+/// `i32` addition is associative under wrapping, so grouping the sum by 4 and correcting
+/// the bias afterward reproduces the ascending-`k` widen sum bit-for-bit. `IntGemmVnni`
+/// and `IntGemm` always agree exactly. Alpha fold and the `i32` epilogue reuse the shared
 /// `int32_epilogue` helper above
 #[derive(Clone, Copy)]
 pub struct IntGemmVnni(PhantomData<()>);
@@ -393,9 +400,9 @@ impl KernelFamily for IntGemmVnni {
     const FORCE_PACK_RHS: bool = true;
     const DEPTH_MULTIPLE: usize = Self::Q;
 
-    /// Pack the `mc x kc` LHS k-quad-interleaved: 4 contiguous depth bytes per row, ready
-    /// for `vpdpbusd`, each offset `+128` by `vnni_a_xform`. A padded row (past `mc` or
-    /// `kc`) packs as `xform(0) == 128`, which the bias correction cancels
+    /// Pack the `mc x kc` LHS k-quad-interleaved. 4 contiguous depth bytes sit per row,
+    /// ready for `vpdpbusd`, each offset `+128` by `vnni_a_xform`. A padded row (past `mc`
+    /// or `kc`) packs as `xform(0) == 128`, which the bias correction cancels
     #[inline]
     unsafe fn pack_lhs(
         dst: *mut i8,
@@ -414,7 +421,7 @@ impl KernelFamily for IntGemmVnni {
 
     /// Pack one `kc x nr` RHS panel k-quad-interleaved: 4 contiguous depth bytes per
     /// column, so each quad reads back as one `i32` for a single broadcast. Values stay
-    /// signed (identity transform); a padded column or depth step packs as `0`, so it
+    /// signed (identity transform). A padded column or depth step packs as `0`, so it
     /// never enters the column sum
     #[inline]
     unsafe fn pack_rhs(
@@ -454,9 +461,9 @@ impl KernelFamily for IntGemmVnni {
         S: KernelSimd<i8, i8, i32, i32>,
     {
         unsafe {
-            // acc is filled for the full NR (FORCE_PACK_RHS zero-pads tail columns, so
-            // they contribute 0 to the dot); int32_epilogue below copies only the live
-            // mr_eff x nr_eff sub-tile out
+            // acc is filled for the full NR. FORCE_PACK_RHS zero-pads tail columns, so
+            // they contribute 0 to the dot. int32_epilogue below copies out only the live
+            // mr_eff x nr_eff sub-tile
             let mut acc: [[<S as SimdOps<i32>>::Reg; MR_REG]; NR] = [[simd.zero(); MR_REG]; NR];
             // Fully qualified: a VNNI token implements dot_accumulate for both this
             // concrete <i8,i8,i32,i32> and the requant blanket, so a plain call is ambiguous
@@ -483,16 +490,18 @@ impl KernelFamily for IntGemmVnni {
 }
 
 /// The `i8 -> O` requantizing integer family (widen-and-multiply), where the output byte
-/// `O` is `i8` (`[-128, 127]`, the default) or `u8` (`[0, 255]`, ONNX-QLinearMatMul):
-/// accumulate in `i32` exactly like [`IntGemm`], then apply an `i32 -> O` requantize
+/// `O` is `i8` (`[-128, 127]`, the default) or `u8` (`[0, 255]`, ONNX-QLinearMatMul)
+///
+/// Accumulates in `i32` exactly like [`IntGemm`], then applies an `i32 -> O` requantize
 /// [`Epilogue`] (per-tensor scale, zero-point, optional integer bias) as the tile is
 /// stored. The default type parameter means a bare `IntGemmQ` is `IntGemmQ<i8>`
 ///
-/// `OUT_IS_ACC = false` forces the driver to a single depth panel (`kc = k`), so the
-/// requantize fires exactly once per output element with no `last_k` gate to check, and an
-/// `i32` partial never has to round-trip through `O`. `alpha` is folded into `scale` and
-/// `beta` is disallowed (there is no well-defined way to accumulate into a quantized `C`);
-/// the call site below enforces both (`AlphaStatus::One`, `BetaStatus::Zero`)
+/// `OUT_IS_ACC = false` forces the driver to a single depth panel (`kc = k`). The
+/// requantize fires exactly once per output element with no `last_k` gate to check, and
+/// an `i32` partial never has to round-trip through `O`. `alpha` is folded into `scale`,
+/// and `beta` is disallowed because there is no well-defined way to accumulate into a
+/// quantized `C`. The call site below enforces both, with `AlphaStatus::One` and
+/// `BetaStatus::Zero`
 #[cfg(feature = "epilogue")]
 #[derive(Clone, Copy)]
 pub struct IntGemmQ<O = i8>(PhantomData<O>);
@@ -504,9 +513,9 @@ impl<O: QuantOut> KernelFamily for IntGemmQ<O> {
     type Acc = i32;
     type Out = O;
 
-    const OUT_IS_ACC: bool = false; // forces the driver to kc = k: fires the requantize once
+    const OUT_IS_ACC: bool = false; // Forces the driver to kc = k, so it fires the requantize once
 
-    /// Same plain micropanel copy as [`IntGemm::pack_lhs`]; delegate to it
+    /// Delegates to [`IntGemm::pack_lhs`] for the same pack
     #[inline]
     unsafe fn pack_lhs(
         dst: *mut i8,
@@ -520,7 +529,7 @@ impl<O: QuantOut> KernelFamily for IntGemmQ<O> {
         unsafe { <IntGemm as KernelFamily>::pack_lhs(dst, src, rs, cs, mc, kc, mr) }
     }
 
-    /// Same as [`IntGemm::pack_rhs`]; delegate to it
+    /// Delegates to [`IntGemm::pack_rhs`] for the same pack
     #[inline]
     unsafe fn pack_rhs(
         dst: *mut i8,
@@ -574,12 +583,14 @@ impl<O: QuantOut> KernelFamily for IntGemmQ<O> {
     }
 }
 
-/// The VNNI requantizing family: the same `i8 -> O` requantize as [`IntGemmQ`], but the
-/// underlying `i32` sum comes from `vpdpbusd` instead of widen-and-multiply, mirroring how
-/// [`IntGemmVnni`] relates to [`IntGemm`] (`FORCE_PACK_* = true`, `DEPTH_MULTIPLE = 4`, the
-/// k-quad-interleaved `+128`/identity pack). Since the grouped VNNI sum is bit-equal to the
-/// widen sum, `IntGemmVnniQ<O>` and `IntGemmQ<O>` requantize to identical output. `O`
-/// defaults to `i8`, so a bare `IntGemmVnniQ` is `IntGemmVnniQ<i8>`
+/// The VNNI requantizing family: the same `i8 -> O` requantize as [`IntGemmQ`]
+///
+/// The underlying `i32` sum comes from `vpdpbusd` instead of widen-and-multiply. This
+/// mirrors how [`IntGemmVnni`] relates to [`IntGemm`]: `FORCE_PACK_* = true`,
+/// `DEPTH_MULTIPLE = 4`, and the same k-quad-interleaved, `+128`-biased pack. Since the
+/// grouped VNNI sum is bit-equal to the widen sum, `IntGemmVnniQ<O>` and `IntGemmQ<O>`
+/// requantize to identical output. `O` defaults to `i8`, so a bare `IntGemmVnniQ` is
+/// `IntGemmVnniQ<i8>`
 #[cfg(feature = "epilogue")]
 #[derive(Clone, Copy)]
 pub struct IntGemmVnniQ<O = i8>(PhantomData<O>);
@@ -602,7 +613,8 @@ impl<O: QuantOut> KernelFamily for IntGemmVnniQ<O> {
     const FORCE_PACK_RHS: bool = true;
     const DEPTH_MULTIPLE: usize = Self::Q;
 
-    /// Same k-quad-interleaved, `+128`-biased pack as [`IntGemmVnni::pack_lhs`]; delegate to it
+    /// Delegates to [`IntGemmVnni::pack_lhs`] for the same k-quad-interleaved,
+    /// `+128`-biased pack
     #[inline]
     unsafe fn pack_lhs(
         dst: *mut i8,
@@ -616,7 +628,8 @@ impl<O: QuantOut> KernelFamily for IntGemmVnniQ<O> {
         unsafe { <IntGemmVnni as KernelFamily>::pack_lhs(dst, src, rs, cs, mc, kc, mr) }
     }
 
-    /// Same k-quad-interleaved, signed-value pack as [`IntGemmVnni::pack_rhs`]; delegate to it
+    /// Delegates to [`IntGemmVnni::pack_rhs`] for the same k-quad-interleaved,
+    /// signed-value pack
     #[inline]
     unsafe fn pack_rhs(
         dst: *mut i8,

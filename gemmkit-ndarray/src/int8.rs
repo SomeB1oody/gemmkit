@@ -4,12 +4,12 @@ use crate::common::dims_strides;
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 use gemmkit::adapter::{requant_bias, requant_scale};
 
-/// Integer `C(i32) <- alpha*A(i8)*B(i8) + beta*C`, the ndarray adapter over gemmkit's
-/// [`gemmkit::gemm_i8`]. `i8` inputs accumulate into an `i32` output (`alpha`/`beta`/`C` are
-/// `i32`); arithmetic wraps on overflow, the conventional integer-GEMM semantics. A separate
-/// entry from [`gemm`] because input (`i8`) and output (`i32`) types differ. Reads the
-/// pointers/strides directly, so transposed, F-order, and general-stride views work without
-/// copying
+/// Integer `C(i32) <- alpha*A(i8)*B(i8) + beta*C`. This is the ndarray adapter over gemmkit's
+/// [`gemmkit::gemm_i8`]. `i8` inputs accumulate into an `i32` output (`alpha`, `beta`, and `C`
+/// are all `i32`). Arithmetic wraps on overflow, the conventional integer-GEMM semantics. This
+/// is a separate entry from [`gemm`] because the input type (`i8`) and the output type (`i32`)
+/// differ. It reads the pointers and strides directly, so transposed, F-order, and
+/// general-stride views work without copying
 ///
 /// # Panics
 /// If the inner dimensions disagree
@@ -76,8 +76,9 @@ fn gemm_i8_common<S1, S2, SC>(
     let cs = c.strides();
     let (rsc, csc) = (cs[0], cs[1]);
     let cp = c.as_mut_ptr();
-    // SAFETY: dims validated above; ndarray guarantees the layouts are in-bounds; `c` (a `&mut
-    // i32` borrow) can't alias `a`/`b` (`&i8`): different element types, so distinct storage
+    // SAFETY: the dims are validated above. ndarray guarantees the layouts are in-bounds. `c` (a
+    // `&mut i32` borrow) cannot alias `a`/`b` (`&i8`), because different element types sit in
+    // distinct storage
     unsafe {
         match ws {
             Some(ws) => gemm_i8_unchecked_with(
@@ -135,17 +136,20 @@ where
 }
 
 /// Requantizing integer GEMM: `i8` inputs multiplied into an `i32` accumulator, then requantized
-/// to an `i8` output in 1 pass: the ndarray adapter over gemmkit's
-/// [`gemmkit::gemm_i8_requant`]. The [`Requantize`] carries the per-tensor or per-row `scale`,
-/// `zero_point`, and an optional per-row `i32` bias; there is no `alpha` (folds into `scale`) or
-/// `beta`. Reads the pointers/strides directly and forwards to gemmkit's raw engine, so
-/// transposed, general-stride, and reversed (negative-stride) views all work without copying
+/// to an `i8` output in 1 pass. This is the ndarray adapter over gemmkit's
+/// [`gemmkit::gemm_i8_requant`]. The [`Requantize`] value carries the per-tensor or per-row
+/// `scale`, the `zero_point`, and an optional per-row `i32` bias. There is no `alpha` parameter,
+/// because it folds into `scale`, and no `beta` parameter. It reads the pointers and strides
+/// directly and forwards to gemmkit's raw engine. Transposed, general-stride, and reversed
+/// (negative-stride) views all work without copying
 ///
 /// # Panics
-/// If the inner dimensions disagree, or on the requant parameters the adapter rejects (a
-/// non-finite or non-positive `scale`, per-tensor or any per-row element; a per-row scale slice
-/// whose length is not `A.rows` or which overlaps `C`; a `zero_point` outside `[-128, 127]`; or a
-/// bias whose length is not `A.rows` or which overlaps `C`)
+/// If the inner dimensions disagree, or on a requant parameter the adapter rejects:
+///
+/// - a non-finite or non-positive `scale`, per-tensor or any per-row element
+/// - a per-row scale slice whose length is not `A.rows`, or which overlaps `C`
+/// - a `zero_point` outside `[-128, 127]`
+/// - a bias whose length is not `A.rows`, or which overlaps `C`
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 pub fn gemm_i8_requant<S1, S2, SC>(
     a: &ArrayBase<S1, Ix2>,
@@ -204,9 +208,9 @@ fn gemm_i8_requant_common<S1, S2, SC>(
     let cs = c.strides();
     let (rsc, csc) = (cs[0], cs[1]);
     let cp = c.as_mut_ptr();
-    // Requantize validation matching gemmkit's checked-entry wording: a finite, positive
-    // per-tensor or per-row scale (a per-row slice length A.rows, disjoint from C); zero_point in
-    // the i8 band; a per-row bias of length A.rows disjoint from C (raw pointer math only)
+    // Requantize validation mirrors gemmkit's checked-entry rules. The scale is finite and
+    // positive, per-tensor or per-row, and disjoint from C. The zero_point sits inside the i8
+    // band, and the bias is disjoint from C. All checks use raw pointer math only
     let (scale, row_scales, has_row_scales) =
         requant_scale(m, cp, &[(cm, rsc), (cn, csc)], req.scale);
     assert!(
@@ -216,8 +220,8 @@ fn gemm_i8_requant_common<S1, S2, SC>(
     );
     let (bias_ptr, has_bias) = requant_bias(m, cp, &[(cm, rsc), (cn, csc)], req.bias);
 
-    // SAFETY: dims validated above; ndarray guarantees the layouts are in-bounds; `c` (a `&mut
-    // i8` borrow) can't alias `a`/`b`, and the bias was validated disjoint from C above
+    // SAFETY: the dims are validated above. ndarray guarantees the layouts are in-bounds. `c` (a
+    // `&mut i8` borrow) cannot alias `a`/`b`, and the bias was validated disjoint from C above
     unsafe {
         match ws {
             Some(ws) => gemm_i8_requant_unchecked_with(
@@ -267,16 +271,18 @@ fn gemm_i8_requant_common<S1, S2, SC>(
     }
 }
 
-/// Requantizing integer GEMM with an **unsigned `u8` output** (ONNX-QLinearMatMul-style
-/// activation): the ndarray adapter over gemmkit's [`gemmkit::gemm_i8_requant_u8`]. The
-/// `u8`-output twin of [`gemm_i8_requant`], differing only in the output domain `[0, 255]` and
-/// the `zero_point` range
+/// Requantizing integer GEMM with an unsigned `u8` output (ONNX-QLinearMatMul-style activation):
+/// the ndarray adapter over gemmkit's [`gemmkit::gemm_i8_requant_u8`]. This is the `u8`-output
+/// twin of [`gemm_i8_requant`], differing only in the output domain `[0, 255]` and the
+/// `zero_point` range
 ///
 /// # Panics
-/// If the inner dimensions disagree, or on the requant parameters the adapter rejects (a
-/// non-finite or non-positive `scale`, per-tensor or any per-row element; a per-row scale slice
-/// whose length is not `A.rows` or which overlaps `C`; a `zero_point` outside `[0, 255]`; or a
-/// bias whose length is not `A.rows` or which overlaps `C`)
+/// If the inner dimensions disagree, or on a requant parameter the adapter rejects:
+///
+/// - a non-finite or non-positive `scale`, per-tensor or any per-row element
+/// - a per-row scale slice whose length is not `A.rows`, or which overlaps `C`
+/// - a `zero_point` outside `[0, 255]`
+/// - a bias whose length is not `A.rows`, or which overlaps `C`
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 pub fn gemm_i8_requant_u8<S1, S2, SC>(
     a: &ArrayBase<S1, Ix2>,
@@ -334,9 +340,9 @@ fn gemm_i8_requant_u8_common<S1, S2, SC>(
     let cs = c.strides();
     let (rsc, csc) = (cs[0], cs[1]);
     let cp = c.as_mut_ptr();
-    // Requantize validation matching gemmkit's checked-entry wording: a finite, positive
-    // per-tensor or per-row scale (a per-row slice length A.rows, disjoint from C); zero_point in
-    // the u8 band; a per-row bias of length A.rows disjoint from C (raw pointer math only)
+    // Requantize validation mirrors gemmkit's checked-entry rules. The scale is finite and
+    // positive, per-tensor or per-row, and disjoint from C. The zero_point sits inside the u8
+    // band, and the bias is disjoint from C. All checks use raw pointer math only
     let (scale, row_scales, has_row_scales) =
         requant_scale(m, cp, &[(cm, rsc), (cn, csc)], req.scale);
     assert!(
@@ -346,8 +352,8 @@ fn gemm_i8_requant_u8_common<S1, S2, SC>(
     );
     let (bias_ptr, has_bias) = requant_bias(m, cp, &[(cm, rsc), (cn, csc)], req.bias);
 
-    // SAFETY: dims validated above; ndarray guarantees the layouts are in-bounds; `c` (a `&mut
-    // u8` borrow) can't alias `a`/`b`, and the bias was validated disjoint from C above
+    // SAFETY: the dims are validated above. ndarray guarantees the layouts are in-bounds. `c` (a
+    // `&mut u8` borrow) cannot alias `a`/`b`, and the bias was validated disjoint from C above
     unsafe {
         match ws {
             Some(ws) => gemm_i8_requant_u8_unchecked_with(

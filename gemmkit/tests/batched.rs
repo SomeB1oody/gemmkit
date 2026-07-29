@@ -74,16 +74,17 @@ fn assert_batched_matches_loop(
     );
 }
 
+/// `gemm_batched` must match a loop of single `gemm(par)` calls bit-for-bit, over many small
+/// elements: batch counts not a multiple of the worker count, non-square shapes, beta != 0. Some
+/// shapes also route through a small element's own horizontal kernel
 #[test]
 fn batched_matches_gemm_loop_many_small() {
-    // Batch counts not a multiple of the worker count; non-square shapes; beta != 0, alpha != 1
-    // Small elements land on the batch-parallel schedule, and some also route through a small
-    // element's own horizontal kernel
     for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
         assert_batched_matches_loop(200, 8, 8, 8, 1.0, 0.0, par);
         assert_batched_matches_loop(101, 6, 40, 5, 2.5, -0.5, par);
         assert_batched_matches_loop(37, 16, 100, 4, -1.0, 1.0, par);
-        assert_batched_matches_loop(1, 12, 12, 12, 1.0, 0.0, par); // batch of 1, the degenerate case
+        // batch of 1, the degenerate case
+        assert_batched_matches_loop(1, 12, 12, 12, 1.0, 0.0, par);
     }
 }
 
@@ -146,11 +147,11 @@ fn batched_unchecked_matches_gemm_loop() {
     }
 }
 
+/// `gemm_batched` must match a loop of single `gemm(par)` calls bit-for-bit, over cache-resident
+/// elements (each fits L2): a batch smaller than the core count resolves to the batch-parallel
+/// schedule (1 element per worker, run serially) rather than splitting elements across workers
 #[test]
 fn batched_matches_gemm_loop_few_large() {
-    // Cache-resident elements (each fits L2), so a batch smaller than the core count still
-    // resolves to the batch-parallel schedule (1 element per worker, run serially) rather than
-    // splitting elements across workers, and stays bit-identical to the gemm() loop
     for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
         assert_batched_matches_loop(3, 200, 150, 180, 1.0, 0.0, par);
         assert_batched_matches_loop(2, 128, 96, 160, 0.75, 0.25, par);
@@ -208,7 +209,7 @@ fn batched_dram_bound_few_large_correct() {
 /// `gemm_batched` must not panic when called from inside a rayon worker. The batch-parallel
 /// schedule blocks its calling worker inside a `for_each`, and rayon can work-steal a 2nd, nested
 /// `gemm_batched` onto that same worker while it still holds the thread-local pool; the pool
-/// accessor falls back to a fresh one-off `Workspace` rather than double-borrowing, so this can't
+/// accessor falls back to a fresh one-off `Workspace` rather than double-borrowing, so this cannot
 /// panic on a borrow conflict. Uses more outer tasks than the core count to actually force a steal
 #[cfg(all(feature = "parallel", not(miri)))]
 #[test]
@@ -246,6 +247,8 @@ fn batched_from_inside_rayon_worker_does_not_panic() {
     }
 }
 
+/// Output-partitioning gives no cross-thread reduction, so a batched run must be bit-identical
+/// serial vs parallel
 #[test]
 fn batched_serial_equals_parallel_bit_identical() {
     let (batch, m, k, n) = (300, 12, 64, 9);
@@ -274,9 +277,10 @@ fn batched_serial_equals_parallel_bit_identical() {
     );
 }
 
+/// `a_batch_stride = 0` broadcasts a single A across every element; B and C stay per-element.
+/// Must match a loop of single `gemm()` calls, each reusing that same A
 #[test]
 fn batched_broadcast_a_shared_across_elements() {
-    // a_batch_stride = 0 broadcasts a single A across every element; B and C are per-element
     let (batch, m, k, n) = (16, 8, 20, 6);
     let a = fill(m * k, 21); // a single element's worth, reused by every element below
     let b = packed(batch, k, n, 22);
@@ -311,10 +315,10 @@ fn batched_broadcast_a_shared_across_elements() {
     assert_eq!(c_ref, c_bat, "broadcast-A batched != gemm() loop");
 }
 
+/// `batch == 0` short-circuits before validation, so mismatched/placeholder element shapes
+/// (which would otherwise panic) must not be dereferenced or checked at all
 #[test]
 fn batched_zero_batch_is_noop() {
-    // batch == 0 short-circuits before validation, so mismatched/placeholder element shapes
-    // (which would otherwise panic) must not be dereferenced or checked at all
     let a = fill(4 * 3, 1);
     let b = fill(5 * 2, 2); // B.rows (5) deliberately != A.cols (3)
     let mut c = vec![7.0f32; 4 * 2];
@@ -337,10 +341,10 @@ fn batched_zero_batch_is_noop() {
     );
 }
 
+/// `gemm_batched_with` threads a caller-owned `Workspace` through the serial and few-large
+/// schedules instead of the thread-local pool, and stays correct across repeated calls
 #[test]
 fn batched_reuses_workspace() {
-    // gemm_batched_with threads a caller-owned Workspace through the serial and few-large
-    // schedules instead of the thread-local pool
     let (batch, m, k, n) = (4, 64, 64, 64);
     let a = packed(batch, m, k, 31);
     let b = packed(batch, k, n, 32);
@@ -378,10 +382,11 @@ fn batched_reuses_workspace() {
 
 // The batched API must reject invalid layouts
 
+/// A C batch stride below the element extent `m*n` must panic: element 1 would overwrite
+/// element 0
 #[test]
 #[should_panic(expected = "stay disjoint")]
 fn batched_rejects_overlapping_c() {
-    // C batch stride set below the element extent m*n, so element 1 would overwrite element 0
     let (batch, m, n) = (2usize, 4usize, 4usize);
     let a = packed(batch, m, m, 1);
     let b = packed(batch, m, n, 2);
@@ -400,10 +405,10 @@ fn batched_rejects_overlapping_c() {
     );
 }
 
+/// `cs = 0` collapses every column onto the same memory, aliasing C against itself; must panic
 #[test]
 #[should_panic(expected = "aliases itself")]
 fn batched_rejects_self_aliasing_c() {
-    // cs = 0 collapses every column onto the same memory, aliasing C against itself
     let (batch, m, n) = (2usize, 4usize, 4usize);
     let a = packed(batch, m, m, 1);
     let b = packed(batch, m, n, 2);
@@ -422,11 +427,11 @@ fn batched_rejects_self_aliasing_c() {
     );
 }
 
+/// A buffer 1 element short of what `batch` elements need must panic even though only the
+/// last element's view runs out of bounds: the check must not stop at element 0
 #[test]
 #[should_panic(expected = "needs")]
 fn batched_rejects_last_element_out_of_bounds() {
-    // The buffer is 1 element short of what `batch` elements need, so only the last element's
-    // view runs out of bounds; the check must not stop at element 0
     let (batch, m, k, n) = (4usize, 8usize, 8usize, 8usize);
     let a = vec![0.0f32; batch * m * k - 1];
     let b = packed(batch, k, n, 2);
@@ -445,6 +450,7 @@ fn batched_rejects_last_element_out_of_bounds() {
     );
 }
 
+/// A negative batch stride must panic
 #[test]
 #[should_panic(expected = "non-negative")]
 fn batched_rejects_negative_batch_stride() {
@@ -466,6 +472,7 @@ fn batched_rejects_negative_batch_stride() {
     );
 }
 
+/// A per-element shape mismatch (`A.cols != B.rows`) must panic
 #[test]
 #[should_panic(expected = "!= B.rows")]
 fn batched_rejects_shape_mismatch() {
@@ -719,6 +726,8 @@ fn batched_slice_parallel_matches_serial_bit_for_bit() {
     }
 }
 
+/// `gemm_batched_slice` must panic on a per-element shape mismatch (`A.cols != B.rows`), same as
+/// the strided-batched form
 #[test]
 #[should_panic(expected = "!= B.rows")]
 fn batched_slice_rejects_shape_mismatch() {

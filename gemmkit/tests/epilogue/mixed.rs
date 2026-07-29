@@ -1,25 +1,13 @@
 //! `gemm_fused` tests for the narrow floats (`f16`/`bf16`, feature `half`)
 //!
-//! A narrow fused call is not bitwise-equal to `gemm()` followed by a separate narrow map: the
-//! bias vector and `LeakyRelu` slope are the narrow type, widened **exactly** to `f32`, and the
-//! whole bias+activation transform runs in `f32` against the `f32` accumulator, narrowed to the
-//! output **once**. `gemm`-then-map would instead round to `N` for the plain store and round
-//! again after the map, 2 roundings where the fused call has 1, so the fused result is *more*
-//! precise, not identical. What each test locks down:
+//! A narrow fused call is not bitwise-equal to `gemm()` then a separate narrow map: the bias and
+//! `LeakyRelu` slope widen exactly to `f32`, and the whole bias+activation transform runs in
+//! `f32` against the `f32` accumulator, narrowed to the output once, so the fused result is more
+//! precise than the 2-rounding `gemm`-then-map alternative, not bitwise identical to it
 //!
-//! * (a) the vector fast path and the scalar/scratch path agree bit-for-bit on the same input;
-//! * (b) at `k = 1` (an exact `f32` product), the fused output matches a single-rounding
-//!   reference bitwise, and that reference is shown to differ from the 2-rounding alternative;
-//! * (c) the general-driver shape matches an f64 oracle within a per-element tolerance, across
-//!   the full bias x activation x beta sweep;
-//! * (d) the `small_mn` / small-`k` special routes match the oracle and reproduce serial ==
-//!   Rayon(4) bit-for-bit;
-//! * (e) `bias = None, act = None` delegates to plain `gemm` bit-for-bit (the zero-cost path);
-//! * (f) `ReLU` maps a NaN accumulator to `+0.0`, every ISA and store path;
-//! * (g) at deep `k`, the fused route stays single-panel while a plain narrow `gemm` re-blocks
-//!   through its f32-output twin, and both stay accurate and serial == parallel
-//!
-//! All shapes are platform-independent: deterministic LCG fills, self-computed references
+//! Covers: vector vs scalar path agreement, the `k = 1` single-rounding reference, a general-shape
+//! f64 oracle within tolerance, the `small_mn`/small-`k` special routes, the bias/act-`None`
+//! identity delegation, `ReLU(NaN) = +0.0`, and the deep-`k` route split
 
 use crate::common::Rng;
 use gemmkit::{
@@ -94,8 +82,8 @@ impl Narrow for gemmkit::bf16 {
     }
 }
 
-/// A `Copy` descriptor for the activation a reference computation should apply. `gemmkit::Activation`
-/// is not `Clone`, so this stands in for it wherever a value needs to be reused across several calls
+/// A `Copy` descriptor for the activation a reference computation should apply.
+/// `gemmkit::Activation` is not `Clone`, so this stands in wherever a value is reused across calls
 #[derive(Copy, Clone)]
 enum ActK {
     None,

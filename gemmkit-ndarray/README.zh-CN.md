@@ -4,9 +4,9 @@
 
 [![crates.io](https://img.shields.io/crates/v/gemmkit-ndarray.svg)](https://crates.io/crates/gemmkit-ndarray) [![docs.rs](https://img.shields.io/docsrs/gemmkit-ndarray)](https://docs.rs/gemmkit-ndarray)
 
-面向 [`gemmkit`](https://crates.io/crates/gemmkit) GEMM 引擎的零拷贝 [`ndarray`](https://crates.io/crates/ndarray) 适配器。每个入口都接受 `&ArrayBase<S, Ix2>`，其中存储类型 `S: Data` 任意（因此 `ArrayView2` 和 `&Array2` 都可用），直接从数组中读出指针和步长，再转交给 gemmkit 的引擎。因此 C 序、F 序、一般步长以及反转（负步长）视图都无需拷贝即可工作，输出参数 `&mut ArrayBase<SC, Ix2>` 同样可以是任意布局。
+面向 [`gemmkit`](https://crates.io/crates/gemmkit) GEMM 引擎的零拷贝 [`ndarray`](https://crates.io/crates/ndarray) 适配器。每个入口都接受 `&ArrayBase<S, Ix2>`，其中存储类型 `S: Data` 可以是任意实现，因此 `ArrayView2` 和 `&Array2` 都能使用。每个入口直接从数组中读出指针和步长，再转交给 gemmkit 的引擎。因此 C 序、F 序、一般步长以及反转（负步长）视图都无需拷贝即可工作。输出参数 `&mut ArrayBase<SC, Ix2>` 同样可以是任意布局。
 
-该适配器完整镜像了核心 API：实数 `f32` / `f64`（在 `half` 下还有 `f16` / `bf16`）、`complex` 下的复数、`int8` 下的 `i8 -> i32`，以及 `epilogue` 下的融合尾部运算（fused epilogue）入口（偏置、激活、`i8` / `u8` 重量化，以及用户自定义的逐元素映射），另外还有预打包操作数的复用路径（`prepack_lhs` / `prepack_rhs`）。它也是唯一带有批量 GEMM 入口的适配器，映射到 ndarray 的三维数组类型（`Ix3`，批次维为 0 轴）。完整的入口点列表见 [API 文档](https://docs.rs/gemmkit-ndarray)。
+该适配器完整镜像了核心 API 的功能范围：实数 `f32` / `f64`（在 `half` 下还有 `f16` / `bf16`）、`complex` 下的复数，以及 `int8` 下的 `i8 -> i32`。它还包含 `epilogue` 下的融合尾部运算（fused epilogue）入口：偏置、激活、`i8` / `u8` 重量化，以及用户自定义的逐元素映射。此外还覆盖了预打包操作数的复用路径（`prepack_lhs` / `prepack_rhs`）。它也是唯一带有批量 GEMM 入口的适配器，映射到 ndarray 的三维数组类型（`Ix3`，批次维为 0 轴）。完整的入口点列表见 [API 文档](https://docs.rs/gemmkit-ndarray)。
 
 本适配器的分步教程见 [gemmkit 指南](https://someb1oody.github.io/gemmkit/zh-Hans/gemmkit-ndarray/在ndarray中使用gemmkit.html)。
 
@@ -31,7 +31,7 @@ fn main() {
 }
 ```
 
-`gemm` 就地写入通用形式 `C <- alpha*A*B + beta*C`，并且接受任意布局而无需拷贝，包括转置后的（列主序）视图：
+`gemm` 就地写入通用形式 `C <- alpha*A*B + beta*C`。它接受任意布局而无需拷贝，包括转置后的（列主序）视图：
 
 ```rust
 use gemmkit_ndarray::Parallelism;
@@ -49,7 +49,7 @@ fn main() {
 }
 ```
 
-可复用 `Workspace` 的变体（`gemm_with` 等）以及各个 feature 门控的类型族都遵循同样的形式，详见 [API 文档](https://docs.rs/gemmkit-ndarray)。
+可复用 `Workspace` 的变体（`gemm_with` 等）以及各个 feature 门控的类型族都遵循同样的形式。详见 [API 文档](https://docs.rs/gemmkit-ndarray)。
 
 ## Cargo feature
 
@@ -58,7 +58,7 @@ fn main() {
 | Feature | 默认 | 作用 |
 | --- | --- | --- |
 | `parallel` | 是 | 基于 rayon 的多线程（`gemmkit/parallel`）。 |
-| `wasm_threads` | 否 | 在 `wasm32-wasip1-threads` 上启用线程；隐含 `parallel`。 |
+| `wasm_threads` | 否 | 在 `wasm32-wasip1-threads` 上启用线程。隐含 `parallel`。 |
 | `half` | 否 | `f16` / `bf16` 输入，以 `f32` 累加。 |
 | `complex` | 否 | `Complex<f32>` / `Complex<f64>` 矩阵。 |
 | `int8` | 否 | `i8` 输入，累加进 `i32`。 |
@@ -66,8 +66,8 @@ fn main() {
 
 ## 支持的元素类型
 
-实数 `f32` 与 `f64` 路径始终构建，其余类型由上面的 feature 门控。每种类型都直接从
-`ndarray` 数组读出，C 序、F 序或任意步长布局皆可，无需转换。
+实数 `f32` 与 `f64` 路径始终构建，其余类型由上面的
+`feature` 控制。适配器直接从 `ndarray` 数组读出每种类型，C 序、F 序或任意步长布局皆可，无需转换。
 
 | 元素类型 | Feature | 计算 | 入口 |
 | --- | --- | --- | --- |
@@ -83,7 +83,7 @@ ndarray 的三维数组（`Ix3`，批次维为 0 轴）。
 
 ## 相关 crate
 
-- [`gemmkit`](https://crates.io/crates/gemmkit)：核心引擎。所有算法相关的文档都在那里以及它的 [docs.rs 页面](https://docs.rs/gemmkit)上；本适配器只负责把 ndarray 的类型映射过去。
+- [`gemmkit`](https://crates.io/crates/gemmkit)：核心引擎。所有算法相关的文档都在那里以及它的 [docs.rs 页面](https://docs.rs/gemmkit)上。本适配器只负责把 ndarray 的类型映射过去。
 - [`gemmkit-nalgebra`](https://crates.io/crates/gemmkit-nalgebra) 和 [`gemmkit-faer`](https://crates.io/crates/gemmkit-faer)：面向 nalgebra 与 faer 的同类适配器。
 - [`gemmkit-tune`](https://crates.io/crates/gemmkit-tune)：安装期自动调优二进制程序。
 

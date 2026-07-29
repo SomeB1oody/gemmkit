@@ -2,22 +2,23 @@
 //! shallow for packing to pay off
 //!
 //! The register-tiling driver packs A/B into micropanels so the microkernel walks a
-//! contiguous depth axis; that pack is a fixed cost per element, amortized over the reuse
-//! the driver's blocking gets out of it. At small `k` there is only one depth panel and
-//! every packed element is read exactly once, so the pack buys nothing and is pure
+//! contiguous depth axis. That pack is a fixed cost per element, amortized over the reuse
+//! the driver's blocking gets from it. At small `k` there is only one depth panel, and every
+//! packed element is read exactly once. The pack therefore buys nothing and is pure
 //! overhead. This route instead calls the family's
-//! [`microkernel`](crate::kernel::KernelFamily::microkernel) directly over unpacked A/B,
-//! `kc = k` in a single pass, inheriting whatever widen/bias/conj/rounding behavior the
-//! family's microkernel already has
+//! [`microkernel_epi`](crate::kernel::KernelFamily::microkernel_epi) directly over unpacked
+//! A/B, with `kc = k` in a single pass. It inherits whatever widen, bias, conj, or rounding
+//! behavior the family's microkernel already has
 //!
-//! Dispatch only reaches this route below the (arch-tuned) `small_k_threshold`, and only
-//! for a family whose LHS the microkernel can read in place: `rsa == 1` (column-major A)
-//! and no forced packing transform (complex conj-planar, mixed narrow repacking). When
-//! either fails, [`run_epi`] falls back to [`driver::run_epilogue`] instead, which is
-//! still correct there and is the faster route once `k` grows past the in-place regime
+//! Dispatch only reaches this route below the arch-tuned `small_k_threshold`. It also
+//! requires a family whose LHS the microkernel can read in place: `rsa == 1`, meaning
+//! column-major A. The family must also need no forced packing transform, such as complex
+//! conj-planar layout or mixed narrow repacking. When either condition fails, [`run_epi`]
+//! falls back to [`driver::run_epilogue`] instead. That route is still correct there and
+//! becomes the faster route once `k` grows past the in-place regime
 //!
 //! Every output tile is one full-depth reduction computed by a single worker, so splitting
-//! tiles across workers adds no cross-thread reduction step: the result is bit-identical to
+//! tiles across workers adds no cross-thread reduction step. The result is bit-identical to
 //! the serial run at any worker count
 
 use core::mem::MaybeUninit;
@@ -29,21 +30,21 @@ use crate::parallel::{self, JobCursor, Parallelism, Ptr};
 use crate::simd::{KernelSimd, SimdOps};
 use crate::workspace::Workspace;
 
-/// Largest `k` this route accepts in place. Bounds the stack pad buffer used for a partial
-/// bottom row-tile (`MAX_MR * SMALL_K_MAX` elements); `k` past this falls back to the
-/// driver, which is already the better choice there
+/// Largest `k` this route accepts in place. It bounds the stack pad buffer used for a
+/// partial bottom row-tile, sized `MAX_MR * SMALL_K_MAX` elements. Past this `k`, the route
+/// falls back to the driver, which is already the better choice there
 const SMALL_K_MAX: usize = 32;
 
-/// Small-`k` GEMM, plain (non-fused) output. Thin [`Identity`] wrapper over [`run_epi`]:
-/// with `E = Identity` every epilogue hook const-folds away, so this is exactly the code
-/// this route ran before the epilogue mechanism existed
+/// Small-`k` GEMM, plain (non-fused) output. It is a thin [`Identity`] wrapper over
+/// [`run_epi`]. With `E = Identity`, every epilogue hook const-folds away, so this produces
+/// the same code path as the plain route with no epilogue
 ///
 /// # Safety
 /// All pointers must be valid for the regions implied by the strides/sizes, and `C` must
 /// not alias `A` or `B`
-// dead_code without int8: the unified float/mixed dispatch ladders now call run_epi directly (with
-// Identity for the plain route), so the i8 ladder in dispatch/int.rs is this wrapper's only caller;
-// it stays as the documented plain entry the run_epi docs reference
+// Without int8, this function has no caller: the unified float/mixed dispatch ladders call
+// run_epi directly, with Identity for the plain route. The i8 ladder in dispatch/int.rs is
+// its only caller, so it stays as the documented plain entry that the run_epi docs reference
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(not(feature = "int8"), allow(dead_code))]
 pub unsafe fn run<Fam, S, const MR_REG: usize, const NR: usize>(
@@ -77,8 +78,8 @@ pub unsafe fn run<Fam, S, const MR_REG: usize, const NR: usize>(
 }
 
 /// Small-`k` GEMM with a fused [`Epilogue`] `E` applied at each element's store. Since the
-/// whole contraction is a single `kc = k` panel, every element is written exactly once, so
-/// `last_k` is unconditionally true and the epilogue fires exactly once per element - the
+/// whole contraction is a single `kc = k` panel, every element is written exactly once. So
+/// `last_k` is unconditionally true, and the epilogue fires exactly once per element. The
 /// fused output equals plain [`run`] followed by the same scalar map
 ///
 /// # Safety
@@ -122,7 +123,7 @@ pub unsafe fn run_epi<Fam, S, E, const MR_REG: usize, const NR: usize>(
             return;
         }
 
-        // Epilogue is Copy; move a value copy into the worker closures below
+        // Epilogue is Copy. Move a value copy into the worker closures below
         let epi = *epi;
 
         let lanes = <S as SimdOps<Fam::Acc>>::LANES;
@@ -142,8 +143,8 @@ pub unsafe fn run_epi<Fam, S, E, const MR_REG: usize, const NR: usize>(
         let ash = alpha_status(alpha);
         let bst = beta_status(beta);
 
-        // This shape is memory-bound (m*n C writes dominate at small k), so size the worker
-        // count off measured byte traffic rather than the compute-ramp heuristic
+        // This shape is memory-bound, since m*n C writes dominate at small k. This sizes the
+        // worker count from byte traffic instead of the compute-ramp heuristic
         let bytes = m
             .saturating_mul(k)
             .saturating_mul(core::mem::size_of::<Fam::Lhs>())
@@ -161,8 +162,9 @@ pub unsafe fn run_epi<Fam, S, E, const MR_REG: usize, const NR: usize>(
         let b = Ptr(b as *mut Fam::Rhs);
         let c = Ptr(c);
 
-        // One kc = k panel per tile; column-tile-outer flat order so a worker's consecutive
-        // tiles share a C column block (contiguous stores for column-major C)
+        // One kc = k panel exists per tile. Column-tile-outer flat order means a worker's
+        // consecutive tiles share a C column block, giving contiguous stores for a
+        // column-major C
         let body = move |q_start: usize, q_end: usize| {
             let (a, b, c, epi) = (a, b, c, epi);
             let a = a.0 as *const Fam::Lhs;
@@ -173,9 +175,9 @@ pub unsafe fn run_epi<Fam, S, E, const MR_REG: usize, const NR: usize>(
                 let scratch_ptr = scratch.as_mut_ptr() as *mut Fam::Acc;
 
                 // The microkernel always loads a full mr rows regardless of the tile's real
-                // height, so reading the bottom partial tile's A in place would run past A's
+                // height. Reading the bottom partial tile's A in place would run past A's
                 // end. Pack it once, zero-padded to mr rows, and reuse it for every column
-                // tile (its A block does not depend on the column)
+                // tile, since its A block does not depend on the column
                 let mut pad = [const { MaybeUninit::<Fam::Lhs>::uninit() }; MAX_MR * SMALL_K_MAX];
                 let pad_base = if bottom_partial {
                     Fam::pack_lhs(
@@ -199,9 +201,9 @@ pub unsafe fn run_epi<Fam, S, E, const MR_REG: usize, const NR: usize>(
                     let jc = jt * nr;
                     let mr_eff = core::cmp::min(mr, m - ic);
                     let nr_eff = core::cmp::min(nr, n - jc);
-                    // A full row-tile reads A in place (rows unit-stride, depth stride csa);
-                    // the bottom partial tile reads the padded panel instead (depth stride
-                    // mr, since it is packed micropanel-major)
+                    // A full row-tile reads A in place, rows unit-stride, depth stride csa
+                    // The bottom partial tile instead reads the padded panel, depth stride
+                    // mr, since that panel is packed micropanel-major
                     let (apan, a_cs) = if mr_eff < mr {
                         (pad_base, mr as isize)
                     } else {
@@ -243,7 +245,7 @@ pub unsafe fn run_epi<Fam, S, E, const MR_REG: usize, const NR: usize>(
             return;
         }
 
-        // Workers pull disjoint flat-tile ranges from a shared cursor; each tile is a
+        // Workers pull disjoint flat-tile ranges from a shared cursor. Each tile is a
         // complete k-reduction owned by one worker, so no cross-worker reduction and no
         // barrier is needed
         let cur = JobCursor::new(n_tiles, parallel::job_grain(n_tiles, n_threads));

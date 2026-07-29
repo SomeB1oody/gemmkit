@@ -3,26 +3,23 @@
 //!
 //! Unlike the rest of this suite these benches assert, because the failure they guard
 //! against is not a few percent of throughput. A fused kernel is a separate
-//! monomorphization of the same generic body, so an epilogue can degrade the *kernel*
-//! rather than the store: with the bias/activation decode replicated into every slot of
-//! the unrolled store pass, the compiler stopped keeping the accumulator tile in
-//! registers at all and wrote it through to the stack from inside the `kc` loop, running
-//! the AVX-512 `f32` fused path at 1/3 the plain rate while AVX2 was unaffected. That is
-//! invisible to every correctness test and to any bench that measures fused paths alone.
-//! The bound below is sized for that class of collapse, not to police small regressions
+//! monomorphization of the same generic body, so an epilogue can degrade the kernel itself
+//! rather than just the store, if the compiler stops keeping the accumulator tile in
+//! registers across the `kc` loop. That is invisible to every correctness test and to any
+//! bench that measures fused paths alone, so the bound below is sized for that class of
+//! collapse, not to police small regressions
 //!
-//! Self-relative by construction: both sides are gemmkit on the current machine and ISA,
-//! so there is no absolute figure to go stale on other hardware. Shapes with a wide
-//! register tile matter most, so the sweep covers a large square, a shallow-`k` shape
-//! (where the epilogue is least amortized) and a tall/skinny one
+//! Self-relative by construction: both sides are gemmkit on the current machine and ISA, so
+//! there is no absolute figure to go stale on other hardware. The sweep covers a large
+//! square, a shallow-`k` shape (where the epilogue is least amortized), and a tall/skinny one
 
 use crate::harness::{BENCH_GUARD, fill, measure};
 use gemmkit::{Activation, Bias, MatMut, MatRef, Parallelism, gemm, gemm_fused};
 
 /// Ratio of fused to plain time above which the epilogue is judged to have broken the
-/// kernel rather than added work to the store. The observed collapse was 2.6-3.2x and a
-/// healthy fused path measures 0.97-1.06x, so this sits far from both: it must not fire
-/// on a loaded CI runner, and a real collapse clears it by a wide margin
+/// kernel rather than added work to the store: set well above normal jitter, so it must
+/// not fire on a loaded CI runner, and well below the multi-x slowdown a real collapse
+/// produces
 const MAX_FUSED_RATIO: f64 = 2.0;
 
 /// `(m, k, n)` shapes: a large square, a shallow `k` (the epilogue's worst amortization),
@@ -80,6 +77,8 @@ fn bench(par: Parallelism, tag: &str) {
     }
 }
 
+/// Fused vs plain across every shape in `SHAPES`, serial: asserts the ratio stays under
+/// `MAX_FUSED_RATIO`
 #[test]
 #[ignore = "benchmark"]
 fn perf_fused_overhead_serial() {
@@ -87,6 +86,8 @@ fn perf_fused_overhead_serial() {
     bench(Parallelism::Serial, "ser");
 }
 
+/// Fused vs plain across every shape in `SHAPES`, parallel: asserts the ratio stays under
+/// `MAX_FUSED_RATIO`
 #[test]
 #[ignore = "benchmark"]
 fn perf_fused_overhead_parallel() {

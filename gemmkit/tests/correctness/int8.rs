@@ -158,8 +158,9 @@ fn i8_unchecked_with_matches_gemm_i8() {
                 v
             };
             let mut c = c0.clone();
-            // SAFETY: a/bcol/c are 3 distinct, correctly sized buffers, so every stride/extent
-            // implied by (rsa,csa)/(rsb,csb)/(rsc,csc) stays in bounds and C aliases neither operand
+            // SAFETY: a/bcol/c are 3 distinct, correctly sized buffers, so every
+            // stride/extent implied by (rsa,csa)/(rsb,csb)/(rsc,csc) stays in bounds and C
+            // aliases neither operand
             unsafe {
                 gemm_i8_unchecked_with(
                     &mut ws,

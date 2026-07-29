@@ -106,6 +106,8 @@ fn stream_triad_parallel_peak(avail: usize) -> (usize, Stat) {
     best.unwrap_or_else(|| (1, stream_triad_serial()))
 }
 
+/// Serial STREAM copy and triad plus a parallel triad thread ladder: the bandwidth ceiling
+/// the gemv/gevv benches below are read against
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
 fn perf_stream() {
@@ -261,6 +263,8 @@ fn bench_gemv(m: usize, k: usize, par: Parallelism, ceiling: f64) {
     );
 }
 
+/// axpy-layout gemv (column-major A) across an `m,k` grid, serial and parallel, against its
+/// own STREAM ceiling and the external baselines
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
 fn perf_gemv() {
@@ -348,6 +352,8 @@ fn bench_gemv_dot(m: usize, k: usize, par: Parallelism, ceiling: f64) {
     );
 }
 
+/// Row-major-A gemv (routes to the dot-layout path) across a cache-resident-to-DRAM `m,k`
+/// spread, serial and parallel, against its own STREAM ceiling
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
 fn perf_gemv_dot() {
@@ -448,6 +454,8 @@ fn bench_gemv_mixed<T: gemmkit::GemmScalar>(
     );
 }
 
+/// f16/bf16 gemv, dot and axpy layouts, against the general driver with the widen-gemv
+/// route forced off, serial and parallel
 #[cfg(all(feature = "half", not(target_family = "wasm")))]
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
@@ -468,11 +476,10 @@ fn perf_gemv_mixed() {
 }
 
 /// For a gemv-shaped call, compares the dedicated gemv special path against the general
-/// driver (reached by forcing the gemv threshold down to 0) and against the `gemm` crate, all
-/// 3 on the same buffers. Confirms the special path earns its keep: the driver packs A into
-/// micropanels for a compute-bound kernel, which is the wrong tool for a bandwidth-bound
-/// shape, and this shows exactly how much that costs; it also tracks the remaining gap to
-/// `gemm`'s own dedicated path
+/// driver (reached by forcing the gemv threshold down to 0) and against the `gemm` crate,
+/// all 3 on the same buffers. The general driver packs A into micropanels for a
+/// compute-bound kernel, the wrong tool for a bandwidth-bound shape; this shows what that
+/// costs, plus the remaining gap to `gemm`'s own dedicated path
 #[cfg(not(target_family = "wasm"))]
 fn bench_gemv_paths(m: usize, k: usize, par: Parallelism) {
     let a = fill(m * k, 1);
@@ -513,6 +520,8 @@ fn bench_gemv_paths(m: usize, k: usize, par: Parallelism) {
     );
 }
 
+/// f32 gemv: the axpy special path against the general driver and the `gemm` crate, across
+/// an `m,k` grid
 #[cfg(not(target_family = "wasm"))]
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
@@ -541,8 +550,8 @@ fn perf_gemv_paths() {
 /// small enough to be cache-resident reads identically at every cap regardless of `k`, and
 /// only once the output grows past that gate does the cap actually change which strategy
 /// runs. `k` is kept small on the largest `m` rows so the A matrix itself stays a manageable
-/// size. Calibrated on Zen5; re-run on any new target (e.g. aarch64) before retuning either
-/// the gate or this cap, since both are machine properties
+/// size. Both the gate and this cap are machine properties, not portable constants: re-run
+/// this sweep before retuning either on a new target
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
 fn perf_k_stream() {
@@ -629,6 +638,8 @@ fn bench_gevv(m: usize, n: usize, k: usize, par: Parallelism, ceiling: f64) {
     );
 }
 
+/// gevv / skinny GEMM at small `k`, serial and parallel, against its own STREAM ceiling and
+/// the external baselines
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
 fn perf_gevv() {
@@ -751,6 +762,8 @@ fn bench_small_k_crossover(m: usize, n: usize, k: usize, par: Parallelism) {
     );
 }
 
+/// Small-k route forced on and off across a `k` sweep, to locate where the register-tiling
+/// driver catches up to the in-place small-k route
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
 fn perf_small_k() {
@@ -767,6 +780,8 @@ fn perf_small_k() {
     }
 }
 
+/// gevv GB/s across a forced thread-count ladder plus the auto `Rayon(0)` pick, at a
+/// DRAM-bound and a cache-resident shape
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
 fn perf_gemv_scaling() {

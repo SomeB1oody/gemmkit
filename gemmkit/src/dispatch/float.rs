@@ -1,7 +1,9 @@
-//! `f32`/`f64` homogeneous-float dispatch: driver entries for the plain, fused-bias,
-//! user-map, and prepacked-RHS routes, the per-ISA wrapper functions, the memoized
-//! descriptors, ISA selection, and the `GemmScalar`/`FusedScalar`/`MapScalar` impls that
-//! plug into the dispatch layer
+//! Dispatch for the `f32`/`f64` homogeneous-float family
+//!
+//! This module holds driver entries for the plain, fused-bias, user-map, and
+//! prepacked-RHS routes. It also holds the per-ISA wrapper functions, the memoized
+//! dispatch descriptors, ISA selection, and the `GemmScalar`/`FusedScalar`/`MapScalar`
+//! impls that plug into the dispatch layer
 
 #[cfg(feature = "std")]
 use std::sync::OnceLock;
@@ -29,30 +31,36 @@ use crate::special::{gemv, small_k, small_mn};
 use crate::tuning;
 use crate::workspace::Workspace;
 
-/// The single route-priority ladder for the float family (`f32`/`f64`): route one concrete
-/// `(type, ISA, tile)` GEMM through gemv, the small-`m,n` horizontal kernel, the small-`k` panel
-/// kernel, or the general driver, whichever the shape and tuning gates select, with the fused
-/// [`Epilogue`] `E` threaded into every route. The named entries below ([`run_typed`],
-/// [`run_typed_fused`], [`run_typed_map`]) are thin epilogue-choice wrappers over this one body,
-/// mirroring the `Identity`-wrapper pattern the special layer and driver already use: with
-/// `E = Identity` every hook const-folds away, so the plain route is bit-identical to the
-/// non-fused kernel; for a real epilogue each route stores exactly the bits plain `gemm` would and
-/// applies the same scalar map exactly once per element (the vector fast path agrees bitwise with
-/// the scalar map by the [`Epilogue::apply_reg`] contract), so a fused / map result is `gemm()`
-/// then that map for every shape
+/// The single route-priority ladder for the float family (`f32`/`f64`)
 ///
-/// Concrete typing here (`T: Float<Acc = T>`) gives the special paths the `Float` bound the fully
-/// generic driver entry intentionally lacks
+/// This function routes one concrete `(type, ISA, tile)` GEMM through gemv, the
+/// small-`m,n` horizontal kernel, the small-`k` panel kernel, or the general driver. The
+/// shape and the tuning gates decide which route runs, and the fused [`Epilogue`] `E`
+/// threads through every route
 ///
-/// Route-frame semantics: gemv dispatches **before** orientation normalization, in the user frame,
-/// so `epi` still speaks the caller's original coordinates (gemv resolves its own per-row / per-col
-/// ambiguity through `swap_rc`, so a [`FusedEpi`] needs no bias-axis flip and a [`MapEpi`] stays
-/// `swapped = false`). Every route after it runs in the **oriented** frame, and `on_orient_swap`
-/// re-orients the epilogue's frame-dependent state exactly once on a swap - a field write flipping
-/// a bias axis or flagging a coordinate transpose, not a new monomorphization
+/// The named entries below ([`run_typed`], [`run_typed_fused`], [`run_typed_map`]) are
+/// thin epilogue-choice wrappers over this one body. This mirrors the `Identity`-wrapper
+/// pattern the special layer and the driver already use. With `E = Identity` every hook
+/// const-folds away, so the plain route is bit-identical to the non-fused kernel. For a
+/// real epilogue, each route stores exactly the bits plain `gemm` would and applies the
+/// same scalar map exactly once per element. The vector fast path agrees bitwise with the
+/// scalar map, under the [`Epilogue::apply_reg`] contract. A fused or mapped result
+/// equals `gemm()` followed by that map, for every shape
+///
+/// Concrete typing here (`T: Float<Acc = T>`) gives the special paths the `Float` bound
+/// that the fully generic driver entry does not carry
+///
+/// gemv dispatches before orientation normalization, in the user frame, so `epi` still
+/// uses the caller's original coordinates. gemv resolves its own per-row or per-col
+/// ambiguity through `swap_rc`, so a [`FusedEpi`] needs no bias-axis flip and a [`MapEpi`]
+/// stays `swapped = false`. Every route after gemv runs in the oriented frame, and
+/// `on_orient_swap` re-orients the epilogue's frame-dependent state exactly once on a
+/// swap. That re-orientation is a field write that flips a bias axis or flags a
+/// coordinate transpose, not a new monomorphization
 ///
 /// # Safety
-/// As [`crate::dispatch::execute`], plus `epi`'s interior pointers valid for the (pre-swap) problem's `m`/`n`
+/// As [`crate::dispatch::execute`], plus `epi`'s interior pointers valid for the (pre-swap)
+/// problem's `m`/`n`
 #[inline]
 unsafe fn run_typed_epi<T, S, E, const MR_REG: usize, const NR: usize>(
     simd: S,
@@ -66,11 +74,10 @@ unsafe fn run_typed_epi<T, S, E, const MR_REG: usize, const NR: usize>(
     E: Epilogue<FloatGemm<T>>,
 {
     unsafe {
-        // gemv/gevv shape, skipped if tuning::gemv_threshold() has been lowered below the true
-        // minimum dimension; either way falls through correctly to the general driver. gemv
-        // dispatches before orientation normalization, so epi stays in the user frame: it resolves
-        // the per-row / per-col coordinate itself from its own n == 1 / m == 1 swap_rc branch (no
-        // bias-axis flip, a MapEpi stays swapped == false)
+        // gemv/gevv shape. This falls through to the general driver if tuning::gemv_threshold()
+        // is lowered below the true minimum dimension. gemv dispatches before orientation
+        // normalization, so epi stays in the user frame. Its n == 1 / m == 1 swap_rc branch
+        // resolves the per-row or per-col coordinate directly, so a MapEpi stays swapped == false
         if (t.n == 1 || t.m == 1) && core::cmp::min(t.m, t.n) <= tuning::gemv_threshold() {
             gemv::run_typed_epi::<T, S, E>(
                 simd, t.m, t.k, t.n, par, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb, t.beta,
@@ -79,23 +86,23 @@ unsafe fn run_typed_epi<T, S, E, const MR_REG: usize, const NR: usize>(
             return;
         }
 
-        // Orientation normalization transposes the engine frame for the routes below (they all
-        // consume the oriented epi): a row-major-ish C computes C^T = B^T*A^T (swapping m<->n), so
-        // on_orient_swap re-orients epi's frame-dependent state once - flipping a FusedEpi bias
-        // axis (per-row becomes per-col) or flagging a MapEpi (row, col) transpose (a no-op for
-        // Identity)
+        // Orientation normalization transposes the engine frame for the routes below, which all
+        // consume the oriented epi. A row-major-ish C computes C^T = B^T*A^T, swapping m and n,
+        // so on_orient_swap re-orients epi's frame-dependent state once. This flips a FusedEpi
+        // bias axis (per-row becomes per-col) or flags a MapEpi (row, col) transpose, a no-op for
+        // Identity
         if orient_transpose(&mut t) {
             epi.on_orient_swap();
         }
 
-        // Small m,n with a long contraction: the driver would pad the tiny row/col tiles to a
-        // full microtile and pack mostly padding, where the horizontal path computes each output
-        // as a direct SIMD dot over k instead, applying the epilogue at that cell's single store
-        // The zero-copy gate needs k above small_k_threshold and both operands unit-stride along k
-        // (csa == 1, rsb == 1); the pack gate needs k above its own small_mn_pack_min_k floor and
-        // covers the rest by copying only the failing operand into k-contiguous scratch first (the
-        // epilogue still fires on the same per-cell store either way). Short k instead takes the
-        // small_k route below
+        // Small m,n with a long contraction. The driver would pad the tiny row/col tiles to a
+        // full microtile and pack mostly padding. The horizontal path instead computes each
+        // output as a direct SIMD dot over k, applying the epilogue at that cell's single store
+        // The zero-copy gate needs k above small_k_threshold with both operands unit-stride
+        // along k (csa == 1, rsb == 1). The pack gate needs k above its own small_mn_pack_min_k
+        // floor, and copies only the failing operand into k-contiguous scratch first. Either
+        // gate fires the epilogue at the same per-cell store. Short k instead takes the small_k
+        // route below
         if small_mn_eligible(&t) || small_mn_pack_eligible(&t) {
             small_mn::run_epi::<T, S, E>(
                 simd, t.m, t.k, t.n, par, ws, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb,
@@ -104,8 +111,9 @@ unsafe fn run_typed_epi<T, S, E, const MR_REG: usize, const NR: usize>(
             return;
         }
         // Low-depth shape: the whole product fits in one depth panel, so the driver's
-        // blocking/packing setup would be pure overhead; read A/B in place instead and apply the
-        // epilogue at that single per-tile store (last_k is structurally true here)
+        // blocking and packing setup would be pure overhead. This route reads A/B in place
+        // instead, and applies the epilogue at that single per-tile store (last_k is
+        // structurally true here)
         if t.k <= tuning::small_k_threshold() {
             small_k::run_epi::<FloatGemm<T>, S, E, MR_REG, NR>(
                 simd, t.m, t.k, t.n, t.alpha, t.a, t.rsa, t.csa, t.b, t.rsb, t.csb, t.beta, t.c,
@@ -121,7 +129,7 @@ unsafe fn run_typed_epi<T, S, E, const MR_REG: usize, const NR: usize>(
 }
 
 /// Route one concrete `(type, ISA, tile)` plain GEMM: the `E = Identity` choice of
-/// [`run_typed_epi`], so every epilogue hook const-folds away and the monomorphization is
+/// [`run_typed_epi`]. Every epilogue hook const-folds away, so the monomorphization is
 /// bit-identical to a non-fused kernel
 ///
 /// # Safety
@@ -139,17 +147,22 @@ unsafe fn run_typed<T, S, const MR_REG: usize, const NR: usize>(
     unsafe { run_typed_epi::<T, S, Identity, MR_REG, NR>(simd, t, Identity, par, ws) }
 }
 
-/// Fused-epilogue driver entry for a concrete `(type, ISA, tile)`: the [`FusedEpi`] choice of
-/// [`run_typed_epi`]. A fused shape takes the same kernel plain `gemm` would (gemv / small_mn /
-/// small_k / general driver) rather than paying the driver's pack/blocking overhead on a shape one
-/// of the special paths wins, and each route stores exactly the bits plain `gemm` would and applies
-/// the same scalar map exactly once per element, so the fused result is bit-identical to `gemm()`
-/// followed by that map for every shape (the vector fast path agrees bitwise with the scalar map by
-/// the [`Epilogue::apply_reg`] contract). The orientation swap flips the bias axis through
-/// `on_orient_swap` (see [`run_typed_epi`] for the route-frame semantics)
+/// Fused-epilogue driver entry for a concrete `(type, ISA, tile)`: the [`FusedEpi`] choice
+/// of [`run_typed_epi`]
+///
+/// A fused shape takes the same route plain `gemm` would: gemv, `small_mn`, `small_k`, or
+/// the general driver. This avoids the driver's pack and blocking overhead on a shape one
+/// of the special paths wins. Each route stores exactly the bits plain `gemm` would and
+/// applies the same scalar map exactly once per element. The vector fast path agrees
+/// bitwise with the scalar map, under the [`Epilogue::apply_reg`] contract. So the fused
+/// result is bit-identical to `gemm()` followed by that map, for every shape
+///
+/// The orientation swap flips the bias axis through `on_orient_swap` (see [`run_typed_epi`]
+/// for the route-frame semantics)
 ///
 /// # Safety
-/// As [`run_typed`], plus `epi`'s interior pointers valid for the (pre-swap) problem's `m`/`n`
+/// As [`run_typed`], plus `epi`'s interior pointers valid for the (pre-swap) problem's
+/// `m`/`n`
 #[cfg(feature = "epilogue")]
 #[inline]
 unsafe fn run_typed_fused<T, S, const MR_REG: usize, const NR: usize>(
@@ -159,7 +172,7 @@ unsafe fn run_typed_fused<T, S, const MR_REG: usize, const NR: usize>(
     par: Parallelism,
     ws: &mut Workspace,
 ) where
-    // FusedEpi<T>: Epilogue<FloatGemm<T>> needs Float<Acc = T> + PartialOrd; FusedScalar itself
+    // FusedEpi<T>: Epilogue<FloatGemm<T>> needs Float<Acc = T> + PartialOrd. FusedScalar itself
     // does not imply them, since it also covers the narrow f16/bf16 types, which route through
     // run_typed_mixed_fused instead
     T: Float<Acc = T> + PartialOrd,
@@ -168,19 +181,24 @@ unsafe fn run_typed_fused<T, S, const MR_REG: usize, const NR: usize>(
     unsafe { run_typed_epi::<T, S, FusedEpi<T>, MR_REG, NR>(simd, t, epi, par, ws) }
 }
 
-/// User-defined map-epilogue driver entry for a concrete `(type, ISA, tile)`: the borrowed-closure
-/// [`MapEpi`] choice of [`run_typed_epi`]. A `gemm_map` shape takes the same kernel plain `gemm`
-/// would (gemv / small_mn / small_k / general driver), each route storing exactly the bits plain
-/// `gemm` would and then applying the closure exactly once per element. [`MapEpi`] sets
-/// `VECTOR = true`, so the microkernel takes the same path selection plain `gemm` does (fast vector
-/// store for a full column-major tile, scratch for an edge), and the value handed to the closure is
-/// bit-for-bit the plain-`gemm` store value on every path, so `gemm_map` is `gemm()` then the
-/// per-element `f` for every `f32`/`f64` shape. The orientation swap flags `MapEpi`'s coordinate
-/// transpose through `on_orient_swap`, so [`MapEpi::apply`] flips `(row, col)` back to the user
-/// frame for the closure (see [`run_typed_epi`] for the route-frame semantics)
+/// User-defined map-epilogue driver entry for a concrete `(type, ISA, tile)`: the
+/// borrowed-closure [`MapEpi`] choice of [`run_typed_epi`]
+///
+/// A `gemm_map` shape takes the same route plain `gemm` would (gemv, `small_mn`,
+/// `small_k`, or the general driver). Each route stores exactly the bits plain `gemm`
+/// would, then applies the closure exactly once per element. [`MapEpi`] sets
+/// `VECTOR = true`, so the microkernel takes the same path plain `gemm` does. That path
+/// is a fast vector store for a full column-major tile, and scratch for an edge
+///
+/// The value handed to the closure is bit-for-bit the plain-`gemm` store value on every
+/// path. So `gemm_map` is `gemm()` then the per-element `f`, for every `f32`/`f64` shape
+///
+/// The orientation swap flags `MapEpi`'s coordinate transpose through `on_orient_swap`.
+/// So [`MapEpi::apply`] flips `(row, col)` back to the user frame for the closure (see
+/// [`run_typed_epi`] for the route-frame semantics)
 ///
 /// # Safety
-/// As [`run_typed`]; the closure in `epi` is total (it is called on every stored element)
+/// As [`run_typed`]. The closure in `epi` is total: it is called on every stored element
 #[cfg(feature = "epilogue")]
 #[inline]
 unsafe fn run_typed_map<'u, T, S, const MR_REG: usize, const NR: usize>(
@@ -190,8 +208,9 @@ unsafe fn run_typed_map<'u, T, S, const MR_REG: usize, const NR: usize>(
     par: Parallelism,
     ws: &mut Workspace,
 ) where
-    // The real-float map epilogue (`MapEpi<T>: Epilogue<FloatGemm<T>>`) and the special paths need
-    // `Float<Acc = T>`; the closure never compares, so (unlike `FusedEpi`) no `PartialOrd`
+    // The real-float map epilogue (`MapEpi<T>: Epilogue<FloatGemm<T>>`) and the special paths
+    // need `Float<Acc = T>`. The closure never compares, so, unlike `FusedEpi`, it needs no
+    // `PartialOrd`
     T: Float<Acc = T>,
     S: SimdOps<T>,
 {
@@ -215,9 +234,9 @@ unsafe fn run_packed_typed<T, S, const MR_REG: usize, const NR: usize>(
     S: SimdOps<T>,
 {
     unsafe {
-        // The driver reads panels with the buffer's own (kc, nc), so nothing is re-derived
-        // nr is structural (the panel width is this kernel's NR); one process's memoized ISA
-        // choice guarantees they agree
+        // The driver reads panels using the buffer's own (kc, nc), so nothing is re-derived
+        // The panel width nr is structural: it is this kernel's NR. One process's memoized
+        // ISA choice guarantees the two agree
         debug_assert_eq!(NR, req.nr, "prepacked RHS panel width != kernel NR");
         driver::run_packed_rhs::<FloatGemm<T>, S, MR_REG, NR>(
             simd, req.m, req.k, req.n, req.alpha, req.a, req.rsa, req.csa, req.packed, req.kc,
@@ -226,14 +245,16 @@ unsafe fn run_packed_typed<T, S, const MR_REG: usize, const NR: usize>(
     }
 }
 
-/// Fused-epilogue prepacked-RHS driver entry for a concrete `(type, ISA, tile)`: the mirror of
-/// [`run_packed_typed`] threading `epi` into the prepacked driver entry
-/// ([`driver::run_packed_rhs_epilogue`]). Like the plain prepacked path there is no gemv route
-/// and no orientation swap in the driver: the consume frame is the frame the buffer was packed
-/// for, so `epi` is applied verbatim (the `gemm_packed_a_fused` entry has already flipped the
-/// bias axis where its transposed consume requires it). Because the engine
-/// (blocking/scheduling/panel bytes) is epilogue-independent, the fused result is bit-identical
-/// to a plain prepacked GEMM then the same scalar map for `f32`/`f64`
+/// Fused-epilogue prepacked-RHS driver entry for a concrete `(type, ISA, tile)`: the mirror
+/// of [`run_packed_typed`] that threads `epi` into the prepacked driver entry
+/// ([`driver::run_packed_rhs_epilogue`])
+///
+/// Like the plain prepacked path, there is no gemv route and no orientation swap in the
+/// driver. The consume frame is the frame the buffer was packed for, so `epi` applies
+/// verbatim. The `gemm_packed_a_fused` entry has already flipped the bias axis where its
+/// transposed consume requires it. The engine (blocking, scheduling, panel bytes) is
+/// epilogue-independent, so the fused result is bit-identical to a plain prepacked GEMM
+/// then the same scalar map, for `f32`/`f64`
 ///
 /// # Safety
 /// As [`run_packed_typed`], plus `epi`'s interior pointers valid for the problem's `m`/`n`
@@ -261,7 +282,7 @@ unsafe fn run_typed_packed_fused<T, S, const MR_REG: usize, const NR: usize>(
 
 // per-type, per-ISA monomorphized entry points (the dispatch slots)
 //
-// Tile geometry (MR_REG, NR) is the only per-(type, ISA) knob; everything else is
+// Tile geometry (MR_REG, NR) is the only per-(type, ISA) knob. Everything else is
 // shared generic code. MR = MR_REG * LANES
 
 unsafe fn gemm_f32_scalar(t: Task<f32>, par: Parallelism, ws: &mut Workspace) {
@@ -294,10 +315,10 @@ unsafe fn gemm_f64_avx512f(t: Task<f64>, par: Parallelism, ws: &mut Workspace) {
 
 #[cfg(target_arch = "aarch64")]
 unsafe fn gemm_f32_neon(t: Task<f32>, par: Parallelism, ws: &mut Workspace) {
-    // MR = 4*4 = 16, NR = 4 -> 16 acc + 4 lhs + 1 rhs = 21 of the 32 v0-v31 vector
-    // registers (NR == LANES, so 1 loaded RHS vector feeds all 4 columns). The ~11
-    // spare registers are deliberate: they give the wide out-of-order window rename
-    // headroom to overlap the next step's loads with the current FMAs
+    // MR = 4*4 = 16, NR = 4 -> 16 acc + 4 lhs + 1 rhs = 21 of the 32 v0-v31 registers
+    // (NR == LANES, so 1 loaded RHS vector feeds all 4 columns). The remaining 11
+    // registers give the out-of-order window room to overlap the next step's loads
+    // with the current FMAs
     unsafe { run_typed::<f32, Neon, 4, 4>(Neon, t, par, ws) }
 }
 #[cfg(target_arch = "aarch64")]
@@ -310,8 +331,8 @@ unsafe fn gemm_f64_neon(t: Task<f64>, par: Parallelism, ws: &mut Workspace) {
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 unsafe fn gemm_f32_simd128(t: Task<f32>, par: Parallelism, ws: &mut Workspace) {
     // MR = 2*4 = 8, NR = 4 -> 8 acc + 2 lhs + 1 rhs = 11 live v128. wasm has no
-    // hardware FMA (LANE_FMA is false) and LLVM's wasm backend spills past ~16 live
-    // vectors, so the wider NEON-style 4x4 tile would over-subscribe
+    // hardware FMA (LANE_FMA is false), and LLVM's wasm backend spills past ~16 live
+    // vectors. The wider NEON-style 4x4 tile would over-subscribe those registers
     unsafe { run_typed::<f32, Simd128, 2, 4>(Simd128, t, par, ws) }
 }
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
@@ -567,18 +588,22 @@ unsafe fn gemm_f64_simd128_packed_fused(
     unsafe { run_typed_packed_fused::<f64, Simd128, 2, 4>(Simd128, r, epi, par, ws) }
 }
 
-/// The sealed element-type bound for the fused-epilogue public API: the real floats `f32`/`f64`
-/// and, under the `half` feature, the narrow floats `f16`/`bf16`. A superset of [`GemmScalar`]
-/// (for dispatch), sealed (a private supertrait) so downstream crates cannot widen the fused
-/// surface. It does not require `Float<Acc = Self> + PartialOrd`: the real-float [`FusedEpi`]
-/// arithmetic keeps those bounds on its own `Epilogue<FloatGemm<T>>` impl, and the narrow types
-/// are not `Float` (they widen to `f32`). What every fused type must provide is the finiteness
-/// test used to validate a `LeakyRelu` slope, and the degenerate `C <- act(beta*C + bias)` map
-/// (type-specific: real floats compute in `T`, narrow types in `f32`, narrowing once)
+/// The sealed element-type bound for the fused-epilogue public API
+///
+/// This bound covers the real floats `f32`/`f64` and, under the `half` feature, the
+/// narrow floats `f16`/`bf16`. It is a superset of [`GemmScalar`] for dispatch, and it is
+/// sealed by a private supertrait so downstream crates cannot widen the fused surface
+///
+/// This trait does not require `Float<Acc = Self> + PartialOrd`. The real-float
+/// [`FusedEpi`] arithmetic keeps those bounds on its own `Epilogue<FloatGemm<T>>` impl,
+/// and the narrow types are not `Float`, since they widen to `f32`. Every fused type must
+/// provide the finiteness test used to validate a `LeakyRelu` slope, and the degenerate
+/// `C <- act(beta*C + bias)` map. That map is type-specific: real floats compute in `T`,
+/// and narrow types compute in `f32`, narrowing once
 #[cfg(feature = "epilogue")]
 pub trait FusedScalar: GemmScalar + sealed::Sealed {
-    /// `true` iff `self` is finite. `f32`/`f64` use the inherent test; `f16`/`bf16` widen to
-    /// `f32` first. `core`-only, so it is `no_std`-safe
+    /// `true` when `self` is finite. `f32`/`f64` use the inherent test, and `f16`/`bf16`
+    /// widen to `f32` first. This is `core`-only, so it stays `no_std`-safe
     #[doc(hidden)]
     fn finite(self) -> bool;
 
@@ -586,7 +611,7 @@ pub trait FusedScalar: GemmScalar + sealed::Sealed {
     /// when the `A*B` term vanishes (`k == 0` or `alpha == 0`)
     ///
     /// # Safety
-    /// `c` valid for the `m x n` region; `epi`'s bias valid for the problem's `m`/`n`
+    /// `c` valid for the `m x n` region, and `epi`'s bias valid for the problem's `m`/`n`
     #[doc(hidden)]
     unsafe fn fused_degenerate(t: &Task<Self>, epi: &FusedEpi<Self>);
 }
@@ -630,7 +655,7 @@ impl FusedScalar for f64 {
 /// frame (before orientation), then run the ISA-dispatched fused kernel
 ///
 /// # Safety
-/// `task`'s pointers must be valid; `c` must not alias `a`/`b`, and `epi`'s bias slice must
+/// `task`'s pointers must be valid, `c` must not alias `a`/`b`, and `epi`'s bias slice must
 /// not overlap `c` (the API validates this)
 #[cfg(feature = "epilogue")]
 pub(crate) unsafe fn execute_fused<T: FusedScalar>(
@@ -677,9 +702,9 @@ pub(crate) unsafe fn execute_packed_fused<T: FusedScalar>(
         }
         // A*B vanishes (k == 0 or alpha == 0): C <- act(beta*C + bias), element-wise in the
         // consume (oriented) frame. fused_degenerate reads only the output geometry
-        // (m/n/c/strides/beta) and epi, so a Task built from req (with a null, unread b) drives
-        // it at the right coordinates; epi is already oriented (the gemm_packed_a entry
-        // pre-flipped the bias axis), so the degenerate matches the compute path's bias axis
+        // (m/n/c/strides/beta) and epi, so a Task built from req, with a null unread b, drives
+        // it at the right coordinates. epi is already oriented, since the gemm_packed_a entry
+        // pre-flipped the bias axis, so the degenerate matches the compute path's bias axis
         if req.k == 0 || req.alpha == T::ZERO {
             let task = Task {
                 m: req.m,
@@ -709,7 +734,7 @@ pub(crate) unsafe fn execute_packed_fused<T: FusedScalar>(
 /// combines in `f32` and narrows once) lives in [`crate::dispatch`]'s `mixed` module
 ///
 /// # Safety
-/// `c` valid for the `m x n` region; `epi`'s bias valid for the problem's `m`/`n`
+/// `c` valid for the `m x n` region, and `epi`'s bias valid for the problem's `m`/`n`
 #[cfg(feature = "epilogue")]
 pub(super) unsafe fn fused_degenerate_float<T: Float<Acc = T> + PartialOrd>(
     t: &Task<T>,
@@ -748,10 +773,11 @@ pub(super) type PackedFusedFn<T> =
     unsafe fn(PackedConsume<T>, FusedEpi<T>, Parallelism, &mut Workspace);
 
 /// The memoized dispatch slot for one element type: the plain kernel, the prepacked-RHS
-/// kernel, the fused-epilogue kernels, and the microtile `(mr, nr)` they all share. Bundling
-/// them keeps adding an ISA a single `select_*` ladder arm. `mr`/`nr` mirror the tile constants
-/// in the wrappers above and feed `prepack_rhs` (via `rhs_tile`) so the buffer and the consume
-/// path agree on the blocking geometry
+/// kernel, the fused-epilogue kernels, and the microtile `(mr, nr)` they all share
+///
+/// Bundling them means adding an ISA only touches one `select_*` ladder arm. `mr`/`nr`
+/// mirror the tile constants in the wrappers above. They feed `prepack_rhs` (through
+/// `rhs_tile`) so the buffer and the consume path agree on the blocking geometry
 #[derive(Copy, Clone)]
 pub(super) struct Dispatched<T> {
     pub(super) run: GemmFn<T>,
@@ -774,9 +800,9 @@ pub(super) struct Dispatched<T> {
     pub(super) depth_multiple: usize,
 }
 
-// One descriptor per (type, ISA). mr = MR_REG*LANES, nr = NR: mirrors the tile in each
-// wrapper's comment above (scalar 4x4; FMA 16x6 / f64 8x6; AVX-512F 32x12 / f64 16x12;
-// NEON 16x4 / f64 8x4; simd128 8x4 / f64 4x4)
+// One descriptor exists per (type, ISA). mr = MR_REG*LANES and nr = NR, matching each
+// wrapper's tile above: scalar 4x4, FMA 16x6 (f64 8x6), AVX-512F 32x12 (f64 16x12),
+// NEON 16x4 (f64 8x4), simd128 8x4 (f64 4x4)
 const DISP_F32_SCALAR: Dispatched<f32> = Dispatched {
     run: gemm_f32_scalar,
     run_packed: gemm_f32_scalar_packed,
@@ -924,7 +950,7 @@ fn select_f32() -> Dispatched<f32> {
             panic!("GEMMKIT_REQUIRE_ISA: requested SIMD ISA is unavailable on this target")
         }
         #[cfg(target_arch = "aarch64")]
-        ForcedIsa::Neon => return DISP_F32_NEON, // aarch64 guarantees NEON, so this arm never panics
+        ForcedIsa::Neon => return DISP_F32_NEON, // aarch64 guarantees NEON, so this never panics
         #[cfg(not(target_arch = "aarch64"))]
         ForcedIsa::Neon => {
             panic!("GEMMKIT_REQUIRE_ISA=neon, but this target is not aarch64")
@@ -995,7 +1021,7 @@ fn select_f64() -> Dispatched<f64> {
             panic!("GEMMKIT_REQUIRE_ISA: requested SIMD ISA is unavailable on this target")
         }
         #[cfg(target_arch = "aarch64")]
-        ForcedIsa::Neon => return DISP_F64_NEON, // aarch64 guarantees NEON, so this arm never panics
+        ForcedIsa::Neon => return DISP_F64_NEON, // aarch64 guarantees NEON, so this never panics
         #[cfg(not(target_arch = "aarch64"))]
         ForcedIsa::Neon => {
             panic!("GEMMKIT_REQUIRE_ISA=neon, but this target is not aarch64")
@@ -1057,12 +1083,16 @@ memoized_select!(
     "The memoized dispatch descriptor for `f64` (selection runs once)."
 );
 
-/// Emit the `GemmScalar` impl for a homogeneous float type (`f32` / `f64`): `Out == Acc`
-/// (`OUT_IS_ACC = true`), in-place `scale_c`, packing through `FloatGemm<$t>`, and the
-/// always-present fused path. `$disp` is the memoized dispatch accessor. The 2 float impls
-/// are pure type substitutions, so this macro keeps them from drifting apart. The narrow
-/// `f16`/`bf16` impls differ too much to share it (narrow scale, `MixedGemm`, no fused path,
-/// bf16's depth-multiple pack switch), so they stay hand-written in `dispatch/mixed.rs`
+/// Emit the `GemmScalar` impl for a homogeneous float type (`f32`/`f64`)
+///
+/// The impl sets `Out == Acc` (`OUT_IS_ACC = true`), packs through `FloatGemm<$t>` with
+/// an in-place `scale_c`, and always includes the fused path. `$disp` is the memoized
+/// dispatch accessor
+///
+/// The 2 float impls are pure type substitutions, so this macro keeps them from
+/// drifting apart. The narrow `f16`/`bf16` impls differ too much to share it: narrow
+/// scale, `MixedGemm`, and bf16's depth-multiple pack switch. So they stay hand-written
+/// in `dispatch/mixed.rs`
 macro_rules! float_gemm_scalar {
     ($t:ty, $disp:ident) => {
         impl GemmScalar for $t {
@@ -1133,12 +1163,14 @@ float_gemm_scalar!(f64, dispatched_f64);
 
 // user-defined per-element map epilogue (gemm_map)
 //
-// Kept off the shared Dispatched<T> descriptor on purpose: that struct is reused by the narrow
-// (f16/bf16) mixed module, which has no valid map path (a T-domain closure after the f32
-// accumulate would double-round). Adding a run_map field would force a bogus f16 map wrapper
-// into every mixed descriptor. Instead the map entry rides its own memoized table (MAP_F32 /
-// MAP_F64), built only for f32/f64, so Dispatched and the mixed module stay untouched and there
-// is no unreachable narrow map path anywhere
+// This map entry is kept off the shared Dispatched<T> descriptor on purpose. That struct
+// is reused by the narrow (f16/bf16) mixed module, which has no valid map path: a T-domain
+// closure after the f32 accumulate would double-round. Adding a run_map field would force
+// a bogus f16 map wrapper into every mixed descriptor
+//
+// Instead the map entry rides its own memoized table (MAP_F32 / MAP_F64), built only for
+// f32/f64. So Dispatched and the mixed module stay untouched, and there is no unreachable
+// narrow map path anywhere
 
 /// The map-epilogue kernel entry: a [`Task`] plus the borrowed-closure [`MapEpi`]. Higher-ranked
 /// over the closure lifetime `'u` so one memoized function pointer serves every call. Only
@@ -1249,9 +1281,10 @@ unsafe fn gemm_f64_simd128_map(
     unsafe { run_typed_map::<f64, Simd128, 2, 4>(Simd128, t, epi, par, ws) }
 }
 
-/// Select the `f32` map-epilogue entry for the running CPU, mirroring [`select_f32`]'s ISA
-/// ladder exactly (same `GEMMKIT_REQUIRE_ISA` pins, same detection order) but returning the
-/// map wrapper instead
+/// Select the `f32` map-epilogue entry for the running CPU
+///
+/// This mirrors [`select_f32`]'s ISA ladder exactly, using the same `GEMMKIT_REQUIRE_ISA`
+/// pins and the same detection order, but returns the map wrapper instead
 #[cfg(feature = "epilogue")]
 fn select_map_f32() -> MapFn<f32> {
     match forced_isa() {
@@ -1403,22 +1436,24 @@ memoized_select!(
 );
 
 /// The sealed element-type bound for the user-defined map-epilogue public API
-/// ([`crate::gemm_map`]): the real floats `f32`/`f64` only. A superset of [`GemmScalar`] (for
-/// dispatch), sealed by the private `sealed::Sealed` supertrait so downstream crates cannot
-/// widen the surface
+/// ([`crate::gemm_map`]): the real floats `f32`/`f64` only
 ///
-/// The narrow floats (`f16`/`bf16`) are excluded on purpose: a `T`-domain closure applied after
-/// the `f32` accumulate would double-round (narrow, then the closure re-widens/re-narrows),
-/// breaking the `gemm_map == gemm()`-then-`f` bitwise contract the fused-in-`f32` convention
-/// relies on. Complex and integer are likewise out of scope for v1 (no `apply` seam is wired for
-/// a per-element closure). For bias/activation use [`crate::gemm_fused`] (it vectorizes);
-/// `gemm_map` is the general per-element extension point
+/// This trait is a superset of [`GemmScalar`] for dispatch, and it is sealed by the
+/// private `sealed::Sealed` supertrait so downstream crates cannot widen the surface
+///
+/// The narrow floats (`f16`/`bf16`) are excluded on purpose. A `T`-domain closure applied
+/// after the `f32` accumulate would double-round: it narrows, then the closure re-widens
+/// and re-narrows. This breaks the `gemm_map == gemm()`-then-`f` bitwise contract that the
+/// fused-in-`f32` convention relies on. Complex and integer types have no `apply` seam
+/// wired for a per-element closure, so they are out of scope here. For bias or activation
+/// use [`crate::gemm_fused`], since it vectorizes. `gemm_map` is the general per-element
+/// extension point
 #[cfg(feature = "epilogue")]
 pub trait MapScalar: GemmScalar + sealed::Sealed {
     /// Run the ISA-dispatched per-element map kernel for this type
     ///
     /// # Safety
-    /// `task`'s pointers valid and `c` not aliasing `a`/`b`; the closure in `epi` is total
+    /// `task`'s pointers valid and `c` not aliasing `a`/`b`. The closure in `epi` is total
     #[doc(hidden)]
     unsafe fn dispatch_map(
         task: Task<Self>,
@@ -1469,11 +1504,14 @@ impl MapScalar for f64 {
     }
 }
 
-/// Top-level map entry (called by the API layer): handle the degenerate case in the user frame
-/// (before orientation, so `epi.swapped` is still `false`), then run the ISA-dispatched map kernel
+/// This is the top-level map entry, called by the API layer
+///
+/// It handles the degenerate case in the user frame (before orientation, so
+/// `epi.swapped` is still `false`), then runs the ISA-dispatched map kernel
 ///
 /// # Safety
-/// `task`'s pointers must be valid; `c` must not alias `a`/`b`, and the closure in `epi` is total
+/// `task`'s pointers must be valid, `c` must not alias `a`/`b`, and the closure in `epi`
+/// is total
 #[cfg(feature = "epilogue")]
 pub(crate) unsafe fn execute_map<T: MapScalar>(
     task: Task<T>,

@@ -1,8 +1,8 @@
 //! # gemmkit
 //!
 //! A GEMM (general matrix multiply) engine with no ndarray dependency. It computes
-//! `C <- alpha*A*B + beta*C` over data-type-agnostic `&[T]` + stride views (or raw
-//! pointers), picking the fastest instruction set the running CPU supports
+//! `C <- alpha*A*B + beta*C` over data-type-agnostic `&[T]` and stride views, or raw
+//! pointers. It picks the fastest instruction set the running CPU supports
 //!
 //! ## Quick start
 //!
@@ -26,28 +26,31 @@
 //!
 //! ## Architecture in brief
 //!
-//! Every axis of variation lives behind a trait: the instruction set is
-//! [`simd::SimdOps`], the element type is [`scalar::Scalar`], the operation family
-//! is [`kernel::KernelFamily`]. One generic 5-loop [`driver`] and one generic
+//! Every axis of variation lives behind a trait. The instruction set is
+//! [`simd::SimdOps`], the element type is [`scalar::Scalar`], and the operation
+//! family is [`kernel::KernelFamily`]. One generic 5-loop [`driver`] and one generic
 //! microkernel cover every `(type, ISA, tile)` combination with no macros and no
 //! `transmute`. See `ARCHITECTURE.md` for the full tour
 //!
 //! ## Features
 //!
-//! * `std` (default): runtime cache/CPU-feature detection, the `GEMMKIT_REQUIRE_ISA`
-//!   and tuning env knobs, and the thread-local workspace pool. With `std` off the
-//!   crate is `#![no_std]`, needing only `core` and `alloc`
-//! * `parallel` (default, implies `std`): rayon multithreading. With it off the
-//!   crate still compiles and runs, single-threaded
+//! * `std` (default): runtime cache and CPU-feature detection, the `GEMMKIT_REQUIRE_ISA`
+//!   env var, tuning knobs, and the thread-local workspace pool. With `std` off, the
+//!   crate is `#![no_std]` and needs only `core` and `alloc`
+//! * `parallel` (default, implies `std`): rayon multithreading. With it off, the crate
+//!   still compiles and runs, single-threaded
+//! * `wasm_threads` (implies `parallel`): a stable-toolchain rayon thread pool for a
+//!   threaded wasm target, sized from a tuning knob because wasm cannot report its own
+//!   core count
 //! * `complex`: complex GEMM over `c32`/`c64` with optional conjugation
-//!   ([`gemm_cplx`]); pulls in `num-complex`
-//! * `half`: `f16`/`bf16` mixed-precision GEMM, accumulating in `f32`; pulls in `half`
-//! * `int8`: `i8 -> i32` integer GEMM ([`gemm_i8`]); no extra dependency
-//! * `epilogue`: fused epilogues, bias/activation ([`gemm_fused`], `gemm_batched_fused*`,
-//!   the prepacked `gemm_packed_a_fused*` / `gemm_packed_b_fused*`, and, with `complex`,
-//!   `gemm_cplx_fused*`); a user-defined per-element closure ([`gemm_map`], `f32`/`f64`
-//!   only); and, with `int8`, requantized `i8`/`u8` output (`gemm_i8_requant*`); no
-//!   extra dependency
+//!   ([`gemm_cplx`]). Pulls in `num-complex`
+//! * `half`: `f16`/`bf16` mixed-precision GEMM, accumulating in `f32`. Pulls in `half`
+//! * `int8`: `i8 -> i32` integer GEMM ([`gemm_i8`]), with no extra dependency
+//! * `epilogue`: fused epilogues for bias and activation ([`gemm_fused`],
+//!   `gemm_batched_fused*`, the prepacked `gemm_packed_a_fused*` and `gemm_packed_b_fused*`,
+//!   and, with `complex`, `gemm_cplx_fused*`). Also a user-defined per-element closure
+//!   ([`gemm_map`], `f32`/`f64` only), and, with `int8`, requantized `i8`/`u8` output
+//!   (`gemm_i8_requant*`). No extra dependency
 //!
 //! `complex`, `half`, and `int8` are off by default, so a plain `f32`/`f64` build pays
 //! for none of their codegen or dependencies. `epilogue` is off by default too, so a
@@ -56,10 +59,10 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_docs)]
-#![allow(clippy::missing_safety_doc)] // documented at the module/contract level, not per fn
+#![allow(clippy::missing_safety_doc)] // documented at module or contract level, not per function
 
-// Some modules (batched/packed API buffers) need heap `Vec`s even in a no_std
-// build, so pull in `alloc` unconditionally rather than gating this on `std`
+// Some modules, such as the batched and packed API buffers, need heap `Vec`s even in a
+// no_std build. The crate pulls in `alloc` unconditionally instead of gating it on `std`
 extern crate alloc;
 
 // Cache topology detection and BLIS-model analytical blocking (layer L3)
@@ -77,10 +80,8 @@ pub mod tuning;
 
 // Public API: safe slice/stride entry points plus the raw unchecked engine (layer L8a)
 mod api;
-// Shared validation/lowering surface for the view adapters (support for L8a, not a layer of
-// its own): the pointer-level bias/requant checks the raw-pointer adapters and the checked
-// core entries both consume. doc(hidden) = not part of the documented API, versioned in
-// lockstep with the adapters
+// Shared validation and lowering surface for the view adapters, support for L8a and not a
+// layer of its own. Hidden from the public docs and versioned in lockstep with the adapters
 #[doc(hidden)]
 pub mod adapter;
 // Runtime ISA dispatch, memoized per element type (layer L7)

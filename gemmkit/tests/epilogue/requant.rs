@@ -1,9 +1,7 @@
-//! Fused `i8` requantize epilogue tests, covering both output bytes (`gemm_i8_requant` -> `i8`,
-//! `gemm_i8_requant_u8` -> `u8`) and both `RequantScale` variants (per-tensor, per-row). Each
-//! fused result is checked bit-for-bit against an independent scalar model (`ref_requant` /
-//! `ref_requant_u8`) applied to a `gemm_i8`-computed exact `i32` accumulator, and the
-//! checked/unchecked and thread-local/caller-`Workspace` entry-point twins are cross-checked the
-//! same way. The `i32` accumulator is exact and ISA-independent, so every oracle here holds
+//! Fused `i8` requantize epilogue tests: `gemm_i8_requant` (`i8` output) and `gemm_i8_requant_u8`
+//! (`u8` output), both `RequantScale` variants (per-tensor, per-row). Each result is checked
+//! bit-for-bit against an independent scalar model applied to a `gemm_i8`-computed exact `i32`
+//! accumulator; since that accumulator is exact and ISA-independent, every oracle here holds
 //! bitwise under any `GEMMKIT_REQUIRE_ISA` pin
 
 use crate::common::Rng;
@@ -97,6 +95,7 @@ fn check_requant(
     }
 }
 
+// shape, scale, zero-point, bias, C orientation, and parallelism swept against ref_requant
 #[test]
 fn requant_bitwise_matrix() {
     let mut rng = Rng::new(0x9111);
@@ -574,6 +573,7 @@ fn requant_degenerate_k0() {
     }
 }
 
+// a zero requantize scale must panic
 #[test]
 #[should_panic(expected = "scale")]
 fn requant_bad_scale() {
@@ -594,6 +594,7 @@ fn requant_bad_scale() {
     );
 }
 
+// a zero_point outside the i8 output band [-128, 127] must panic
 #[test]
 #[should_panic(expected = "zero_point")]
 fn requant_bad_zp() {
@@ -614,6 +615,7 @@ fn requant_bad_zp() {
     );
 }
 
+// a bias slice whose length does not match A.rows must panic
 #[test]
 #[should_panic(expected = "bias length")]
 fn requant_bad_bias_len() {
@@ -1046,6 +1048,7 @@ fn requant_u8_zero_k_degenerate() {
     }
 }
 
+// a zero_point above 255 (u8 output) must panic
 #[test]
 #[should_panic(expected = "zero_point")]
 fn requant_u8_bad_zp_high() {
@@ -1066,6 +1069,7 @@ fn requant_u8_bad_zp_high() {
     );
 }
 
+// a negative zero_point (u8 output) must panic
 #[test]
 #[should_panic(expected = "zero_point")]
 fn requant_u8_bad_zp_low() {
@@ -1086,6 +1090,7 @@ fn requant_u8_bad_zp_low() {
     );
 }
 
+// a bias slice whose length does not match A.rows must panic (u8 output)
 #[test]
 #[should_panic(expected = "bias length")]
 fn requant_u8_bad_bias_len() {
@@ -1451,6 +1456,7 @@ fn requant_per_row_degenerate_k0() {
     }
 }
 
+// a PerRow scales slice whose length does not match A.rows must panic
 #[test]
 #[should_panic(expected = "scales length")]
 fn requant_per_row_bad_len() {
@@ -1472,6 +1478,7 @@ fn requant_per_row_bad_len() {
     );
 }
 
+// a non-finite per-row scale must panic
 #[test]
 #[should_panic(expected = "must be finite and > 0")]
 fn requant_per_row_non_finite() {
@@ -1493,6 +1500,7 @@ fn requant_per_row_non_finite() {
     );
 }
 
+// a non-positive per-row scale must panic
 #[test]
 #[should_panic(expected = "must be finite and > 0")]
 fn requant_per_row_non_positive() {
@@ -1514,6 +1522,7 @@ fn requant_per_row_non_positive() {
     );
 }
 
+// a PerRow scales slice aliasing C must panic before any element is touched
 #[test]
 #[should_panic(expected = "scales overlap C")]
 fn requant_per_row_overlaps_c() {

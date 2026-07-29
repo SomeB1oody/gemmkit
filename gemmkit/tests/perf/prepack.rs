@@ -64,6 +64,8 @@ fn bench_prepack(k: usize, n: usize, m: usize, b_row_major: bool, par: Paralleli
     );
 }
 
+/// Reused prepacked-RHS throughput vs plain gemm, row-major and column-major B, serial and
+/// parallel
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
 fn perf_prepack() {
@@ -190,6 +192,8 @@ fn bench_prepack_i8(k: usize, n: usize, m: usize, par: Parallelism) {
     );
 }
 
+/// Reused prepacked-i8-RHS throughput vs plain `gemm_i8`, serial and parallel, at a small
+/// activation batch where the per-call repack cost dominates
 #[cfg(all(feature = "int8", not(target_family = "wasm")))]
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
@@ -265,6 +269,8 @@ fn bench_prepack_lhs(m: usize, k: usize, n: usize, a_col_major: bool, par: Paral
     );
 }
 
+/// Reused prepacked-LHS throughput vs plain gemm, row-major and column-major A, serial and
+/// parallel
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
 fn perf_prepack_lhs() {
@@ -339,6 +345,8 @@ fn bench_shared_lhs(s: usize, row_major_a: bool) {
     );
 }
 
+/// Shared-LHS A-pack gate forced on and off across an `s` sweep, row-major and column-major
+/// A, parallel only
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
 fn perf_shared_lhs() {

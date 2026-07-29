@@ -4,26 +4,33 @@
 
 [![CI](https://github.com/SomeB1oody/gemmkit/actions/workflows/ci.yml/badge.svg)](https://github.com/SomeB1oody/gemmkit/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/gemmkit.svg)](https://crates.io/crates/gemmkit) [![docs.rs](https://img.shields.io/docsrs/gemmkit)](https://docs.rs/gemmkit)
 
-A pure-Rust workspace for GEMM (general matrix multiply): it computes
-`C <- alpha*A*B + beta*C` over strided views (or raw pointers) and picks the
-best available instruction set at runtime.
+gemmkit is a pure-Rust workspace for GEMM (general matrix multiply). It computes
+`C <- alpha*A*B + beta*C` over strided views or raw pointers. It picks the best
+available instruction set at runtime.
 
-The core engine works on `f32` and `f64` out of the box, and, behind Cargo
-features, on `f16`/`bf16` (mixed precision with `f32` accumulation), `i8 -> i32`
-integer, and `c32`/`c64` complex data. Runtime ISA dispatch covers x86-64 FMA and
-AVX-512F (with AVX-512 VNNI for `int8` and AVX-512 BF16 for `bf16`), aarch64 NEON,
-and wasm32 `simd128`, over a portable scalar fallback; the `GEMMKIT_REQUIRE_ISA`
-environment variable pins or forbids a backend. Multithreading is optional
-(rayon) and produces run-to-run reproducible results for a fixed input and
-configuration. With default features off the core builds under `no_std` (only
-`core` + `alloc`). Beyond plain GEMM it offers fused epilogues (bias, activation,
-`i8`/`u8` requantization, and a user per-element map), prepacked-operand reuse for
-fixed-weight inner loops, batched GEMM, and automatic bandwidth-bound paths for
-matrix-vector and small shapes.
+The core engine works on `f32` and `f64` by default. Behind Cargo features, it
+also works on `f16`/`bf16` (mixed precision with `f32` accumulation), on
+`i8 -> i32` integers, and on `c32`/`c64` complex data. Runtime ISA dispatch
+covers x86-64 FMA and AVX-512F (with AVX-512 VNNI for `int8` and AVX-512 BF16
+for `bf16`), aarch64 NEON, and wasm32 `simd128`. A portable scalar fallback
+backs every one of them, for a target with no vector support. The
+`GEMMKIT_REQUIRE_ISA` environment variable pins or forbids a backend.
+
+Multithreading is optional and uses rayon. For a fixed input and a fixed
+configuration on one machine, results are reproducible. With default features
+off, the core builds under `no_std`. It then needs only `core` and `alloc`.
+
+Beyond plain GEMM, gemmkit offers:
+
+- fused epilogues: bias, activation, `i8`/`u8` requantization, and a user
+  per-element map
+- prepacked-operand reuse for fixed-weight inner loops
+- batched GEMM
+- automatic bandwidth-bound paths for matrix-vector products and small shapes
 
 ## Crates
 
-The workspace ships five crates that share version 0.1.0 and release in lockstep.
+The workspace ships 5 crates. They share version 0.1.1 and release in lockstep.
 
 | Crate | Description |
 | --- | --- |
@@ -31,10 +38,10 @@ The workspace ships five crates that share version 0.1.0 and release in lockstep
 | [gemmkit-ndarray](https://crates.io/crates/gemmkit-ndarray) | Zero-copy adapter over `ndarray` matrix views |
 | [gemmkit-nalgebra](https://crates.io/crates/gemmkit-nalgebra) | Zero-copy adapter over `nalgebra` matrix views |
 | [gemmkit-faer](https://crates.io/crates/gemmkit-faer) | Zero-copy adapter over `faer` matrix views |
-| [gemmkit-tune](https://crates.io/crates/gemmkit-tune) | Install-time autotuner binary: sweeps the runtime knobs on the target machine and emits a `GEMMKIT_*` env profile |
+| [gemmkit-tune](https://crates.io/crates/gemmkit-tune) | Install-time autotuner binary: sweeps the runtime knobs on the target machine and emits a `GEMMKIT_*` environment profile |
 
-The adapters wrap `ndarray >= 0.17.1`, `nalgebra 0.35`, and `faer 0.24`, and
-forward each `parallel` / `wasm_threads` / `half` / `complex` / `int8` /
+The adapters wrap `ndarray >= 0.17.1`, `nalgebra 0.35`, and `faer 0.24`. Each
+one forwards its `parallel`, `wasm_threads`, `half`, `complex`, `int8`, and
 `epilogue` feature to the same-named `gemmkit` feature.
 
 ## Quick start
@@ -64,13 +71,13 @@ fn main() {
 }
 ```
 
-Transposition is expressed through strides (`from_col_major`, or explicit `rs`/`cs`
-in `MatRef::new`), so a transposed operand needs no copy.
+Strides express transposition. Use `from_col_major`, or give an explicit
+`rs`/`cs` in `MatRef::new`. A transposed operand needs no copy.
 
 ## Element types and backends
 
-Every element-type family below has a SIMD implementation on every backend, over
-the scalar fallback that runs anywhere.
+Every element-type family below has a SIMD implementation on every backend,
+over the scalar fallback that runs anywhere.
 
 | Family | Feature | Accumulator |
 | --- | --- | --- |
@@ -87,10 +94,15 @@ Backends, selected at runtime (or pinned with `GEMMKIT_REQUIRE_ISA`):
 - aarch64 NEON
 - wasm32 `simd128` (compile-time feature detection)
 
-The `gemmkit` Cargo features are `std` and `parallel` (both default), `wasm_threads`
-(for `wasm32-wasip1-threads`), `complex`, `half`, `int8`, and `epilogue` (fused
-bias/activation, `i8`/`u8` requantization, and the user per-element map). With
-`std` off the crate is `no_std`; `parallel` implies `std`.
+The `gemmkit` Cargo features are:
+
+- `std` and `parallel`, both on by default
+- `wasm_threads`, for the `wasm32-wasip1-threads` target
+- `complex`, `half`, and `int8`
+- `epilogue`: fused bias and activation, `i8`/`u8` requantization, and the
+  user per-element map
+
+With `std` off, the crate is `no_std`. `parallel` implies `std`.
 
 ## Documentation
 

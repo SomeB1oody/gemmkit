@@ -4,9 +4,9 @@
 
 [![crates.io](https://img.shields.io/crates/v/gemmkit-faer.svg)](https://crates.io/crates/gemmkit-faer) [![docs.rs](https://img.shields.io/docsrs/gemmkit-faer)](https://docs.rs/gemmkit-faer)
 
-Zero-copy [faer](https://crates.io/crates/faer) adapter for the [gemmkit](https://crates.io/crates/gemmkit) GEMM engine. It accepts faer's view types (`MatRef<'_, T>` for the inputs, `MatMut<'_, T>` for the output), reads the data pointer and the element-unit `isize` row and column strides straight out of each view, and forwards them to gemmkit's raw engine. faer's column-major layout, transposed views, sub-matrices, and reversed (negative-stride) views therefore all work without copying.
+Zero-copy [faer](https://crates.io/crates/faer) adapter for the [gemmkit](https://crates.io/crates/gemmkit) GEMM engine. It accepts faer's view types: `MatRef<'_, T>` for the inputs and `MatMut<'_, T>` for the output. Each entry reads the data pointer and the element-unit `isize` row and column strides straight out of the view. It then forwards them to gemmkit's raw engine. faer's column-major layout, transposed views, sub-matrices, and reversed (negative-stride) views therefore all work without copying.
 
-The entry points mirror the core gemmkit surface, including the feature-gated element families (`half`, `complex`, `int8`) and the fused epilogue entries (`epilogue`). faer has no rank-3 array type, so batched GEMM (`gemm_batched`) takes the batch as a slice of per-element `(A, B)` `MatRef` inputs paired with a slice of `&mut C` `MatMut` outputs (over gemmkit's pointer-array batched engine), with heterogeneous per-element shapes.
+The entry points mirror the core gemmkit surface. This includes the feature-gated element families (`half`, `complex`, `int8`) and the fused epilogue entries (`epilogue`). faer has no rank-3 array type. Batched GEMM (`gemm_batched`) instead takes the batch as a slice of per-element `(A, B)` `MatRef` inputs, paired with a slice of `&mut C` `MatMut` outputs. This runs over gemmkit's pointer-array batched engine. Each element in the batch may have its own shape.
 
 A step-by-step guide for this adapter lives in the [gemmkit Guide](https://someb1oody.github.io/gemmkit/en/gemmkit-faer/Using_gemmkit_with_faer.html).
 
@@ -30,14 +30,14 @@ fn main() {
 }
 ```
 
-`dot` returns `A*B` in a fresh column-major `Mat`. For the general update `C <- alpha*A*B + beta*C` in place, use `gemm(alpha, a, b, beta, c, par)`, where `par` is a `gemmkit_faer::Parallelism`; `gemm_with` runs the same call against a caller-owned `gemmkit_faer::Workspace`. The element type `T` is `f32` or `f64`, plus `f16` and `bf16` under `half`.
+`dot` returns `A*B` in a fresh column-major `Mat`. For the general update `C <- alpha*A*B + beta*C` in place, use `gemm(alpha, a, b, beta, c, par)`, where `par` is a `gemmkit_faer::Parallelism`. `gemm_with` runs the same call against a caller-owned `gemmkit_faer::Workspace`. The element type `T` is `f32` or `f64`, plus `f16` and `bf16` under `half`.
 
 Beyond `gemm` and `dot`, the crate exposes:
 
 - Prepacked-operand reuse: `prepack_rhs` / `prepack_lhs` produce a reusable handle consumed by `gemm_packed_b` / `gemm_packed_a` for fixed-weight loops.
 - Complex (`complex` feature): `gemm_cplx` / `dot_cplx` over faer's `c32` / `c64`, with optional per-operand conjugation.
 - Integer (`int8` feature): `gemm_i8` / `dot_i8` take `i8` inputs and accumulate into an `i32` output.
-- Fused epilogue (`epilogue` feature): `gemm_fused` computes `C <- act(alpha*A*B + beta*C + bias)` in one pass, `gemm_map` applies a user closure per output element (`f32` / `f64`), `gemm_i8_requant` / `gemm_i8_requant_u8` requantize the `i8` result (with `int8`), and `gemm_cplx_fused` adds a bias to a complex result (with `complex`). The prepacked entries have fused twins as well.
+- Fused epilogue (`epilogue` feature): `gemm_fused` computes `C <- act(alpha*A*B + beta*C + bias)` in one pass. `gemm_map` applies a user closure to each output element (`f32` / `f64`). `gemm_i8_requant` and `gemm_i8_requant_u8` requantize the `i8` result (with `int8`). `gemm_cplx_fused` adds a bias to a complex result (with `complex`). The prepacked entries have fused twins as well.
 
 Each entry has a `_with` variant that reuses a caller-owned `Workspace`. See the [API docs](https://docs.rs/gemmkit-faer) for the complete list of signatures.
 
@@ -48,7 +48,7 @@ Every feature forwards to the same-named `gemmkit` feature.
 | Feature | Default | Effect |
 | --- | --- | --- |
 | `parallel` | Yes | rayon-based parallelism. |
-| `wasm_threads` | No | Threading on `wasm32-wasip1-threads` (also enables `parallel`). |
+| `wasm_threads` | No | Threading on `wasm32-wasip1-threads`. Implies `parallel`. |
 | `half` | No | `f16` and `bf16` element types, accumulated in `f32`. |
 | `complex` | No | `c32` and `c64` element types. |
 | `int8` | No | `i8` inputs into an `i32` output. |
@@ -56,9 +56,9 @@ Every feature forwards to the same-named `gemmkit` feature.
 
 ## Supported element types
 
-The real `f32` and `f64` paths are always built; the rest are gated behind the
-features above. `T` is read straight out of faer's view, so every type below works
-in faer's native `c32` / `c64` and `f16` / `bf16` spellings without conversion.
+The real `f32` and `f64` paths are always built. The features above gate the rest.
+The adapter reads `T` straight out of faer's view. Every type below works in
+faer's native `c32` / `c64` and `f16` / `bf16` spellings without conversion.
 
 | Element type | Feature | Computes | Entry points |
 | --- | --- | --- | --- |
@@ -68,9 +68,9 @@ in faer's native `c32` / `c64` and `f16` / `bf16` spellings without conversion.
 | `i8` (requantized) | `int8` + `epilogue` | `i8 * i8 ->` `i8` or `u8` | `gemm_i8_requant`, `gemm_i8_requant_u8` |
 | `c32`, `c64` | `complex` | same, optional `conj(A)` / `conj(B)` | `gemm_cplx`, `dot_cplx`, `gemm_cplx_fused` |
 
-Each entry also has a `_with` variant that reuses a caller-owned `Workspace`, and
-the prepacked (`gemm_packed_a` / `gemm_packed_b`) and batched (`gemm_batched`)
-paths carry the same element types.
+Each entry also has a `_with` variant that reuses a caller-owned `Workspace`. The
+prepacked (`gemm_packed_a` / `gemm_packed_b`) and batched (`gemm_batched`) paths carry
+the same element types.
 
 ## Related crates
 

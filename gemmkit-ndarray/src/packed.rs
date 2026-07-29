@@ -4,9 +4,14 @@ use crate::common::dims_strides;
 #[cfg(feature = "epilogue")]
 use gemmkit::adapter::lower_bias;
 
-/// Pre-pack a 2-D RHS `B` into a reusable [`PackedRhs`] (gemmkit's fixed-weight reuse path):
-/// pack once here, then skip the per-call repack across many [`gemm_packed_b`] calls that share
-/// this `B`. Reads B's pointer/strides directly, so any layout works without copying
+/// Pre-pack a 2-D RHS `B` into a reusable [`PackedRhs`] (gemmkit's fixed-weight reuse path).
+/// The pack runs once here, and each later [`gemm_packed_b`] call that shares this `B` skips
+/// its per-call repack. It reads B's pointer and strides directly, so any layout works
+/// without copying
+///
+/// # Panics
+/// If `B` is so large that the pack buffer size overflows `usize`. A broadcast stride can
+/// make `B`'s logical dimensions run far larger than its backing memory
 pub fn prepack_rhs<T, S>(b: &ArrayBase<S, Ix2>) -> PackedRhs<T>
 where
     T: GemmScalar,
@@ -18,8 +23,8 @@ where
 }
 
 /// `C <- alpha*A*B + beta*C` reusing a prepacked `B` ([`prepack_rhs`]). `C` must be
-/// column-major-ish (`|col stride| >= |row stride|`): a row-major `C` would swap A/B and
-/// invalidate the prepacked RHS, which gemmkit rejects; use [`gemm`] for that layout
+/// column-major-ish (`|col stride| >= |row stride|`). A row-major `C` would swap A and B and
+/// invalidate the prepacked RHS, which gemmkit rejects. Use [`gemm`] for that layout instead
 ///
 /// # Panics
 /// If the dimensions disagree, or if `C` is not column-major-ish
@@ -91,8 +96,8 @@ fn gemm_packed_b_common<T, S1, SC>(
     let cs = c.strides();
     let (rsc, csc) = (cs[0], cs[1]);
     let cp = c.as_mut_ptr();
-    // SAFETY: dims validated above; ndarray guarantees A/C layouts are in-bounds; `c` (a `&mut`
-    // borrow) can't alias A, and the prepacked B is a separate owned buffer
+    // SAFETY: the dims are validated above. ndarray guarantees A/C layouts are in-bounds. `c`
+    // (a `&mut` borrow) cannot alias A, and the prepacked B is a separate owned buffer
     unsafe {
         match ws {
             Some(ws) => gemm_packed_b_unchecked_with(
@@ -127,9 +132,13 @@ fn gemm_packed_b_common<T, S1, SC>(
 }
 
 /// Pre-pack a 2-D LHS `A` into a reusable [`PackedLhs`] (a fixed `A` against a stream of
-/// differently-shaped `B` operands): pack once, then skip the per-call repack across many
-/// [`gemm_packed_a`] calls. Reads A's pointer/strides directly, so any layout works without
-/// copying
+/// differently-shaped `B` operands). The pack runs once here, and each later
+/// [`gemm_packed_a`] call skips its per-call repack. It reads A's pointer and strides
+/// directly, so any layout works without copying
+///
+/// # Panics
+/// If `A` is so large that the pack buffer size overflows `usize`. A broadcast stride can
+/// make `A`'s logical dimensions run far larger than its backing memory
 pub fn prepack_lhs<T, S>(a: &ArrayBase<S, Ix2>) -> PackedLhs<T>
 where
     T: GemmScalar,
@@ -141,8 +150,9 @@ where
 }
 
 /// `C <- alpha*A*B + beta*C` reusing a prepacked `A` ([`prepack_lhs`]). `C` must be
-/// row-major-ish (`|col stride| <= |row stride|`): a column-major `C` would keep A in the LHS
-/// role and invalidate the prepacked LHS, which gemmkit rejects; use [`gemm`] for that layout
+/// row-major-ish (`|col stride| <= |row stride|`). A column-major `C` would keep A in the LHS
+/// role and invalidate the prepacked LHS, which gemmkit rejects. Use [`gemm`] for that layout
+/// instead
 ///
 /// # Panics
 /// If the dimensions disagree, or if `C` is not row-major-ish
@@ -213,8 +223,8 @@ fn gemm_packed_a_common<T, S2, SC>(
     let cs = c.strides();
     let (rsc, csc) = (cs[0], cs[1]);
     let cp = c.as_mut_ptr();
-    // SAFETY: dims validated above; ndarray guarantees B/C layouts are in-bounds; `c` (a `&mut`
-    // borrow) can't alias B, and the prepacked A is a separate owned buffer
+    // SAFETY: the dims are validated above. ndarray guarantees B/C layouts are in-bounds. `c`
+    // (a `&mut` borrow) cannot alias B, and the prepacked A is a separate owned buffer
     unsafe {
         match ws {
             Some(ws) => gemm_packed_a_unchecked_with(
@@ -249,18 +259,21 @@ fn gemm_packed_a_common<T, S2, SC>(
 }
 
 /// `C <- act(alpha*A*(prepacked B) + beta*C + bias)` in 1 fused pass, reusing a prepacked `B`
-/// ([`prepack_rhs`]): the ndarray adapter over gemmkit's [`gemmkit::gemm_packed_b_fused`]. The
-/// **same** [`PackedRhs`] serves both [`gemm_packed_b`] and this fused entry (the epilogue is
-/// store-side only). `C` must be column-major-ish (`|col stride| >= |row stride|`); a row-major
-/// `C` would swap A/B and invalidate the prepacked RHS, which gemmkit rejects. The optional
-/// [`Bias`] is [`Bias::PerRow`] (length `A.rows`) or [`Bias::PerCol`] (length `B.cols`) and the
-/// optional [`Activation`] is applied last; `bias == None && act == None` matches
-/// [`gemm_packed_b`]
+/// ([`prepack_rhs`]). This is the ndarray adapter over gemmkit's
+/// [`gemmkit::gemm_packed_b_fused`]. The same [`PackedRhs`] serves both [`gemm_packed_b`] and
+/// this fused entry, because the epilogue is store-side only. `C` must be column-major-ish
+/// (`|col stride| >= |row stride|`). A row-major `C` would swap A and B and invalidate the
+/// prepacked RHS, which gemmkit rejects. The optional [`Bias`] is [`Bias::PerRow`] (length
+/// `A.rows`) or [`Bias::PerCol`] (length `B.cols`), and the optional [`Activation`] is applied
+/// last. `bias == None && act == None` matches [`gemm_packed_b`]
 ///
 /// # Panics
 /// If the dimensions disagree, if `C` is not column-major-ish, or on a bias/activation the
-/// adapter rejects (wrong-length bias, a bias slice overlapping `C`, or a non-finite `LeakyRelu`
-/// slope)
+/// adapter rejects:
+///
+/// - a wrong-length bias
+/// - a bias slice that overlaps `C`
+/// - a non-finite `LeakyRelu` slope
 #[cfg(feature = "epilogue")]
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_packed_b_fused<T, S1, SC>(
@@ -340,19 +353,19 @@ fn gemm_packed_b_fused_common<T, S1, SC>(
     let (rsc, csc) = (cs[0], cs[1]);
     let cp = c.as_mut_ptr();
 
-    // Bias/activation validation matching gemmkit's checked-entry wording: the bias length
-    // matches its axis (PerRow == A.rows, PerCol == packed B.cols == C.cols) and does not overlap
-    // C (raw pointer math only), and a LeakyRelu slope must be finite. The packed-B path never
-    // swaps A/B, so the user-frame bias passes through with no axis flip
+    // Bias/activation validation mirrors gemmkit's checked-entry rules. The bias length
+    // matches its axis (PerRow == A.rows, PerCol == packed B.cols == C.cols). It does not
+    // overlap C, checked by raw pointer math only. A LeakyRelu slope must be finite. The
+    // packed-B path never swaps A/B, so the user-frame bias passes through with no axis flip
     let (bias_ptr, bias_dim, has_bias) =
         lower_bias(bias, m, packed.cols(), cp, &[(cm, rsc), (cn, csc)]);
     if let Some(Activation::LeakyRelu(s)) = &act {
         assert!(T::finite(*s), "gemmkit: LeakyRelu slope must be finite");
     }
 
-    // SAFETY: dims validated above; ndarray guarantees A/C layouts are in-bounds and `c` (a
-    // `&mut` borrow) can't alias A; the prepacked B is a separate owned buffer; the bias was
-    // validated disjoint from C above. The `_unchecked` tier below raises the
+    // SAFETY: the dims are validated above. ndarray guarantees A/C layouts are in-bounds, and
+    // `c` (a `&mut` borrow) cannot alias A. The prepacked B is a separate owned buffer, and the
+    // bias was validated disjoint from C above. The `_unchecked` tier below raises the
     // column-major-ish-C panic if C is not column-major-ish
     unsafe {
         match ws {
@@ -396,17 +409,21 @@ fn gemm_packed_b_fused_common<T, S1, SC>(
 }
 
 /// `C <- act(alpha*(prepacked A)*B + beta*C + bias)` in 1 fused pass, reusing a prepacked `A`
-/// ([`prepack_lhs`]): the ndarray adapter over gemmkit's [`gemmkit::gemm_packed_a_fused`]. The
-/// **same** [`PackedLhs`] serves both [`gemm_packed_a`] and this fused entry. `C` must be
-/// row-major-ish (`|col stride| <= |row stride|`); a column-major `C` would keep A in the LHS
-/// role and invalidate the prepacked LHS, which gemmkit rejects. The optional [`Bias`] is
-/// [`Bias::PerRow`] (length `A.rows`) or [`Bias::PerCol`] (length `B.cols`), specified in the
-/// user frame; the optional [`Activation`] is applied last; `bias == None && act == None`
-/// matches [`gemm_packed_a`]
+/// ([`prepack_lhs`]). This is the ndarray adapter over gemmkit's
+/// [`gemmkit::gemm_packed_a_fused`]. The same [`PackedLhs`] serves both [`gemm_packed_a`] and
+/// this fused entry. `C` must be row-major-ish (`|col stride| <= |row stride|`). A column-major
+/// `C` would keep A in the LHS role and invalidate the prepacked LHS, which gemmkit rejects. The
+/// optional [`Bias`] is [`Bias::PerRow`] (length `A.rows`) or [`Bias::PerCol`] (length
+/// `B.cols`), specified in the user frame, and the optional [`Activation`] is applied last.
+/// `bias == None && act == None` matches [`gemm_packed_a`]
 ///
 /// # Panics
-/// If the dimensions disagree, if `C` is not row-major-ish, or on a bias/activation the adapter
-/// rejects (wrong-length bias, a bias slice overlapping `C`, or a non-finite `LeakyRelu` slope)
+/// If the dimensions disagree, if `C` is not row-major-ish, or on a bias/activation the
+/// adapter rejects:
+///
+/// - a wrong-length bias
+/// - a bias slice that overlaps `C`
+/// - a non-finite `LeakyRelu` slope
 #[cfg(feature = "epilogue")]
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_packed_a_fused<T, S2, SC>(
@@ -486,20 +503,21 @@ fn gemm_packed_a_fused_common<T, S2, SC>(
     let (rsc, csc) = (cs[0], cs[1]);
     let cp = c.as_mut_ptr();
 
-    // Bias/activation validation matching gemmkit's checked-entry wording: the bias length
-    // matches its USER axis (PerRow == packed A.rows == C.rows, PerCol == B.cols) and does not
-    // overlap C, and a LeakyRelu slope must be finite. The bias stays in the user frame here;
-    // gemmkit's packed-A path flips it internally to match the transposed product it drives
+    // Bias/activation validation mirrors gemmkit's checked-entry rules. The bias length
+    // matches its user-facing axis (PerRow == packed A.rows == C.rows, PerCol == B.cols) and
+    // does not overlap C. A LeakyRelu slope must be finite. The bias stays in the user frame
+    // here, and gemmkit's packed-A path flips it internally to match the transposed product
+    // it drives
     let (bias_ptr, bias_dim, has_bias) =
         lower_bias(bias, packed.rows(), n, cp, &[(cm, rsc), (cn, csc)]);
     if let Some(Activation::LeakyRelu(s)) = &act {
         assert!(T::finite(*s), "gemmkit: LeakyRelu slope must be finite");
     }
 
-    // SAFETY: dims validated above; ndarray guarantees B/C layouts are in-bounds and `c` (a
-    // `&mut` borrow) can't alias B; the prepacked A is a separate owned buffer; the bias was
-    // validated disjoint from C above. The `_unchecked` tier below raises the row-major-ish-C
-    // panic if C is not row-major-ish
+    // SAFETY: the dims are validated above. ndarray guarantees B/C layouts are in-bounds, and
+    // `c` (a `&mut` borrow) cannot alias B. The prepacked A is a separate owned buffer, and the
+    // bias was validated disjoint from C above. The `_unchecked` tier below raises the
+    // row-major-ish-C panic if C is not row-major-ish
     unsafe {
         match ws {
             Some(ws) => gemm_packed_a_fused_unchecked_with(

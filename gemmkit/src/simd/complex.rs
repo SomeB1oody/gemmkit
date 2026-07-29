@@ -1,41 +1,42 @@
 //! The shared split (structure-of-arrays) complex microkernel, plus the per-ISA glue
 //! macro that wires each token into it
 //!
-//! [`crate::kernel::complex::ComplexGemm`] is homogeneous at the family level
-//! (`Lhs = Rhs = Acc = Out = Complex<_>`), so the driver binds it through
-//! `KernelSimd<Complex<_>, Complex<_>, Complex<_>, Complex<_>>`, which resolves to plain
-//! `SimdOps<Complex<_>>`, not the *real*-typed ops the split kernel needs to run its FMAs.
-//! [`SimdOps::cplx_microkernel`] bridges that gap: each token's override (emitted by
-//! [`impl_complex_simd!`] below) forwards to the one ISA-generic [`soa_microkernel`],
-//! generic over `S: SimdOps<R>` for the real component type `R`, which the token supplies
-//! concretely
+//! [`crate::kernel::complex::ComplexGemm`] is homogeneous at the family level, `Lhs =
+//! Rhs = Acc = Out = Complex<_>`, so the driver binds it through `KernelSimd<Complex<_>,
+//! Complex<_>, Complex<_>, Complex<_>>`. That resolves to plain `SimdOps<Complex<_>>`,
+//! not the real-typed ops the split kernel needs to run its FMAs.
+//! [`SimdOps::cplx_microkernel`] bridges that gap. Each token's override, emitted by
+//! [`impl_complex_simd!`] below, forwards to the one ISA-generic [`soa_microkernel`].
+//! That function is generic over `S: SimdOps<R>` for the real component type `R`, which
+//! the token supplies concretely
 //!
-//! The `SimdOps<Complex<_>>` impl the macro generates is glue, not a kernel: it exists so
-//! the driver can read `LANES` and `Reg` and so the homogeneous `KernelSimd` blanket
+//! The `SimdOps<Complex<_>>` impl the macro generates is glue, not a kernel. It exists so
+//! the driver can read `LANES` and `Reg`, and so the homogeneous `KernelSimd` blanket
 //! applies to `ComplexGemm`. Its element ops (`zero`/`splat`/`mul`/...) are never called
-//! and stub out to `unreachable!`; `LANES` is the **real** lane count, since one real lane
+//! and stub out to `unreachable!`. `LANES` is the real lane count, since one real lane
 //! spans one complex row of the tile
 
 use super::SimdOps;
 use crate::scalar::ComplexFloat;
 
-/// The split (SoA) complex microkernel: accumulate one `MR x NR` complex tile into
-/// separate real/imaginary register banks over `kc` depth steps, then apply the complex
-/// `alpha`/`beta` epilogue and write the interleaved output
+/// The split (SoA) complex microkernel: accumulate one `MR x NR` complex tile over `kc`
+/// depth steps, then apply the complex epilogue and write the interleaved output
 ///
 /// Each complex multiply-accumulate is 4 real FMAs into the 2 banks, in a fixed order:
 /// `acc_re += ar*br`, `acc_re -= ai*bi`, `acc_im += ar*bi`, `acc_im += ai*br`. Ascending
 /// `p` and this exact step order are what make full and edge tiles of the same matrix
-/// round identically. `a`/`b` are the **planar** packed panels (the real plane then the
-/// imaginary plane per depth step); both operands are always packed, so `a_cs`/`b_rs`
+/// round identically. `a`/`b` are the planar packed panels: the real plane, then the
+/// imaginary plane, per depth step. Both operands are always packed, so `a_cs`/`b_rs`
 /// equal the panel widths `mr`/`NR`. `c` is the interleaved output tile: the epilogue
 /// de-interleaves through `scratch`, folds complex `alpha`/`beta` once per output element
 /// (`O(MN)`, not `O(MNK)`), and re-interleaves on store
 ///
 /// # Safety
-/// `a`/`b` valid for the packed planar panels over `kc` depth; `c` valid for the
-/// `mr_eff x nr_eff` output sub-tile at `rsc`/`csc`; `scratch` valid for `2*mr*NR`
-/// reals; run inside this token's [`super::Simd::vectorize`] context
+///
+/// - `a`/`b` are valid for the packed planar panels over `kc` depth
+/// - `c` is valid for the `mr_eff x nr_eff` output sub-tile at `rsc`/`csc`
+/// - `scratch` is valid for `2*mr*NR` reals
+/// - Run inside this token's [`super::Simd::vectorize`] context
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 #[inline(always)]
 pub(crate) unsafe fn soa_microkernel<C, S, const MR_REG: usize, const NR: usize>(
@@ -105,9 +106,10 @@ pub(crate) unsafe fn soa_microkernel<C, S, const MR_REG: usize, const NR: usize>
             }
         }
 
-        // Drain both banks to planar scratch (real block, then imaginary block), each laid
-        // out `scratch[j*mr + row]`, column-major within the tile, so the scalar epilogue
-        // below can index any live (row, col) uniformly regardless of tile shape or stride
+        // Drain both banks to planar scratch, a real block then an imaginary block, each
+        // laid out as `scratch[j*mr + row]`, column-major within the tile. This lets the
+        // scalar epilogue below index any live (row, col) uniformly, regardless of tile
+        // shape or stride
         let im_base = mr * NR;
         for j in 0..NR {
             for i in 0..MR_REG {
@@ -151,17 +153,19 @@ pub(crate) unsafe fn soa_microkernel<C, S, const MR_REG: usize, const NR: usize>
     }
 }
 
-/// Generate the `SimdOps<Complex<$real>>` glue impl for one `($tok, $real)` pair: the
-/// `LANES` (the **real** lane count) and `Reg` the driver reads, every element op
-/// stubbed to `unreachable!` (complex GEMM never calls them, it routes through
-/// `cplx_microkernel`), and the `cplx_microkernel` override forwarding to
-/// [`soa_microkernel`]. This is boilerplate wiring, not a kernel body: the actual kernel
-/// is the single `soa_microkernel` above, shared by every invocation of this macro
+/// Generate the `SimdOps<Complex<$real>>` glue impl for one `($tok, $real)` pair. It
+/// defines `LANES`, the real lane count, and `Reg`, the type the driver reads. Every
+/// element op stubs to `unreachable!`, since complex GEMM never calls them and instead
+/// routes through `cplx_microkernel`. The `cplx_microkernel` override forwards to
+/// [`soa_microkernel`]
+///
+/// This is boilerplate wiring, not a kernel body. The actual kernel is the single
+/// `soa_microkernel` above, shared by every invocation of this macro
 macro_rules! impl_complex_simd {
     ($tok:ty, $real:ty, $reg:ty, $lanes:expr) => {
         impl $crate::simd::SimdOps<num_complex::Complex<$real>> for $tok {
             type Reg = $reg;
-            // LANES is the real lane count: one real lane is one complex row, so the
+            // LANES is the real lane count: one real lane is one complex row. So the
             // driver's mr = MR_REG * LANES is the tile's complex-row count
             const LANES: usize = $lanes;
 

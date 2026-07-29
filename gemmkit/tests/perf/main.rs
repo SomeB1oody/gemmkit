@@ -1,25 +1,15 @@
-//! Root of the `perf` integration-test binary: a collection of `#[ignore]`d throughput
-//! benchmarks, not correctness gates, meant to be run and read by hand
+//! Root of the `perf` integration-test binary: `#[ignore]`d throughput benchmarks, meant
+//! to be run and read by hand, not correctness gates
 //!
-//! * **Native cross-library benches** (`bandwidth`, `batched`, `dtypes`, `prepack`,
-//!   `sgemm`, `small_mn`) compare gemmkit against the `gemm` crate and/or
-//!   `matrixmultiply`. Those are dev-dependencies under
-//!   `cfg(all(not(miri), not(target_family = "wasm")))` in `Cargo.toml`, so any bench that
-//!   calls into them is itself gated `cfg(not(target_family = "wasm"))`.
-//! * **The wasm bench** (`simd128`, `perf_simd128`) has no external crate to compare
-//!   against on that target, so it instead measures gemmkit's `simd128` token against its
-//!   own scalar token, the same `NativeTok`-vs-baseline shape `bench_native_equal_isa`
-//!   uses natively. `harness.rs` (`fill`/`measure`/`gflops`/`Stat`) needs only `std`, so it
-//!   compiles for both worlds unmodified. Correctness of the simd128 kernel itself is
-//!   proven separately by `isa_simd128` in `tests/correctness/isa.rs`; what runs here is
-//!   only the throughput comparison
+//! Native benches (`bandwidth`, `batched`, `dtypes`, `prepack`, `sgemm`, `small_mn`)
+//! compare gemmkit against the `gemm` crate and/or `matrixmultiply`; those dev-dependencies
+//! are excluded on wasm, so those modules are too. The wasm bench (`simd128`) has no
+//! external crate to compare against on that target, so it instead measures gemmkit's
+//! `simd128` token against its own scalar token. This whole file is `cfg(not(miri))`:
+//! Miri cannot execute the target-feature-gated SIMD intrinsics these benches drive
 //!
-//! This whole file is `cfg(not(miri))`: Miri cannot execute the target-feature-gated SIMD
-//! intrinsics these benches drive, so there is nothing for it to run. Every bench here
-//! saturates all available cores, so 2 of them running at once would corrupt each other's
-//! numbers; each takes the shared `BENCH_GUARD` lock as its first line, which serializes
-//! them even under the harness's default multi-threaded test runner (no need to also pass
-//! `--test-threads=1`). Run them with:
+//! Every bench saturates all available cores, so each takes the shared `BENCH_GUARD` lock
+//! as its first line to keep 2 from corrupting each other's numbers. Run with:
 //!   cargo test -p gemmkit --release --test perf -- --ignored --nocapture
 //! Run the wasm benchmark (compile-time `+simd128`) under a wasm runtime:
 //!   RUSTFLAGS="-C target-feature=+simd128" CARGO_TARGET_WASM32_WASIP1_RUNNER=wasmtime \

@@ -5,14 +5,11 @@
 //! no-swap orientation panics, the checked/allocating vs `_unchecked`/`_with` equivalence, and
 //! (submodule [`narrow`]) the narrow `f16`/`bf16` pre-narrow contract
 //!
-//! For `f32`/`f64` every comparison against the plain packed entry followed by the same scalar
-//! map is bitwise: the fused epilogue only changes the store at the end of the *same* prepacked
-//! kernel `gemm_packed_*` already runs (identical blocking, packing, and scheduling), applying to
-//! the exact register or scratch value the plain store would otherwise have written. The narrow
-//! path instead applies the epilogue in `f32` before its single narrowing, so it is locked against
-//! an `f32` single-rounding reference: a per-element tolerance gate over the general shape, and a
-//! bitwise check at `k == 1` where the accumulator is a single exact product; not the 2-rounding
-//! `narrow-gemm-then-map` a naive oracle would use
+//! For `f32`/`f64` every comparison is bitwise. The narrow path applies the epilogue in `f32`
+//! before its single narrowing, so it is locked against an `f32` single-rounding reference instead
+//! of the 2-rounding `narrow-gemm-then-map` a naive oracle would use: a per-element tolerance gate
+//! over the general shape, and a bitwise check at `k == 1` where the accumulator is a single exact
+//! product
 
 use crate::common::*;
 use gemmkit::{
@@ -323,6 +320,7 @@ fn packed_a_matrix<T: Flt>(par: Parallelism) {
     }
 }
 
+// packed_b_matrix and packed_a_matrix's full sweep, serial
 #[test]
 fn packed_fused_eq_packed_then_map_serial() {
     packed_b_matrix::<f32>(Parallelism::Serial);
@@ -331,6 +329,7 @@ fn packed_fused_eq_packed_then_map_serial() {
     packed_a_matrix::<f64>(Parallelism::Serial);
 }
 
+// the same sweep, Rayon(8)
 #[test]
 fn packed_fused_eq_packed_then_map_parallel() {
     packed_b_matrix::<f32>(Parallelism::Rayon(8));
@@ -506,6 +505,7 @@ fn packed_b_fused_row_major_c_panics() {
     );
 }
 
+// gemm_packed_a_fused rejects column-major C the same way plain gemm_packed_a does
 #[test]
 #[should_panic(expected = "row-major-ish C")]
 fn packed_a_fused_col_major_c_panics() {
@@ -860,6 +860,8 @@ mod narrow {
         }
     }
 
+    // per-element accuracy gate vs the f64 reference, for both packed_b_fused (col-major C) and
+    // packed_a_fused (row-major C, bias-axis flip)
     fn gate<N: Narrow>() {
         let mut rng = Rng::new(0xC0FF_AC00);
         let (m, k, n) = (96usize, 128usize, 72usize);
@@ -925,7 +927,8 @@ mod narrow {
         let mut rng = Rng::new(0x9E27_ACB1);
         let (m, n) = (32usize, 24usize);
         let k = 1usize;
-        // [1, 2): the product carries sub-narrow bits that a comparable bias below keeps significant
+        // [1, 2): the product carries sub-narrow bits that a comparable bias below keeps
+        // significant
         let a: Vec<N> = (0..m)
             .map(|_| N::of(1.0 + (rng.unit() + 1.0) * 0.5))
             .collect();

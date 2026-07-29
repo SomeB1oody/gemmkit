@@ -1,10 +1,14 @@
 # SIMD Tokens and ISA Dispatch
 
-gemmkit picks its instruction set at runtime, and that decision collides head-on with how Rust compiles SIMD intrinsics. AVX and AVX-512 intrinsics must be code-generated inside a context where the corresponding target feature is enabled — normally a `#[target_feature(enable = "...")]` attribute on the enclosing function. But which features are safe to enable is only known once the program is running on a concrete CPU, and the microkernel is one generic function shared by every instruction set: there is no single attribute you could pin on it. This page explains how the L0 SIMD layer (`gemmkit/src/simd.rs` and `gemmkit/src/simd/`) resolves that tension with zero-sized ISA tokens and a trampoline, and how the L7 dispatch layer (`gemmkit/src/dispatch.rs` and `gemmkit/src/dispatch/`) selects and caches the winning kernel.
+gemmkit picks its instruction set at runtime. That decision collides with how Rust compiles SIMD intrinsics. AVX and AVX-512 intrinsics compile correctly only inside a context where the target feature is enabled. Normally that context comes from a `#[target_feature(enable = "...")]` attribute on the enclosing function. The program only knows which features are safe to enable once it runs on a concrete CPU. The microkernel is one generic function shared by every instruction set, so no single attribute can sit on it.
+
+This page explains 2 things. First, how the L0 SIMD layer (`gemmkit/src/simd.rs` and `gemmkit/src/simd/`) resolves that tension with zero-sized ISA tokens and a trampoline function. Second, how the L7 dispatch layer (`gemmkit/src/dispatch.rs` and `gemmkit/src/dispatch/`) selects and caches the winning kernel.
 
 ## ISA tokens and the vectorize trampoline
 
-An ISA token is a zero-sized type that stands for one instruction-set choice: `Fma` (AVX2 + FMA) and `Avx512F` on x86, plus the dot-kernel variants `Avx512Vnni` and `Avx512Bf16`; `Neon` on aarch64; `Simd128` on wasm32; and `ScalarTok` everywhere as the portable floor. Each token implements the `Simd` trait, whose only method is `vectorize`: run a closure with this token's target features enabled. Here is the entire mechanism, from `gemmkit/src/simd/fma.rs`:
+An ISA token is a zero-sized type that stands for one instruction-set choice. On x86 the tokens are `Fma` (AVX2 + FMA) and `Avx512F`, plus the dot-kernel variants `Avx512Vnni` and `Avx512Bf16`. On aarch64 the token is `Neon`. On wasm32 the token is `Simd128`. `ScalarTok` exists on every platform as the portable floor.
+
+Each token implements the `Simd` trait. Its only method is `vectorize`, which runs a closure with this token's target features enabled. The code below shows the entire mechanism, from `gemmkit/src/simd/fma.rs`.
 
 ```rust
 /// AVX2 + FMA ISA token
@@ -26,19 +30,31 @@ impl Simd for Fma {
 }
 ```
 
-The trick is inlining direction. `inner` is a tiny `#[target_feature]`-annotated function, and the closure `f` — the packing loops and microkernel calls, all built from `#[inline(always)]` primitives — inlines *into* it. Every intrinsic therefore lands in a codegen context where the feature is enabled, even though no attribute ever touches the generic kernel itself. The `unsafe` contract is exactly one obligation: the caller must guarantee the CPU really supports the token's features, which the runtime dispatcher establishes once per process. This is the proven pulp/faer pattern, and it works identically for the serial path and for rayon worker closures; the driver wraps each column strip of microkernel calls in `simd.vectorize(|| ...)`, so the trampoline overhead is amortized over many tiles. `ScalarTok`'s `vectorize` is just `f()` — nothing to enable — which is what makes the scalar path runnable everywhere, including under Miri.
+The trick is the direction of inlining. `inner` is a tiny function with a `#[target_feature]` attribute. The closure `f` inlines into it. `f` holds the packing loops and the microkernel calls, and every one of those is built from `#[inline(always)]` primitives. Every intrinsic therefore lands in a codegen context where the feature is enabled. No attribute ever touches the generic kernel itself.
+
+The `unsafe` contract has exactly one obligation. The caller must guarantee the CPU really supports the token's features. The runtime dispatcher establishes this once per process.
+
+This is the same pattern pulp and faer use. It works the same way for the serial path and for rayon worker closures. The driver wraps each column strip of microkernel calls in `simd.vectorize(|| ...)`. This amortizes the trampoline overhead over many tiles.
+
+`ScalarTok`'s `vectorize` is just `f()`. It has nothing to enable. This is what makes the scalar path run everywhere, including under Miri.
 
 ## SimdOps: the per-type vocabulary
 
-The token deliberately knows nothing about element types. All actual operations live on a second trait, `SimdOps<T>`, implemented per `(ISA, T)` pair: it names the register type `Reg`, the lane count `LANES`, and every primitive the microkernel needs. Because the token and the element type are decoupled, `LANES` varies with the pair — `f32` is 8 lanes under `Fma` and 16 under `Avx512F`, and `f64` halves both.
+L0 builds on 3 traits, not 2. `Simd` is the ISA token trait above. `SimdOps<T>` is the per-element-type vocabulary this section covers. `KernelSimd<L, R, A, O>` is a third trait. It widens loads and narrows stores when a family's input type, accumulator type, and output type are not all the same. This section covers it near the end.
 
-The vocabulary is deliberately thick. The basics are `zero`, `splat`, `loadu`, `storeu`, `mul`, `add`, the fused `mul_add`, its subtractive partner `fnma` (`c - a*b`, needed by the complex kernel), and the horizontal `reduce_sum` used by gemv and dot epilogues. On top of those sit `max`/`min` (overridden only by the real-float tokens, for the fused ReLU/clip epilogues), the `LANE_FMA` flag with `fma_bvec` (NEON's lane-indexed FMA path, which loads a block of RHS columns as one vector instead of issuing a splat per column), and `accumulate_tile` — the GEMM inner loop itself, with a portable default schedule that LLVM already lowers to the canonical register-blocked kernel on any out-of-order core. The complex split kernel gets its own seam here too (`cplx_microkernel`), as do the dot kernels (`dot_accumulate` on the `KernelSimd` companion trait) — those are covered in [Scalars and Kernel Families](Scalars_and_Kernel_Families.md) and [Dot Kernels and the Deep-K Twin](Dot_Kernels_and_the_Deep-K_Twin.md).
+The token itself knows nothing about element types. All the raw operations live on `SimdOps<T>`, implemented once per `(ISA, T)` pair. It names the register type `Reg`, the lane count `LANES`, and every primitive the microkernel needs. The token and the element type are decoupled, so `LANES` varies with the pair. `f32` gets 8 lanes under `Fma` and 16 lanes under `Avx512F`. `f64` gets half as many lanes as `f32` on the same token.
 
-The thickness is the point. matrixmultiply's thin per-ISA trait forces each instruction set to reimplement the kernel; here *every* primitive the kernel needs is behind `SimdOps`, so the microkernel is one generic function over all ISAs, and adding an instruction set costs a new token, its `SimdOps` impls, and one line in each dispatch ladder. The `simd` module depends only on `crate::scalar` and `core` — no reverse dependency on the kernel, driver, or cache layers — so the whole abstraction could be split into its own crate unchanged.
+The vocabulary is deliberately thick. The basic operations are `zero`, `splat`, `loadu`, `storeu`, `mul`, `add`, and the fused `mul_add`. Its subtractive partner is `fnma`, which computes `c - a*b`. The complex kernel needs `fnma` for one of its accumulation terms. The vocabulary also has the horizontal `reduce_sum`, used by the gemv and dot-product epilogues.
+
+On top of those sit a few more primitives. `max` and `min` exist only on the real-float tokens, for the fused ReLU and clip epilogues. The `LANE_FMA` flag and its `fma_bvec` method give NEON a lane-indexed FMA path. It loads a block of RHS columns as one vector, instead of issuing a separate splat per column. `accumulate_tile` is the GEMM inner loop itself. Its portable default schedule already compiles down to the canonical register-blocked kernel on any out-of-order core.
+
+The complex split kernel has its own seam here too, `cplx_microkernel`. The dot kernels have theirs as well, `dot_accumulate`, which lives on `KernelSimd` rather than on `SimdOps`. `KernelSimd<L, R, A, O>` is the seam a family drives on when its input types, accumulator type, and output type are not all equal. One example is an `f16` input with an `f32` accumulator. It widens a narrow input load into the accumulator type and narrows an accumulator value back down on store. A homogeneous family has all 4 types equal. It gets a `KernelSimd` implementation for free through a blanket impl. It never needs any per-ISA code of its own. See [Scalars and Kernel Families](Scalars_and_Kernel_Families.md) and [Dot Kernels and the Deep-K Twin](Dot_Kernels_and_the_Deep-K_Twin.md) for more on both seams.
+
+The thickness is the point. matrixmultiply's per-ISA trait is thin, so each instruction set has to reimplement the kernel from scratch. Here every primitive the kernel needs sits behind `SimdOps`, so the microkernel is one generic function over every ISA. Adding an instruction set costs a new token, its `SimdOps` impls, and one line in each dispatch ladder. The `simd` module depends only on `crate::scalar` and `core`. It has no reverse dependency on the kernel, driver, or cache layers, so the whole abstraction could move into its own crate unchanged.
 
 ## The dispatch layer
 
-Dispatch turns "which token do we use?" into a one-time decision. Each dispatched element type owns one `OnceLock` slot holding a `Dispatched<T>` descriptor: `f32`/`f64` in `gemmkit/src/dispatch/float.rs`, `f16`/`bf16` in `dispatch/mixed.rs`, `i8` in `dispatch/int.rs` (its own `IntDispatched`/`IntRequantDispatched` shapes, since the types are heterogeneous), and `c32`/`c64` in `dispatch/complex.rs`. From `dispatch/float.rs`, lightly trimmed:
+Dispatch turns the question "which token applies" into a one-time decision. Each dispatched element type owns one `OnceLock` slot holding a `Dispatched<T>` descriptor. `f32` and `f64` use `gemmkit/src/dispatch/float.rs`. `f16` and `bf16` use `dispatch/mixed.rs`. `i8` uses `dispatch/int.rs`, with its own `IntDispatched` and `IntRequantDispatched` shapes, because those types are heterogeneous. `c32` and `c64` use `dispatch/complex.rs`. The code below, lightly trimmed, is from `dispatch/float.rs`.
 
 ```rust
 #[derive(Copy, Clone)]
@@ -55,15 +71,21 @@ pub(super) struct Dispatched<T> {
 }
 ```
 
-The slot caches the winning monomorphized entry points — the plain kernel, the prepacked-RHS kernel, and (under the `epilogue` feature) their fused twins — plus the microtile geometry `(mr, nr)` and the family's `depth_multiple`. The geometry is cached so `prepack_rhs` can size a buffer through the *same* ISA choice the consuming call will make, and `depth_multiple` lets the bf16 prepack path round its packed depth to match the dot kernel's layout. Everything is a typed function pointer: no `transmute`, no `AtomicPtr<()>`. A call flows as `gemm` → `dispatch::execute` (degenerate cases handled here) → `T::dispatch` → the memoized slot → one indirect call into a wrapper like `gemm_f32_avx512f`, which instantiates the shared generic entry as `run_typed::<f32, Avx512F, 2, 12>`.
+The slot caches the winning monomorphized entry points: the plain kernel, the prepacked-RHS kernel, and, under the `epilogue` feature, their fused twins. It also caches the microtile geometry `(mr, nr)` and the family's `depth_multiple`. The geometry is cached so `prepack_rhs` can size a buffer through the same ISA choice the consuming call will make. `depth_multiple` lets the bf16 prepack path round its packed depth to match the dot kernel's layout. Everything here is a typed function pointer. There is no `transmute` and no `AtomicPtr<()>`.
 
-Selection runs once, inside the `OnceLock` initializer. After honoring any `GEMMKIT_REQUIRE_ISA` pin (below), the auto ladder on x86 probes `avx512f` first, then `avx2` + `fma`, then falls to scalar. On aarch64 NEON is baseline — mandatory in the architecture, so no probe is needed. On wasm32 there is no runtime feature detection at all: `simd128` is chosen at compile time via `cfg(target_feature = "simd128")`, so the build must pass `-C target-feature=+simd128` or it gets the scalar kernel. Scalar is the floor on every architecture. Per-type ladders add their own gates on the same skeleton: the `f16` FMA arm additionally requires `f16c` (for the `vcvtph2ps`/`vcvtps2ph` conversions), the `bf16` ladder tries the `avx512bf16` dot kernel before plain AVX-512F, and the `i8` ladder tries `avx512vnni` (with `avx512bw`) before the widen kernel.
+A call flows through a fixed chain. `gemm` calls `dispatch::execute`, which handles the degenerate cases. `dispatch::execute` calls `T::dispatch`, which reads the memoized slot. The slot resolves to one indirect call into a wrapper, such as `gemm_f32_avx512f`. That wrapper instantiates the shared generic entry as `run_typed::<f32, Avx512F, 2, 12>`.
 
-Two build-mode wrinkles are worth knowing. Under `std`, feature detection is `is_x86_feature_detected!` and the result is memoized in the `OnceLock`. Without `std` there is no runtime CPU detection (`raw-cpuid` is `std`-gated): the probe macro degrades to `cfg!(target_feature = ...)`, `GEMMKIT_REQUIRE_ISA` parsing degrades to `Auto`, and the select function runs on each call — but every branch in it is now a compile-time constant, so it folds to a direct choice. A `no_std` build simply runs whatever its compile-time target features guarantee; see [no_std and WebAssembly](../gemmkit-guide/no_std_and_WebAssembly.md).
+Selection runs once, inside the `OnceLock` initializer. It first honors any `GEMMKIT_REQUIRE_ISA` pin, covered below. After that, the auto ladder on x86 probes `avx512f` first, then `avx2` plus `fma`, and falls back to scalar last. On aarch64, NEON is the baseline. The architecture makes NEON mandatory, so no probe is needed there.
+
+On wasm32 there is no runtime feature detection at all. `simd128` is chosen at compile time, through `cfg(target_feature = "simd128")`. The build must pass `-C target-feature=+simd128`, or it gets the scalar kernel instead. Scalar is the floor on every architecture.
+
+Each per-type ladder adds its own gate on the same skeleton. The `f16` FMA arm also requires `f16c`, for the `vcvtph2ps` and `vcvtps2ph` conversions. The `bf16` ladder tries the `avx512bf16` dot kernel before plain AVX-512F. The `i8` ladder tries `avx512vnni` (with `avx512bw`) before the widen kernel.
+
+2 build-mode details are worth knowing. Under `std`, feature detection uses `is_x86_feature_detected!`, and the result is memoized in the `OnceLock`. Without `std`, there is no runtime CPU detection, because `raw-cpuid` is gated on `std`. The probe macro degrades to `cfg!(target_feature = ...)`, `GEMMKIT_REQUIRE_ISA` parsing degrades to `Auto`, and the select function runs on every call. Every branch inside it is now a compile-time constant, so it folds down to a direct choice. A `no_std` build simply runs whatever its compile-time target features guarantee. See [no_std and WebAssembly](../gemmkit-guide/no_std_and_WebAssembly.md).
 
 ## Tile geometry as const generics
 
-The one thing that genuinely varies per `(type, ISA)` besides the instruction encoding is the microtile shape, and it is expressed as a pair of const generics `(MR_REG, NR)` chosen at the dispatch site — never a new type, trait, or macro. `MR_REG` is how many registers tall the tile is, so the row count is `MR = MR_REG * LANES`. For `f32`:
+Besides the instruction encoding, the one thing that genuinely varies per `(type, ISA)` is the microtile shape. It is expressed as a pair of const generics, `(MR_REG, NR)`, chosen at the dispatch site. It is never a new type, trait, or macro. `MR_REG` is how many registers tall the tile is, so the row count is `MR = MR_REG * LANES`. The table below covers `f32`.
 
 | ISA | `(MR_REG, NR)` | `LANES` | Tile `MR x NR` | Register budget |
 |---|---|---|---|---|
@@ -73,12 +95,25 @@ The one thing that genuinely varies per `(type, ISA)` besides the instruction en
 | simd128 | `(2, 4)` | 4 | 8 x 4 | 8 acc + 2 lhs + 1 rhs = 11 live `v128` |
 | scalar | `(4, 4)` | 1 | 4 x 4 | plain locals |
 
-`f64` halves the lane count, so the same `(MR_REG, NR)` pairs yield 16x12 (AVX-512F), 8x6 (FMA), 8x4 (NEON), and 4x4 (simd128). The budgets are not accidents: NEON deliberately leaves ~11 spare registers as rename headroom for a wide out-of-order core to overlap loads with FMAs, and simd128 stays at 11 live vectors because LLVM's wasm backend starts spilling past roughly 16. These comments live next to the wrappers in `dispatch/float.rs`, so the table above is the code, not an aspiration.
+`f64` halves the lane count. The same `(MR_REG, NR)` pairs then yield 16x12 on AVX-512F, 8x6 on FMA, 8x4 on NEON, and 4x4 on simd128. The budgets are not accidents. NEON deliberately leaves about 11 registers free, as rename headroom for a wide out-of-order core to overlap loads with FMAs. simd128 stays at 11 live vectors, because LLVM's wasm backend starts spilling past roughly 16. These comments live next to the wrappers in `dispatch/float.rs`, so the table above is the code, not an aspiration.
 
 ## Pinning with GEMMKIT_REQUIRE_ISA
 
-By default the best available ISA wins. Setting the environment variable `GEMMKIT_REQUIRE_ISA` forces exactly one kernel instead. Accepted values (case-insensitive) are `scalar`, `fma` (alias `avx2`), `avx512f`, `avx512vnni` (alias `vnni`), `avx512bf16` (alias `bf16`), `neon`, `simd128` (alias `wasm`), and `auto`; unset or empty means `auto`, and an unrecognized value is a hard panic so a typo in CI configuration cannot silently select the wrong thing. `avx512vnni` pins the `i8` `vpdpbusd` dot kernel and `avx512bf16` the `bf16` `vdpbf16ps` dot kernel; for every other element type both resolve to the plain AVX-512F path.
+By default the best available ISA wins. Setting the environment variable `GEMMKIT_REQUIRE_ISA` forces exactly one kernel instead of the automatic choice. It accepts these values, case-insensitive:
 
-The defining behavior is that a pin never falls back. If the CPU (or an emulator such as Intel SDE) does not report the required feature, or the requested ISA does not exist on the target architecture — `neon` off aarch64, `fma`/`avx512*` off x86 — dispatch panics with a message naming the missing feature. The rationale is CI honesty: a job that means to exercise a given kernel must fail loudly rather than silently test a different one. The `simd128` pin earns its keep the same way on wasm: the target feature is an easily forgotten compile-time flag, and pinning turns "the flag was dropped" from a silent scalar-fallback into a build that refuses to run.
+- `scalar`
+- `fma` (alias `avx2`)
+- `avx512f`
+- `avx512vnni` (alias `vnni`)
+- `avx512bf16` (alias `bf16`)
+- `neon`
+- `simd128` (alias `wasm`)
+- `auto`
 
-The value is read once. Selection is memoized in the per-type `OnceLock`, so the variable must be set in the process environment before the first GEMM call; changing it afterwards has no effect for the life of the process. The user-facing side of pinning — CI recipes and interaction with the tuning knobs — is covered in [Runtime ISA Dispatch](../gemmkit-guide/Runtime_ISA_Dispatch.md).
+Unset or empty means `auto`. An unrecognized value causes a hard panic, so a typo in a CI configuration cannot silently select the wrong thing. `avx512vnni` pins the `i8` `vpdpbusd` dot kernel. `avx512bf16` pins the `bf16` `vdpbf16ps` dot kernel. For every other element type, both resolve to the plain AVX-512F path.
+
+The defining behavior is that a pin never falls back. Selection panics if the CPU, or an emulator such as Intel SDE, does not report the required feature. It also panics if the requested ISA does not exist on the target architecture at all, such as `neon` off aarch64 or `fma`/`avx512*` off x86. The panic message names the missing feature. The rationale is CI honesty. A job that means to exercise a given kernel must fail loudly, rather than silently test a different one.
+
+The `simd128` pin earns its keep the same way on wasm. The target feature is an easily forgotten compile-time flag. Pinning turns a dropped flag from a silent scalar fallback into a build that refuses to run.
+
+The value is read once. Selection is memoized in the per-type `OnceLock`, so the variable must be set in the process environment before the first GEMM call. Changing it afterward has no effect for the life of the process. See [Runtime ISA Dispatch](../gemmkit-guide/Runtime_ISA_Dispatch.md) for the user-facing side of pinning, including CI recipes and how it interacts with the tuning knobs.

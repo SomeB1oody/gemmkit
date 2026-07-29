@@ -1,10 +1,10 @@
 //! # gemmkit-nalgebra
 //!
-//! A thin [`nalgebra`] adapter over the [`gemmkit`] GEMM engine: every entry point takes
-//! `&Matrix<T, R, C, S>` for any storage `S: RawStorage` (so `DMatrix`, a static `SMatrix`, and
-//! every view type all work), reads the pointer and strides straight off the matrix, and forwards
-//! them to gemmkit's raw engine. Column-major (nalgebra's natural layout), row-major, and
-//! general-stride views therefore all work without copying
+//! A thin [`nalgebra`] adapter over the [`gemmkit`] GEMM engine. Every entry point takes
+//! `&Matrix<T, R, C, S>` for any storage `S: RawStorage`, so `DMatrix`, a static `SMatrix`, and
+//! every view type all work. Each entry reads the pointer and strides directly off the matrix
+//! and forwards them to the gemmkit raw engine. Column-major (nalgebra's natural layout),
+//! row-major, and general-stride views all work without copying
 //!
 //! ```
 //! use nalgebra::{DMatrix, Matrix2};
@@ -14,62 +14,63 @@
 //! assert_eq!(c, DMatrix::from_row_slice(2, 2, &[19.0, 22.0, 43.0, 50.0]));
 //! ```
 //!
-//! [`gemm`]/[`gemm_with`]/[`dot`] are generic over [`GemmScalar`]: `f32`/`f64` always,
-//! plus `f16`/`bf16` under the `half` feature. [`prepack_rhs`]/[`prepack_lhs`] (consumed by
-//! [`gemm_packed_b`]/[`gemm_packed_a`]) pre-pack 1 reused operand for the fixed-weight inference
-//! loop. Complex (`Complex<f32>`/`Complex<f64>`, with optional conjugation) needs the separate
-//! [`gemm_cplx`]/[`gemm_cplx_with`]/[`dot_cplx`] under the `complex` feature, since the conj flags
-//! don't fit the homogeneous surface. The integer (`i8 -> i32`) path likewise gets its own
-//! [`gemm_i8`]/[`gemm_i8_with`]/[`dot_i8`] under the `int8` feature (`i8` inputs, `i32` output)
+//! [`gemm`], [`gemm_with`], and [`dot`] are generic over [`GemmScalar`]: `f32`/`f64` always, plus
+//! `f16`/`bf16` under the `half` feature. [`prepack_rhs`] and [`prepack_lhs`] (consumed by
+//! [`gemm_packed_b`] and [`gemm_packed_a`]) pre-pack 1 reused operand for a fixed-weight
+//! inference loop. Complex types (`Complex<f32>`/`Complex<f64>`, with optional conjugation) need
+//! the separate [`gemm_cplx`], [`gemm_cplx_with`], and [`dot_cplx`] entries under the `complex`
+//! feature. The conjugation flags do not fit the homogeneous surface. The integer (`i8 -> i32`)
+//! path likewise gets its own [`gemm_i8`], [`gemm_i8_with`], and [`dot_i8`] under
+//! the `int8` feature (`i8` inputs, `i32` output)
 //!
-//! Under the `epilogue` feature the fused-epilogue entries mirror gemmkit's own:
-//! [`gemm_fused`]/[`gemm_fused_with`] (`C <- act(alpha*A*B + beta*C + bias)` in 1 pass, an
-//! optional [`Bias`] plus an optional [`Activation`]) and the prepacked-operand twins
+//! Under the `epilogue` feature the fused-epilogue entries mirror gemmkit's own. [`gemm_fused`]
+//! and [`gemm_fused_with`] compute `C <- act(alpha*A*B + beta*C + bias)` in 1 pass, with an
+//! optional [`Bias`] and an optional [`Activation`]. The prepacked-operand twins
 //! [`gemm_packed_b_fused`]/[`gemm_packed_b_fused_with`] and
-//! [`gemm_packed_a_fused`]/[`gemm_packed_a_fused_with`] (the same reused
-//! [`PackedRhs`]/[`PackedLhs`] handle, plus a fused bias/activation). `f16`/`bf16` ride the same
-//! generic when `half` is also on. Requantized output needs `int8` + `epilogue`:
+//! [`gemm_packed_a_fused`]/[`gemm_packed_a_fused_with`] take the same reused
+//! [`PackedRhs`]/[`PackedLhs`] handle, plus a fused bias and activation. `f16`/`bf16` ride the
+//! same generic when `half` is also on. Requantized output needs `int8` + `epilogue`.
 //! [`gemm_i8_requant`]/[`gemm_i8_requant_with`] (and the `u8`-output
-//! [`gemm_i8_requant_u8`]/[`gemm_i8_requant_u8_with`]) take a [`Requantize`] and fuse the
-//! requantize step into a quantized `i8` (resp. `u8`) output. Complex-fused needs `complex` +
-//! `epilogue`: the bias-only [`gemm_cplx_fused`]/[`gemm_cplx_fused_with`] (no activation
-//! parameter, since an ordering activation is undefined on complex numbers)
+//! [`gemm_i8_requant_u8`]/[`gemm_i8_requant_u8_with`]) take a [`Requantize`] and fuse it into a
+//! quantized `i8` or `u8` output. Complex-fused needs `complex` +
+//! `epilogue`: the bias-only [`gemm_cplx_fused`]/[`gemm_cplx_fused_with`] takes no activation
+//! parameter, because an ordering activation is undefined on complex numbers
 //!
-//! nalgebra has no rank-3 array type, so [`gemm_batched`] takes a batch as a slice of per-element
-//! `(&A, &B)` inputs paired with a slice of `&mut C` outputs, over gemmkit's pointer-array
-//! [`gemmkit::gemm_batched_ptr_unchecked`] engine, rather than the 3-D strided form the ndarray
-//! adapter uses. The ndarray adapter's `gemm_batched_fused` (1 bias/activation shared by the
-//! whole batch) has no pointer-array analogue in gemmkit's core, so it has no counterpart here
+//! nalgebra has no rank-3 array type. [`gemm_batched`] instead takes a batch as a slice of
+//! per-element `(&A, &B)` inputs, paired with a slice of `&mut C` outputs. This runs over
+//! gemmkit's pointer-array [`gemmkit::gemm_batched_ptr_unchecked`] engine, rather than the 3-D
+//! strided form the ndarray adapter uses. The ndarray adapter's `gemm_batched_fused` (1 bias and
+//! activation shared by the whole batch) has no pointer-array analogue in gemmkit's core. It has
+//! no matching entry here
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
-/// The element-type bound of the complex entries, re-exported so a caller writing a wrapper
-/// generic over [`gemm_cplx`] doesn't need a direct `gemmkit` dependency to name the bound
+/// Re-exported element-type bound for the complex entries. A wrapper generic over
+/// [`gemm_cplx`] can name the bound without a direct `gemmkit` dependency
 #[cfg(feature = "complex")]
 pub use gemmkit::ComplexScalar;
-/// The element-type bound of the plain real entries, re-exported so a caller writing a wrapper
-/// generic over [`gemm`]/[`dot`]/[`prepack_rhs`] doesn't need a direct `gemmkit` dependency to
-/// name the bound
+/// Re-exported element-type bound for the plain real entries. A wrapper generic over
+/// [`gemm`]/[`dot`]/[`prepack_rhs`] can name the bound without a direct `gemmkit` dependency
 pub use gemmkit::GemmScalar;
-/// gemmkit's heuristic thresholds: the `tuning::set_*` setters, their getters, and the compiled
-/// defaults, re-exported so callers don't need a direct `gemmkit` dependency. The knobs are
-/// process-global atomics, so reaching them through a separately resolved second `gemmkit` would
-/// set a copy this adapter never reads
+/// Re-exported heuristic thresholds from gemmkit: the `tuning::set_*` setters, their getters,
+/// and the compiled defaults. Callers do not need a direct `gemmkit` dependency to reach them.
+/// The knobs are process-global atomics, so a separately resolved 2nd `gemmkit` copy would set
+/// values this adapter never reads
 #[doc(no_inline)]
 pub use gemmkit::tuning;
 /// Fused-epilogue selectors ([`Bias`], [`Activation`]), re-exported so callers of [`gemm_fused`]
-/// don't need a direct `gemmkit` dependency
+/// do not need a direct `gemmkit` dependency
 #[cfg(feature = "epilogue")]
 pub use gemmkit::{Activation, Bias};
-/// The complex element type of [`gemm_cplx`] and its `c32` / `c64` aliases, re-exported so a
-/// caller need not reach for a 2nd source of them (they are the same `num_complex` types
-/// [`nalgebra::Complex`] is)
+/// The complex element type behind [`gemm_cplx`], with its `c32`/`c64` aliases, re-exported so a
+/// caller does not need a 2nd source for them. These are the same `num_complex` types as
+/// [`nalgebra::Complex`]
 #[cfg(feature = "complex")]
 #[doc(no_inline)]
 pub use gemmkit::{Complex, c32, c64};
-/// The element-type bounds of the fused entries ([`FusedScalar`] for the bias/activation form,
-/// [`MapScalar`] for [`gemm_map`]), re-exported so a caller writing a wrapper generic over them
-/// doesn't need a direct `gemmkit` dependency to name the bound
+/// Re-exported element-type bounds for the fused entries: [`FusedScalar`] for the bias and
+/// activation form, [`MapScalar`] for [`gemm_map`]. A wrapper generic over them can name the
+/// bound without a direct `gemmkit` dependency
 #[cfg(feature = "epilogue")]
 pub use gemmkit::{FusedScalar, MapScalar};
 use gemmkit::{
@@ -77,19 +78,20 @@ use gemmkit::{
     gemm_packed_b_unchecked, gemm_packed_b_unchecked_with, gemm_unchecked, gemm_unchecked_with,
     prepack_lhs_unchecked, prepack_rhs_unchecked,
 };
-/// Prepacked-operand handles, re-exported so callers of [`prepack_rhs`]/[`prepack_lhs`] don't need
-/// a direct `gemmkit` dependency
+/// Prepacked-operand handles, re-exported so callers of [`prepack_rhs`]/[`prepack_lhs`] do not
+/// need a direct `gemmkit` dependency
 pub use gemmkit::{PackedLhs, PackedRhs};
-/// The [`Parallelism`] selector every entry takes and the reusable [`Workspace`] the `_with`
-/// variants take, re-exported so callers don't need a direct `gemmkit` dependency
+/// Every entry except [`prepack_rhs`]/[`prepack_lhs`] takes the [`Parallelism`] selector,
+/// re-exported here so callers do not need a direct `gemmkit` dependency. The `_with` variants
+/// also take the reusable [`Workspace`], re-exported for the same reason
 pub use gemmkit::{Parallelism, Workspace};
-/// Requantization parameters ([`Requantize`], with its per-tensor / per-row output scale
-/// [`RequantScale`]) for the `int8` fused entries, re-exported so callers of [`gemm_i8_requant`]
-/// don't need a direct `gemmkit` dependency
+/// Requantization parameters ([`Requantize`], with its per-tensor or per-row output scale
+/// [`RequantScale`]) for the `int8` fused entries. This is re-exported so callers of
+/// [`gemm_i8_requant`] do not need a direct `gemmkit` dependency
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 pub use gemmkit::{RequantScale, Requantize};
-/// The narrow float element types of the `half`-gated entries, re-exported so callers don't need
-/// a direct `half` dependency ([`nalgebra`] exposes neither). Both accumulate in `f32`
+/// The narrow float element types of the `half`-gated entries, re-exported so callers do not
+/// need a direct `half` dependency ([`nalgebra`] exposes neither). Both accumulate in `f32`
 #[cfg(feature = "half")]
 #[doc(no_inline)]
 pub use gemmkit::{bf16, f16};

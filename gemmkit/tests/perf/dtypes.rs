@@ -77,6 +77,7 @@ fn bench_f16(s: usize, parallel: bool) {
     );
 }
 
+/// f16 GEMM throughput, gemmkit vs the `gemm` crate, serial and parallel
 #[cfg(all(feature = "half", not(target_family = "wasm")))]
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
@@ -156,6 +157,8 @@ fn bench_narrow_k_sweep(m: usize, k: usize, n: usize) {
     );
 }
 
+/// f32 vs f16 vs bf16 throughput across a `k` sweep at fixed small `m = n`, serial, spanning
+/// the single-slice-to-multi-slice narrow-output hand-off
 #[cfg(all(feature = "half", not(target_family = "wasm")))]
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
@@ -206,6 +209,8 @@ fn bench_bf16(s: usize, parallel: bool) {
     );
 }
 
+/// bf16-in, f32-accumulate GEMM throughput, gemmkit only (no external bf16 baseline),
+/// serial and parallel
 #[cfg(all(feature = "half", not(target_family = "wasm")))]
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
@@ -222,8 +227,7 @@ fn perf_bf16() {
 /// i8-in, i32-accumulate GEMM throughput: no baseline here either (0.18 has no i8 support).
 /// On a VNNI-capable box `gemm_i8`'s auto-select mostly runs the `vpdpbusd` dot kernel here
 /// (every serial call, and every parallel call whose `m*n*k` clears `i8_vnni_min_par_mnk`);
-/// only a small parallel problem falls back to the plain widen-and-multiply kernel. Either
-/// way this just confirms i8 throughput is SIMD-accelerated rather than scalar-bound
+/// only a small parallel problem falls back to the plain widen-and-multiply kernel
 #[cfg(all(feature = "int8", not(target_family = "wasm")))]
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]

@@ -89,8 +89,8 @@ fn gemm_common<T, R1, C1, S1, R2, C2, S2, RC, CC, SC>(
     let (rsc, csc) = (cs.0 as isize, cs.1 as isize);
     let cp = c.as_mut_ptr();
 
-    // SAFETY: dims checked above; nalgebra guarantees the storage's pointer/strides describe a
-    // valid in-bounds layout, and `c` (a `&mut` borrow) can't alias `a`/`b`
+    // SAFETY: dims are checked above. nalgebra guarantees the storage's pointer and strides
+    // describe a valid in-bounds layout, and `c` (a `&mut` borrow) cannot alias `a` or `b`
     unsafe {
         match ws {
             Some(ws) => gemm_unchecked_with(
@@ -148,7 +148,7 @@ where
 {
     let (m, _) = a.shape();
     let (_, n) = b.shape();
-    // beta = 0, so gemm overwrites every cell; the fill value is never read
+    // beta = 0, so gemm overwrites every cell. The fill value is never read
     let mut c = filled_dmatrix(m, n, T::ZERO);
     gemm(T::ONE, a, b, T::ZERO, &mut c, Parallelism::default());
     c

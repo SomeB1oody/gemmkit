@@ -1,4 +1,5 @@
-//! RNG, per-element numeric/canary traits, and strided-layout operand construction shared by every fuzz target
+//! RNG, per-element numeric and canary traits, and strided-layout operand construction
+//! shared by every fuzz target
 
 use arbitrary::{Result, Unstructured};
 use gemmkit::{Complex, ComplexScalar, GemmScalar, Parallelism, bf16, c32, c64, f16};
@@ -10,17 +11,17 @@ use gemmkit::{Complex, ComplexScalar, GemmScalar, Parallelism, bf16, c32, c64, f
 /// corners. Index 0 is `0.0`, so `ab_index` can land on the `beta == 0` "C not read" case
 pub(crate) const AB_TABLE: [f64; 6] = [0.0, 1.0, -1.0, 0.5, 0.75, 2.5];
 
-/// Integer twin of `AB_TABLE`: `gemm_i8` takes `i32` alpha/beta, so truncating the
-/// float table would fold `0.0`/`0.5`/`0.75` into the same `0` - this table keeps
-/// its entries distinct
+/// Integer twin of `AB_TABLE`. `gemm_i8` takes `i32` alpha and beta, so a truncated float
+/// table would fold `0.0`, `0.5`, and `0.75` into the same `0`. This table keeps its
+/// entries distinct
 pub(crate) const I8_AB_TABLE: [i32; 6] = [0, 1, -1, 2, 3, -2];
 
 /// Sentinel fill for the gap slots of an i8-GEMM output buffer (C is i32)
 const I32_CANARY: i32 = 0x0BAD_F00Du32 as i32;
 
-/// xorshift matching the correctness suite's `rand_vec` (`tests/oracle_common/mod.rs`);
-/// seeded once per operand from a plan-supplied `u64` and iterated internally, so a large
-/// operand does not have to spend libFuzzer's `-max_len` byte budget 1 byte per element
+/// xorshift matching the correctness suite's `rand_vec` (`tests/oracle_common/mod.rs`). It seeds
+/// once per operand from a plan-supplied `u64` and iterates internally. This way a large
+/// operand does not spend libFuzzer's `-max_len` byte budget 1 byte per element
 pub(crate) struct Rng(u64);
 impl Rng {
     pub(crate) fn new(seed: u64) -> Self {
@@ -33,14 +34,14 @@ impl Rng {
         self.0 ^= self.0 << 17;
         self.0
     }
-    /// Full-range i8 draw: used directly for i8 operands and as the source for next_quant
+    /// Full-range i8 draw: used directly for i8 operands and as the source for `next_quant`
     #[inline]
     pub(crate) fn next_i8(&mut self) -> i8 {
         (self.step() >> 24) as u8 as i8
     }
-    /// `i8 / 64.0`: magnitude <= 2 and, since the denominator is `2^6`, exactly
-    /// representable in every float element type - no extra input-rounding error to
-    /// fold into the tolerance gate
+    /// `i8 / 64.0`. The magnitude stays at most 2, and since the denominator is `2^6`, the
+    /// value is exactly representable in every float element type. This leaves no extra
+    /// input-rounding error to fold into the tolerance gate
     #[inline]
     pub(crate) fn next_quant(&mut self) -> f64 {
         self.next_i8() as f64 / 64.0
@@ -49,9 +50,9 @@ impl Rng {
 
 // per-element traits: f64 <-> element conversion, plus the gap-canary sentinel
 
-/// Bit-pattern sentinel for the non-view "gap" slots of an output buffer: the GEMM
-/// call must never touch them, so a slot that no longer reads as the sentinel is a
-/// stray write
+/// Bit-pattern sentinel for the non-view "gap" slots of an output buffer. The GEMM call
+/// must never touch them, so a slot that no longer reads as the sentinel marks a stray
+/// write
 pub(crate) trait Canary: Copy {
     const SENTINEL: Self;
     fn is_sentinel(self) -> bool;
@@ -183,8 +184,8 @@ pub enum LayoutPlan {
 }
 
 impl LayoutPlan {
-    /// `(rs, cs)` for a `rows x cols` view in this layout; every case is non-negative,
-    /// matching what the checked API (`api.rs::extent`) accepts
+    /// `(rs, cs)` for a `rows x cols` view in this layout. Every case is non-negative, which
+    /// matches what the checked API (`api.rs::extent`) accepts
     pub fn strides(self, rows: usize, cols: usize) -> (isize, isize) {
         match self {
             LayoutPlan::RowIsh { il, pad } => ((cols * il + pad) as isize, il as isize),
@@ -204,9 +205,9 @@ impl LayoutPlan {
     }
 }
 
-/// Highest slice offset (exclusive) of a `rows x cols` view: the same formula as
-/// `api.rs::extent`, simplified for the non-negative, non-overflowing strides this
-/// harness ever builds
+/// Highest slice offset, exclusive, of a `rows x cols` view. This uses the same formula as
+/// `api.rs::extent`, simplified for the non-negative, non-overflowing strides this harness
+/// ever builds
 pub(crate) fn extent_of(rows: usize, cols: usize, rs: isize, cs: isize) -> usize {
     if rows == 0 || cols == 0 {
         return 0;
@@ -214,9 +215,9 @@ pub(crate) fn extent_of(rows: usize, cols: usize, rs: isize, cs: isize) -> usize
     ((rows - 1) as isize * rs + (cols - 1) as isize * cs) as usize + 1
 }
 
-/// Build a `rows x cols` operand: allocate exactly the extent this layout needs, fill
-/// its view slots via `genf` through the strides, and return `(buf, rs, cs)`. The gap
-/// slots outside the view keep `fill` untouched
+/// Build a `rows x cols` operand. Allocate exactly the extent this layout needs, fill its
+/// view slots via `genf` through the strides, and return `(buf, rs, cs)`. The gap slots
+/// outside the view keep `fill` untouched
 pub(crate) fn build_operand<T: Copy>(
     rows: usize,
     cols: usize,
@@ -235,8 +236,9 @@ pub(crate) fn build_operand<T: Copy>(
     (buf, rs, cs)
 }
 
-/// Panics if the GEMM call wrote a slot outside the `rows x cols` view: the cheapest
-/// detector for the stride/epilogue out-of-bounds-write class these layouts probe
+/// Panics if the GEMM call wrote a slot outside the `rows x cols` view. This is the
+/// cheapest detector for the stride and epilogue out-of-bounds-write class these layouts
+/// probe
 pub(crate) fn assert_no_gap_writes<T: Canary>(
     buf: &[T],
     rows: usize,
@@ -262,7 +264,8 @@ pub(crate) fn assert_no_gap_writes<T: Canary>(
 // small Arbitrary-decoding helpers shared by every plan
 
 pub(crate) fn arb_par(u: &mut Unstructured) -> Result<Parallelism> {
-    // Serial weighted 2x for exec/s; explicit thread counts capped at Rayon(2)
+    // Serial is weighted 2x to keep executions per second high. Explicit thread counts
+    // are capped at Rayon(2)
     Ok(*u.choose(&[
         Parallelism::Serial,
         Parallelism::Serial,
@@ -272,9 +275,9 @@ pub(crate) fn arb_par(u: &mut Unstructured) -> Result<Parallelism> {
 }
 
 pub(crate) fn arb_par_knobs(u: &mut Unstructured) -> Result<Parallelism> {
-    // Also exercises Rayon(0) (auto-detect), the only path where par_mnk_per_worker
-    // takes effect (parallel_threshold gates every Rayon variant); still Serial-weighted
-    // for throughput
+    // Also exercises Rayon(0), the auto-detect path where par_mnk_per_worker takes
+    // effect. parallel_threshold still gates every Rayon variant, and Serial stays
+    // weighted for throughput
     Ok(*u.choose(&[
         Parallelism::Serial,
         Parallelism::Serial,

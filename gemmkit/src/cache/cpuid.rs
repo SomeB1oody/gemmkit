@@ -1,51 +1,52 @@
 //! CPUID cache backend (x86 / x86-64)
 //!
-//! Cache geometry comes straight from the CPUID instruction, so this works the
-//! same in a container or most VMs as on bare metal; only a hypervisor that
-//! masks the relevant leaves makes [`detect`] return `None`, in which case the
-//! caller falls through to the next backend. Both vendors expose a per-cache
-//! topology leaf (Intel CPUID.04h, AMD 0x8000_001D), walked sub-leaf by
-//! sub-leaf; it describes each cache as reachable from the executing core, so
-//! on a multi-die part (a 2-CCD Ryzen) the L3 figure is the one complex a core
-//! can actually hit, not the package total - the semantic every consumer wants
-//! (see [`super::Level::bytes`]). AMD parts or hypervisors without that leaf
-//! fall back to the legacy L1 (0x8000_0005) and L2/L3 (0x8000_0006) leaves,
-//! which only know a package-total L3 and a coarse associativity encoding
+//! Cache geometry comes from the CPUID instruction. This works the same in a
+//! container or most VMs as on bare metal. Only a hypervisor that masks the
+//! relevant leaves makes [`detect`] return `None`. The caller then falls
+//! through to the next backend
+//!
+//! Both vendors expose a per-cache topology leaf (Intel CPUID.04h, AMD
+//! 0x8000_001D), walked sub-leaf by sub-leaf. Each entry describes a cache as
+//! reachable from the executing core. On a multi-die part, the L3 figure is
+//! the slice one core can reach, not the package total (see
+//! [`super::Level::bytes`])
+//!
+//! AMD parts or hypervisors without that leaf fall back to the legacy L1
+//! (0x8000_0005) and L2/L3 (0x8000_0006) leaves. These report only a
+//! package-total L3 size and a coarse associativity encoding
 
 use super::{CacheTopology, Level};
 use raw_cpuid::{Associativity, CacheType, CpuId, CpuIdReader};
 
-/// Best-effort cache topology from CPUID; `None` when both leaf families are
-/// unreadable
+/// Reads a best-effort cache topology from the CPUID instruction
+///
+/// # Returns
+///
+/// - `Option<CacheTopology>` - `None` when both leaf families are unreadable
 pub fn detect() -> Option<CacheTopology> {
     let cpuid = CpuId::new();
-    // The topology leaf first: raw-cpuid selects CPUID.04h or 0x8000_001D by
-    // vendor, and both report per-core-reachable caches. The legacy AMD leaves
-    // are only a fallback, at the cost of a package-total L3 figure on
-    // multi-CCD parts and a guessed associativity
+    // Tries the topology leaf first (per-core-reachable caches), then falls back
+    // to the legacy AMD leaves (package-total L3, guessed associativity)
     detect_topology_leaf(&cpuid).or_else(|| detect_amd_legacy(&cpuid))
 }
 
-// Map raw_cpuid's associativity encoding to a plain way count
+// Maps raw_cpuid's associativity encoding to a way count
 fn assoc_num(a: Associativity) -> usize {
     match a {
         Associativity::DirectMapped => 1,
         Associativity::NWay(n) => n as usize,
-        // Not a real way count, just a value large enough that the blocking model
-        // treats the cache as effectively unconstrained by associativity
+        // A large placeholder, not a real way count, so the blocking model treats
+        // this cache as unconstrained by associativity
         Associativity::FullyAssociative => 64,
-        // Disabled, or Unknown ("see leaf 0x8000_001d"): no ways figure to report,
-        // so fall back to a plausible default
+        // Disabled or Unknown: no way count to report, so this falls back to a
+        // default value
         _ => 8,
     }
 }
 
-// AMD legacy leaves: the L1 (0x8000_0005) and L2/L3 (0x8000_0006) leaves must both
-// decode; L3 is reported inside the L2/L3 leaf and treated as absent below when its
-// size field reads 0, not by the leaf itself being unreadable. Only reached when the
-// topology leaf is unavailable: the L3 size here is the package total, which
-// overstates what one core can hit on a multi-CCD part, and 16-way associativity is
-// not even encodable (it reads back as `Unknown`)
+// Reads the legacy AMD leaves: L1 (0x8000_0005) and L2/L3 (0x8000_0006) leaves must
+// both decode. This path reports L3 as the package total, not the per-core slice,
+// and cannot encode 16-way associativity, which reads back as `Unknown`
 fn detect_amd_legacy<R: CpuIdReader>(cpuid: &CpuId<R>) -> Option<CacheTopology> {
     let l1 = cpuid.get_l1_cache_and_tlb_info()?;
     let l23 = cpuid.get_l2_l3_cache_and_tlb_info()?;
@@ -77,13 +78,10 @@ fn detect_amd_legacy<R: CpuIdReader>(cpuid: &CpuId<R>) -> Option<CacheTopology> 
     Some(CacheTopology { l1d, l2, l3 })
 }
 
-// The per-cache topology leaf (Intel CPUID.04h, AMD 0x8000_001D - raw-cpuid picks
-// by vendor): the sub-leaf iterator stops on its own at the Null terminator, so this
-// just keeps the 1st Data-or-Unified entry seen at each of levels 1-3. L3 is
-// optional; L1d and L2 are not, so a topology missing either comes back as None. That
-// None also covers `get_cache_parameters` itself returning None, which is what happens
-// on an AMD part whose 0x8000_001D is masked: raw-cpuid never falls back to the Intel
-// leaf for AMD, so the caller then tries the legacy leaves
+// Reads the per-cache topology leaf (Intel CPUID.04h, AMD 0x8000_001D, chosen by
+// raw-cpuid based on vendor). The sub-leaf walk keeps the 1st Data-or-Unified entry
+// seen at each of levels 1-3. L3 is optional. A topology missing L1d or L2, or a
+// masked leaf, returns `None`, so the caller then tries the legacy leaves
 fn detect_topology_leaf<R: CpuIdReader>(cpuid: &CpuId<R>) -> Option<CacheTopology> {
     let params = cpuid.get_cache_parameters()?;
     let mut l1d = None;
@@ -122,10 +120,10 @@ fn detect_topology_leaf<R: CpuIdReader>(cpuid: &CpuId<R>) -> Option<CacheTopolog
 mod tests {
     use raw_cpuid::{CpuId, CpuIdResult};
 
-    /// Build a CPUID leaf-04h sub-leaf `CpuIdResult` from decoded fields, following the
-    /// real register layout: `eax` packs the cache type into bits 0-4 and the level into
-    /// bits 5-7; `ebx` packs line size, physical partitions, and ways, each biased by 1;
-    /// `ecx` is the set count, also biased by 1. The cache size those fields describe is
+    /// Builds a CPUID leaf-04h sub-leaf `CpuIdResult` from decoded fields, matching
+    /// the real register layout. `eax` packs the cache type into bits 0-4 and the
+    /// level into bits 5-7. `ebx` packs line size, physical partitions, and ways,
+    /// each biased by 1. `ecx` is the set count, also biased by 1. The cache size is
     /// `ways * line * sets * partitions`
     fn leaf04(ctype: u32, level: u32, line: u32, parts: u32, ways: u32, sets: u32) -> CpuIdResult {
         CpuIdResult {
@@ -136,16 +134,16 @@ mod tests {
         }
     }
 
-    /// Feed `detect_topology_leaf` a mock leaf-04h walk (L1d 48 KiB/12-way, an L1
-    /// *instruction* cache that the `Data | Unified` filter must skip, L2 1 MiB/8-way
-    /// unified, L3 32 MiB/16-way unified) and check the resulting sizes and way counts.
-    /// `detect_topology_leaf` is generic over the CPUID reader, so a mock exercises the
-    /// Intel flavor of the leaf on any host, including the AMD dev box
+    /// Feeds `detect_topology_leaf` a mock leaf-04h walk with L1d 48 KiB/12-way, L2 1
+    /// MiB/8-way, and L3 32 MiB/16-way. An L1 instruction cache is present too, but the
+    /// `Data | Unified` filter must skip it. The test checks the resulting sizes and way
+    /// counts. Because `detect_topology_leaf` is generic over the CPUID reader, the mock
+    /// exercises the Intel leaf layout on any host
     #[test]
     fn detect_topology_leaf_from_canned_intel_leaf04() {
         let reader = |eax: u32, ecx: u32| -> CpuIdResult {
             match (eax, ecx) {
-                // Leaf 0: report a max basic leaf of 4 or higher, and spell out
+                // Leaf 0: reports a max basic leaf of 4 or higher, and spells
                 // "GenuineIntel" across ebx/edx/ecx in that order
                 (0x0, _) => CpuIdResult {
                     eax: 0x16,
@@ -187,18 +185,17 @@ mod tests {
         assert_eq!(l3.assoc, 16, "L3 ways");
     }
 
-    /// Feed `detect_amd_legacy` a mock AMD leaf pair whose associativity nibbles decode
-    /// to `DirectMapped` (L1d) and `FullyAssociative` (L2 and L3), encodings a real Zen
-    /// part does not emit for those fields, and check that `assoc_num` folds them to
-    /// `1` and `64` respectively. A real AMD host never reaches this path (the topology
-    /// leaf wins), so the mock is the only coverage for the legacy decode and for the
-    /// `DirectMapped` and `FullyAssociative` arms
+    /// Feeds `detect_amd_legacy` a mock AMD leaf pair whose associativity nibbles
+    /// decode to `DirectMapped` (L1d) and `FullyAssociative` (L2 and L3). Real AMD
+    /// hardware does not emit those encodings, so this is the only coverage for
+    /// `assoc_num` folding them to `1` and `64`. A real AMD host never reaches this
+    /// path, because the topology leaf wins first
     #[test]
     fn detect_amd_legacy_exotic_associativities() {
         let reader = |eax: u32, _ecx: u32| -> CpuIdResult {
             match eax {
-                // Leaf 0: spell "AuthenticAMD" across ebx/edx/ecx (max basic leaf value,
-                // eax, is not read by this path)
+                // Leaf 0: spells "AuthenticAMD" across ebx/edx/ecx. eax, the max basic
+                // leaf value, is not read by this path
                 0x0 => CpuIdResult {
                     eax: 0x10,
                     ebx: 0x6874_7541, // "Auth"
@@ -213,7 +210,7 @@ mod tests {
                     ecx: 0,
                     edx: 0,
                 },
-                // L1 cache/TLB leaf: ecx = size(KiB) << 24 | assoc << 16 | line;
+                // L1 cache/TLB leaf: ecx = size(KiB) << 24 | assoc << 16 | line
                 // assoc 0x01 decodes to DirectMapped
                 0x8000_0005 => CpuIdResult {
                     eax: 0,
@@ -221,8 +218,8 @@ mod tests {
                     ecx: (64 << 24) | (0x01 << 16) | 64,
                     edx: 0,
                 },
-                // L2/L3 cache leaf: ecx = l2size(KiB) << 16 | l2assoc << 12 | l2line;
-                // edx = l3size(*512 KiB) << 18 | l3assoc << 12 | l3line;
+                // L2/L3 cache leaf: ecx = l2size(KiB) << 16 | l2assoc << 12 | l2line
+                // edx = l3size(*512 KiB) << 18 | l3assoc << 12 | l3line
                 // assoc 0xF decodes to FullyAssociative on both
                 0x8000_0006 => CpuIdResult {
                     eax: 0,
@@ -250,18 +247,17 @@ mod tests {
         assert_eq!(l3.assoc, 64, "FullyAssociative L3 folds to assoc 64");
     }
 
-    /// Feed `detect_topology_leaf` the AMD flavor of the leaf (0x8000_001D, selected by
-    /// raw-cpuid on an "AuthenticAMD" vendor with the extended max leaf high enough),
-    /// canned as the 9950X reports it: L3 32 MiB/16-way, the one-CCD slice a core can
-    /// hit. The mock also serves the legacy L2/L3 leaf with the 64 MiB package total,
-    /// so the asserts prove the topology leaf is the one being decoded - the exact
-    /// misread this backend used to ship (64 MiB, associativity guessed as 8, from the
-    /// legacy leaf) can never come back silently
+    /// Feeds `detect_topology_leaf` the AMD flavor of the leaf (0x8000_001D, selected
+    /// by raw-cpuid on an "AuthenticAMD" vendor with the extended max leaf high
+    /// enough). L3 in the mock is 32 MiB/16-way, the per-CCD slice a core can reach.
+    /// The mock also serves the legacy L2/L3 leaf with a 64 MiB package-total L3. The
+    /// asserts confirm that `detect_topology_leaf` decodes the topology leaf value,
+    /// not the legacy one
     #[test]
     fn detect_topology_leaf_from_canned_amd_leaf1d() {
         let reader = |eax: u32, ecx: u32| -> CpuIdResult {
             match (eax, ecx) {
-                // Leaf 0: spell "AuthenticAMD" across ebx/edx/ecx
+                // Leaf 0: spells "AuthenticAMD" across ebx/edx/ecx
                 (0x0, _) => CpuIdResult {
                     eax: 0x10,
                     ebx: 0x6874_7541, // "Auth"
@@ -276,17 +272,17 @@ mod tests {
                     ecx: 0,
                     edx: 0,
                 },
-                // The legacy L2/L3 leaf, reporting the 64 MiB package-total L3
-                // (128 * 512 KiB): decoding this instead of the topology leaf below
-                // is exactly the regression the asserts rule out
+                // The legacy L2/L3 leaf, reporting a 64 MiB package-total L3
+                // (128 * 512 KiB). The asserts confirm that detect_topology_leaf uses
+                // the topology leaf value instead of this one
                 (0x8000_0006, _) => CpuIdResult {
                     eax: 0,
                     ebx: 0,
                     ecx: (1024 << 16) | (0x6 << 12) | 64,
                     edx: (128 << 18) | (0x9 << 12) | 64,
                 },
-                // Topology leaf sub-leaves, 9950X geometry: L1d, L1i (skipped by the
-                // Data | Unified filter), L2, the per-CCD L3, then the Null terminator
+                // Topology leaf sub-leaves: L1d, L1i (skipped by the Data | Unified
+                // filter), L2, the per-CCD L3, then the Null terminator
                 (0x8000_001D, 0) => leaf04(1, 1, 64, 1, 12, 64), // Data, L1: 48 KiB
                 (0x8000_001D, 1) => leaf04(2, 1, 64, 1, 8, 64),  // Instruction, L1
                 (0x8000_001D, 2) => leaf04(3, 2, 64, 1, 16, 1024), // Unified, L2: 1 MiB

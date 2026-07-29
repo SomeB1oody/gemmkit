@@ -1,35 +1,36 @@
 //! `gemmkit-tune`: install-time autotuner for [`gemmkit`]
 //!
-//! Run this on the deploy machine, never from `build.rs`: the machine that builds a binary is
-//! not necessarily the machine that runs it. It sweeps gemmkit's runtime knobs (the `set_*`/
-//! `GEMMKIT_*` pairs in `gemmkit::tuning`) over a representative shape set for each, then writes
-//! a `gemmkit-tune.env` profile of `export GEMMKIT_*=...` lines. `source` that file before
-//! running a gemmkit application to retune the shipped binary for the host with no recompile
+//! Run this on the deploy machine, never from `build.rs`. The machine that builds a binary is
+//! not always the machine that runs it. This tool sweeps gemmkit's runtime knobs (the `set_*`/
+//! `GEMMKIT_*` pairs in `gemmkit::tuning`) over a representative shape set for each knob. It
+//! then writes a `gemmkit-tune.env` profile of `export GEMMKIT_*=...` lines. Source that file
+//! before you run a gemmkit application. This retunes the shipped binary for the host without
+//! a recompile
 //!
 //! ## How it sweeps
 //!
-//! Each knob is swept independently: every other knob stays at its default while this knob's
-//! candidate values are measured back-to-back through its public setter, against freshly filled
-//! but identically seeded buffers so machine drift and input data both cancel out of the
-//! comparison. A candidate's score is the geometric mean throughput over the knob's probe-shape
-//! set rather than any single shape's number, so a winner reflects a broad improvement, not one
-//! shape's quirk. The tie-break is deliberately default-biased and noise-aware: a candidate
-//! replaces the incumbent (which starts as the default) only when its geomean beats the
-//! incumbent's by more than the larger of the 2 measured spreads, so run-to-run noise can never
-//! flip a knob. There is no RNG anywhere, so the output is a deterministic function of
-//! (machine, config)
+//! Each knob is swept independently. Every other knob stays at its default while this knob's
+//! candidate values are measured, one after another, through its public setter. Each candidate
+//! sees freshly filled but identically seeded buffers, so machine drift and input data both
+//! cancel out of the comparison. A candidate's score is the geometric mean throughput over the
+//! knob's probe-shape set, not any single shape's number. A winner then reflects a broad
+//! improvement, not one shape's quirk. The tie-break is default-biased and noise-aware
 //!
-//! gemmkit's defaults were hand-calibrated on a Ryzen 9950X (Zen5), so a run on that same
-//! machine re-derives essentially the same values (overall speedup around 1.0x): that is the
-//! expected outcome and is what validates the tool, not a bug. The payoff is on a different
-//! machine
+//! A candidate replaces the incumbent, which starts as the default. It takes over only when its
+//! geomean clears the incumbent's score by more than the larger of the 2 measured spreads. This
+//! way run-to-run noise never flips a knob. There is no RNG anywhere in the sweep, so the output
+//! is a deterministic function of the machine and its configuration
+//!
+//! If you run this on the machine gemmkit's defaults were calibrated on, the sweep re-derives
+//! essentially the same values. That outcome is expected, since it validates the tool rather
+//! than signaling a bug. The payoff comes on a different machine
 //!
 //! Knobs this probe cannot safely tune are skipped, each with a reason, in both the report and
-//! the profile's footer comment: some are inert on this machine (aarch64-only, x86-only, or
-//! no-L3-only knobs), and `PARALLEL_THRESHOLD` is skipped because its serial/parallel break-even
-//! depends heavily on shape, not just size, so no single `m*n*k` scalar generalizes across
-//! aspect ratios; the hand-calibrated cross-shape default is kept instead. `GEMV_THRESHOLD`, by
-//! contrast, is a clean on/off decision and is swept
+//! the profile's footer comment. Some are inert on this machine, such as an aarch64-only,
+//! x86-only, or no-L3-only knob. `PARALLEL_THRESHOLD` is skipped because its serial/parallel
+//! break-even depends on shape, not just size, so no single `m*n*k` value generalizes across
+//! aspect ratios. The hand-calibrated cross-shape default is kept instead. `GEMV_THRESHOLD`, in
+//! contrast, is a clean on/off decision, so it is swept
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -85,18 +86,17 @@ impl Stat {
     }
 }
 
-/// Measurement effort: rep count and the per-batch timing target; `--time-budget` coarsens the
-/// rep count
+/// Measurement effort: rep count and the per-batch timing target. `--time-budget` coarsens
+/// the rep count
 #[derive(Clone, Copy)]
 struct Timing {
     reps: usize,
     batch_secs: f64,
 }
 
-/// Robust throughput estimate for one workload: warms up, auto-sizes a batch to hit
-/// `t.batch_secs`, then times `t.reps` such batches and reports the median (with min/max) of
-/// `to_rate` applied to each batch's average per-call seconds. Steadier than a single
-/// fixed-iteration timing, which one slow tick can throw off
+/// Estimates throughput for one workload, resistant to an outlier tick. Warms up, then
+/// auto-sizes a batch to hit `t.batch_secs`. It times `t.reps` such batches and returns the
+/// median (with min/max) of `to_rate` applied to each batch's average per-call time
 fn measure<F: FnMut(), R: Fn(f64) -> f64>(t: &Timing, mut f: F, to_rate: R) -> Stat {
     for _ in 0..3 {
         f();
@@ -122,10 +122,10 @@ fn measure<F: FnMut(), R: Fn(f64) -> f64>(t: &Timing, mut f: F, to_rate: R) -> S
     }
 }
 
-/// Reduce several per-shape `Stat`s to one score: the geometric mean of the per-shape medians
-/// (equal weight, so no single large shape dominates), with min/max reconstructed from the worst
-/// per-shape spread so the returned `Stat`'s own spread carries that same worst-case noise into
-/// the sweep's noise gate
+/// Reduces several per-shape `Stat`s to one score: the geometric mean of the per-shape medians,
+/// weighted equally so no single large shape dominates. Reconstructs min/max from the worst
+/// per-shape spread, so the returned `Stat`'s spread carries that same noise into the sweep's
+/// noise gate
 fn geomean(stats: &[Stat]) -> Stat {
     let n = stats.len().max(1) as f64;
     let ln_sum: f64 = stats.iter().map(|s| s.median.max(1e-9).ln()).sum();
@@ -156,8 +156,8 @@ struct Row {
     stat: Stat,
 }
 
-/// One knob's completed sweep: every candidate tried, the chosen winner, and enough context
-/// (env name, unit, probe-shape count) to render a report row and a profile line
+/// One knob's completed sweep: every candidate tried, the winner, and context (env name, unit,
+/// probe-shape count) for a report row and profile line
 struct KnobResult {
     env: &'static str,
     default: usize,
@@ -188,8 +188,8 @@ fn sweep(
     shapes: usize,
     mut probe: impl FnMut() -> Stat,
 ) -> KnobResult {
-    // candidate order: default (the incumbent) first, then each distinct extra, always the same
-    // fixed order
+    // candidate order: default (the incumbent) first, then each distinct extra, always in the
+    // same fixed order
     let mut cands = vec![default];
     for &c in extras {
         if !cands.contains(&c) {
@@ -207,12 +207,13 @@ fn sweep(
     }
     set(default); // restore the default so the next sweep starts clean
 
-    // Winner starts at the default; a candidate only takes over once it clears the incumbent by
-    // more than the larger of the 2 measured spreads, so noise never decides and ties keep default
-    // "0" always means auto (machine-derived) rather than a real value, so give it extra headroom:
-    // a fixed override must clear a higher bar than replacing one literal value with another would
+    // "0" commonly means auto (machine-derived) rather than a literal value, so an override must
+    // clear extra headroom before it can replace an auto default
     let auto_margin = if default == 0 { 0.05 } else { 0.0 };
     let baseline = rows[0].stat.median;
+    // The winner starts at the default. A candidate takes over only once it clears the
+    // incumbent by more than the larger of the 2 measured spreads. This way noise never
+    // decides a tie
     let mut best = 0usize;
     for i in 1..rows.len() {
         let noise = rows[best].stat.spread_pct().max(rows[i].stat.spread_pct()) / 100.0;
@@ -236,10 +237,10 @@ fn sweep(
 // Per-shape-family sweep helpers: each shape gets its own freshly filled, identically seeded
 // buffers, so every candidate value sees the same input data
 
-/// One GFLOP/s `Stat` per `(m, k, n)` probe shape: fresh seeded operands (A optionally
-/// row-major, B/C always column-major), `gemm` at `alpha = 1, beta = 0`. Split out from
-/// [`sweep_sgemm`] so a knob that governs more than the compute path can fold these into a
-/// wider score (see [`sweep_sgemm_gemv`])
+/// One GFLOP/s `Stat` per `(m, k, n)` probe shape. Each shape gets fresh seeded operands (A
+/// optionally row-major, B/C always column-major) and runs `gemm` at `alpha = 1, beta = 0`.
+/// Split out from [`sweep_sgemm`] so a knob that governs more than the compute path can fold
+/// these stats into a wider score. See [`sweep_sgemm_gemv`]
 fn sgemm_stats(
     t: &Timing,
     shapes: &[(usize, usize, usize)],
@@ -275,9 +276,9 @@ fn sgemm_stats(
         .collect()
 }
 
-/// GEMM (f32) sweep helper: for each `(m, k, n)` probe shape, fills fresh seeded operands (A
-/// optionally row-major, B/C always column-major), runs `gemm` at `alpha = 1, beta = 0`, and
-/// folds the per-shape GFLOP/s into one geomean `Stat` via [`sweep`]
+/// GEMM (f32) sweep helper. For each `(m, k, n)` probe shape, it fills fresh seeded operands (A
+/// optionally row-major, B/C always column-major). It then runs `gemm` at `alpha = 1, beta = 0`
+/// and folds the per-shape GFLOP/s into one geomean `Stat` via [`sweep`]
 #[allow(clippy::too_many_arguments)]
 fn sweep_sgemm(
     env: &'static str,
@@ -294,9 +295,9 @@ fn sweep_sgemm(
     })
 }
 
-/// gemv (matrix-vector) sweep helper: for each `(m, k)` probe shape, fills fresh seeded
-/// column-major operands and a length-`k` vector (`n = 1` routes `gemm` to the dedicated gemv
-/// path), runs it at `alpha = 1, beta = 0`, and folds the per-shape GB/s (bytes of A, the
+/// gemv (matrix-vector) sweep helper. For each `(m, k)` probe shape, it fills fresh seeded
+/// column-major operands and a length-`k` vector. `n = 1` routes `gemm` to the dedicated gemv
+/// path. It runs that at `alpha = 1, beta = 0`. It folds the per-shape GB/s (bytes of A, the
 /// vector, and the output, over time) into one geomean `Stat` via [`sweep`]
 fn sweep_gemv(
     env: &'static str,
@@ -312,8 +313,8 @@ fn sweep_gemv(
     })
 }
 
-/// One GB/s `Stat` per `(m, k)` gemv probe shape; the body [`sweep_gemv`] used to inline. Split
-/// out for the same reason as [`sgemm_stats`]
+/// One GB/s `Stat` per `(m, k)` gemv probe shape. Split out from [`sweep_gemv`] for the same
+/// reason as [`sgemm_stats`]
 fn gemv_stats(t: &Timing, shapes: &[(usize, usize)], par: Parallelism) -> Vec<Stat> {
     shapes
         .iter()
@@ -340,13 +341,14 @@ fn gemv_stats(t: &Timing, shapes: &[(usize, usize)], par: Parallelism) -> Vec<St
         .collect()
 }
 
-/// Sweep helper for a knob that governs the compute path AND the bandwidth-bound gemv path:
-/// scores one geomean over both probe families together, so a value that wins one path and loses
-/// the other cannot score as a wash. The knob!s are swept independently of each other by
-/// construction, so a cross-path interaction is invisible unless one knob's own score sees both
-/// paths - which is exactly the `POOL_CLASSES` case (its tiers are both the compute pools and the
-/// gemv ladder rungs). Mixing GFLOP/s and GB/s makes the absolute score meaningless, but [`sweep`]
-/// only ever compares candidates to each other, and every candidate is scored the same way
+/// Sweep helper for a knob that governs both the compute path and the bandwidth-bound gemv
+/// path. It scores one geomean over both probe families together, so a value that wins one path
+/// and loses the other cannot score as a wash. Every knob is swept independently of the others
+/// by construction. A cross-path interaction therefore stays invisible unless the score of the
+/// knob itself sees both paths, which is exactly the `POOL_CLASSES` case: its tiers are both the
+/// compute pools and the rungs of the gemv ladder. Mixing GFLOP/s with GB/s makes the absolute
+/// score meaningless, but [`sweep`] only compares candidates against each other, and it scores
+/// every candidate the same way
 #[allow(clippy::too_many_arguments)]
 fn sweep_sgemm_gemv(
     env: &'static str,
@@ -366,6 +368,10 @@ fn sweep_sgemm_gemv(
     })
 }
 
+/// i8 GEMM sweep helper, mirroring `sweep_sgemm`. For each square size `s`, it fills fresh
+/// seeded i8 operands and runs `gemmkit::gemm_i8` at `alpha = 1, beta = 0`. It then folds the
+/// per-shape GFLOP/s into one geomean `Stat` via [`sweep`]. It is x86-only because the only
+/// knob it backs, `I8_VNNI_MIN_PAR_MNK`, gates the x86 VNNI small-parallel fallback
 #[cfg(target_arch = "x86_64")]
 fn sweep_i8(
     env: &'static str,
@@ -403,10 +409,11 @@ fn sweep_i8(
     })
 }
 
-/// Batched-GEMM sweep helper (mirrors `sweep_sgemm`): for each `(batch, m, k, n)` probe shape,
-/// fills fresh seeded column-major operands and runs `gemm_batched`, folding whole-batch GFLOP/s
-/// (`batch * 2*m*k*n` work) into one geomean `Stat` via [`sweep`]. aarch64-only because the only
-/// knob it backs, `SEQ_INTERNAL_BYTES_PER_WORKER`, is read solely by the aarch64 `resolve_batch`
+/// Batched-GEMM sweep helper, mirroring `sweep_sgemm`. For each `(batch, m, k, n)` probe shape,
+/// it fills fresh seeded column-major operands and runs `gemm_batched`. This folds whole-batch
+/// GFLOP/s (`batch * 2*m*k*n` work) into one geomean `Stat` via [`sweep`]. It is aarch64-only
+/// because the only knob it backs, `SEQ_INTERNAL_BYTES_PER_WORKER`, is read solely by the
+/// aarch64 `resolve_batch`
 #[cfg(target_arch = "aarch64")]
 fn sweep_batched(
     env: &'static str,
@@ -421,7 +428,8 @@ fn sweep_batched(
         let stats: Vec<Stat> = shapes
             .iter()
             .map(|&(batch, m, k, n)| {
-                // each batch element is one contiguous col-major m x k block; batch stride = element size
+                // each batch element is a contiguous col-major m x k block, so the batch stride
+                // equals one block's element count
                 let a = fill(batch * m * k, 1);
                 let b = fill(batch * k * n, 2);
                 let mut c = vec![0.0f32; batch * m * n];
@@ -463,9 +471,8 @@ struct Cli {
 }
 
 /// Parse a `--time-budget` value like `30s`, `2m`, `1h`, or a bare number of seconds. Returns
-/// `None` for anything that is not finite, non-negative, and within a sane range, so the caller
-/// can reject a negative, NaN, infinite, or overflowing input cleanly instead of letting it panic
-/// inside `Duration::from_secs_f64`
+/// `None` for a negative, NaN, infinite, or absurdly large input, so the caller can reject it
+/// cleanly instead of letting it panic inside `Duration::from_secs_f64`
 fn parse_duration(s: &str) -> Option<f64> {
     let s = s.trim();
     let (num, mult) = match s.as_bytes().last()? {
@@ -500,7 +507,7 @@ fn parse_cli() -> Cli {
         large_gib: None,
     };
     // args_os + lossy, not args: a non-UTF-8 argument must produce a clean usage error, not a
-    // panic; a mangled arg just fails to match any known flag and falls through to `die`
+    // panic. A mangled arg just fails to match any known flag and falls through to `die`
     let mut args = std::env::args_os()
         .skip(1)
         .map(|a| a.to_string_lossy().into_owned());
@@ -526,9 +533,8 @@ fn parse_cli() -> Cli {
             "--dry-run" => cli.dry_run = true,
             "--large-matrices" => {
                 let v = take(args.next(), "--large-matrices");
-                // must be positive, finite, and within a sane range: rejects 0, NaN, inf,
-                // negative, and absurdly large input so a giant probe matrix is never sized from
-                // garbage
+                // must be positive, finite, and within a sane range, so a giant probe matrix is
+                // never sized from garbage input
                 match v.parse::<f64>() {
                     Ok(g) if g.is_finite() && (0.0..=4096.0).contains(&g) && g > 0.0 => {
                         cli.large_gib = Some(g)
@@ -550,7 +556,7 @@ fn parse_cli() -> Cli {
 
 fn print_usage() {
     println!(
-        "gemmkit-tune — sweep gemmkit's runtime knobs on this machine and emit a GEMMKIT_* profile\n\n\
+        "gemmkit-tune: sweep gemmkit's runtime knobs on this machine and emit a GEMMKIT_* profile\n\n\
          USAGE:\n    gemmkit-tune [OPTIONS]\n\n\
          OPTIONS:\n    \
          --threads <n>        Tune for this worker count (default: available parallelism)\n    \
@@ -581,6 +587,8 @@ fn ymd_from_unix(secs: u64) -> (i64, u32, u32) {
     (y + i64::from(m <= 2), m, d)
 }
 
+/// Builds the profile file's header comment: generation timestamp, host cache topology, and
+/// worker count
 fn host_stamp(threads: usize) -> String {
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -602,7 +610,7 @@ fn host_stamp(threads: usize) -> String {
         (t / 3600, (t % 3600) / 60, t % 60)
     };
     format!(
-        "# gemmkit-tune profile — source before running a gemmkit app: `source <this file>`\n\
+        "# gemmkit-tune profile. Source this before you run a gemmkit app: `source <this file>`\n\
          # generated {y:04}-{mo:02}-{da:02} {hh:02}:{mm:02}:{ss:02} UTC by gemmkit-tune {ver}\n\
          # host: {cores} logical cores; L1d {l1} KiB, L2 {l2} KiB, L3 {l3}; page {pg} KiB\n\
          # tuned for {threads} worker(s)\n",
@@ -617,41 +625,39 @@ fn host_stamp(threads: usize) -> String {
 
 const MAX: usize = usize::MAX;
 
-/// Build the probe plan for the opt-in `K_STREAM_MAX` sweep. The gemv register-block gate engages
-/// once the output crosses a last-level-cache-derived threshold (see `gemv_regblock_engage_bytes`
-/// in gemmkit), but only wins once the output is clearly DRAM-bound, so the probe fixes the
-/// output size at about 2x the LLC: an output right at the LLC boundary would sit on the cache
-/// edge and measure nothing decisive. Returns the shared row count and the probe `k` values, or a
-/// reason string when the probe cannot fit this target's address space, or when `budget_bytes`
-/// cannot hold the whole probe at the largest `k`. That reason rounds the advised budget up to
-/// the printed precision, so re-running with it actually clears the gate
+/// Builds the probe plan for the opt-in `K_STREAM_MAX` sweep. The gemv register-block gate
+/// engages only once the output is DRAM-bound. The probe therefore fixes the output size at
+/// about 2x the last-level cache (see `gemv_regblock_engage_bytes` in gemmkit). Returns the
+/// shared row count and probe `k` values. Returns a reason string instead when the probe does
+/// not fit this target's address space or the given budget
 fn plan_k_stream(budget_bytes: u64, gib: f64) -> Result<(usize, Vec<usize>), String> {
-    const MAX_PROBE_K: usize = 48; // top candidate; with the k=24 probe, brackets {16, 32, 48}
+    const MAX_PROBE_K: usize = 48; // top candidate: brackets {16, 32, 48} together with k=24
     let topo = gemmkit::topology();
     let llc = topo.l3.map(|l| l.bytes).unwrap_or(topo.l2.bytes).max(1);
-    // about 2x the LLC so the plain form's per-column output re-reads clearly spill to DRAM
-    // (where register-blocking pays); a fixed target, not budget-scaled, since a smaller output
-    // would just run cache-resident and measure noise instead of the DRAM-bound regime
+    // fixed at about 2x the LLC, not budget-scaled. This way the per-column output re-reads
+    // clearly spill to DRAM, where register-blocking pays, instead of measuring a cache-resident
+    // output
     let out = llc.saturating_mul(2);
-    // peak live bytes of the largest (k = MAX_PROBE_K) col-major f32 probe, matching sweep_gemv's
-    // own allocation: matrix a (rows*k*4 = out*k) + output y (rows*4 = out) + input x (k*4)
-    // computed in u64 so a 32-bit usize can't wrap `need` (or the budget check) and silently pass
+    // peak live bytes of the largest (k = MAX_PROBE_K) probe, matching sweep_gemv's own
+    // allocation: matrix a (rows*k*4 = out*k), output y (rows*4 = out), input x (k*4). Computed
+    // in u64 so a 32-bit usize cannot wrap `need` or the budget check and silently pass
     let need = (out as u64)
         .saturating_mul(MAX_PROBE_K as u64)
         .saturating_add(out as u64)
         .saturating_add(MAX_PROBE_K as u64 * 4);
-    // the probe has to fit this target's address space at all: on 32-bit, a multi-GB matrix can't
-    // be allocated, so skip cleanly here instead of letting the Vec allocation abort the process
+    // the probe must fit this target's address space. On 32-bit, a multi-GB matrix cannot be
+    // allocated, so this skips cleanly instead of letting the Vec allocation abort the process
     if need > usize::MAX as u64 {
         return Err(format!(
             "a DRAM-bound ~2x-LLC ({} MiB) gemv probe needs multi-GB matrices that do not fit this \
-             target's address space — --large-matrices is only usable on 64-bit",
+             target's address space. --large-matrices is only usable on 64-bit",
             out / (1 << 20),
         ));
     }
     if budget_bytes < need {
-        // round the advised budget UP to the printed 0.1 GiB, so following it actually clears
-        // `budget_bytes < need` (a truncated "1.5 GiB" that is really 1.53 would loop forever)
+        // rounds the advised budget up to the printed 0.1 GiB, so following it actually clears
+        // `budget_bytes < need`. Otherwise a truncated 1.5 GiB that is really 1.53 would loop
+        // forever
         let need_gib = (need as f64 / (1u64 << 30) as f64 * 10.0).ceil() / 10.0;
         return Err(format!(
             "--large-matrices {gib} GiB cannot hold a DRAM-bound ~2x-LLC ({} MiB) gemv probe at \
@@ -662,7 +668,7 @@ fn plan_k_stream(budget_bytes: u64, gib: f64) -> Result<(usize, Vec<usize>), Str
             need_gib,
         ));
     }
-    let rows = (out / 4).max(1); // out is bytes; f32 elements = out/4
+    let rows = (out / 4).max(1); // out is bytes, so the f32 element count is out/4
     Ok((rows, vec![24, MAX_PROBE_K]))
 }
 
@@ -671,15 +677,14 @@ fn main() {
     let avail = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
-    // `--threads` is already validated >= 1 in parse_cli, but clamp to `avail` too: gemmkit caps
-    // Rayon(n) internally to the machine width anyway, so this just keeps the reported and
-    // stamped worker count truthful instead of echoing an unusable request
+    // `--threads` is already validated >= 1 in parse_cli, and gemmkit caps Rayon(n) to the
+    // machine width anyway. This clamp only keeps the reported and stamped worker count truthful
     let threads = cli.threads.unwrap_or(avail).min(avail).max(1);
     let par = Parallelism::Rayon(threads);
     let ser = Parallelism::Serial;
 
-    // fewer reps under a tight time budget; the hard deadline below (once set) skips whole knobs
-    // near the end instead
+    // fewer reps under a tight time budget. The hard deadline below (once set) skips whole
+    // knobs near the end instead
     let reps = match cli.budget_secs {
         Some(b) if b < 30.0 => 3,
         Some(b) if b < 90.0 => 5,
@@ -694,10 +699,9 @@ fn main() {
 
     eprintln!("gemmkit-tune: tuning for {threads} worker(s); this takes a minute or two...");
 
-    // a GEMMKIT_* var left set in this shell can skew a sweep's baseline: gemmkit reads env vars
-    // for any knob it has not been explicitly `set()` for, and NEUTRALIZE below does not reach
-    // every knob a sweep might consult, so warn rather than silently mis-tune. A clean
-    // environment gives the most faithful profile
+    // a GEMMKIT_* var left set in this shell can skew a sweep's baseline. gemmkit reads an env
+    // var for any knob not explicitly `set()`. NEUTRALIZE below does not reach every knob a
+    // sweep might consult, so this warns rather than silently mis-tuning
     // vars_os, not vars: an unrelated non-UTF-8 environment variable must not panic the tool
     let dirty: Vec<String> = std::env::vars_os()
         .filter_map(|(k, _)| k.into_string().ok())
@@ -705,15 +709,16 @@ fn main() {
         .collect();
     if !dirty.is_empty() {
         eprintln!(
-            "gemmkit-tune: warning: GEMMKIT_* variables are set in this environment ({}); they \
-             influence the baseline and may not all be written to the profile — run in a clean \
-             environment for a faithful profile.",
+            "gemmkit-tune: warning: GEMMKIT_* variables are set in this environment ({}). They \
+             influence the baseline, and the profile may not capture every one of them. Run in \
+             a clean environment for a faithful profile.",
             dirty.join(", ")
         );
     }
 
-    // reset every knob in NEUTRALIZE to its compiled default via `set()` (never the env-consulting
-    // getter), so a GEMMKIT_* value the tuning shell happens to carry cannot leak into a baseline
+    // reset every knob in NEUTRALIZE to its compiled default via `set()`, never the
+    // env-consulting getter. This way a GEMMKIT_* value the tuning shell happens to carry
+    // cannot leak into a baseline
     for &(set, def) in NEUTRALIZE {
         set(def);
     }
@@ -762,8 +767,8 @@ fn main() {
             "GEMMKIT_MC_REG_PANELS",
             tuning::set_mc_reg_panels,
             tuning::MC_REG_PANELS_DEFAULT,
-            // candidates run up to 32: a large shared L2 can keep a taller A macro-panel resident,
-            // so the optimum may sit above a lower ceiling; the 3072-shape probe stresses that case
+            // candidates run up to 32, since a large shared L2 can keep a taller A macro-panel
+            // resident and push the optimum above a lower ceiling. The 3072 probe exercises this
             &[4, 6, 12, 16, 24, 32],
             &timing,
             &[
@@ -829,9 +834,8 @@ fn main() {
         )
     );
 
-    // No-L3 column-block cap: only consulted when the machine reports no L3, so it is dead (and
-    // stays in `skipped` below) on an L3 host. NC = min(this * NR, N), so N must clear
-    // default * NR (2048 f32 columns) for a candidate value to actually bind
+    // No-L3 column-block cap: inert on an L3 host (see `skipped` below). NC = min(this * NR, N),
+    // so N must clear default * NR for a candidate to bind
     if gemmkit::topology().l3.is_none() {
         knob!(
             "GEMMKIT_NC_NO_L3_PANELS",
@@ -888,16 +892,11 @@ fn main() {
             false,
         )
     );
-    // Exact-fit size-class pool tiers: 0 (disabled), 1 (half width only), or 3 (adds eighth
-    // width). Scored on BOTH paths on purpose: the tiers are the compute path's exact-fit pools
-    // AND the rungs of the bandwidth-bound gemv ladder (`bandwidth_cap`), and the 2 paths need
-    // not agree. Measured on an M4 Max (14 cores, where both 2 and 3 yield tiers [3, 7]), the
-    // sgemm probes below separate 1 from 3 by 0.2% while the low rung of 3 workers costs a gemv
-    // 30-34% across the band it owns - so scored on sgemm alone this sweep would silently
-    // reconfigure gemv on sgemm noise. The sgemm probes span tier-8 territory (128^3), the 8/16
-    // crossover (256^3), and the 16-vs-full-width regime (384^3); the gemv probes straddle the
-    // low rung's byte band, which is [floor, floor*GEMV_TIER_STEP) touched bytes - 4 and 12 MiB
-    // land inside it on both reference machines, 64 MiB above it as the control
+    // Exact-fit size-class pool tiers: 0 disables them, 1 keeps the half-width tier only, and 3
+    // adds an eighth-width tier. Scored on both paths on purpose, since the tiers are both the
+    // compute path's exact-fit pools and the rungs of the gemv ladder, and the 2 paths need not
+    // agree. The sgemm probes span the tier-8, crossover, and full-width regimes. The gemv probes
+    // straddle the byte band the low rung owns, with the widest one above that band as a control
     knob!(
         "GEMMKIT_POOL_CLASSES",
         sweep_sgemm_gemv(
@@ -912,8 +911,8 @@ fn main() {
         )
     );
     // Full-machine-width work gate: the m*n*k above which auto leaves the largest pool tier for
-    // the full machine width. MAX means never leave that tier. The probes bracket the measured
-    // 448^3/512^3 crossover, plus a larger 640^3 that full width should clearly win
+    // the full machine width. MAX means never leave that tier. The probes bracket the tier
+    // crossover, plus a larger shape that full width should clearly win
     knob!(
         "GEMMKIT_FULL_WIDTH_MNK",
         sweep_sgemm(
@@ -948,10 +947,9 @@ fn main() {
             "GEMMKIT_LHS_PACK_THRESHOLD",
             tuning::set_lhs_pack_threshold,
             tuning::LHS_PACK_THRESHOLD_DEFAULT,
-            // candidates span 32..2048 to bracket both arch optima: aarch64's cheap-packing win is
-            // a flat plateau from 32 up through 256 then a drop-off (needs the low candidates to
-            // find the plateau top), while x86's default of 1024 needs 2048 above it to confirm
-            // there is no further gain
+            // candidates span 32..2048 to bracket both architectures' optima. The low end tests
+            // whether cheap packing already wins on aarch64, and the high end confirms x86's
+            // higher default gains nothing further above it
             &[32, 64, 128, 256, 512, 1024, 2048, MAX],
             &timing,
             &[(1024, 512, 512), (2048, 256, 256)],
@@ -967,10 +965,9 @@ fn main() {
             tuning::LHS_PACK_STRIDE_DEFAULT, // 0 = auto (page-derived)
             &[2048, 4096, 8192, MAX],
             &timing,
-            // Square col-major shapes: the reuse floor now vetoes the force-pack on the
-            // tall/skinny shapes stride was first probed on (too few column tiles), so every
-            // stride candidate measured identical there. Probe the same square trio the span
-            // sweep uses, where the stride gate still governs the pack decision
+            // Square col-major shapes, matching the span sweep below. The LHS_PACK_REUSE floor
+            // vetoes the force-pack on tall/skinny shapes, so this knob needs a shape where the
+            // stride gate still governs the pack decision
             &[(1024, 1024, 1024), (2048, 2048, 2048), (4096, 4096, 4096)],
             par,
             false,
@@ -984,9 +981,8 @@ fn main() {
             tuning::LHS_PACK_SPAN_DEFAULT, // 0 = auto (4 MiB)
             &[1 << 20, 2 << 20, 8 << 20, MAX],
             &timing,
-            // Square col-major shapes bracketing the in-place/pack crossover the
-            // span gate controls (the 9950X measured it between the 2 MiB walk of
-            // n = 1024 and the 4 MiB walk of n = 2048)
+            // Square col-major shapes bracketing the in-place/pack crossover the span gate
+            // controls, since the default sits between the working sets these 2 shapes touch
             &[(1024, 1024, 1024), (2048, 2048, 2048), (4096, 4096, 4096)],
             par,
             false,
@@ -1041,10 +1037,9 @@ fn main() {
         )
     );
     // Small-m,n horizontal PACK-tier k gate. Probed on shapes ineligible for the zero-copy tier
-    // (col-major A, so A is strided along k), which is what routes them through this gate instead
-    // of the driver. `MAX` disables the tier (falls back to the driver), so raising the gate only
-    // helps if packing ever loses; it wins at every measured k here, so the default (fire right
-    // from the small-k boundary) holds
+    // (col-major A, strided along k), which routes them through this gate instead of the
+    // driver. `MAX` disables the tier, falling back to the driver, so raising the gate only
+    // helps if packing loses
     knob!(
         "GEMMKIT_SMALL_MN_PACK_MIN_K",
         sweep_sgemm(
@@ -1060,12 +1055,13 @@ fn main() {
     );
 
     // Bandwidth-bound gemv knobs
-    // GEMMKIT_K_STREAM_MAX is a heavy opt-in knob swept only under --large-matrices; see the
-    // "Large-matrix probes" block below
-    // The 2.4 MiB shape is the point of the shape list: the auto width is a size ladder, so a
-    // probe set that sits entirely in one rung (these 2 large shapes alone are both ~134 MiB,
-    // deep in the top rung) cannot see a flat override lose to the ladder, and would report
-    // every candidate as equivalent
+
+    // GEMMKIT_K_STREAM_MAX is a heavy opt-in knob, swept only under --large-matrices (see the
+    // "Large-matrix probes" block below)
+
+    // GEMMKIT_GEMV_THREAD_CAP's auto width is a size ladder, so the probe shapes must span more
+    // than one rung. A probe set that sits entirely in one rung cannot see a flat override lose
+    // to the ladder, and would report every candidate as equivalent
     knob!(
         "GEMMKIT_GEMV_THREAD_CAP",
         sweep_gemv(
@@ -1090,11 +1086,10 @@ fn main() {
             par,
         )
     );
-    // Rung spacing for that same ladder, so the shapes must straddle a rung boundary to
-    // discriminate: ~2.4 MiB, ~10.5 MiB and ~134 MiB of touched bytes, which the candidates move
-    // between rungs (a step of 4 or 8 puts the smallest shape one rung below the other 2, while
-    // 32 pulls the middle shape down with it). Inert where fewer than 2 pool tiers are active,
-    // which the report flags as a no-effect sweep rather than a recommendation
+    // Rung spacing for the same ladder. The probe shapes must straddle a rung boundary, so a
+    // step candidate moves one shape into a different rung than the others. This knob is inert
+    // where fewer than 2 pool tiers are active. There every candidate measures the same, and
+    // the sweep keeps the default
     knob!(
         "GEMMKIT_GEMV_TIER_STEP",
         sweep_gemv(
@@ -1109,15 +1104,12 @@ fn main() {
     );
 
     // Output-row floor under which a column-major gemv refuses to split its rows. The probe set
-    // must straddle the candidate floors or every candidate scores the same, so it holds the
-    // matrix at ~128 MiB and moves the row count across them: 256 rows sits under every non-zero
-    // candidate, 1024 under all but 1024 itself, 8192 under all but 4096, and 65536 over all of
-    // them. A floor of 0 then loses on the narrow probes and a floor of 65536 loses on the wide
-    // one, which is what separates them. The 256-row probe and the 1024 candidate exist because
-    // the aarch64 crossover measured on an M4 Max sits at 1024 rows, an order of magnitude below
-    // the x86 one: without them the smallest probe sat exactly ON that crossover and no candidate
-    // could express it, so the sweep could only ever return 0 there. `sweep_gemv` builds
-    // `from_col_major` operands, i.e. exactly the axpy shape this knob governs
+    // must straddle the candidate floors, or every candidate scores the same. It holds the matrix
+    // size fixed and moves the row count across them, so each candidate crosses a different
+    // subset of the probes. The narrowest probe and the 1024 candidate exist for aarch64, whose
+    // crossover sits an order of magnitude below the x86 one. Without them, no candidate could
+    // express that crossover and the sweep could only return 0 there. `sweep_gemv` builds
+    // `from_col_major` operands, which is exactly the axpy shape this knob governs
     knob!(
         "GEMMKIT_GEMV_AXPY_PAR_MIN_ROWS",
         sweep_gemv(
@@ -1137,9 +1129,11 @@ fn main() {
     );
 
     // Integer (i8) knobs
+
     // gates the VNNI -> widen small-parallel fallback, which exists only for the x86 VNNI i8
-    // kernel (`small_par_fallback` is `None` for every other kernel, so elsewhere the knob is read
-    // but never acts); inert on a non-x86 target, so sweeping it there would just measure noise
+    // kernel. `small_par_fallback` is `None` for every other kernel, so elsewhere the knob is
+    // read but never acted on. Inert on a non-x86 target, so sweeping it there would measure
+    // only noise
     #[cfg(target_arch = "x86_64")]
     knob!(
         "GEMMKIT_I8_VNNI_MIN_PAR_MNK",
@@ -1154,14 +1148,11 @@ fn main() {
         )
     );
 
-    // aarch64 batched-GEMM split crossover: SequentialInternal (split each element across the
-    // machine in turn) vs BatchParallel (run the `batch` elements 1-per-worker) when `batch <
-    // workers`. Only the aarch64 `resolve_batch` reads this knob (x86 uses an L2-residency test
-    // instead), so it is skipped on x86. The probe shapes give per-batch-worker shares
-    // (`elem_bytes / batch`) of 96/192/384/432 KiB, straddling the 128 KiB default on both sides,
-    // so the sweep is a 2-sided validator: a lower candidate (64 KiB) would wrongly split the
-    // 96 KiB shape (256^3 batch 8, where 1-per-worker is faster), and a higher one (320 KiB)
-    // would wrongly serialize the 192 KiB shape (256^3 batch 4, where splitting is faster)
+    // aarch64 batched-GEMM split crossover: SequentialInternal (split each element across
+    // the machine) vs BatchParallel (run the `batch` elements 1 per worker) when `batch <
+    // workers`. Only aarch64's `resolve_batch` reads this knob, since x86 uses an
+    // L2-residency test instead. The probe shapes straddle the default on both sides, so
+    // a lower candidate splits too eagerly and a higher one serializes too eagerly
     #[cfg(target_arch = "aarch64")]
     knob!(
         "GEMMKIT_SEQ_INTERNAL_BYTES_PER_WORKER",
@@ -1175,17 +1166,16 @@ fn main() {
                 (8, 512, 512, 512),
                 (4, 256, 256, 256),
                 (4, 384, 384, 384),
-                (8, 256, 256, 256), // share 96 KiB: the sub-default point bracketing 128 KiB from below
+                (8, 256, 256, 256), // per-worker share sits just under the default, from below
             ],
             par,
         )
     );
 
     // gemv path vs general driver: a binary on/off decision. For a vector shape (min(m, n) == 1)
-    // the cap has no intermediate value, so the dedicated gemv path is either on (MAX, default) or
-    // off (0, general driver). Measured in parallel across a range of m/k, since the dedicated
-    // path's edge is mostly its bandwidth-parallel behavior; default-biased, so it only flips off
-    // if the driver robustly wins across every probed shape
+    // the cap has no intermediate value. The dedicated gemv path is either on (MAX, default) or
+    // off (0, general driver). This is default-biased, so it only flips off if the driver
+    // robustly wins across every probed shape
     knob!(
         "GEMMKIT_GEMV_THRESHOLD",
         sweep_gemv(
@@ -1199,29 +1189,30 @@ fn main() {
         )
     );
 
-    // Large-matrix probes: opt-in via --large-matrices <GiB>. Both knobs bite only in an expensive
-    // regime (K_STREAM_MAX once the gemv output spills the LLC, needing multi-GB matrices;
-    // SHARED_LHS_MNK above its high-FLOP pre-pass crossover), so both run only once the user opts
-    // in with a memory budget
+    // Large-matrix probes: opt-in via --large-matrices <GiB>. Both knobs bite only in an
+    // expensive regime. K_STREAM_MAX bites once the gemv output spills the LLC (needing
+    // multi-GB matrices). SHARED_LHS_MNK bites above its high-FLOP pre-pass crossover. Both run
+    // only once the user opts in with a memory budget
     match cli.large_gib {
         None => {
             large_skipped.push((
                 "GEMMKIT_K_STREAM_MAX",
-                "gemv register-block cap; only bites in the DRAM-bound huge-m regime (output \
-                 spilling the LLC) — pass --large-matrices <GiB> (needs multi-GB matrices) to probe \
-                 it. The maintainer bench perf_k_stream also covers this calibration"
+                "gemv register-block cap. It only engages in the DRAM-bound huge-m regime, once \
+                 the output spills the LLC. Pass --large-matrices <GiB> (needs multi-GB matrices) \
+                 to probe it. The maintainer bench perf_k_stream also covers this"
                     .to_string(),
             ));
             large_skipped.push((
                 "GEMMKIT_SHARED_LHS_MNK",
-                "shared-A pre-pass crossover; the pre-pass engages only above a large m*n*k (~8e9 \
-                 on x86), so probing needs high-FLOP shapes — pass --large-matrices <GiB> to enable"
+                "shared-A pre-pass crossover. The pre-pass engages only above a large m*n*k value \
+                 (~8e9 on x86). Probing it needs high-FLOP shapes. Pass --large-matrices <GiB> to \
+                 enable it"
                     .to_string(),
             ));
         }
         Some(gib) => {
             // u64, not usize: a validated `gib` (<= 4096) cannot overflow u64, so the budget stays
-            // exact on every target; a 32-bit usize would saturate and defeat plan_k_stream's gate
+            // exact on every target. A 32-bit usize would saturate and defeat plan_k_stream's gate
             let budget = (gib * (1u64 << 30) as f64) as u64;
             match plan_k_stream(budget, gib) {
                 Ok((rows, ks)) => {
@@ -1259,7 +1250,7 @@ fn main() {
 
     bar.finish_and_clear();
 
-    // knobs deliberately not swept on this machine, each with why; reasons are owned Strings so
+    // knobs deliberately not swept on this machine, each with why. Reasons are owned Strings, so
     // the opt-in and budget branches below (whose reasons are built at runtime) can push here too
     let mut skipped: Vec<(&'static str, String)> = vec![(
         "GEMMKIT_PARALLEL_THRESHOLD",
@@ -1267,8 +1258,8 @@ fn main() {
              and the default is a deliberate cross-shape compromise"
             .to_string(),
     )];
-    // DEEP_KC_BYTES gates the f16/bf16 deep-contraction twin: this tool runs no narrow-type
-    // probes, and the auto default is derived from L2 (a machine property); override
+    // DEEP_KC_BYTES gates the f16/bf16 deep-contraction twin. This tool runs no narrow-type
+    // probes, and the auto default derives from L2 (a machine property). Override
     // GEMMKIT_DEEP_KC_BYTES directly to retune the narrow deep-k engage point
     skipped.push((
         "GEMMKIT_DEEP_KC_BYTES",
@@ -1276,9 +1267,9 @@ fn main() {
          auto default is derived from L2"
             .to_string(),
     ));
-    // PREFETCH_MIN_BYTES gates the driver's C-tile prefetch on working-set-vs-LLC: the auto
-    // default is derived from the detected LLC (a machine property, like DEEP_KC_BYTES), and
-    // probing the crossover needs beyond-LLC working sets on every candidate; override
+    // PREFETCH_MIN_BYTES gates the driver's C-tile prefetch on working-set-vs-LLC. The auto
+    // default derives from the detected LLC (a machine property, like DEEP_KC_BYTES), and
+    // probing the crossover needs beyond-LLC working sets on every candidate. Override
     // GEMMKIT_PREFETCH_MIN_BYTES directly (usize::MAX disables) to retune the engage point
     skipped.push((
         "GEMMKIT_PREFETCH_MIN_BYTES",
@@ -1287,14 +1278,14 @@ fn main() {
             .to_string(),
     ));
     // SEQ_INTERNAL_BYTES_PER_WORKER is swept above on aarch64, the only arch whose resolve_batch
-    // reads it; inert on x86, so skip it there
+    // reads it. It is inert on x86, so this skips it there
     #[cfg(not(target_arch = "aarch64"))]
     skipped.push((
         "GEMMKIT_SEQ_INTERNAL_BYTES_PER_WORKER",
         "aarch64-only effect (batched split plan); inert on x86".to_string(),
     ));
     // I8_VNNI_MIN_PAR_MNK is swept above on x86, the only arch with a VNNI i8 small-parallel
-    // fallback; elsewhere no i8 kernel has a fallback, so the knob is inert - skip it there
+    // fallback. Elsewhere no i8 kernel has a fallback, so the knob is inert. This skips it there
     #[cfg(not(target_arch = "x86_64"))]
     skipped.push((
         "GEMMKIT_I8_VNNI_MIN_PAR_MNK",
@@ -1302,7 +1293,8 @@ fn main() {
          so it is inert"
             .to_string(),
     ));
-    // NC_NO_L3_PANELS is swept above only on a no-L3 host; the cap is dead on an L3 host, so skip it
+    // NC_NO_L3_PANELS is swept above only on a no-L3 host. The cap is dead on an L3 host, so
+    // this skips it there
     if gemmkit::topology().l3.is_some() {
         skipped.push((
             "GEMMKIT_NC_NO_L3_PANELS",
@@ -1337,10 +1329,10 @@ fn main() {
 type Setter = fn(usize);
 
 /// Setter/default pairs neutralized before every sweep run, so a stale `GEMMKIT_*` env value
-/// cannot leak into a baseline measurement: covers knobs a sweep's `gemm` calls may consult even
-/// when that particular knob is not the one being swept (`PARALLEL_THRESHOLD` gates every probe's
-/// serial/parallel choice), or that are swept only under some other config (`NC_NO_L3_PANELS`,
-/// `SEQ_INTERNAL_BYTES_PER_WORKER`)
+/// cannot leak into a baseline measurement. Covers knobs a sweep's `gemm` calls may consult even
+/// when that knob is not the one being swept. `PARALLEL_THRESHOLD` gates every sgemm and
+/// batched-GEMM probe's serial/parallel choice. It also covers knobs swept only under some other
+/// config (`NC_NO_L3_PANELS`, `SEQ_INTERNAL_BYTES_PER_WORKER`)
 const NEUTRALIZE: &[(Setter, usize)] = &[
     (tuning::set_mc_reg_panels, tuning::MC_REG_PANELS_DEFAULT),
     (tuning::set_kc_min, tuning::KC_MIN_DEFAULT),
@@ -1390,16 +1382,17 @@ const NEUTRALIZE: &[(Setter, usize)] = &[
         tuning::I8_VNNI_MIN_PAR_MNK_DEFAULT,
     ),
     (tuning::set_gemv_threshold, tuning::GEMV_THRESHOLD_DEFAULT),
-    // heavy knobs, only swept under --large-matrices, but neutralized unconditionally: both
-    // getters are still consulted on every ordinary gemv/sgemm sweep call, so a stale env value
-    // could skew their baselines even when this sweep itself never runs
+    // heavy knobs, only swept under --large-matrices, but neutralized unconditionally. Both
+    // getters are still consulted on every ordinary gemv/sgemm sweep call. A stale env value
+    // could therefore skew their baselines even when this sweep itself never runs
     (tuning::set_k_stream_max, tuning::K_STREAM_MAX_DEFAULT),
     (tuning::set_shared_lhs_mnk, tuning::SHARED_LHS_MNK_DEFAULT),
-    // consulted by gemm calls during every sweep, so a stale env value would silently skew a
-    // baseline regardless of whether the knob is itself being swept. PARALLEL_THRESHOLD gates
-    // serial/parallel dispatch in every sgemm/gemv sweep; NC_NO_L3_PANELS caps the block on a
-    // no-L3 host (swept there, skipped on an L3 host); SEQ_INTERNAL_BYTES_PER_WORKER drives the
-    // aarch64 batched split (swept there, skipped on x86)
+    // consulted by gemm calls during every sweep. A stale env value would therefore silently
+    // skew a baseline regardless of whether the knob is itself being swept. PARALLEL_THRESHOLD
+    // gates serial/parallel dispatch in every sgemm and batched-GEMM sweep, though not gemv,
+    // which gates on GEMV_PARALLEL_BYTES instead. NC_NO_L3_PANELS caps the block on a no-L3
+    // host, swept there and skipped on an L3 host. SEQ_INTERNAL_BYTES_PER_WORKER drives the
+    // aarch64 batched split, swept there and skipped on x86
     (
         tuning::set_parallel_threshold,
         tuning::PARALLEL_THRESHOLD_DEFAULT,
@@ -1439,7 +1432,7 @@ fn report(
     let mut moved = 0usize;
 
     if !results.is_empty() {
-        // summary table: one row per swept knob
+        // summary table: 1 row per swept knob
         const RIGHT: [bool; 7] = [false, false, true, true, true, true, false];
         let headers = [
             "knob", "unit", "shapes", "default", "winner", "speedup", "result",
@@ -1467,8 +1460,8 @@ fn report(
                 changed,
             ));
         }
-        // column widths measured from plain text; color wraps the whole padded line afterward,
-        // so it never perturbs alignment
+        // column widths are measured from plain text. Color wraps the whole padded line
+        // afterward, so it never perturbs alignment
         let mut w: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
         for (cells, _) in &rows {
             for (c, cell) in cells.iter().enumerate() {
@@ -1567,12 +1560,12 @@ fn report(
     if results.is_empty() {
         println!(
             "  {}",
-            style("no knobs swept — the time budget was too small to measure even one; raise --time-budget").dim()
+            style("no knobs swept. The time budget was too small to measure even one. Raise --time-budget").dim()
         );
     } else if moved == 0 {
         println!(
             "  {}",
-            style("all knobs kept their defaults — expected on the machine the defaults were calibrated on; the profile reproduces them").dim()
+            style("all knobs kept their defaults. This is expected on the machine the defaults were calibrated on. The profile reproduces them").dim()
         );
     }
 }
@@ -1590,9 +1583,10 @@ fn build_profile(
         } else {
             "tuned"
         };
-        // emit the raw integer, never the `show()` "MAX" alias: gemmkit's resolve_env only parses
-        // a decimal integer, so an unbounded (usize::MAX) winner must be written numerically (it
-        // gets clamped back to MAX - 1 on load, equivalent for a disable/unbounded gate)
+        // emit the raw integer, never the `show()` "MAX" alias. gemmkit's resolve_env only
+        // parses a decimal integer. An unbounded (usize::MAX) winner must be written
+        // numerically. It then gets clamped back to MAX - 1 on load, equivalent for a
+        // disable/unbounded gate
         s.push_str(&format!(
             "export {}={}  # {} ({:.2}x)\n",
             r.env,
@@ -1610,15 +1604,15 @@ fn build_profile(
 
 // Knob-coverage guard
 //
-// Every canonical gemmkit knob must be either swept by this tool (on at least one supported
-// target/config) or listed in the small never-tuned allowlist below, with a reason. Both lists are
-// asserted against `gemmkit::tuning::knob_env_names` in the test below, so a knob added to gemmkit
-// cannot silently escape the autotuner: it fails the test until classified as TUNED (with a real
-// `knob!` sweep) or NEVER_TUNED
+// Every canonical gemmkit knob must be classified. Either this tool sweeps it (on at least 1
+// target or config), or the never-tuned allowlist below lists it with a reason. Both lists are
+// asserted against `gemmkit::tuning::knob_env_names` in the test below, so a knob added to
+// gemmkit cannot silently escape the autotuner. It fails the test until classified as TUNED,
+// with a real `knob!` sweep, or NEVER_TUNED
 
-/// Knobs this tool sweeps on at least one supported target/config. Some are arch- or flag-gated:
-/// `SEQ_INTERNAL_BYTES_PER_WORKER` only on aarch64, `I8_VNNI_MIN_PAR_MNK` only on x86,
-/// `NC_NO_L3_PANELS` only on a no-L3 host, `K_STREAM_MAX`/`SHARED_LHS_MNK` only under
+/// Knobs this tool sweeps on at least 1 supported target/config. Some are arch- or flag-gated.
+/// `SEQ_INTERNAL_BYTES_PER_WORKER` runs only on aarch64, `I8_VNNI_MIN_PAR_MNK` only on x86, and
+/// `NC_NO_L3_PANELS` only on a no-L3 host. `K_STREAM_MAX` and `SHARED_LHS_MNK` run only under
 /// `--large-matrices`, but each appears as a `knob!` sweep somewhere in `main`
 #[cfg(test)]
 const TUNED: &[&str] = &[
@@ -1652,7 +1646,7 @@ const TUNED: &[&str] = &[
     "GEMMKIT_I8_VNNI_MIN_PAR_MNK",
 ];
 
-/// Knobs deliberately never swept, each with why; mirrors the owned `skipped` reasons `report`
+/// Knobs deliberately never swept, each with why. Mirrors the owned `skipped` reasons `report`
 /// builds at runtime
 #[cfg(test)]
 const NEVER_TUNED: &[(&str, &str)] = &[
@@ -1679,7 +1673,7 @@ mod knob_coverage {
     #[test]
     fn sweep_table_covers_every_knob() {
         // gemmkit-tune enables the int8 feature but not wasm_threads (see Cargo.toml), so
-        // knob_env_names() is always the 30 base knobs plus I8_VNNI_MIN_PAR_MNK, 31 total; TUNED
+        // knob_env_names() is always the 30 base knobs plus I8_VNNI_MIN_PAR_MNK, 31 total. TUNED
         // and NEVER_TUNED must partition that set exactly
         let names: BTreeSet<&str> = gemmkit::tuning::knob_env_names().iter().copied().collect();
         let tuned: BTreeSet<&str> = TUNED.iter().copied().collect();
@@ -1705,7 +1699,8 @@ mod knob_coverage {
             missing.is_empty(),
             "gemmkit knobs neither swept nor in the never-tuned allowlist: {missing:?}"
         );
-        // no stale or misspelled entries: every TUNED/NEVER_TUNED name must be a real canonical knob
+        // no stale or misspelled entries: every TUNED/NEVER_TUNED name must be a real canonical
+        // knob
         let unknown: Vec<&str> = handled.difference(&names).copied().collect();
         assert!(
             unknown.is_empty(),

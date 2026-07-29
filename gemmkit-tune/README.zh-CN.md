@@ -4,9 +4,9 @@
 
 [![crates.io](https://img.shields.io/crates/v/gemmkit-tune.svg)](https://crates.io/crates/gemmkit-tune)
 
-面向 [`gemmkit`](https://crates.io/crates/gemmkit) GEMM 引擎的安装期自动调优器。它在将要运行你的 gemmkit 应用的那台机器上执行，为每个 `GEMMKIT_*` 运行时调优旋钮测量一组有代表性的矩阵形状，以此扫描各旋钮取值，并输出一个由 `export GEMMKIT_*=...` 行组成的环境变量配置文件。启动 gemmkit 二进制前 source 该文件，即可无需重新编译地针对当前主机重新调优。
+面向 [`gemmkit`](https://crates.io/crates/gemmkit) GEMM 引擎的安装期自动调优器。它运行在将要运行你的 gemmkit 应用的那台机器上。它会为每个 `GEMMKIT_*` 运行时调优旋钮测量一组有代表性的矩阵形状，以此扫描各旋钮的取值。然后它会输出一个由 `export GEMMKIT_*=...` 行组成的环境变量配置文件。在启动 gemmkit 二进制前 source 该文件，即可针对当前主机重新调优，无需重新编译。
 
-请在部署机器上运行它，而不是放进 `build.rs`：构建主机通常并非部署主机，而这些旋钮是针对真正执行计算的 CPU 校准的。gemmkit 编译期内置的默认值是在某一台机器（Ryzen 9950X）上校准的，因此在同一台机器上运行基本只会重新得到相同的取值；真正的收益出现在换一台机器时。
+请在部署机器上运行它，而不是放进 `build.rs`。构建主机通常并非部署主机。它是针对真正执行计算的那颗 CPU 来校准这些旋钮的。gemmkit 编译期内置的默认值是在某一台机器（Ryzen 9950X）上校准的。在同一台机器上运行，基本只会重新得到相同的取值。真正的收益出现在换一台机器的时候。
 
 更完整的教程（包括扫描过程的内部原理）见 [gemmkit 指南](https://someb1oody.github.io/gemmkit/zh-Hans/gemmkit-tune/使用gemmkit-tune调优.html)。
 
@@ -26,9 +26,9 @@ source gemmkit-tune.env
 ./your-gemmkit-app
 ```
 
-生成的文件是一组 `export GEMMKIT_*=<value>` 行，并带有一段头部注释，记录调优所针对的主机和工作线程数。gemmkit 在运行时读取这些变量，因此无需重新构建。该工具还会在终端打印一份报告，逐个旋钮列出扫描的默认值、最终选定的取值，以及哪些旋钮被跳过、为何被跳过。
+生成的文件是一组 `export GEMMKIT_*=<value>` 行。文件头部还带有一段注释，记录调优所针对的主机和工作线程数。gemmkit 在运行时读取这些变量，因此无需重新构建。该工具还会在终端打印一份报告。对每个旋钮，报告都会列出扫描的默认值、最终选定的取值，以及被跳过的旋钮和原因。
 
-调优所在的 shell 中不应设置任何 `GEMMKIT_*` 变量：它们会影响测得的基准，工具在发现这类变量时会发出警告。
+在运行本工具之前，先清空调优所在 shell 中的所有 `GEMMKIT_*` 变量。它们会影响测得的基准。工具在发现这类变量时会发出警告。
 
 ## 选项
 
@@ -43,7 +43,7 @@ source gemmkit-tune.env
 
 ## Feature 标志
 
-无。`gemmkit-tune` 是一个二进制 crate，自身不提供任何 Cargo feature；它在构建时会启用 `gemmkit` 的 `complex`、`half` 和 `int8` 类型族，以便探测每一种元素类型。
+无。`gemmkit-tune` 是一个二进制 crate，自身不提供任何 Cargo feature。它在构建时会启用 `gemmkit` 的 `complex`、`half` 和 `int8` 类型族，以便探测每一种元素类型。
 
 ## 相关 crate
 

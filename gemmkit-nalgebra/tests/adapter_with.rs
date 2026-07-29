@@ -1,9 +1,7 @@
-//! Correctness tests for the workspace-reusing `_with` adapters (`gemm_with`,
-//! `gemm_packed_b_with`, `gemm_packed_a_with`, `gemm_i8_with`, `gemm_cplx_with`,
-//! `gemm_fused_with`, `gemm_i8_requant_with`/`gemm_i8_requant_u8_with`, and
-//! `gemm_cplx_fused_with`): each must match its allocating counterpart (checked in `adapter.rs`)
-//! while reusing a caller-owned [`Workspace`] across calls, exercising the `Some(ws)` match arm of
-//! every `_common` helper and, transitively, `gemmkit::gemm_unchecked_with`
+//! The workspace-reusing `_with` adapters (`gemm_with`, `gemm_packed_b_with`, `gemm_packed_a_with`,
+//! `gemm_i8_with`, `gemm_cplx_with`, `gemm_fused_with`, `gemm_i8_requant_with`/
+//! `gemm_i8_requant_u8_with`, `gemm_cplx_fused_with`) must each match their allocating counterpart
+//! while reusing a caller-owned [`Workspace`] across calls
 
 use approx::assert_relative_eq;
 use nalgebra::{DMatrix, DMatrixViewMut, Dim, Matrix, RawStorage};
@@ -76,7 +74,7 @@ fn gemm_packed_b_with_matches() {
     let packed = prepack_rhs(&b);
     let mut ws = Workspace::new();
     for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
-        let mut c_with = DMatrix::<f64>::zeros(m, n); // column-major: the orientation gemm_packed_b requires
+        let mut c_with = DMatrix::<f64>::zeros(m, n); // column-major (packed_b orientation)
         gemm_packed_b_with(&mut ws, 1.0, &a, &packed, 0.0, &mut c_with, par);
 
         let mut c_ref = DMatrix::<f64>::zeros(m, n);

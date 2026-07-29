@@ -224,6 +224,8 @@ fn prepack_lhs_check<T: Elem>(
     }
 }
 
+// f32/f64 instances of prepack_rhs_check and prepack_lhs_check above
+
 proptest! {
     #![proptest_config(ProptestConfig { cases: cases(96), ..ProptestConfig::default() })]
 
@@ -271,6 +273,8 @@ fn kdim_mixed() -> impl Strategy<Value = usize> {
         1 => proptest::sample::select(&[513usize, 1024][..]),
     ]
 }
+
+// f16/bf16 instances of the same 2 checks, over the deeper k tail kdim_mixed adds
 
 #[cfg(feature = "half")]
 proptest! {

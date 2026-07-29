@@ -8,12 +8,11 @@
 
 use gemmkit::tuning;
 
-/// Exercises every branch of the env-resolution contract in 1 test (so no 2nd test can race
-/// these `set_var` calls): an unset var falls through to the compile-time default; a malformed
-/// value falls back to the default (and, by reading the source, takes the warning-and-fallback
-/// branch rather than panicking, though its exact stderr text is not checked here, since
-/// capturing this process's own output needs a child process); a well-formed value is parsed and
-/// used; and a programmatic `set_*` call wins over whatever the env var says
+/// Exercises every branch of the env-resolution contract in 1 test, so no 2nd test can race
+/// these `set_var` calls: an unset var falls through to the default, a malformed value falls
+/// back to the default without panicking (stderr is not checked here, since capturing this
+/// process's own output needs a child process), a well-formed value is parsed and used, and a
+/// programmatic `set_*` call overrides the env var
 #[test]
 fn env_knobs_resolution_contract() {
     // Clear any ambient value (a dev's shell profile could export this) so the assertion below

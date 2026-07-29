@@ -1,22 +1,48 @@
 # The Complex Split Kernel
 
-Complex GEMM is the one homogeneous type family that does not ride `FloatGemm`. On paper it could: `Complex<f32>` and `Complex<f64>` accumulate in themselves (`Lhs = Rhs = Acc = Out`), which is exactly the shape the float family handles. The problem is the memory layout. `num_complex` stores a complex number as an adjacent `(re, im)` pair, so a SIMD register loaded from a complex slice holds `re, im, re, im, ...`, and one complex multiply needs cross-lane combinations: `re*re - im*im` for the real part, `re*im + im*re` for the imaginary part. On interleaved lanes those combinations force shuffle and `fmaddsub`-style instructions inside the innermost loop, once per depth step, `O(mnk)` times. gemmkit instead rewrites the layout once at pack time and keeps the hot loop as pure real FMAs, with no in-loop shuffles at all. This page covers that split design, how conjugation falls out of it for free, the seam the kernel runs through, the register-budget arithmetic behind the tile shapes, and what the numerics guarantee.
+Complex GEMM is the one homogeneous type family that does not ride `FloatGemm`. On paper it could. `Complex<f32>` and `Complex<f64>` accumulate in themselves, so `Lhs = Rhs = Acc = Out`. That is exactly the shape the float family handles.
+
+The problem is the memory layout. `num_complex` stores a complex number as an adjacent `(re, im)` pair. So a SIMD register loaded from a complex slice holds `re, im, re, im, ...`. One complex multiply needs cross-lane combinations: `re*re - im*im` for the real part, and `re*im + im*re` for the imaginary part.
+
+On interleaved lanes, those combinations force shuffle and `fmaddsub`-style instructions inside the innermost loop. That cost repeats once per depth step, `O(mnk)` times in total. gemmkit instead rewrites the layout once, at pack time, and keeps the hot loop as pure real FMAs, with no in-loop shuffles at all.
+
+This page covers 5 things. First, the split design itself. Second, how conjugation falls out of it for free. Third, the seam the kernel runs through. Fourth, the register-budget arithmetic behind the tile shapes. Fifth, what the numerics guarantee.
 
 ## The split layout
 
-The family is `ComplexGemm<T, CONJ_A, CONJ_B>` in `gemmkit/src/kernel/complex.rs`, and its packers are where the design lives. `pack_planar` lays each micropanel down in structure-of-arrays form: for every depth step, the panel stores `width` real parts immediately followed by `width` imaginary parts (`width` is `mr` for the LHS, `nr` for the RHS, with strides swapped exactly as in the shared `pack_panels`). The kernel then loads a register of reals and a register of imags with plain contiguous loads, and the de-interleave cost moves out of the `kc` inner loop into the pack: amortized `O(MK + KN)` instead of `O(MNK)`.
+The family is `ComplexGemm<T, CONJ_A, CONJ_B>`, in `gemmkit/src/kernel/complex.rs`. Its packers are where the design lives.
 
-Because the kernel can only consume that planar layout, both operands are always packed: the family sets `FORCE_PACK_LHS = FORCE_PACK_RHS = true`, overriding the driver's cost-based decision to read an operand in place. `pack_planar` mirrors `pack_panels`' two write paths, a straight walk when the leading dimension is contiguous and a cache-blocked transpose for a strided source, so a row-major operand packs without a cache miss per element; the two paths write byte-identical panels, only the write order differs (see [Packing and Workspaces](Packing_and_Workspaces.md) for the shared framework).
+`pack_planar` lays each micropanel down in structure-of-arrays form. For every depth step, the panel stores `width` real parts, immediately followed by `width` imaginary parts. `width` is `mr` for the LHS and `nr` for the RHS, with strides swapped exactly as in the shared `pack_panels`.
+
+The kernel then loads a register of reals and a register of imaginary parts with plain contiguous loads. The de-interleave cost moves out of the `kc` inner loop and into the pack step. The amortized cost becomes `O(MK + KN)`, instead of `O(MNK)`.
+
+The kernel can only consume that planar layout. So both operands are always packed. The family sets `FORCE_PACK_LHS = FORCE_PACK_RHS = true`, overriding the driver's cost-based decision to read an operand in place instead.
+
+`pack_planar` mirrors `pack_panels`' 2 write paths. One is a straight walk, used when the leading dimension is contiguous. The other is a cache-blocked transpose, used for a strided source, so a row-major operand packs without a cache miss per element. The 2 paths write byte-identical panels. Only the write order differs. See [Packing and Workspaces](Packing_and_Workspaces.md) for the shared framework.
 
 ## Conjugation as a pack-time sign flip
 
-Conjugation only negates the imaginary part, and the pack already writes the imaginary plane separately, so `conj(A)*B` and `A*conj(B)` cost nothing in the hot loop: a set `CONJ_A`/`CONJ_B` const generic makes the packer negate the imag plane as it copies (a true negation, so `+0.0` maps to `-0.0`, matching `num_complex`'s `.conj()`), and the same real-FMA loop runs unchanged, with no per-element conj branch anywhere. This is also the second reason for the force-pack flags: when packing does more than a plain copy, the transform must always run.
+Conjugation only negates the imaginary part. The pack already writes the imaginary plane separately. So `conj(A)*B` and `A*conj(B)` cost nothing in the hot loop.
 
-The runtime-to-compile-time bridge lives in `gemmkit/src/dispatch/complex.rs`. The public entry [`gemm_cplx`](https://docs.rs/gemmkit) takes `conj_a`/`conj_b` as plain `bool`s; `run_complex` matches on the pair once and dispatches to the matching one of four `ComplexGemm` monomorphizations, so the branch happens once per call, never in the loop. One subtlety rides along: the orientation swap that normalizes a row-major-ish `C` computes `C^T = B^T * A^T`, and since `(conj(A)*B)^T = B^T * conj(A)^T`, the swap must also swap the conj flags, which it does before the match. Output conjugation (`conjC`) is not implemented. On the degenerate path (`k == 0` or `alpha == 0`) the flags are simply irrelevant: with no `A*B` term there is nothing to conjugate.
+Setting the `CONJ_A` or `CONJ_B` const generic makes the packer negate the imaginary plane as it copies. This is a true negation, so `+0.0` maps to `-0.0`, matching `num_complex`'s `.conj()`. The same real-FMA loop then runs unchanged, with no per-element conjugation branch anywhere.
 
-## The hot loop: four real FMAs per complex MAC
+This is also the second reason for the force-pack flags. When packing does more than a plain copy, the transform must always run.
 
-There is one more layering problem to solve before the loop can run. The family is homogeneous, so the driver's bound is `KernelSimd<T, T, T, T>` with `T` complex, which only yields `SimdOps<Complex<..>>`, not the real-typed ops the split kernel actually needs. The bridge is the `SimdOps::cplx_microkernel` seam: the family's `microkernel` forwards to it, and each ISA token's override (generated by the `impl_complex_simd!` glue macro in `gemmkit/src/simd/complex.rs`) forwards in turn to the single shared, ISA-generic `soa_microkernel`, written over `S: SimdOps<C::Real>`. The accumulator stays `Complex`-typed at the family seam, so complex `alpha`/`beta` thread through the driver unchanged, while inside the seam the accumulators are two banks of real registers. The thin `SimdOps<Complex<..>>` glue exists only so the driver can read `LANES` and the homogeneous blanket impl applies; its element ops are `unreachable!` because complex GEMM never calls them, and `LANES` is set to the real lane count, so one real lane spans one complex row and the driver's `mr = MR_REG * LANES` counts complex rows.
+The runtime-to-compile-time bridge lives in `gemmkit/src/dispatch/complex.rs`. The public entry, [`gemm_cplx`](https://docs.rs/gemmkit), takes `conj_a` and `conj_b` as plain `bool`s. `run_complex` matches on that pair once, and dispatches to the matching one of 4 `ComplexGemm` monomorphizations. The branch happens once per call, never inside the loop.
+
+One subtlety rides along with this. The orientation swap that normalizes a row-major-ish `C` computes `C^T = B^T * A^T` instead. Since `(conj(A)*B)^T = B^T * conj(A)^T`, the swap must also swap the conj flags. It does this before the match runs.
+
+Output conjugation, `conjC`, is not implemented. On the degenerate path, where `k == 0` or `alpha == 0`, the flags are simply irrelevant. With no `A*B` term, there is nothing to conjugate.
+
+## The hot loop: 4 real FMAs per complex MAC
+
+There is one more layering problem to solve before the loop can run. The family is homogeneous, so the driver's bound is `KernelSimd<T, T, T, T>` with `T` complex. That bound only yields `SimdOps<Complex<..>>`, not the real-typed operations the split kernel actually needs.
+
+The bridge is the `SimdOps::cplx_microkernel` seam. The family's `microkernel` forwards to it. Each ISA token's override, generated by the `impl_complex_simd!` glue macro in `gemmkit/src/simd/complex.rs`, forwards in turn to one shared, ISA-generic function, `soa_microkernel`, written over `S: SimdOps<C::Real>`.
+
+The accumulator stays `Complex`-typed at the family seam. So complex `alpha` and `beta` thread through the driver unchanged. Inside the seam, though, the accumulators are 2 banks of real registers.
+
+The thin `SimdOps<Complex<..>>` glue exists only so the driver can read `LANES`, and so the homogeneous blanket impl applies. Its element operations are all `unreachable!`, because complex GEMM never calls them. `LANES` is set to the real lane count. So one real lane spans one complex row, and the driver's `mr = MR_REG * LANES` counts complex rows.
 
 The loop itself, from `gemmkit/src/simd/complex.rs`:
 
@@ -43,20 +69,42 @@ for p in 0..kc {
 }
 ```
 
-One complex multiply-accumulate is four fused real steps into two running banks: a `mul_add` and an `fnma` (fused negate-multiply-add, `vfnmadd` on x86) into `acc_re`, two `mul_add`s into `acc_im`. Every operation is a plain lane-parallel FMA on contiguous loads and scalar broadcasts; nothing crosses lanes until the epilogue. The fixed per-`p` order is deliberate: it is what makes full and edge tiles of the same matrix round identically.
+One complex multiply-accumulate is 4 fused real steps, into 2 running banks. `acc_re` gets a `mul_add` and an `fnma`, the fused negate-multiply-add, `vfnmadd` on x86. `acc_im` gets 2 `mul_add`s.
 
-After the loop, the banks drain to planar scratch and a scalar epilogue folds complex `alpha` (skipping the complex multiply when `alpha == 1`), combines `beta*C` case by case, and re-interleaves on store, an amortized `O(MN)` pass that handles full, edge, and strided output tiles uniformly. The scalar de-interleave in the pack and the scalar re-interleave in the epilogue are a measured decision, not an oversight: a vectorized `vld2`/`vst2` per-ISA seam was tried on NEON and did not pay, because the inner loop dominates, so the generic scalar path is the floor.
+Every operation is a plain lane-parallel FMA, on contiguous loads and scalar broadcasts. Nothing crosses lanes until the epilogue. The fixed per-`p` order is deliberate. It is what makes full tiles and edge tiles of the same matrix round identically.
+
+After the loop, the banks drain to planar scratch. A scalar epilogue folds complex `alpha`, skipping the complex multiply when `alpha == 1`. It combines `beta*C` case by case, and re-interleaves on store. This is an amortized `O(MN)` pass that handles full, edge, and strided output tiles uniformly.
+
+The scalar de-interleave in the pack, and the scalar re-interleave in the epilogue, are both a deliberate choice, not an oversight. The inner loop dominates the total cost of the kernel. So the generic scalar path stays the floor for both steps, on every ISA.
 
 ## Register pressure and the NR choice
 
-The split design doubles the accumulator count: an `MR_REG x NR` complex tile needs `2*MR_REG*NR` accumulator registers (a re bank and an im bank) plus `2*MR_REG` A-plane registers and 2 B splats per column step. That budget, documented tile by tile in `gemmkit/src/dispatch/complex.rs`, makes the complex tiles smaller than the float ones, and it is where the one hard-won number on this page comes from. On FMA (16 YMM registers), c32 runs `MR_REG = 1` (8 complex rows at 8 real lanes) with `NR = 5`: 10 accumulators + 2 A + 2 B splats = 14 of 16 registers. The two spare registers matter: a full 16-of-16 tile with `NR = 6` spills accumulators to the stack and roughly halves throughput, so `NR` was shrunk to 5 and the code comment records why. AVX-512's 32 ZMM registers relax the pressure: c32 runs `MR_REG = 2`, `NR = 6`, using 24 + 4 + 2 = 30 of 32. NEON (32 vector registers) runs `MR_REG = 2`, `NR = 5` for 26 of 32, leaving room for in-flight load temporaries, and wasm `simd128` runs `MR_REG = 1`, `NR = 4` for 12 v128s. Each c64 variant keeps its c32 sibling's `MR_REG`/`NR` with halved lanes, since the budget arithmetic is lane-count independent.
+The split design doubles the accumulator count. An `MR_REG x NR` complex tile needs `2*MR_REG*NR` accumulator registers, a real bank and an imaginary bank. It also needs `2*MR_REG` A-plane registers, and 2 B splats per column step. That budget is documented tile by tile in `gemmkit/src/dispatch/complex.rs`. It makes the complex tiles smaller than the float ones, and it is where the tile shapes on this page come from.
+
+On FMA, with 16 YMM registers, c32 runs `MR_REG = 1`, which is 8 complex rows at 8 real lanes, with `NR = 5`. That is 10 accumulators, plus 2 A registers, plus 2 B splats, for 14 of 16 registers. The 2 spare registers matter. A full 16-of-16 tile with `NR = 6` instead spills accumulators to the stack. So `NR` was shrunk to 5, and the code comment records why.
+
+AVX-512's 32 ZMM registers relax the pressure. c32 runs `MR_REG = 2`, `NR = 6`, using 24 + 4 + 2 = 30 of 32 registers. NEON, with 32 vector registers, runs `MR_REG = 2`, `NR = 5`, for 26 of 32, leaving room for in-flight load temporaries. wasm `simd128` runs `MR_REG = 1`, `NR = 4`, for 12 live `v128` registers.
+
+Each c64 variant keeps its c32 sibling's `MR_REG` and `NR`, with halved lanes. The budget arithmetic does not depend on the lane count.
 
 ## Accuracy and reproducibility
 
-Complex has no special paths: `run_complex` routes every shape to `driver::run`, with no gemv, `small_mn`, or small-`k` arms (the [Special Paths](Special_Paths.md) machinery is real-float and integer only). That makes the numeric contract easy to state, and `gemmkit/tests/correctness/complex.rs` tests each piece of it directly.
+Complex has no special paths. `run_complex` routes every shape to `driver::run`, with no gemv, `small_mn`, or small-`k` arms. The [Special Paths](Special_Paths.md) machinery is real-float and integer only.
 
-Determinism and thread independence hold bitwise: blocking is thread-count independent, so serial and parallel runs of the same problem produce bit-identical output, and the test asserts equality of the raw `re`/`im` bit patterns across thread counts. Within one run, the fixed per-step order of the four FMAs means full tiles and edge tiles of the same matrix round identically, so results do not depend on where a tile boundary happened to fall. Conjugation adds no rounding at all, it is a sign flip on exact values, and a dedicated test on small-integer inputs (where every product and sum is exactly representable) checks all four conj combinations against a naive reference with exact equality, not tolerance.
+This makes the numeric contract easy to state. `gemmkit/tests/correctness/complex.rs` tests each piece of it directly.
 
-Against an external oracle the bar is necessarily looser: the correctness suite compares `gemm_cplx`, including every conj combination, against the `gemm` crate under the suite's usual L2-style tolerance (and separately exercises a negative-row-stride view plus conj against a row-reversed reference), because a blocked SoA contraction legitimately rounds differently from another engine's ordering. That is the [reproducibility contract](Design_Goals_and_the_Big_Picture.md) applied to complex: same input, environment, and configuration give the same bits; different engines or orderings agree to tolerance.
+Determinism and thread independence hold bitwise. Blocking is thread-count independent, so serial and parallel runs of the same problem produce bit-identical output. The test asserts equality of the raw `re`/`im` bit patterns across thread counts.
 
-The fused-bias entry is the exception that gets a bitwise guarantee. `gemm_cplx_fused` supports a per-row or per-col complex bias and deliberately no activation, since ReLU-style activations are undefined on an unordered field. Its epilogue never touches the kernel's arithmetic: the SoA kernel stores exactly the bits plain `gemm_cplx` would, and a tile-local post-pass maps them in place on the final depth panel only (complex is `OUT_IS_ACC = true`, so intermediate panels must keep their raw partials). The result is bit-identical to `gemm_cplx` followed by the same element-wise bias add, for every shape and every conj combination, and the `Identity` instantiation const-folds the post-pass away entirely, so the non-fused path pays nothing for the hook's existence (the general mechanism is covered in [Epilogue Fusion](Epilogue_Fusion.md)).
+Within one run, the fixed per-step order of the 4 FMAs means full tiles and edge tiles of the same matrix round identically. So results do not depend on where a tile boundary happened to fall.
+
+Conjugation adds no rounding at all. It is a sign flip on exact values. A dedicated test on small-integer inputs, where every product and sum is exactly representable, checks all 4 conjugation combinations against a naive reference. That test uses exact equality, not tolerance.
+
+Against an external oracle, the bar is necessarily looser. The correctness suite compares `gemm_cplx`, including every conjugation combination, against the `gemm` crate, under the suite's usual L2-style tolerance. It separately exercises a negative-row-stride view, plus conjugation, against a row-reversed reference. This looser bar exists because a blocked SoA contraction legitimately rounds differently from another engine's ordering.
+
+That is the [reproducibility contract](Design_Goals_and_the_Big_Picture.md), applied to complex numbers. Under a fixed input, environment, and configuration, the result is the same bits. Across different engines or different orderings, results agree only to tolerance.
+
+The fused-bias entry is the exception that gets a bitwise guarantee. `gemm_cplx_fused` supports a per-row or per-column complex bias. It deliberately supports no activation, since ReLU-style activations are undefined on an unordered field.
+
+Its epilogue never touches the kernel's arithmetic. The SoA kernel stores exactly the bits plain `gemm_cplx` would store. A tile-local post-pass then maps them in place, on the final depth panel only. Complex is `OUT_IS_ACC = true`, so intermediate panels must keep their raw partials.
+
+The result is bit-identical to `gemm_cplx` followed by the same element-wise bias add, for every shape and every conjugation combination. The `Identity` instantiation const-folds the post-pass away entirely. So the non-fused path pays nothing for the hook's existence. [Epilogue Fusion](Epilogue_Fusion.md) covers the general mechanism.

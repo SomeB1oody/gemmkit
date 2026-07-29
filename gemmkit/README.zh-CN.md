@@ -4,16 +4,21 @@
 
 [![crates.io](https://img.shields.io/crates/v/gemmkit.svg)](https://crates.io/crates/gemmkit) [![docs.rs](https://img.shields.io/docsrs/gemmkit)](https://docs.rs/gemmkit)
 
-gemmkit 是一个通用矩阵乘法（GEMM）引擎，在带步长（stride）的 `&[T]` 视图上为 f32
-和 f64 计算 `C <- alpha*A*B + beta*C`，且不依赖任何矩阵库。它在运行时选择当前可用的
-最优指令集，并以可移植的标量路径覆盖没有向量后端的目标平台。转置通过步长来表达
-（转置视图只是交换行步长与列步长，无需拷贝）；当 `beta == 0` 时输出 `C` 不会被读取，
-因此它可以是未初始化的。
+gemmkit 是一个通用矩阵乘法（GEMM）引擎。它在带步长（stride）的 `&[T]` 视图上为
+f32 和 f64 计算 `C <- alpha*A*B + beta*C`。它不依赖任何矩阵库。gemmkit 在运行时
+选择当前可用的最优指令集。可移植的标量路径覆盖没有向量后端的目标平台。
 
-入口函数 `gemm` 接受带检查的 `MatRef`/`MatMut` 切片视图，并在执行任何 unsafe 代码之前
-就对形状、边界或别名重叠错误 panic。另有两档 API 用检查换控制力：`*_with` 变体接受由
-调用方持有的 `Workspace`，从而避免每次调用都分配内存；`*_unchecked` 入口则直接操作裸
-指针和 `isize` 步长（包括负步长），供自行校验输入的调用方使用。
+步长表达转置：转置视图只是交换行步长与列步长，因此无需拷贝。当 `beta == 0`
+时，gemmkit 不会读取输出 `C`，因此 `C` 可以是未初始化的。
+
+入口函数 `gemm` 接受带检查的 `MatRef`/`MatMut` 切片视图，并在执行任何 unsafe
+代码之前，就对形状、边界或别名重叠错误 panic。
+
+另有两档 API 用检查换取控制力：
+
+- `*_with` 变体接受由调用方持有的 `Workspace`，从而避免每次调用都分配内存。
+- `*_unchecked` 入口直接操作裸指针和 `isize` 步长（包括负步长），供自行校验
+  输入的调用方使用。
 
 除了基本的矩阵乘积，gemmkit 还提供：
 
@@ -28,8 +33,8 @@ gemmkit 是一个通用矩阵乘法（GEMM）引擎，在带步长（stride）�
 - `epilogue` feature 之后的融合尾部运算（fused epilogue）：`gemm_fused`（偏置与
   激活）、`gemm_i8_requant`（整数重量化）和 `gemm_map`（用户自定义的逐元素闭包）。
 - 针对带宽受限形状（gemv、小 k 以及小 m,n）的自动特殊路径，在同样的入口之后自动选用。
-- 基于 rayon 的并行，且在输入与配置固定时结果可复现；关闭默认 feature 后还可在
-  `no_std` 下运行（仅需 `core` 和 `alloc`）。
+- 基于 rayon 的并行，只要在同一台机器上输入与配置固定，结果就可复现。
+- 关闭默认 feature 后可在 `no_std` 下运行（仅需 `core` 和 `alloc`）。
 
 ## 用法
 
@@ -65,20 +70,21 @@ fn main() {
 | `std` | 是 | 运行时 CPU 特性与缓存检测、`GEMMKIT_REQUIRE_ISA` 及各项 `GEMMKIT_*` 调优旋钮，以及线程局部的工作区池。关闭后 crate 即为 `no_std`，仅需 `core` 和 `alloc`。 |
 | `parallel` | 是 | rayon 多线程（隐含开启 `std`）。关闭后一切照常编译并以单线程运行。 |
 | `wasm_threads` | 否 | 在 `wasm32-wasip1-threads` 目标上启用 rayon 并行（隐含开启 `parallel`）。 |
-| `complex` | 否 | c32/c64 复数 GEMM，支持对 A 或 B 的可选共轭；引入 `num-complex` 依赖。 |
-| `half` | 否 | 以 f32 累加的 f16/bf16 混合精度 GEMM；引入 `half` 依赖。 |
-| `int8` | 否 | i8 到 i32 的整数 GEMM；算术在溢出时回绕。 |
+| `complex` | 否 | c32/c64 复数 GEMM，支持对 A 或 B 的可选共轭。引入 `num-complex` 依赖。 |
+| `half` | 否 | 以 f32 累加的 f16/bf16 混合精度 GEMM。引入 `half` 依赖。 |
+| `int8` | 否 | i8 到 i32 的整数 GEMM。算术在溢出时回绕。 |
 | `epilogue` | 否 | 融合尾部运算：偏置与激活、逐元素映射，以及（配合 `int8`）i8/u8 重量化。默认关闭，因此纯 GEMM 构建不会为它的代码生成付出任何代价。 |
 
 ## 支持的元素类型
 
-实数 f32 与 f64 路径始终构建；其余类型族由上面的 cargo feature 门控。每个类型族都
-可走同样的带检查 / `_with` / `_unchecked` 三档 API，以及预打包和批量入口。
+gemmkit 始终构建实数 f32 与 f64 路径。其余类型族由上面的 cargo feature 门控。
+每个类型族都可以走同样的带检查 / `_with` / `_unchecked` 三档 API，以及预打包
+和批量入口。
 
 | 元素类型 | Feature | 计算 | 入口 | ISA 加速 |
 | --- | --- | --- | --- | --- |
 | `f32`、`f64` | 内置 | `C <- alpha*A*B + beta*C` | `gemm`、`gemm_fused`、`gemm_map` | FMA、AVX-512F、NEON、simd128、标量 |
-| `f16`、`bf16` | `half` | 同上，输入即输出类型，以 f32 累加 | `gemm`、`gemm_fused` | bf16 走 AVX-512 BF16 点积；f16 及所有回退路径都先加宽到 f32 |
+| `f16`、`bf16` | `half` | 同上，输入即输出类型，以 f32 累加 | `gemm`、`gemm_fused` | bf16 走 AVX-512 BF16 点积。f16 及所有回退路径都先加宽到 f32 |
 | `i8` | `int8` | `i8 * i8 -> i32` | `gemm_i8` | AVX-512 VNNI 点积，否则通用加宽 |
 | `i8`（重量化） | `int8` + `epilogue` | `i8 * i8 ->` `i8` 或 `u8` | `gemm_i8_requant`、`gemm_i8_requant_u8` | 同 `int8`，外加一趟融合的整数重量化 |
 | `c32`、`c64` | `complex` | 同上，可选 `conj(A)` / `conj(B)` | `gemm_cplx`、`gemm_cplx_fused` | 实部/虚部拆分，走 FMA、AVX-512F、NEON、simd128、标量 |
@@ -89,10 +95,10 @@ fn main() {
 
 ## 调优
 
-每一个启发式阈值的解析顺序为：每次调用传入的参数，其次是编程式 setter，再次是
-`GEMMKIT_*` 环境变量，最后是编译期默认值。
+每一个启发式阈值都按以下顺序解析：先是每次调用传入的参数，其次是编程式
+setter，再次是 `GEMMKIT_*` 环境变量，最后是编译期默认值。
 [gemmkit-tune](https://crates.io/crates/gemmkit-tune) 程序会在目标机器上扫描这些
-旋钮，并输出一份可直接 source 的环境变量配置；各个旋钮的说明见
+旋钮。它会输出一份可直接 source 的环境变量配置。各个旋钮的说明参见
 [docs.rs](https://docs.rs/gemmkit)。
 
 ## 文档

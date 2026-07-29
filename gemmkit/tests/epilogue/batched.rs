@@ -662,6 +662,7 @@ mod validation {
         )
     }
 
+    // a PerRow bias whose length does not match A.rows must panic
     #[test]
     #[should_panic(expected = "bias length")]
     fn bias_wrong_length() {
@@ -684,6 +685,7 @@ mod validation {
         );
     }
 
+    // a bias slice aliasing C must panic before any element is touched
     #[test]
     #[should_panic(expected = "bias slice overlaps C")]
     fn bias_overlaps_c() {
@@ -711,6 +713,7 @@ mod validation {
         );
     }
 
+    // a non-finite LeakyRelu slope must panic
     #[test]
     #[should_panic(expected = "LeakyRelu slope must be finite")]
     fn leaky_slope_not_finite() {

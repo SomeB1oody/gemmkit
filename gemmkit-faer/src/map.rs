@@ -3,17 +3,19 @@ use super::*;
 use crate::common::ref_parts;
 
 /// `C[r, c] <- f(alpha*A*B + beta*C, r, c)` in 1 fused pass, the faer adapter over gemmkit's
-/// [`gemmkit::gemm_map`]. The closure `f(value, row, col)` runs on each output element at its final
-/// value, with `(row, col)` in the **user** frame of `C`, exactly once per element. `T` is
-/// `f32`/`f64` only: fusing a narrow-float closure after the `f32` accumulate would double-round,
-/// so gemmkit's map bound leaves `f16`/`bf16` out. Like [`gemm`], it reads the pointer/strides
-/// directly and forwards to gemmkit's raw engine, so transposed, sub-matrix, and reversed
-/// (negative-stride) views all work without copying
+/// [`gemmkit::gemm_map`]. The closure `f(value, row, col)` runs on each output element at its
+/// final value. `(row, col)` is in the user frame of `C`, and the closure runs exactly once per
+/// element
 ///
-/// For a bias/activation prefer [`gemm_fused`] (it vectorizes); `gemm_map` is the general
-/// per-element extension point (GELU, sigmoid, clamps, position-dependent transforms), at the cost
-/// of 1 indirect call per output element. The result is bit-identical to [`gemm`] followed by
-/// mapping each `C[r, c]` through `f(C[r, c], r, c)`, for every shape
+/// `T` is `f32`/`f64` only. A narrow-float closure fused after the `f32` accumulate would
+/// double-round the result, so gemmkit's map bound leaves `f16`/`bf16` out. Like [`gemm`], it
+/// reads the pointer and strides directly and forwards to gemmkit's raw engine. Transposed,
+/// sub-matrix, and reversed (negative-stride) views all work without copying
+///
+/// For a bias or activation, prefer [`gemm_fused`], which vectorizes. `gemm_map` is the general
+/// per-element extension point (GELU, sigmoid, clamps, position-dependent transforms), at the
+/// cost of 1 indirect call per output element. The result is bit-identical to [`gemm`] followed
+/// by a pass that maps each `C[r, c]` through `f(C[r, c], r, c)`, for every shape
 ///
 /// # Panics
 /// If the inner dimensions disagree (same conditions as [`gemm`])
@@ -71,10 +73,10 @@ fn gemm_map_common<T: MapScalar>(
     let (rsc, csc) = (c.row_stride(), c.col_stride());
     let cp = c.as_ptr_mut();
 
-    // SAFETY: dims validated above; faer guarantees the pointer + element-unit `isize` strides
-    // describe a valid in-bounds layout (negative for a reversed view, which the raw engine
-    // handles), `c` (a `MatMut` exclusive borrow) can't alias `a`/`b`, and `f` is total (applied to
-    // every output element, never skipped)
+    // SAFETY: dims validated above. faer guarantees the pointer and element-unit `isize` strides
+    // describe a valid in-bounds layout, negative for a reversed view, which the raw engine
+    // handles. The `MatMut` exclusive borrow means `c` cannot alias `a` or `b`, and `f` is total,
+    // applied to every output element and never skipped
     unsafe {
         match ws {
             Some(ws) => gemm_map_unchecked_with(

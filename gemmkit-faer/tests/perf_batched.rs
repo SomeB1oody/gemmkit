@@ -1,5 +1,5 @@
-//! `gemm_batched` throughput vs a naive loop of single `gemm` calls, over many small-to-medium GEMMs.
-//! `#[ignore]`d (a benchmark, not a correctness gate); run with:
+//! `gemm_batched` throughput vs a naive loop of single `gemm` calls, over a few small-to-medium
+//! GEMM shapes. `#[ignore]`d (a benchmark, not a correctness gate); run with:
 //!   cargo test -p gemmkit-faer --release --test perf_batched -- --ignored --nocapture
 #![cfg(not(miri))]
 
@@ -89,6 +89,7 @@ fn bench(batch: usize, m: usize, k: usize, n: usize) {
     );
 }
 
+// prints gemm_batched vs a naive per-element gemm loop, in GFLOP/s, across 3 batch/shape points
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
 fn perf_batched() {

@@ -47,8 +47,9 @@ pub(crate) fn dense_i32(buf: &[i32], rows: usize, cols: usize, rs: isize, cs: is
     out
 }
 
-/// Materialize a complex view row-major in f64, negating the imaginary part when `conj`
-/// (mirrors `gemm_cplx`, which conjugates the operand itself before the product, not the result)
+/// Materialize a complex view row-major in f64. Negate the imaginary part when `conj` is
+/// true. This mirrors `gemm_cplx`, which conjugates the operand itself before the product,
+/// not the result
 pub(crate) fn dense_cplx<T: CplxElem>(
     buf: &[T],
     rows: usize,
@@ -71,8 +72,9 @@ pub(crate) fn frob(v: &[f64]) -> f64 {
     v.iter().map(|x| x * x).sum::<f64>().sqrt()
 }
 
-/// f64 reference `C <- beta*C0 + alpha*A*B`, applying the `beta == 0` "C is not read" rule
-/// (matches `reference` in tests/oracle_common/mod.rs) so a NaN-seeded C0 never taints the result
+/// f64 reference `C <- beta*C0 + alpha*A*B`. It applies the `beta == 0` "C is not read"
+/// rule (matches `reference` in tests/oracle_common/mod.rs), so a NaN-seeded C0 never
+/// taints the result
 pub(crate) fn ref_gemm_real(
     da: &[f64],
     db: &[f64],
@@ -131,9 +133,9 @@ pub(crate) fn ref_gemm_i8(
     out
 }
 
-/// f64 complex reference (conj already baked into `da`/`db` by `dense_cplx`) applying the
-/// `beta == 0` rule; unlike `ref_cplx` in the correctness suite, which never sees a NaN-seeded
-/// C0 and so skips the rule, this must handle it
+/// f64 complex reference. `conj` is already baked into `da` and `db` by `dense_cplx`, and
+/// this applies the `beta == 0` rule. `ref_cplx` in the correctness suite never sees a
+/// NaN-seeded C0, so it skips the rule, but this reference must handle it
 pub(crate) fn ref_gemm_cplx(
     da: &[(f64, f64)],
     db: &[(f64, f64)],
@@ -169,13 +171,16 @@ pub(crate) fn ref_gemm_cplx(
 // tolerance / exact gates (a panic here is the libFuzzer report channel)
 
 /// Relative-Frobenius gate: `||C - Cref|| / denom <= 8*k*EPS`, the same bar as
-/// `assert_accurate` (tests/oracle_common/mod.rs). The correctness suite's `denom` is a
-/// plain `||A||*||B||`, since its cases keep `k >= 1` with an O(1) alpha over a non-empty
-/// product; the fuzzer also reaches `k == 0` (`||A||*||B|| == 0`) and `|alpha| = 2.5`, where
-/// that bare denominator could go to 0 while rounding in the product/epilogue is still
-/// present, so here it additionally folds in `|alpha|` and the `|beta|*||C0||` epilogue
-/// term. `denom` is precomputed by the caller, with the `||C0||` term dropped when
-/// `beta == 0` so a NaN-seeded C0 cannot taint it
+/// `assert_accurate` (tests/oracle_common/mod.rs)
+///
+/// The correctness suite's `denom` is a plain `||A||*||B||`, since its cases keep
+/// `k >= 1` with an O(1) alpha over a non-empty product. The fuzzer also reaches
+/// `k == 0`, where `||A||*||B|| == 0`, and `|alpha| = 2.5`. There the bare denominator
+/// could go to 0 while rounding in the product or epilogue is still present. So this
+/// gate also folds in `|alpha|` and the `|beta|*||C0||` epilogue term
+///
+/// The caller precomputes `denom` and drops the `||C0||` term when `beta == 0`. This
+/// keeps a NaN-seeded C0 from tainting it
 pub(crate) fn real_gate<T: RealElem>(
     cbuf: &[T],
     rsc: isize,
@@ -212,6 +217,9 @@ pub(crate) fn real_denom(alpha_f: f64, na: f64, nb: f64, beta_f: f64, nc0: f64) 
     alpha_f.abs() * na * nb + beta_f.abs() * nc0 + 1e-30
 }
 
+/// Relative-Frobenius gate for complex output. Unlike `real_gate`, which takes a
+/// precomputed `denom`, this computes its own norm from `cref`. The tolerance is
+/// `16*k*EPS`, double `real_gate`'s bound, for the complex-multiply's extra rounding
 pub(crate) fn cplx_gate<T: CplxElem>(
     cbuf: &[T],
     rsc: isize,
@@ -242,6 +250,8 @@ pub(crate) fn cplx_gate<T: CplxElem>(
     }
 }
 
+/// Exact gate for i8 output: `gemm_i8` has no rounding to absorb, so `cbuf` must equal
+/// `cref` bit-for-bit at every `(i, j)`
 pub(crate) fn i8_gate(
     cbuf: &[i32],
     rsc: isize,

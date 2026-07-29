@@ -1,37 +1,38 @@
-//! User-defined per-element map-epilogue GEMM entries
+//! User-defined per-element map-epilogue GEMM entries (feature `epilogue`)
 //!
 //! `gemm_map` applies an arbitrary caller closure `f(value, row, col) -> value` to each output
 //! element, fused into the same store the plain kernel would perform. It is the general
-//! extension point for epilogues gemmkit has no dedicated fast path for (GELU, sigmoid,
-//! clamping, position-dependent transforms). For a plain bias or activation, prefer
-//! [`crate::gemm_fused`], which vectorizes the transform; `gemm_map` trades that for an
+//! extension point for epilogues gemmkit has no dedicated fast path for, such as GELU,
+//! sigmoid, clamping, or a position-dependent transform. For a plain bias or activation, prefer
+//! [`crate::gemm_fused`], which vectorizes the transform. `gemm_map` trades that for an
 //! indirect call per output element in exchange for full generality
 use super::*;
 use crate::dispatch::MapScalar;
 use crate::kernel::epilogue::MapEpi;
 
-/// `C[r, c] <- f(alpha*A*B + beta*C, r, c)` in 1 fused pass: a plain GEMM with a caller
-/// closure applied to each output element at its final value, over safe slice views, using
-/// the thread-local workspace pool. `(r, c)` is the user-frame coordinate of `C` (row `r`,
-/// column `c`), and `f` fires exactly once per element, at the point the plain kernel would
+/// `C[r, c] <- f(alpha*A*B + beta*C, r, c)` in 1 fused pass. This is a plain GEMM with a
+/// caller closure applied to each output element at its final value. It runs over safe slice
+/// views, using the thread-local workspace pool. `(r, c)` is the user-frame coordinate of `C`:
+/// row `r`, column `c`. `f` fires exactly once per element, at the point the plain kernel would
 /// store it
 ///
 /// The map engine routes every shape through the same kernel [`gemm`] would use: the general
-/// register-blocked driver, gemv for `m == 1` / `n == 1`, the small-`m,n` horizontal path, or
-/// the small-`k` path, applying `f` to the value the plain store would write instead of
-/// writing it directly. So for `f32`/`f64` the result is bit-identical to [`gemm`] followed by
-/// mapping every `C[r, c]` through `f(C[r, c], r, c)`, for every shape (strided, transposed,
-/// row-major `C`, gemv, degenerate), and deterministic across thread counts: serial and
-/// parallel runs match bit-for-bit
+/// register-blocked driver, gemv for `m == 1` or `n == 1`, the small-`m,n` horizontal path, or
+/// the small-`k` path. It applies `f` to the value the plain store would write, instead of
+/// writing that value directly. For `f32`/`f64`, the result is bit-identical to [`gemm`]
+/// followed by mapping every `C[r, c]` through `f(C[r, c], r, c)`. This holds for every shape,
+/// including strided, transposed, row-major `C`, gemv, and degenerate views. Serial and
+/// parallel runs also match bit-for-bit today, though the crate's reproducibility contract
+/// covers only a fixed configuration
 ///
 /// The closure may capture its environment by reference: the `+ Sync` bound is what makes that
 /// reference safe to share across the parallel workers. It runs through a `dyn Fn` indirection
-/// once per output element; for a plain bias or activation prefer [`gemm_fused`], which applies
-/// the transform in-register on the vector fast path. `gemm_map` is the extension point for an
-/// arbitrary, position-dependent per-element function
+/// once per output element. For a plain bias or activation, prefer [`gemm_fused`], which
+/// applies the transform in-register on the vector fast path. `gemm_map` is the extension
+/// point for an arbitrary, position-dependent per-element function
 ///
-/// `T` is `f32`/`f64` only. The narrow floats (`f16`/`bf16`), complex, and integer types are not
-/// supported: a `T`-domain closure applied after the `f32` accumulate would double-round,
+/// `T` is `f32`/`f64` only. The narrow floats (`f16`/`bf16`), complex, and integer types are
+/// not supported. A `T`-domain closure applied after the `f32` accumulate would double-round,
 /// breaking the bitwise contract above. The batched and prepacked entries are likewise not
 /// supported. Use [`gemm_fused`] for those
 ///
@@ -73,12 +74,12 @@ pub fn gemm_map_with<T: MapScalar>(
     f: &(dyn Fn(T, usize, usize) -> T + Sync),
     par: Parallelism,
 ) {
-    // Same checks as `gemm`/`gemm_fused`; the closure is total, so nothing epilogue-specific
+    // Same checks as `gemm`/`gemm_fused`. The closure is total, so nothing epilogue-specific
     // needs validating here
     validate_gemm_views(&a, &b, &c);
 
     // SAFETY: validated above, shapes agree, every stride is in bounds, C addresses each (i,j)
-    // uniquely and does not alias A/B; the closure borrow outlives the whole `execute_map` frame
+    // uniquely and does not alias A/B. The closure borrow outlives the whole `execute_map` frame
     unsafe {
         map_unchecked_impl(
             Some(ws),
@@ -232,7 +233,7 @@ unsafe fn map_unchecked_impl<T: MapScalar>(
         rsc,
         csc,
     };
-    // Starts in the user frame; the dispatch layer flips `swapped` if it orients C
+    // Starts in the user frame. The dispatch layer flips `swapped` if it orients C
     let epi = MapEpi { f, swapped: false };
     // SAFETY: preconditions forwarded to the caller (see # Safety)
     unsafe {

@@ -2,20 +2,20 @@
 //!
 //! 2 tiers of safety sit over the same dispatch engine:
 //!
-//! * [`gemm`] / [`gemm_with`] - checked entries over [`MatRef`]/[`MatMut`] slice
-//!   views. Shape mismatches, out-of-bounds strides, and C aliasing A/B all
-//!   **panic** before any unsafe work runs
-//! * [`gemm_unchecked`] / [`gemm_unchecked_with`] - the raw pointer + `isize`-stride
-//!   engine for advanced callers (e.g. the ndarray adapter) that validate their
-//!   own inputs
+//! - [`gemm`] / [`gemm_with`] check the [`MatRef`]/[`MatMut`] slice views before
+//!   dispatch runs. A shape mismatch, an out-of-bounds stride, or C aliasing A or
+//!   B panics before any unsafe code runs
+//! - [`gemm_unchecked`] / [`gemm_unchecked_with`] take raw pointers and `isize`
+//!   strides with no checks. Use these only when the caller, such as the ndarray
+//!   adapter, validates its own inputs
 //!
-//! Semantics are `C <- alpha*A*B + beta*C`. Transposition is expressed through
-//! strides (a transposed view swaps `rs`/`cs`, no copy). When `beta == 0` the
-//! output C is **not read**, so it may be uninitialized
+//! The semantics are `C <- alpha*A*B + beta*C`. A transposed view swaps `rs` and
+//! `cs` with no copy. When `beta == 0`, gemm does not read C, so C may be
+//! uninitialized
 //!
 //! The submodules below add batched, complex, fused-epilogue, integer,
-//! map-epilogue, and prepacked-operand entries on top of the shape/alias
-//! validation helpers defined here
+//! map-epilogue, and prepacked-operand entries on top of the shape and alias
+//! checks defined here
 
 use crate::dispatch::{self, GemmScalar, Task};
 #[cfg(feature = "epilogue")]
@@ -33,7 +33,7 @@ mod cplx;
 // Fused-epilogue (bias/activation) GEMM entries
 #[cfg(feature = "epilogue")]
 mod fused;
-// Integer (i8 -> i32) and requantizing (i8 -> i8) GEMM entries
+// Integer (i8 -> i32) and requantizing (i8 -> i8 or i8 -> u8) GEMM entries
 #[cfg(feature = "int8")]
 mod int8;
 // User-defined per-element map-epilogue GEMM entries
@@ -91,9 +91,10 @@ pub use packed::{
 
 /// An immutable strided matrix view over a slice
 ///
-/// Element `(i, j)` lives at slice offset `i*rs + j*cs`. Negative strides are stored
-/// as given; the checked [`gemm`]/[`gemm_with`] entries reject them at call time (use
-/// [`gemm_unchecked`] for negative strides or a pointer into the middle of a buffer)
+/// Element `(i, j)` lives at slice offset `i*rs + j*cs`. Negative strides are stored as
+/// given. Every checked entry, such as [`gemm`]/[`gemm_with`], rejects them at call
+/// time. Use [`gemm_unchecked`] for negative strides or a pointer into the middle of
+/// a buffer
 #[derive(Copy, Clone)]
 pub struct MatRef<'a, T> {
     data: &'a [T],
@@ -105,7 +106,8 @@ pub struct MatRef<'a, T> {
 
 /// A mutable strided matrix view over a slice
 ///
-/// Same offset formula and stride rules as [`MatRef`]; used for the output `C`
+/// Uses the same offset formula and stride rules as [`MatRef`]. Represents the
+/// output `C`
 pub struct MatMut<'a, T> {
     data: &'a mut [T],
     rows: usize,
@@ -115,8 +117,10 @@ pub struct MatMut<'a, T> {
 }
 
 impl<'a, T> MatRef<'a, T> {
-    /// A view with explicit strides. Construction itself never panics; out-of-bounds
-    /// or negative strides are only caught when the view reaches [`gemm`]/[`gemm_with`]
+    /// A view with explicit strides
+    ///
+    /// Construction never panics. An out-of-bounds or negative stride is only caught
+    /// when the view reaches a checked entry, such as [`gemm`]/[`gemm_with`]
     pub fn new(data: &'a [T], rows: usize, cols: usize, rs: isize, cs: isize) -> Self {
         Self {
             data,
@@ -175,9 +179,12 @@ impl<'a, T> MatMut<'a, T> {
     }
 }
 
-/// Highest slice offset (exclusive) reached by a `rows x cols` view at strides `rs`/`cs`, or
-/// `None` if either stride is negative (unsupported by the safe API) or the arithmetic
-/// overflows `usize` (the view is too large to address)
+/// Highest slice offset (exclusive) reached by a `rows x cols` view at strides
+/// `rs`/`cs`. Returns `None` if a stride paired with a dimension longer than 1 is
+/// negative, because the safe API does not support that case. A dimension of
+/// length 1 or less contributes nothing, regardless of its stride's sign. Also
+/// returns `None` if the arithmetic overflows `usize`, because the view is too
+/// large to address
 fn extent(rows: usize, cols: usize, rs: isize, cs: isize) -> Option<usize> {
     if rows == 0 || cols == 0 {
         return Some(0);
@@ -199,6 +206,10 @@ fn extent(rows: usize, cols: usize, rs: isize, cs: isize) -> Option<usize> {
     }
 }
 
+/// Panics if the view addressed by `rows`/`cols`/`rs`/`cs` does not fit in `data`
+///
+/// Delegates the reachable-extent math to [`extent`], then reports the mismatch
+/// or invalid-stride case with a message naming the view
 fn check_view<T>(data: &[T], rows: usize, cols: usize, rs: isize, cs: isize, name: &str) {
     match extent(rows, cols, rs, cs) {
         Some(need) if need <= data.len() => {}
@@ -212,14 +223,16 @@ fn check_view<T>(data: &[T], rows: usize, cols: usize, rs: isize, cs: isize, nam
     }
 }
 
-/// `true` if a strided `rows x cols` view maps 2 distinct `(i, j)` to the same slice
-/// offset. Reading through such a view is fine (a broadcast input), but it is invalid
-/// as an output: the parallel driver assumes output tiles are disjoint, so 2 workers
-/// could race on the same element. Strides are compared by magnitude (negative strides
-/// are already rejected by [`extent`]). A dimension of length <= 1 spans nothing, so
-/// its stride cannot cause a collision; with 2 real dimensions, there is no collision
-/// exactly when the larger stride clears the smaller dimension's whole span
-/// (`big >= small_stride * small_dim`)
+/// `true` if a strided `rows x cols` view maps 2 distinct `(i, j)` pairs to the same
+/// slice offset
+///
+/// A view that aliases itself this way is fine to read, such as a broadcast input.
+/// It is invalid as an output, because the parallel driver assumes output tiles are
+/// disjoint, and 2 workers could then race on the same element. Strides are compared
+/// by magnitude, since [`extent`] already rejects negative strides. A dimension of
+/// length <= 1 spans nothing, so its stride cannot collide. With 2 real dimensions,
+/// there is no collision when the larger stride clears the smaller dimension's whole
+/// span, `big >= small_stride * small_dim`
 fn self_aliases(rows: usize, cols: usize, rs: isize, cs: isize) -> bool {
     if rows == 0 || cols == 0 {
         return false; // empty view: nothing is written, so nothing can race
@@ -236,21 +249,24 @@ fn self_aliases(rows: usize, cols: usize, rs: isize, cs: isize) -> bool {
     }
 }
 
-/// `true` if the byte ranges of 2 `[T]`-typed views overlap: same-type wrapper around
-/// [`overlaps_bytes`], which callers with differing element types (e.g.
-/// [`validate_gemm_views`]) call directly instead
+/// `true` if the byte ranges of 2 `[T]`-typed views overlap
+///
+/// A same-type wrapper around [`overlaps_bytes`], the common primitive both this
+/// function and [`validate_gemm_views`] build on. A caller with 2 different element
+/// types, such as `i8` A/B against `i32` C, calls [`overlaps_bytes`] directly instead
 fn overlaps<T>(pa: *const T, na: usize, pb: *const T, nb: usize) -> bool {
     let s = core::mem::size_of::<T>();
     overlaps_bytes(pa as *const u8, na, s, pb as *const u8, nb, s)
 }
 
-/// The shared checked-API validation prologue for the `(A, B, C)` trio: matching inner
-/// dimensions, every view in bounds, `C` addressing each element uniquely, and `C` not
-/// overlapping `A`/`B`. Generic over the input element type `TI` and output element type
-/// `TO`, comparing byte ranges via [`overlaps_bytes`] so it serves the homogeneous,
-/// complex, integer (plain and requantizing), and map-epilogue entries alike, not just
-/// the ones where `TI == TO`. Panic messages match the wording tests assert on. Callers
-/// add any entry-specific checks (fused bias / requant scale) after this returns
+/// The shared validation prologue for the checked API's `(A, B, C)` trio
+///
+/// Checks that `A`'s columns match `B`'s rows and that `C`'s shape matches `A`'s
+/// rows and `B`'s columns. Also checks that every view stays in bounds, `C`
+/// addresses each element uniquely, and `C` does not overlap `A` or `B`. Generic
+/// over the input type `TI` and the output type `TO`, so the same checks cover
+/// every entry, even when the 2 types differ. Callers add any entry-specific
+/// checks after this returns
 fn validate_gemm_views<TI, TO>(a: &MatRef<'_, TI>, b: &MatRef<'_, TI>, c: &MatMut<'_, TO>) {
     assert_eq!(
         a.cols, b.rows,
@@ -272,9 +288,9 @@ fn validate_gemm_views<TI, TO>(a: &MatRef<'_, TI>, b: &MatRef<'_, TI>, c: &MatMu
     check_view(b.data, b.rows, b.cols, b.rs, b.cs, "B");
     check_view(c.data, c.rows, c.cols, c.rs, c.cs, "C");
 
-    // C is written, so its strides must address each (i,j) uniquely: a self-aliasing
-    // output (e.g. rsc == 0) would be a data race in parallel mode, reachable from
-    // safe code. A/B may alias themselves (broadcast reads are fine)
+    // C is written, so its strides must address each (i,j) uniquely. A self-aliasing
+    // output, such as rsc == 0, lets 2 workers race in parallel mode, reachable from
+    // safe code. A and B may alias themselves since a broadcast read is fine
     if self_aliases(c.rows, c.cols, c.rs, c.cs) {
         panic!(
             "gemmkit: C view aliases itself (strides {},{} map distinct elements to the same \
@@ -283,10 +299,9 @@ fn validate_gemm_views<TI, TO>(a: &MatRef<'_, TI>, b: &MatRef<'_, TI>, c: &MatMu
         );
     }
 
-    // C must not alias A or B (it is written); safe Rust's borrow checker already
-    // forbids this for a single call, so this is a defensive check for the raw
-    // buffers behind the views. Compared as byte ranges, not element counts, so
-    // TI != TO (e.g. i8 A/B vs i32 C) is still exact
+    // C must not alias A or B, since C is written. The borrow checker already forbids this
+    // for a single call, so this check guards the raw buffers behind the views. It compares
+    // byte ranges rather than element counts, so TI != TO, such as i8 A/B vs i32 C, stays exact
     let cp = c.data.as_ptr() as *const u8;
     let cl = c.data.len();
     let si = core::mem::size_of::<TI>();
@@ -298,30 +313,29 @@ fn validate_gemm_views<TI, TO>(a: &MatRef<'_, TI>, b: &MatRef<'_, TI>, c: &MatMu
     }
 }
 
-/// The shared fused-bias validation for every checked fused entry (plain, batched,
-/// packed-A, packed-B, and the complex `gemm_cplx_fused_with`): a `PerRow` bias must
-/// have length `m` (the output rows) and a `PerCol` bias length `n` (the output cols), and
-/// the bias slice must not overlap `C`'s storage. `None` is a no-op. Both the length and the
-/// overlap check delegate to [`crate::adapter::lower_bias`], the single pointer-level
-/// implementation the view adapters also consume, so the panic wording tests assert on lives
-/// in exactly 1 place. `C`'s backing slice is passed as a single unit-stride axis, whose byte
-/// range `[c_ptr, c_ptr + c_len*size_of::<T>())` is the same one the slice-based overlap test
-/// used before. The activation / `LeakyRelu`-slope check is entry-local (complex has no
-/// activation) and stays at the call sites
+/// The shared bias validation for every checked fused entry: plain, batched,
+/// packed-A, packed-B, and the complex `gemm_cplx_fused_with`
+///
+/// A `PerRow` bias must have length `m`, the output rows, and a `PerCol` bias must
+/// have length `n`, the output cols. The bias slice must not overlap `C`'s storage.
+/// `None` is a no-op. The length and overlap checks both delegate to
+/// [`crate::adapter::lower_bias`], the single implementation every entry shares. The
+/// activation and `LeakyRelu` slope check stay entry-local, since complex numbers have
+/// no activation
 #[cfg(feature = "epilogue")]
 fn validate_bias<T: Copy>(bias: &Option<Bias<'_, T>>, m: usize, n: usize, c: &MatMut<'_, T>) {
-    // Discard the lowered triple: this entry only validates, the lowering to FusedEpi happens
-    // separately. C's full slice as a unit-stride footprint reproduces the byte range the old
-    // slice-based overlaps() test compared against
+    // This only validates the bias. Lowering to FusedEpi happens separately. Passing C's
+    // full slice as a single unit-stride axis covers its complete byte range
     let _ = crate::adapter::lower_bias(*bias, m, n, c.data.as_ptr(), &[(c.data.len(), 1)]);
 }
 
-/// Lower the public `Option<Bias>` / `Option<Activation>` epilogue selectors into the internal
-/// [`FusedEpi`] the dispatch layer consumes: the bias slice pointer is erased to the
-/// `Send + Sync` [`Ptr`] shim, and a `None` selector maps to the matching `None` variant. Used
-/// by every checked fused entry that takes borrowed `Bias`/`Activation` values (plain, complex,
-/// batched, packed-A, packed-B); the `_unchecked` entries lower raw pointers through
-/// [`to_fused_epi_raw`] instead
+/// Lowers the public `Option<Bias>`/`Option<Activation>` selectors into the internal
+/// [`FusedEpi`] the dispatch layer consumes
+///
+/// Erases the bias slice pointer to the `Send + Sync` [`Ptr`] shim, and maps a `None`
+/// selector to the matching `None` variant. Every checked fused entry that takes
+/// borrowed `Bias`/`Activation` values calls this. The `_unchecked` entries lower raw
+/// pointers through [`to_fused_epi_raw`] instead
 #[cfg(feature = "epilogue")]
 fn to_fused_epi<T>(bias: Option<Bias<'_, T>>, act: Option<Activation<T>>) -> FusedEpi<T> {
     let bias = match bias {
@@ -337,13 +351,15 @@ fn to_fused_epi<T>(bias: Option<Bias<'_, T>>, act: Option<Activation<T>>) -> Fus
     FusedEpi { bias, act }
 }
 
-/// The raw-pointer analogue of [`to_fused_epi`]: lower a `(bias ptr, BiasDim, has_bias)`
-/// selector plus an optional [`Activation`] into the internal [`FusedEpi`] the dispatch layer
-/// consumes. `has_bias == false` maps to [`BiasSpec::None`] (the `bias` pointer is then ignored);
-/// otherwise the pointer is erased to the `Send + Sync` [`Ptr`] shim under the chosen axis. Used
-/// by every `_unchecked` fused entry (plain, batched, packed-A, packed-B) and by the complex
-/// `gemm_cplx_fused_unchecked_with`, which always passes `act == None` since an ordering
-/// activation is undefined on complex numbers
+/// The raw-pointer analogue of [`to_fused_epi`]
+///
+/// Lowers a `(bias ptr, BiasDim, has_bias)` selector plus an optional [`Activation`]
+/// into the internal [`FusedEpi`] the dispatch layer consumes. When `has_bias` is
+/// `false`, this maps to [`BiasSpec::None`] and ignores the `bias` pointer. Otherwise
+/// it erases the pointer to the `Send + Sync` [`Ptr`] shim under the chosen axis.
+/// Every `_unchecked` fused entry uses this, including the complex
+/// `gemm_cplx_fused_unchecked_with`, which always passes `act == None` because
+/// complex numbers have no ordering activation
 #[cfg(feature = "epilogue")]
 fn to_fused_epi_raw<T>(
     bias: *const T,
@@ -371,12 +387,16 @@ fn to_fused_epi_raw<T>(
 /// workspace pool
 ///
 /// # Panics
-/// If `A.cols != B.rows`, `A.rows != C.rows`, or `B.cols != C.cols`; if any view's
-/// strides address outside its slice, are negative, or overflow while computing the
-/// addressed extent; if `C`'s strides map 2 distinct elements to the same slot; if
-/// `C`'s storage overlaps `A`'s or `B`'s; or if the problem is so large (broadcast
-/// strides let the logical dimensions run up to `isize::MAX` while touching a small
-/// slice) that an internal pack buffer size overflows `usize`
+///
+/// Panics if any of the following holds:
+///
+/// - `A.cols != B.rows`, `A.rows != C.rows`, or `B.cols != C.cols`
+/// - a view's strides address outside its slice, are negative, or overflow while
+///   computing the addressed extent
+/// - `C`'s strides map 2 distinct elements to the same slot
+/// - `C`'s storage overlaps `A`'s or `B`'s storage
+/// - the strides let the logical dimensions run up to `isize::MAX` while the slice
+///   stays small, and an internal pack buffer size overflows `usize`
 pub fn gemm<T: GemmScalar>(
     alpha: T,
     a: MatRef<'_, T>,
@@ -392,6 +412,7 @@ pub fn gemm<T: GemmScalar>(
 /// the workspace has grown to fit the 1st sufficiently large call
 ///
 /// # Panics
+///
 /// Same conditions as [`gemm`]
 pub fn gemm_with<T: GemmScalar>(
     ws: &mut Workspace,
@@ -408,7 +429,7 @@ pub fn gemm_with<T: GemmScalar>(
     let k = a.cols;
     let n = b.cols;
     // SAFETY: validate_gemm_views checked the shapes agree, every stride stays in
-    // bounds, and C does not alias A/B
+    // bounds, C addresses each element uniquely, and C does not alias A or B
     unsafe {
         dispatch::execute(
             Task {
@@ -434,12 +455,16 @@ pub fn gemm_with<T: GemmScalar>(
 }
 
 /// The raw engine: `C <- alpha*A*B + beta*C` over pointers and `isize` strides,
-/// with no bounds/alias/shape checks. Uses the thread-local workspace pool
+/// with no bounds, alias, or shape checks. Uses the thread-local workspace pool
 ///
 /// # Safety
-/// The caller guarantees: `a`/`b` are valid for reads and `c` for read+write
-/// over every `(i, j)` implied by the dimensions and strides; `c` does not alias
-/// `a`/`b`; and when `beta == 0`, `c` need not be initialized
+///
+/// The caller guarantees all of the following:
+///
+/// - `a` and `b` are valid for reads, and `c` is valid for reads and writes, over
+///   every `(i, j)` implied by the dimensions and strides
+/// - `c` does not alias `a` or `b`
+/// - when `beta == 0`, `c` need not be initialized
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn gemm_unchecked<T: GemmScalar>(
     m: usize,
@@ -484,10 +509,13 @@ pub unsafe fn gemm_unchecked<T: GemmScalar>(
     }
 }
 
-/// `true` if 2 byte ranges, each given as (base pointer, element count, element size),
-/// overlap. The common primitive under [`overlaps`] (same element type on both sides)
-/// and [`validate_gemm_views`] (input/output types that may differ in size, e.g. `i8`
-/// A/B vs `i32` C)
+/// `true` if 2 byte ranges overlap, each given as a base pointer, an element count,
+/// and an element size
+///
+/// The common primitive both [`overlaps`] and [`validate_gemm_views`] build on.
+/// [`overlaps`] wraps it for the common case where both sides share an element
+/// type. [`validate_gemm_views`] calls it directly, since its input and output
+/// types can differ in size, such as `i8` A/B against `i32` C
 fn overlaps_bytes(
     pa: *const u8,
     na: usize,
@@ -506,6 +534,7 @@ fn overlaps_bytes(
 /// Like [`gemm_unchecked`] but reuses a caller-owned [`Workspace`]
 ///
 /// # Safety
+///
 /// See [`gemm_unchecked`]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn gemm_unchecked_with<T: GemmScalar>(

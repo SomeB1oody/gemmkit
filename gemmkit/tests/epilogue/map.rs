@@ -1,16 +1,13 @@
 //! User-defined per-element map-epilogue tests (`gemm_map`): the headline `map == gemm-then-map`
 //! oracle across every route (general driver, both gemv orientations, small-`m,n`, small-`k`),
-//! strided / row-major (orientation-swapped) C, degenerate cases, environment-capturing closures,
-//! serial == parallel, and the `_with` / `_unchecked` twin equivalences
+//! strided / row-major C, degenerate cases, environment-capturing closures, serial == parallel,
+//! and the `_with` / `_unchecked` twin equivalences
 //!
-//! Every comparison is **bitwise**. The oracle is "plain `gemm`, then the exact scalar map,
-//! applied by hand": the map epilogue sets `VECTOR = true`, so a full column-major tile takes the
-//! same `apply_reg` fast path plain `gemm`'s own store would, handing the closure the identical
-//! value plain `gemm` writes. A `VECTOR = false` epilogue would instead force every element
-//! through the scratch path regardless of tile shape, risking a different rounding of the
-//! `beta*C + alpha*A*B` combine once `beta` sits outside `{0, 1}`; the `beta = 0.7` cases here are
-//! what would catch that. The closure is asymmetric and position-dependent (`f(v, r, c) != f(v, c,
-//! r)`), so a wrong orientation-coordinate flip (row-major C) diverges loudly
+//! Every comparison is bitwise. The map epilogue sets `VECTOR = true`, so a full column-major
+//! tile hands the closure the identical value plain `gemm`'s own store would produce; the
+//! `beta = 0.7` cases catch a rounding difference `VECTOR = false` would risk. The shared closure
+//! is asymmetric (`f(v, r, c) != f(v, c, r)`), so a wrong orientation-coordinate flip diverges
+//! loudly
 
 use crate::common::*;
 use gemmkit::{MatMut, MatRef, Parallelism, Workspace, gemm, gemm_map, gemm_map_unchecked};
@@ -103,7 +100,8 @@ fn driver_matrix<T: Flt + gemmkit::MapScalar>(par: Parallelism) {
         (17usize, 20usize, 19usize),
         (33, 40, 24),
         (48, 96, 129),
-        (40, 4096, 40), // multi-panel K: fires only on the last panel, a per-panel map would diverge
+        // multi-panel K: fires only on the last panel, a per-panel map would diverge
+        (40, 4096, 40),
     ];
     // Under GEMMKIT_FAST_TEST, run the full lattice only on shape index 0 (the smallest) and
     // reduce the other 3 shapes to 1 non-trivial combo each. The k = 4096 fire-once shape still
@@ -477,6 +475,7 @@ fn map_unchecked_matches_checked() {
 mod validation {
     use super::*;
 
+    // A.cols != B.rows must panic
     #[test]
     #[should_panic(expected = "A.cols")]
     fn dim_mismatch() {
@@ -495,6 +494,7 @@ mod validation {
         );
     }
 
+    // C sharing storage with A must panic before any compute
     #[test]
     #[should_panic(expected = "C aliases A or B")]
     fn c_aliases_a() {
@@ -515,6 +515,7 @@ mod validation {
         );
     }
 
+    // rsc == 0 maps every row onto the same cell; C aliasing itself must panic
     #[test]
     #[should_panic(expected = "aliases itself")]
     fn c_self_aliases() {

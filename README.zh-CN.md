@@ -4,22 +4,31 @@
 
 [![CI](https://github.com/SomeB1oody/gemmkit/actions/workflows/ci.yml/badge.svg)](https://github.com/SomeB1oody/gemmkit/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/gemmkit.svg)](https://crates.io/crates/gemmkit) [![docs.rs](https://img.shields.io/docsrs/gemmkit)](https://docs.rs/gemmkit)
 
-一个纯 Rust 实现的通用矩阵乘法（GEMM）工作空间：在带步长（stride）的视图（或裸指针）上计算
-`C <- alpha*A*B + beta*C`，并在运行时选择当前可用的最优指令集。
+gemmkit 是一个纯 Rust 实现的通用矩阵乘法（GEMM）工作空间。它在带步长（stride）的视图
+或裸指针上计算 `C <- alpha*A*B + beta*C`。它会在运行时选择当前可用的最优指令集。
 
-核心引擎开箱即用地支持 `f32` 和 `f64`；在 Cargo feature 之后，还支持
-`f16`/`bf16`（以 `f32` 累加的混合精度）、`i8 -> i32` 整数以及 `c32`/`c64` 复数数据。
-运行时 ISA 分发覆盖 x86-64 FMA 与 AVX-512F（`int8` 走 AVX-512 VNNI，`bf16` 走
-AVX-512 BF16）、aarch64 NEON 和 wasm32 `simd128`，并以可移植的标量回退路径兜底；
-`GEMMKIT_REQUIRE_ISA` 环境变量可以锁定或禁用某个后端。多线程是可选的（基于
-rayon），且在输入与配置固定时结果可复现。关闭默认 feature 后，核心可在 `no_std`
-下构建（仅依赖 `core` + `alloc`）。除了普通的 GEMM，它还提供融合尾部运算（fused
-epilogue，包括偏置、激活、`i8`/`u8` 重量化以及用户自定义的逐元素映射）、面向定权重
-内层循环的预打包操作数复用、批量 GEMM，以及针对矩阵-向量乘和小尺寸问题的自动带宽受限路径。
+核心引擎默认支持 `f32` 和 `f64`。在 Cargo feature 之后，它还支持 `f16`/`bf16`
+（以 `f32` 累加的混合精度）、`i8 -> i32` 整数，以及 `c32`/`c64` 复数数据。运行时
+ISA 分发覆盖 x86-64 FMA 与 AVX-512F（`int8` 走 AVX-512 VNNI，`bf16` 走 AVX-512
+BF16）、aarch64 NEON 以及 wasm32 `simd128`。可移植的标量回退路径为其中每一种都
+兜底，用于覆盖没有向量支持的目标平台。`GEMMKIT_REQUIRE_ISA` 环境变量可以锁定或
+禁用某个后端。
+
+多线程是可选的，基于 rayon 实现。在同一台机器上，只要输入与配置固定，结果就是
+可复现的。关闭默认 feature 后，核心可以在 `no_std` 下构建，此时只需要 `core`
+和 `alloc`。
+
+除了普通的矩阵乘法，gemmkit 还提供：
+
+- 融合尾部运算（fused epilogue）：偏置、激活、`i8`/`u8` 重量化，以及用户自定义
+  的逐元素映射
+- 面向定权重内层循环的预打包操作数复用
+- 批量 GEMM
+- 针对矩阵-向量乘和小尺寸问题的自动带宽受限路径
 
 ## Crates
 
-本工作空间包含五个 crate，共享 0.1.0 版本号并同步发布。
+本工作空间包含 5 个 crate，共享 0.1.1 版本号，并同步发布。
 
 | Crate | 说明 |
 | --- | --- |
@@ -29,9 +38,9 @@ epilogue，包括偏置、激活、`i8`/`u8` 重量化以及用户自定义的�
 | [gemmkit-faer](https://crates.io/crates/gemmkit-faer) | 面向 `faer` 矩阵视图的零拷贝适配器 |
 | [gemmkit-tune](https://crates.io/crates/gemmkit-tune) | 安装期自动调优器程序：在目标机器上扫描运行时旋钮，并输出一份 `GEMMKIT_*` 环境变量配置 |
 
-这些适配器分别封装 `ndarray >= 0.17.1`、`nalgebra 0.35` 和 `faer 0.24`，并把
-`parallel` / `wasm_threads` / `half` / `complex` / `int8` / `epilogue` 各个 feature
-转发到 `gemmkit` 中的同名 feature。
+这些适配器分别封装 `ndarray >= 0.17.1`、`nalgebra 0.35` 和 `faer 0.24`。每个
+适配器都会把自己的 `parallel`、`wasm_threads`、`half`、`complex`、`int8` 和
+`epilogue` feature 转发到 `gemmkit` 中的同名 feature。
 
 ## 快速上手
 
@@ -60,8 +69,8 @@ fn main() {
 }
 ```
 
-转置通过步长来表达（`from_col_major`，或在 `MatRef::new` 中显式给出 `rs`/`cs`），
-因此转置操作数无需任何拷贝。
+步长（stride）用来表达转置。使用 `from_col_major`，或者在 `MatRef::new` 中显式
+给出 `rs`/`cs`。转置后的操作数无需任何拷贝。
 
 ## 元素类型与后端
 
@@ -82,10 +91,14 @@ fn main() {
 - aarch64 NEON
 - wasm32 `simd128`（编译期特性检测）
 
-`gemmkit` 的 Cargo feature 包括 `std` 和 `parallel`（两者均默认开启）、`wasm_threads`
-（用于 `wasm32-wasip1-threads`）、`complex`、`half`、`int8`，以及 `epilogue`（融合的
-偏置/激活、`i8`/`u8` 重量化和用户自定义逐元素映射）。关闭 `std` 后 crate 即为
-`no_std`；`parallel` 隐含开启 `std`。
+`gemmkit` 的 Cargo feature 包括：
+
+- `std` 和 `parallel`，两者均默认开启
+- `wasm_threads`，用于 `wasm32-wasip1-threads` 目标
+- `complex`、`half` 和 `int8`
+- `epilogue`：融合的偏置与激活、`i8`/`u8` 重量化，以及用户自定义的逐元素映射
+
+关闭 `std` 后，crate 即为 `no_std`。`parallel` 隐含开启 `std`。
 
 ## 文档
 

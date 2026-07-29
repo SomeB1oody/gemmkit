@@ -4,11 +4,11 @@ use crate::common::{filled_mat, ref_parts};
 #[cfg(feature = "epilogue")]
 use gemmkit::adapter::lower_bias;
 
-/// Complex `C <- alpha*op(A)*op(B) + beta*C`, with `op(A) = conj(A)` when `conj_a` (resp.
-/// `conj(B)` when `conj_b`); `conj_a = conj_b = false` is the plain product `A*B`. `T` is
-/// `Complex<f32>`/`Complex<f64>` (faer's `c32`/`c64`); needs the `complex` feature. Like [`gemm`],
-/// it reads the pointer/strides directly, so transposed, reversed, and general-stride views work
-/// without copying
+/// Complex `C <- alpha*op(A)*op(B) + beta*C`. `op(A)` is `conj(A)` when `conj_a` is true, and
+/// `op(B)` is `conj(B)` when `conj_b` is true. `conj_a = conj_b = false` gives the plain product
+/// `A*B`. `T` is `Complex<f32>` or `Complex<f64>` (faer's `c32`/`c64`), and this function needs
+/// the `complex` feature. Like [`gemm`], it reads the pointer and strides directly, so a
+/// transposed, reversed, or general-stride view works without copying
 ///
 /// # Panics
 /// If the inner dimensions disagree
@@ -27,7 +27,7 @@ pub fn gemm_cplx<T: ComplexScalar>(
     gemm_cplx_common(None, alpha, a, conj_a, b, conj_b, beta, c, par);
 }
 
-/// [`gemm_cplx`], threading a caller-owned [`Workspace`] through instead of the thread-local pool
+/// Like [`gemm_cplx`] but reuses a caller-owned [`Workspace`] instead of the thread-local pool
 ///
 /// # Panics
 /// If the inner dimensions disagree
@@ -69,9 +69,10 @@ fn gemm_cplx_common<T: ComplexScalar>(
     let (rsc, csc) = (c.row_stride(), c.col_stride());
     let cp = c.as_ptr_mut();
 
-    // SAFETY: dims validated above; faer guarantees the pointer + element-unit `isize` strides
-    // describe a valid in-bounds layout (negative for a reversed view, which gemmkit handles), and
-    // `c` (a `MatMut` exclusive borrow) can't alias `a`/`b`
+    // SAFETY: the dims are validated above. faer guarantees that the pointer and the
+    // element-unit `isize` strides describe a valid in-bounds layout. A negative stride marks
+    // a reversed view, which gemmkit handles. `c` is a `MatMut` exclusive borrow, so it cannot
+    // alias `a` or `b`
     unsafe {
         match ws {
             Some(ws) => gemm_cplx_unchecked_with(
@@ -85,8 +86,8 @@ fn gemm_cplx_common<T: ComplexScalar>(
     }
 }
 
-/// Non-conjugated complex `A*B` into a fresh column-major [`Mat`] (the complex analogue of
-/// [`dot`]). For a conjugated product use [`gemm_cplx`] directly. Needs the `complex` feature
+/// Non-conjugated complex `A*B` into a fresh column-major [`Mat`]: the complex analogue of
+/// [`dot`]. For a conjugated product use [`gemm_cplx`] directly. Needs the `complex` feature
 #[cfg(feature = "complex")]
 pub fn dot_cplx<T: ComplexScalar>(a: MatRef<'_, T>, b: MatRef<'_, T>) -> Mat<T> {
     let m = a.nrows();
@@ -106,19 +107,20 @@ pub fn dot_cplx<T: ComplexScalar>(a: MatRef<'_, T>, b: MatRef<'_, T>) -> Mat<T> 
     c
 }
 
-/// Complex `C <- alpha*op(A)*op(B) + beta*C + bias` in 1 fused pass, with `op(A) = conj(A)` when
-/// `conj_a` (resp. `conj(B)` when `conj_b`); the faer adapter over gemmkit's
-/// [`gemmkit::gemm_cplx_fused`]. The optional [`Bias`] is [`Bias::PerRow`] (length `A.rows`) or
-/// [`Bias::PerCol`] (length `B.cols`), added verbatim to every element of that row/column, never
-/// conjugated; `bias == None` behaves exactly like [`gemm_cplx`]. There is **no** activation
-/// parameter: an ordering activation such as ReLU is undefined on complex numbers, which have no
-/// total order. Like [`gemm_cplx`], it reads the pointer/strides directly and forwards to gemmkit's
-/// raw engine, so transposed, sub-matrix, and reversed (negative-stride) views all work without
-/// copying
+/// Complex `C <- alpha*op(A)*op(B) + beta*C + bias` in 1 fused pass. `op(A)` is `conj(A)` when
+/// `conj_a` is true, and `op(B)` is `conj(B)` when `conj_b` is true. This is the faer adapter
+/// over gemmkit's [`gemmkit::gemm_cplx_fused`]. The optional [`Bias`] is [`Bias::PerRow`]
+/// (length `A.rows`) or [`Bias::PerCol`] (length `B.cols`), added verbatim to every element of
+/// that row or column and never conjugated. `bias == None` behaves exactly like [`gemm_cplx`]
+///
+/// There is no activation parameter, because an ordering activation such as ReLU is undefined
+/// on complex numbers, which have no total order. Like [`gemm_cplx`], this function reads the
+/// pointer and strides directly and forwards to gemmkit's raw engine. A transposed, sub-matrix,
+/// or reversed (negative-stride) view works without copying
 ///
 /// # Panics
-/// If the inner dimensions disagree, or on a bias the adapter rejects (a `PerRow`/`PerCol` bias of
-/// the wrong length, or a bias slice overlapping `C`)
+/// If the inner dimensions disagree, or on a bias the adapter rejects: a wrong-length
+/// `PerRow`/`PerCol` bias, or a bias slice that overlaps `C`
 #[cfg(all(feature = "complex", feature = "epilogue"))]
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_cplx_fused<T: ComplexScalar>(
@@ -135,7 +137,7 @@ pub fn gemm_cplx_fused<T: ComplexScalar>(
     gemm_cplx_fused_common(None, alpha, a, conj_a, b, conj_b, beta, c, bias, par);
 }
 
-/// [`gemm_cplx_fused`], threading a caller-owned [`Workspace`] through instead of the thread-local
+/// Like [`gemm_cplx_fused`] but reuses a caller-owned [`Workspace`] instead of the thread-local
 /// pool
 ///
 /// # Panics
@@ -179,14 +181,15 @@ fn gemm_cplx_fused_common<T: ComplexScalar>(
     assert_eq!(n, cn, "gemmkit-faer: B.cols ({n}) != C.cols ({cn})");
     let (rsc, csc) = (c.row_stride(), c.col_stride());
     let cp = c.as_ptr_mut();
-    // Bias validation, matching gemmkit's checked entry (same panic wording): the bias length
-    // matches its axis and doesn't overlap C. No activation, so there is no slope check
+    // Validates the bias the same way gemmkit's checked entry does, with the same panic
+    // wording. Its length matches its axis, and it does not overlap C. There is no activation,
+    // so no slope check runs here
     let (bias_ptr, bias_dim, has_bias) = lower_bias(bias, m, n, cp, &[(cm, rsc), (cn, csc)]);
 
-    // SAFETY: dims validated above; faer guarantees the pointer + element-unit `isize` strides
-    // describe a valid in-bounds layout (negative for a reversed view, which the raw engine
-    // handles), `c` (a `MatMut` exclusive borrow) can't alias `a`/`b`, and the bias was validated
-    // disjoint from C above
+    // SAFETY: the dims are validated above. faer guarantees that the pointer and the
+    // element-unit `isize` strides describe a valid in-bounds layout. A negative stride marks
+    // a reversed view, which the raw engine handles. `c` is a `MatMut` exclusive borrow, so it
+    // cannot alias `a` or `b`, and the bias was validated disjoint from `C` above
     unsafe {
         match ws {
             Some(ws) => gemm_cplx_fused_unchecked_with(

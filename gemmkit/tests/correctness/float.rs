@@ -54,7 +54,7 @@ fn correctness_f32_layouts() {
 }
 
 /// f64 twin of [`correctness_f32_layouts`], with A/B layouts swapped (col-major A,
-/// row-major B) so the 2 float types don't share identical operand orientations
+/// row-major B) so the 2 float types do not share identical operand orientations
 #[test]
 fn correctness_f64_layouts() {
     for (m, k, n) in dims() {
@@ -243,7 +243,7 @@ fn workspace_reuse_matches_allocating() {
 }
 
 /// Serial and parallel runs land on identical bits, for every thread count, on
-/// col-major operands. Float add isn't associative, so this holds only because
+/// col-major operands. Float add is not associative, so this holds only because
 /// `blocking()` derives `mc`/`kc`/`nc` from shape and cache topology alone, never the
 /// thread count, so every run reduces in the same fixed order; the actual contract
 /// (see `driver.rs` and the `accumulate_tile` seam) is reproducibility under a fixed
@@ -346,7 +346,7 @@ fn parallel_equals_serial_row_major_a() {
 /// `set_shared_lhs_mnk(1)` opens the shared-A-pack gate for any nonzero `m*n*k`, so
 /// the shared pre-pack path (1 pack per row-block, read by every worker) runs for
 /// every thread count here and must still land on the same bits as serial. All 3
-/// shapes stay well under the real default gate (50M on aarch64, 8B elsewhere), so
+/// shapes stay well under the real default gate (6M on aarch64, 8B elsewhere), so
 /// this is otherwise the only coverage this path gets; since bit-identity is expected
 /// whether the gate is open or closed, forcing it open cannot disturb concurrently
 /// running tests. Row-major A (`rsa != 1`) is what makes A pack in the first place

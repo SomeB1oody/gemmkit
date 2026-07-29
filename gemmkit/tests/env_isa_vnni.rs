@@ -3,7 +3,8 @@
 //! on this host. A forced pin also disables the small-parallel widen fallback that auto-selected
 //! VNNI can take (its mandatory RHS-pack barrier is skipped only when the choice is dynamic), so
 //! this exercises the VNNI kernel exactly, for every shape that reaches `select_i8` (the small_mn
-//! gate below is a separate, earlier reroute)
+//! gate below is a separate, earlier reroute). A separate test binary from the other
+//! `env_isa_*` pins, since a memoized ISA choice needs its own process to force
 //!
 //! Both tests want the same `avx512vnni` pin, so both go through [`env_isa_common::pin`] (a
 //! single `set_var` under a `Once`, before any dispatch; the shared write also overrides an
@@ -70,10 +71,9 @@ fn ref_i8(
     out
 }
 
-// The small_mn eligibility gate lives in run_typed_int, ahead of and independent of select_i8,
-// so a forced ISA still lets a tiny-m,n / long-k shape reroute to the horizontal small_mn kernel
-// instead of the pinned VNNI driver. Checks that route (eligible A/B layout) against both the
-// pinned driver (ineligible layout, same math) and the exact i32 reference
+// The small_mn eligibility gate lives in run_typed_int, ahead of select_i8, so a tiny-m,n /
+// long-k shape still reroutes to the small_mn kernel despite the VNNI pin. Checks that route
+// against both the pinned VNNI driver (ineligible layout) and the exact i32 reference
 
 #[test]
 fn avx512vnni_pin_i8_small_mn_matches_driver() {

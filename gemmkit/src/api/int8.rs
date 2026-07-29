@@ -1,5 +1,5 @@
 //! Integer (`i8` -> `i32`) and requantizing (`i8` -> `i8`/`u8`) GEMM entries: the
-//! heterogeneous-output counterpart of the plain `gemm` surface, needed because
+//! heterogeneous-output counterpart of the plain `gemm` surface. These entries exist because
 //! `i8 -> i32` and `i8 -> i8`/`u8` cannot be expressed through a single `T` type param
 use super::*;
 #[cfg(feature = "epilogue")]
@@ -13,10 +13,11 @@ use crate::kernel::epilogue::BiasDim;
 /// `i32`), which the homogeneous `gemm<T>` surface cannot express
 ///
 /// # Panics
-/// Same shape / bounds / aliasing conditions as [`gemm`]: `A.cols == B.rows`,
-/// `A.rows == C.rows`, `B.cols == C.cols`, every view in bounds, and `C` addresses each
-/// element uniquely without overlapping `A`/`B`. For negative strides or raw pointers use
-/// [`gemm_i8_unchecked`] ([`gemm_unchecked`] is homogeneous and cannot serve `i8 -> i32`)
+/// Same shape, bounds, and aliasing conditions as [`gemm`] apply: `A.cols == B.rows`,
+/// `A.rows == C.rows`, `B.cols == C.cols`. Every view must stay in bounds, and `C` must
+/// address each element uniquely without overlapping `A` or `B`. For negative strides or raw
+/// pointers use [`gemm_i8_unchecked`] ([`gemm_unchecked`] is homogeneous and cannot serve
+/// `i8 -> i32`)
 #[cfg(feature = "int8")]
 pub fn gemm_i8(
     alpha: i32,
@@ -72,13 +73,13 @@ pub fn gemm_i8_with(
 }
 
 /// `C(i32) <- alpha*A(i8)*B(i8) + beta*C` over raw pointers and `isize` element strides,
-/// with no bounds, alias, or shape checks: the `i8 -> i32` escape hatch for negative
-/// strides or raw-pointer callers, since [`gemm_unchecked`] is typed for the homogeneous
-/// surface and cannot express a differing output type. Uses the thread-local workspace pool
+/// with no bounds, alias, or shape checks. This is the `i8 -> i32` escape hatch for negative
+/// strides or raw-pointer callers. [`gemm_unchecked`] is typed for the homogeneous surface
+/// and cannot express a differing output type. Uses the thread-local workspace pool
 ///
 /// # Safety
 /// `a`/`b` valid for reads and `c` valid for read+write over every `(i,j)` implied by the
-/// dimensions and strides; `c` does not alias `a`/`b`; when `beta == 0`, `c` need not be
+/// dimensions and strides. `c` does not alias `a`/`b`. When `beta == 0`, `c` need not be
 /// initialized
 #[cfg(feature = "int8")]
 #[allow(clippy::too_many_arguments)]
@@ -192,13 +193,13 @@ pub enum RequantScale<'a> {
 /// The quantization parameters for the requantizing entries: [`RequantScale`], an integer
 /// `zero_point`, and an optional per-row `i32` bias (length `m`, the standard qlinear layer
 /// bias). The output is `C[i,j] = clamp(zero_point + round_ne(scale*(sum_k A*B + bias[i])),
-/// LO, HI)` with round-half-to-even, where `scale` is the per-tensor value or the per-row
-/// `scale_i`, and `[LO, HI]` is set by the entry: `[-128, 127]` for [`gemm_i8_requant`],
-/// `[0, 255]` for [`gemm_i8_requant_u8`]
+/// LO, HI)` with round-half-to-even. `scale` is the per-tensor value or the per-row `scale_i`.
+/// `[LO, HI]` is set by the entry: `[-128, 127]` for [`gemm_i8_requant`], `[0, 255]` for
+/// [`gemm_i8_requant_u8`]
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 #[derive(Copy, Clone, Debug)]
 pub struct Requantize<'a> {
-    /// Output scale, per-tensor or per-row/channel; every value must be finite and `> 0`
+    /// Output scale, per-tensor or per-row/channel. Every value must be finite and `> 0`
     pub scale: RequantScale<'a>,
     /// Output zero-point, added after rounding. Must lie in the output domain of the chosen
     /// entry: `[-128, 127]` for [`gemm_i8_requant`], `[0, 255]` for [`gemm_i8_requant_u8`]
@@ -207,17 +208,24 @@ pub struct Requantize<'a> {
     pub bias: Option<&'a [i32]>,
 }
 
-/// Requantizing integer GEMM: `i8` inputs multiplied into an `i32` accumulator, then
-/// requantized to an `i8` output in 1 pass, skipping the full `m x n` `i32` materialization
-/// a separate [`gemm_i8`] followed by a requantize pass would need. No `alpha` (it folds into
-/// `scale`) and no `beta` (accumulating into an already-quantized `C` is not well-defined).
-/// Uses the thread-local workspace pool
+/// Requantizing integer GEMM: `i8` inputs multiply into an `i32` accumulator, then requantize
+/// to an `i8` output in 1 pass. This skips the full `m x n` `i32` materialization that a
+/// separate [`gemm_i8`] call followed by a requantize pass would need. No `alpha` (it folds
+/// into `scale`) and no `beta` (accumulating into an already-quantized `C` is not
+/// well-defined). Uses the thread-local workspace pool
+///
+/// # Determinism
+/// The `i32` accumulation is exact and ISA-independent. The requantize step is bit-exact
+/// across every ISA (scalar, FMA, AVX-512F, VNNI, NEON, simd128) and across the vector and
+/// scalar store paths
 ///
 /// # Panics
-/// Same shape / bounds / aliasing conditions as [`gemm_i8`], plus: a non-finite or
-/// non-positive `scale` (per-tensor or any per-row element); a per-row scale slice whose length
-/// is not `A.rows` or which overlaps `C`; a `zero_point` outside `[-128, 127]`; or a bias whose
-/// length is not `A.rows` or which overlaps `C`
+/// Same shape, bounds, and aliasing conditions as [`gemm_i8`], plus:
+///
+/// - A non-finite or non-positive `scale` (per-tensor or any per-row element)
+/// - A per-row scale slice whose length is not `A.rows`, or which overlaps `C`
+/// - A `zero_point` outside `[-128, 127]`
+/// - A bias whose length is not `A.rows`, or which overlaps `C`
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 pub fn gemm_i8_requant(
     a: MatRef<'_, i8>,
@@ -229,25 +237,31 @@ pub fn gemm_i8_requant(
     workspace::with_thread_pool(|ws| gemm_i8_requant_with(ws, a, b, req, c, par));
 }
 
-/// Bias validation shared by the `i8`- and `u8`-output requantizing entries: checks length
-/// against `a_rows` and checks the byte ranges of `bias` and `C` for overlap (`TO` is 1 byte
-/// either way), then lowers to the `(ptr, has_bias)` pair the dispatch task carries. Both checks
-/// delegate to [`crate::adapter::requant_bias`], the single pointer-level implementation the view
-/// adapters also consume, over `C`'s backing slice as a unit-stride footprint (the same byte range
-/// the slice-based check compared). `scale` and `zero_point` are checked separately in each entry
-/// since the zero-point band differs between `i8` and `u8`
+/// Bias validation shared by the `i8`- and `u8`-output requantizing entries. It checks length
+/// against `a_rows` and checks the byte ranges of `bias` and `C` for overlap, since `TO` is 1
+/// byte either way. It then lowers the result to the `(ptr, has_bias)` pair the dispatch task
+/// carries
+///
+/// Both checks delegate to [`crate::adapter::requant_bias`], the single pointer-level
+/// implementation the view adapters also consume. They pass `C`'s backing slice as a
+/// unit-stride footprint, the same byte range the slice-based check compared. Each entry
+/// checks `scale` and `zero_point` separately, since the zero-point band differs between `i8`
+/// and `u8`
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 fn requant_bias<TO>(a_rows: usize, c: &MatMut<'_, TO>, bias: Option<&[i32]>) -> (*const i32, bool) {
     crate::adapter::requant_bias(a_rows, c.data.as_ptr(), &[(c.data.len(), 1)], bias)
 }
 
-/// Scale validation shared by the `i8`- and `u8`-output requantizing entries: a
-/// [`RequantScale::PerTensor`] must be finite and `> 0`; a [`RequantScale::PerRow`] must have
-/// length `a_rows`, must not overlap `C`'s byte range, and every element must be finite and
-/// `> 0`. Lowers to the `(scale, row_scales_ptr, has_row_scales)` triple the dispatch task
-/// carries: `PerTensor(s) -> (s, null, false)`, `PerRow(p) -> (0.0, p, true)`. Delegates to
-/// [`crate::adapter::requant_scale`], the single pointer-level implementation the view adapters
-/// also consume, over `C`'s backing slice as a unit-stride footprint
+/// Scale validation shared by the `i8`- and `u8`-output requantizing entries:
+///
+/// - A [`RequantScale::PerTensor`] must be finite and `> 0`
+/// - A [`RequantScale::PerRow`] must have length `a_rows`, must not overlap `C`'s byte range,
+///   and every element must be finite and `> 0`
+///
+/// Lowers to the `(scale, row_scales_ptr, has_row_scales)` triple the dispatch task carries:
+/// `PerTensor(s) -> (s, null, false)`, `PerRow(p) -> (0.0, p, true)`. Delegates to
+/// [`crate::adapter::requant_scale`], the single pointer-level implementation the view
+/// adapters also consume, over `C`'s backing slice as a unit-stride footprint
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 fn requant_scale<TO>(
     a_rows: usize,
@@ -283,7 +297,7 @@ pub fn gemm_i8_requant_with(
     let (bias_ptr, has_bias) = requant_bias(a.rows, &c, req.bias);
 
     // SAFETY: validated above, shapes agree, strides in bounds, C addresses each (i,j)
-    // uniquely and does not alias A/B or the bias/scales; scale/zp are in range. The bias
+    // uniquely and does not alias A/B or the bias/scales. Scale/zp are in range. The bias
     // and row-scale slices (borrowed for this call) outlive the `execute_int_requant` frame
     unsafe {
         dispatch::execute_int_requant(
@@ -321,11 +335,13 @@ pub fn gemm_i8_requant_with(
 /// Uses the thread-local workspace pool
 ///
 /// # Safety
-/// `a`/`b` valid for reads and `c` valid for writes over the shape/strides; `c` does not alias
-/// `a`/`b`; when `has_bias`, `bias` is valid for `m` reads and disjoint from `c`; when
-/// `has_row_scales`, `row_scales` is valid for `m` reads and disjoint from `c` (otherwise
-/// `row_scales` may be null or dangling); every applied scale is finite and `> 0`, and
-/// `zero_point` is in `[-128, 127]` (the checked API enforces the last 2)
+/// - `a`/`b` are valid for reads and `c` is valid for writes over the shape and strides
+/// - `c` does not alias `a`/`b`
+/// - When `has_bias`, `bias` is valid for `m` reads and disjoint from `c`
+/// - When `has_row_scales`, `row_scales` is valid for `m` reads and disjoint from `c`.
+///   Otherwise `row_scales` may be null or dangling
+/// - Every applied scale is finite and `> 0`, and `zero_point` is in `[-128, 127]`. The
+///   checked API enforces the last 2
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn gemm_i8_requant_unchecked(
@@ -440,25 +456,25 @@ pub unsafe fn gemm_i8_requant_unchecked_with(
     }
 }
 
-/// Requantizing integer GEMM with an unsigned `u8` output (the ONNX QLinearMatMul
-/// activation convention): `i8` inputs multiplied into an `i32` accumulator, then requantized
-/// in 1 pass to `C[i,j] = clamp(zero_point + round_ne(scale*(sum_k A*B + bias[i])), 0, 255)`
-/// with round-half-to-even, where `scale` is the per-tensor value or the per-row `scale_i`.
-/// The `u8`-output twin of [`gemm_i8_requant`], differing only in the output domain (`[0, 255]`
-/// instead of `[-128, 127]`) and the accepted `zero_point` range. No `alpha` (folds into
+/// Requantizing integer GEMM with an unsigned `u8` output, the ONNX QLinearMatMul activation
+/// convention. `i8` inputs multiply into an `i32` accumulator, then requantize in 1 pass to
+/// `C[i,j] = clamp(zero_point + round_ne(scale*(sum_k A*B + bias[i])), 0, 255)` with
+/// round-half-to-even. `scale` is the per-tensor value or the per-row `scale_i`. This is the
+/// `u8`-output twin of [`gemm_i8_requant`], differing only in the output domain (`[0, 255]`
+/// instead of `[-128, 127]`) and the accepted `zero_point` range. No `alpha` (it folds into
 /// `scale`) and no `beta` (accumulating into an already-quantized `C` is not well-defined).
 /// Uses the thread-local workspace pool
 ///
 /// # Determinism
-/// Same contract as [`gemm_i8_requant`]: the `i32` accumulation is exact and ISA-independent,
-/// and the requantize step is bit-exact across every ISA (scalar, FMA, AVX-512F, VNNI) and
-/// across the vector and scalar store paths
+/// Same contract as [`gemm_i8_requant`]
 ///
 /// # Panics
-/// Same shape / bounds / aliasing conditions as [`gemm_i8`], plus: a non-finite or non-positive
-/// `scale` (per-tensor or any per-row element); a per-row scale slice whose length is not `A.rows`
-/// or which overlaps `C`; a `zero_point` outside `[0, 255]`; or a bias whose length is not
-/// `A.rows` or which overlaps `C`
+/// Same shape, bounds, and aliasing conditions as [`gemm_i8`], plus:
+///
+/// - A non-finite or non-positive `scale` (per-tensor or any per-row element)
+/// - A per-row scale slice whose length is not `A.rows`, or which overlaps `C`
+/// - A `zero_point` outside `[0, 255]`
+/// - A bias whose length is not `A.rows`, or which overlaps `C`
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 pub fn gemm_i8_requant_u8(
     a: MatRef<'_, i8>,
@@ -496,7 +512,7 @@ pub fn gemm_i8_requant_u8_with(
     let (bias_ptr, has_bias) = requant_bias(a.rows, &c, req.bias);
 
     // SAFETY: validated above, shapes agree, strides in bounds, C addresses each (i,j)
-    // uniquely and does not alias A/B or the bias/scales; scale/zp are in range. The bias
+    // uniquely and does not alias A/B or the bias/scales. Scale/zp are in range. The bias
     // and row-scale slices (borrowed for this call) outlive the `execute_int_requant` frame
     unsafe {
         dispatch::execute_int_requant(
@@ -534,11 +550,13 @@ pub fn gemm_i8_requant_u8_with(
 /// supplies 1 `f32` per output row (length `m`) instead. Uses the thread-local workspace pool
 ///
 /// # Safety
-/// `a`/`b` valid for reads and `c` valid for writes over the shape/strides; `c` does not alias
-/// `a`/`b`; when `has_bias`, `bias` is valid for `m` reads and disjoint from `c`; when
-/// `has_row_scales`, `row_scales` is valid for `m` reads and disjoint from `c` (otherwise
-/// `row_scales` may be null or dangling); every applied scale is finite and `> 0`, and
-/// `zero_point` is in `[0, 255]` (the checked API enforces the last 2)
+/// - `a`/`b` are valid for reads and `c` is valid for writes over the shape and strides
+/// - `c` does not alias `a`/`b`
+/// - When `has_bias`, `bias` is valid for `m` reads and disjoint from `c`
+/// - When `has_row_scales`, `row_scales` is valid for `m` reads and disjoint from `c`.
+///   Otherwise `row_scales` may be null or dangling
+/// - Every applied scale is finite and `> 0`, and `zero_point` is in `[0, 255]`. The checked
+///   API enforces the last 2
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn gemm_i8_requant_u8_unchecked(

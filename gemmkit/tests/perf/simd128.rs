@@ -72,6 +72,7 @@ fn bench_simd128_vs_scalar(s: usize) {
     );
 }
 
+/// wasm `simd128` vs the scalar token GFLOP/s at increasing square sizes, single-threaded
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]

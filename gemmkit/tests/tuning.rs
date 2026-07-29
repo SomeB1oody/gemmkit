@@ -1,8 +1,6 @@
 //! Correctness of every route a `tuning::set_*` knob can steer a GEMM onto. Isolated in its
-//! own test binary because the knobs are process-global `AtomicUsize`s; since the harness
-//! runs the tests in this binary concurrently, every test that sets a knob holds
-//! [`KNOB_LOCK`] (via [`knob_guard`]) for its whole body and restores whatever it changed
-//! before returning, so no mutation is ever observed by another test
+//! own test binary because the knobs are process-global; see [`KNOB_LOCK`] for how the tests
+//! in this binary stay serialized
 
 use gemmkit::{
     MatMut, MatRef, Parallelism, gemm, gemm_batched, gemm_packed_b, prepack_rhs, tuning,
@@ -579,13 +577,13 @@ fn small_mn_serial_parallel_bit_identical() {
     tuning::set_gemv_parallel_bytes(pfloor);
 }
 
-/// The horizontal route's PACK tier (a small-`m,n` shape whose operand is strided along `k`) must be
-/// **bit-identical** to the zero-copy eligible layout for the same values: the pre-pack is a pure
-/// reorder, so each cell's dot reads the same numbers in the same order and lands on the same bits.
-/// This macro builds one such test for a real float (`f32`/`f64`), sweeping pack-A (col-major A) /
-/// pack-B (row-major B) / pack-both, tail shapes (`m,n,k` not multiples of the register tile), an
-/// alpha/beta sweep, and serial + parallel. All 4 layouts carry identical logical `A`/`B` values, so
-/// every result must equal the eligible one to the bit
+/// The horizontal route's PACK tier (a small-`m,n` shape whose operand is strided along `k`)
+/// must be **bit-identical** to the zero-copy eligible layout for the same values: the pre-pack
+/// is a pure reorder, so each cell's dot reads the same numbers in the same order and lands on
+/// the same bits. This macro builds 1 such test for a real float (`f32`/`f64`), sweeping
+/// pack-A (col-major A) / pack-B (row-major B) / pack-both, tail shapes (`m,n,k` not multiples
+/// of the register tile), an alpha/beta sweep, and serial + parallel. All 4 layouts carry
+/// identical logical `A`/`B` values, so every result must equal the eligible one to the bit
 macro_rules! small_mn_pack_bit_identical {
     ($name:ident, $t:ty) => {
         #[test]
@@ -595,10 +593,12 @@ macro_rules! small_mn_pack_bit_identical {
             let psk = tuning::small_k_threshold();
             let ppk = tuning::small_mn_pack_min_k();
             let pfl = tuning::gemv_parallel_bytes();
-            tuning::set_small_mn_dim(usize::MAX); // route every small-m,n shape to the horizontal path
+            // route every small-m,n shape to the horizontal path
+            tuning::set_small_mn_dim(usize::MAX);
             tuning::set_small_k_threshold(4); // k below 5 would take small_k; every k here is > 4
             tuning::set_small_mn_pack_min_k(0); // pack tier fires for every k > 0
-            tuning::set_gemv_parallel_bytes(1); // drop the bandwidth floor so parallel actually forks
+            // drop the bandwidth floor so parallel actually forks
+            tuning::set_gemv_parallel_bytes(1);
 
             for &(m, k, n) in &[
                 (4, 64, 4),
@@ -607,10 +607,13 @@ macro_rules! small_mn_pack_bit_identical {
                 (3, 17, 8),
                 (13, 100, 11),
             ] {
-                // Logical A (m x k) row-major and B (k x n) col-major (the eligible forms), plus the
-                // same values re-laid-out col-major A / row-major B (the ineligible forms)
-                let a_rm: Vec<$t> = (0..m * k).map(|x| (x % 23) as $t * 0.1 - 1.0).collect(); // A[i,t] = a_rm[i*k+t]
-                let b_cm: Vec<$t> = (0..k * n).map(|x| (x % 19) as $t * 0.2 - 1.5).collect(); // B[t,j] = b_cm[j*k+t]
+                // Logical A (m x k) row-major and B (k x n) col-major (the eligible forms),
+                // plus the same values re-laid-out col-major A / row-major B (the ineligible
+                // forms)
+                // A[i,t] = a_rm[i*k+t]
+                let a_rm: Vec<$t> = (0..m * k).map(|x| (x % 23) as $t * 0.1 - 1.0).collect();
+                // B[t,j] = b_cm[j*k+t]
+                let b_cm: Vec<$t> = (0..k * n).map(|x| (x % 19) as $t * 0.2 - 1.5).collect();
                 let mut a_cm = vec![0.0 as $t; m * k]; // col-major A: a_cm[t*m+i] = A[i,t]
                 for i in 0..m {
                     for t in 0..k {
@@ -668,8 +671,8 @@ macro_rules! small_mn_pack_bit_identical {
     };
 }
 
-/// Raw-bit view used by the pack-parity tests to compare results exactly (a byte compare, so a `NaN`
-/// or a `-0.0` still has to match)
+/// Raw-bit view used by the pack-parity tests to compare results exactly (a byte compare, so a
+/// `NaN` or a `-0.0` still has to match)
 trait SmnBits {
     type Bits: PartialEq + core::fmt::Debug;
     fn smn_bits(&self) -> Self::Bits;
@@ -1139,7 +1142,8 @@ fn pack_transpose_tile_stays_correct() {
 fn i8_vnni_min_par_mnk_route_correct() {
     let _g = knob_guard();
     let prev = tuning::i8_vnni_min_par_mnk();
-    let (m, k, n) = (128usize, 128usize, 128usize); // above the parallel gate, so Rayon truly splits
+    // above the parallel gate, so Rayon truly splits
+    let (m, k, n) = (128usize, 128usize, 128usize);
     let a: Vec<i8> = (0..m * k).map(|x| ((x % 17) as i8) - 8).collect();
     let b: Vec<i8> = (0..k * n).map(|x| ((x % 13) as i8) - 6).collect();
     let mut cref = vec![0i32; m * n];

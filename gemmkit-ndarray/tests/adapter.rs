@@ -1,8 +1,6 @@
-//! Correctness tests for the plain and packed ndarray adapter entries (`gemm`/`dot`,
-//! `gemm_packed_a`/`gemm_packed_b`) against ndarray's own `.dot()`, across C-order, F-order,
-//! transposed, and reversed-stride views, plus the feature-gated i8/f16/complex/requant entries
-//! against independent scalar references, and the fused/map entries against plain `gemm` followed
-//! by the same scalar step
+//! Correctness tests for the gemmkit-ndarray adapter: `dot`/`gemm` and the packed, i8, f16,
+//! complex, fused, and map entries against ndarray's own `.dot()` or an independent scalar
+//! reference, across C-order, F-order, transposed, and reversed-stride views
 
 use approx::assert_relative_eq;
 use ndarray::Array2;
@@ -10,6 +8,7 @@ use ndarray::Array2;
 use gemmkit::Parallelism;
 use gemmkit_ndarray::{dot, gemm, gemm_packed_a, gemm_packed_b, prepack_lhs, prepack_rhs};
 
+/// Xorshift64 fill for an `Array2<f64>`, values uniform in `[-0.5, 0.5)`
 fn rand2(r: usize, c: usize, seed: u64) -> Array2<f64> {
     let mut s = seed.wrapping_add(0x9E3779B97F4A7C15);
     Array2::from_shape_fn((r, c), |_| {
@@ -20,6 +19,7 @@ fn rand2(r: usize, c: usize, seed: u64) -> Array2<f64> {
     })
 }
 
+// dot() matches ndarray's own .dot() across a spread of m, k, n shapes
 #[test]
 fn dot_matches_ndarray() {
     for &(m, k, n) in &[
@@ -37,6 +37,7 @@ fn dot_matches_ndarray() {
     }
 }
 
+// dot() gives the same result whether operands are owned arrays or full-span views over them
 #[test]
 fn accepts_view_and_owned() {
     let a = rand2(8, 6, 3);
@@ -46,6 +47,7 @@ fn accepts_view_and_owned() {
     assert_relative_eq!(c1, c2, max_relative = 1e-12);
 }
 
+// dot() and gemm() read and write correctly through F-order (column-major) views
 #[test]
 fn transposed_and_fortran_layouts() {
     let m = 16;
@@ -68,6 +70,7 @@ fn transposed_and_fortran_layouts() {
     assert_relative_eq!(c, a.dot(&b), max_relative = 1e-10);
 }
 
+// dot() reads correctly through an A view with a negative (reversed) row stride
 #[test]
 fn reversed_view_negative_strides() {
     let a = rand2(10, 8, 9);
@@ -79,6 +82,7 @@ fn reversed_view_negative_strides() {
     assert_relative_eq!(got, exp, max_relative = 1e-10);
 }
 
+// gemm() combines alpha*A*B with beta*C rather than overwriting C
 #[test]
 fn accumulate_with_beta() {
     let a = rand2(12, 9, 11);

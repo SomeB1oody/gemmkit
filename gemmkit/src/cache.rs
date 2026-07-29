@@ -2,34 +2,34 @@
 //!
 //! 2 facts shape the design:
 //!
-//! 1. **`#[cfg]` only picks the *sniffing method*, never the *values*.** A VM or
+//! 1. A `#[cfg]` only picks the sniffing method, never the values. A VM or
 //!    container can mask CPUID or hide `/sys`, and `#[cfg(target_arch)]` cannot
-//!    tell an Intel apart from an AMD. So every backend is best-effort, and there
-//!    is always a runtime fallback chain that cannot fail
-//! 2. The blocking sizes `(MC, KC, NC)` are computed analytically from the cache
-//!    geometry (the BLIS model), so they adapt to the detected machine instead of
-//!    being hard-coded per micro-architecture
+//!    tell an Intel apart from an AMD. Every backend is therefore best-effort,
+//!    backed by a runtime fallback chain that cannot fail
+//! 2. The blocking sizes `(MC, KC, NC)` are computed analytically from the
+//!    cache geometry (the BLIS model). They adapt to the detected machine
+//!    instead of being hard-coded per microarchitecture
 //!
-//! The fallback chain tries, in order, the CPUID backend (x86), the sysfs backend
-//! (Linux), the sysctl backend (macOS), and finally the [`ZEN5_FALLBACK`] static
-//! default (Ryzen 9950X). The 1st backend that succeeds and passes a plausibility
-//! check wins. Detection runs at most once per process and the result is memoized
-//! in [`Machine`]
+//! The fallback chain tries, in order, the CPUID backend (x86), the sysfs
+//! backend (Linux), the sysctl backend (macOS), and finally the
+//! [`ZEN5_FALLBACK`] static default. The 1st backend that succeeds and passes
+//! a plausibility check wins. Detection runs at most once per process, and
+//! the result is memoized in [`Machine`]
 
-// x86/x86-64 CPUID cache backend; gated on `std` since only the `std`-gated
-// `detect()` function consumes it, which would otherwise leave it dead code
+// x86/x86-64 CPUID cache backend. Gated on `std` because only the `std`-gated
+// `detect()` function uses it, and it would otherwise be dead code
 #[cfg(all(
     feature = "std",
     any(target_arch = "x86", target_arch = "x86_64"),
     not(miri)
 ))]
 mod cpuid;
-// macOS sysctl cache backend; also gated `not(miri)`, which does not support
-// its `sysctlbyname` FFI call
+// macOS sysctl cache backend. Also gated `not(miri)` because Miri does not
+// support the `sysctlbyname` FFI call
 #[cfg(all(feature = "std", target_os = "macos", not(miri)))]
 mod sysctl;
-// Linux sysfs cache backend; also gated `not(miri)`, which isolates file reads
-// from the host by default and so cannot see the real `/sys` tree
+// Linux sysfs cache backend. Also gated `not(miri)` because Miri isolates file
+// reads from the host by default and cannot see the real `/sys` tree
 #[cfg(all(feature = "std", target_os = "linux", not(miri)))]
 mod sysfs;
 
@@ -41,25 +41,26 @@ use std::sync::OnceLock;
 pub struct Level {
     /// Size in bytes of the cache as reachable from one core, before dividing by
     /// `shared_by`. Every backend must report the per-core-reachable slice, not a
-    /// package aggregate: on a multi-die part (a 2-CCD Ryzen) this is the one
-    /// complex's L3 a core can actually hit, since the other die's slice costs a
-    /// fabric round-trip close to DRAM and no single core ever experiences the
-    /// marketing total as one cache
+    /// package aggregate. On a multi-die part, this is the local die's L3 that a
+    /// core can reach directly. A different die's slice costs a fabric round trip
+    /// close to DRAM
     pub bytes: usize,
     /// Associativity (ways)
     pub assoc: usize,
     /// Cache line size in bytes
     pub line: usize,
-    /// Number of concurrent GEMM workers that contend for the *per-worker* data the
-    /// driver keeps at this level, not the raw hardware core-sharing count. It divides
-    /// [`Level::effective_bytes`], which feeds the blocking model, so it must reflect
-    /// contention for the data the driver actually places here. The driver keeps the
-    /// *shared* B macro-panel in L3 and *per-worker* A/B micropanels in L1d, so **L1d
-    /// and L3 are always `1`**: the whole level is budgeted to that one panel, and
-    /// dividing L3 by the core count would crater `NC`. Only **L2**, which holds each
-    /// worker's private A macro-panel, uses the physical-core L2-sharing degree: `1`
-    /// for a private L2 (x86, Neoverse), the cluster size for a shared L2 (Apple). A
-    /// backend must therefore *derive* this value, never store a raw `shared_cpu_list`
+    /// Number of concurrent GEMM workers that contend for the per-worker data
+    /// the driver keeps at this level, not the raw hardware core-sharing count.
+    /// It divides [`Level::effective_bytes`], which feeds the blocking model,
+    /// so it must reflect contention for the data the driver places here
+    ///
+    /// The driver keeps the shared B macro-panel in L3 and the per-worker A/B
+    /// micropanels in L1d, so L1d and L3 are always `1`. The whole level is
+    /// budgeted to that one panel, and dividing L3 by the core count would
+    /// make `NC` wrong. Only L2, which holds each worker's private A
+    /// macro-panel, uses the physical-core L2-sharing degree. This is `1` for
+    /// a private L2, or the cluster size for a shared L2. A backend must
+    /// derive this value, never store a raw `shared_cpu_list`
     /// count
     pub shared_by: usize,
 }
@@ -79,7 +80,7 @@ pub struct CacheTopology {
     pub l1d: Level,
     /// L2 cache
     pub l2: Level,
-    /// L3 cache, if any (some Apple / embedded parts report none)
+    /// L3 cache, if any (some embedded or shared-cluster-L2 designs report none)
     pub l3: Option<Level>,
 }
 
@@ -94,10 +95,10 @@ pub struct Blocking {
     pub nc: usize,
 }
 
-/// The Zen5 (Ryzen 9950X) calibrated default: the bottom of the fallback chain, used
-/// when every runtime backend fails or is unavailable. L1d 48 KiB / 12-way, L2 1 MiB
-/// / 16-way (private), L3 32 MiB / 16-way (per CCD, treated as fully available for
-/// the B macro-panel, i.e. `shared_by = 1`)
+/// The Zen5 (Ryzen 9950X) cache geometry, used as the bottom of the fallback
+/// chain when every runtime backend fails or is unavailable. L1d is 48 KiB,
+/// 12-way. L2 is 1 MiB, 16-way, private. L3 is 32 MiB, 16-way, per CCD,
+/// treated as fully available for the B macro-panel (`shared_by = 1`)
 pub const ZEN5_FALLBACK: CacheTopology = CacheTopology {
     l1d: Level {
         bytes: 48 * 1024,
@@ -119,11 +120,12 @@ pub const ZEN5_FALLBACK: CacheTopology = CacheTopology {
     }),
 };
 
-/// Aggregated host facts, detected once from the running machine: the data-cache
-/// hierarchy used for blocking and the OS memory page size used for the LHS-packing
-/// stride gate. Detection runs at most once and is memoized behind a single
-/// `OnceLock`; [`topology`] and the crate-internal page-size accessor both read
-/// through this struct rather than detecting independently
+/// Aggregated host facts, detected once from the running machine. This holds
+/// the data-cache hierarchy used for blocking, and the OS memory page size
+/// used for the LHS-packing stride gate. Detection runs at most once and is
+/// memoized behind a single `OnceLock`. [`topology`] and the crate-internal
+/// page-size accessor both read through this struct instead of detecting
+/// independently
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Machine {
     /// The data-cache hierarchy used for blocking
@@ -136,7 +138,8 @@ pub struct Machine {
 static MACHINE: OnceLock<Machine> = OnceLock::new();
 
 impl Machine {
-    /// The detected host facts, computed on the 1st call and memoized for every call after
+    /// The detected host facts, computed on the 1st call and memoized for
+    /// every call after
     #[cfg(feature = "std")]
     pub fn current() -> &'static Machine {
         MACHINE.get_or_init(|| Machine {
@@ -145,8 +148,9 @@ impl Machine {
         })
     }
 
-    /// Without `std` there is no `OnceLock` to memoize into and no OS to probe, so this
-    /// always returns the calibrated fallback (Zen5 cache geometry, 4 KiB page)
+    /// Without `std` there is no `OnceLock` to memoize into and no OS to
+    /// probe. This always returns the fixed fallback (Zen5 cache geometry,
+    /// 4 KiB page)
     #[cfg(not(feature = "std"))]
     pub fn current() -> &'static Machine {
         static FALLBACK: Machine = Machine {
@@ -162,9 +166,10 @@ pub fn topology() -> &'static CacheTopology {
     &Machine::current().cache
 }
 
-/// Detect the OS memory page size via `getpagesize`, called once from [`Machine::current`].
-/// `getpagesize` is POSIX/BSD and present on both Linux and macOS, and `std` already links
-/// libc, so a bare `extern "C"` declaration resolves with no extra dependency
+/// Detect the OS memory page size using `getpagesize`, called once from
+/// [`Machine::current`]. `getpagesize` is POSIX/BSD and present on both
+/// Linux and macOS, and `std` already links libc. A bare `extern "C"`
+/// declaration resolves with no extra dependency
 #[cfg(all(unix, feature = "std", not(miri)))]
 fn detect_page_size() -> usize {
     unsafe extern "C" {
@@ -179,25 +184,26 @@ fn detect_page_size() -> usize {
     }
 }
 
-/// Page-size fallback for non-unix targets and for Miri, which cannot make the
-/// `getpagesize` FFI call: assume the common 4 KiB. The no-`std` build skips detection
-/// entirely and hard-codes the same value (see [`Machine::current`])
+/// Page-size fallback for non-unix targets and for Miri, which cannot make
+/// the `getpagesize` FFI call: assume the common 4 KiB. The no-`std` build
+/// skips detection entirely and hard-codes the same value (see
+/// [`Machine::current`])
 #[cfg(all(feature = "std", not(all(unix, not(miri)))))]
 fn detect_page_size() -> usize {
     4096
 }
 
-/// The OS memory page size in bytes, read through the memoized [`Machine`]. Drives
-/// the LHS-packing stride gate
+/// The OS memory page size in bytes, read through the memoized [`Machine`].
+/// Drives the LHS-packing stride gate
 pub(crate) fn page_size() -> usize {
     Machine::current().page_size
 }
 
-/// The LHS-packing depth-stride gate in bytes: a column-major A whose K-walk stride
-/// (`csa * sizeof`) reaches this is packed instead, to dodge a TLB/cache-hostile strided
-/// read. The `GEMMKIT_LHS_PACK_STRIDE` knob overrides it verbatim; `0` (the default) derives
-/// it from the OS page size (half a page). Centralized here, rather than inlined at the
-/// driver's call site, so the `0 => auto` derivation has a single home and a direct test
+/// The LHS-packing depth-stride gate in bytes. The driver packs a
+/// column-major A instead of reading it strided, once its K-walk stride
+/// (`csa * sizeof`) reaches this. This avoids a TLB- and cache-hostile
+/// strided read. The `GEMMKIT_LHS_PACK_STRIDE` knob overrides it verbatim.
+/// The default, `0`, derives it from the OS page size as half a page
 pub(crate) fn lhs_pack_stride_bytes() -> usize {
     match crate::tuning::lhs_pack_stride() {
         0 => page_size() / 2,
@@ -205,15 +211,14 @@ pub(crate) fn lhs_pack_stride_bytes() -> usize {
     }
 }
 
-/// The LHS-packing address-span gate in bytes: the stride gate above only force-packs when the
-/// whole depth-slice walk (`csa * sizeof * kc`) also reaches this much address range - a
-/// page-scale stride over a span that stays cache-resident re-walks warm lines and is faster in
-/// place than the pack it would otherwise pay for. The `GEMMKIT_LHS_PACK_SPAN` knob overrides it
-/// verbatim; `0` (the default) is a flat 4 MiB, calibrated on the Zen5 9950X (in place wins
-/// through a 2 MiB span at n = 1024, packing wins from the 4 MiB span at n = 2048) rather than
-/// derived from the detected topology, since the crossover tracks TLB reach as much as cache
-/// size. Centralized here (like [`lhs_pack_stride_bytes`]) as the one home for the `0 => auto`
-/// derivation
+/// The LHS-packing address-span gate in bytes. The stride gate above only
+/// forces a pack when the whole depth-slice walk (`csa * sizeof * kc`) also
+/// reaches this much address range. A page-scale stride over a span that
+/// stays cache-resident re-walks warm lines and costs less than the pack it
+/// would otherwise trigger. The `GEMMKIT_LHS_PACK_SPAN` knob overrides it
+/// verbatim. The default, `0`, is a flat 4 MiB rather than a value derived
+/// from the detected topology. This is because the crossover tracks TLB
+/// reach more than cache size
 pub(crate) fn lhs_pack_span_bytes() -> usize {
     match crate::tuning::lhs_pack_span() {
         0 => 4 << 20,
@@ -221,31 +226,26 @@ pub(crate) fn lhs_pack_span_bytes() -> usize {
     }
 }
 
-/// The gemv/gevv parallelism byte floor: below this much touched data the matrix fits a single
-/// core's private cache, which that core saturates alone, so splitting only adds fork/join and
-/// shared-cache contention with no bandwidth to gain. Above it the matrix spills to the shared
-/// last level, whose bandwidth a single core cannot saturate, so splitting pays.
-/// `GEMMKIT_GEMV_PARALLEL_BYTES` overrides it verbatim; `0` (the default) derives it from the
-/// cache. Centralized here (like [`lhs_pack_stride_bytes`]) as the one home for the `0 => auto`
-/// derivation
+/// The gemv/gevv parallelism byte floor. Below this many touched bytes the
+/// matrix fits one core's private cache, which that core saturates alone. A
+/// split then only adds fork/join and shared-cache contention with no
+/// bandwidth to gain. Above it the matrix spills to the shared last level,
+/// whose bandwidth one core cannot saturate, so a split pays
 ///
-/// * With an L3 (x86, Graviton): the per-core private L2 (`l2.bytes`), where the matrix stops
-///   fitting private cache and spills to the shared L3. Calibrated on the Zen5 9950X (1 MiB L2):
-///   a hot gemv breaks even near 0.75x L2, wins 1.8x at L2 and 3-5x above, while below 0.5x L2
-///   serial wins by ~20%. The old l3/2 floor (16 MiB) forced serial across the whole L2-to-L3
-///   band, leaving 3-5x unclaimed for a repeatedly scanned matrix. Graviton follows by analogy
-///   (private L2, shared L3), unrevalidated
-/// * No L3 (Apple's shared cluster-L2): a fraction of the *full* shared L2, not
-///   `effective_bytes`, which divides by the cluster size (`shared_by`) for the per-worker BLIS
-///   budget. For the serial-vs-parallel gemv question, a single core streams from the whole
-///   cluster L2 but cannot saturate its bandwidth alone, so splitting across the cluster gains
-///   once the matrix leaves the core-cheap sizes. On aarch64 the fraction is an eighth,
-///   recalibrated on an M4 Max (16 MiB P-cluster L2) with the exact-fit tier pools active,
-///   which cut the very fork/join cost this floor prices: serial still wins at a 2.1 MiB
-///   matrix (47 vs 42 GFLOP/s), parallel wins from 3.2 MiB (+28%) and 4 MiB (+33%), so the
-///   2 MiB floor (`l2.bytes / 8`) admits the winners. An earlier pre-tier-pool calibration
-///   wanted half (parallel only broke even near 8 MiB); the non-aarch64 no-L3 arm keeps that
-///   conservative half, unrevalidated
+/// The `GEMMKIT_GEMV_PARALLEL_BYTES` knob overrides the floor verbatim. The
+/// default, `0`, derives it from the detected cache
+///
+/// With an L3, the floor is the private L2 size (`l2.bytes`), where the
+/// matrix stops fitting private cache and spills to the shared L3
+///
+/// Without an L3, the cache is a cluster L2 shared across cores instead. The
+/// floor is then a fraction of the full shared L2, not
+/// [`Level::effective_bytes`], which divides by the cluster size
+/// (`shared_by`) for the per-worker BLIS budget. A single core streams from
+/// the whole cluster L2 but cannot saturate its bandwidth alone. A split
+/// across the cluster gains once the matrix grows past the sizes a single
+/// core handles cheaply. On aarch64 the fraction is 1/8 of `l2.bytes`.
+/// Elsewhere it is 1/2
 #[cfg(feature = "parallel")]
 pub(crate) fn gemv_parallel_floor_bytes() -> usize {
     match crate::tuning::gemv_parallel_bytes() {
@@ -264,16 +264,18 @@ pub(crate) fn gemv_parallel_floor_bytes() -> usize {
     }
 }
 
-/// Output-size gate for the axpy-gemv register-block strategy (`output_register_block` in
-/// [`crate::special`]): it engages only once the output is large enough that the plain
-/// column-outer form's per-column output re-reads spill toward DRAM. Register-blocking *loses*
-/// while the output is L3-resident (the extra matrix-stream prefetches thrash while the re-reads
-/// stay cheap) and *wins* once the output approaches leaving L3. Calibrated on Zen5, where it
-/// loses up to a ~16 MiB output and wins from ~32 MiB, i.e. the full per-core-reachable L3
-/// (the 9950X's 32 MiB per-CCD slice).
-/// No L3 (Apple): falls back to the L2 gate, pending on-device calibration. Sibling of
-/// [`gemv_parallel_floor_bytes`] as a cache-derived byte threshold; not gated on `parallel`
-/// since the serial gemv path uses it too
+/// The output-size gate for the axpy-gemv register-block strategy
+/// (`output_register_block` in [`crate::special`]). The strategy engages
+/// only once the output grows large enough that the plain column-outer
+/// form's per-column output re-reads spill toward DRAM
+///
+/// Register-blocking loses while the output stays resident in L3, because
+/// its extra matrix-stream prefetches thrash while the re-reads stay cheap
+/// anyway. It wins once the output outgrows L3, using the full
+/// per-core-reachable L3 as the gate ([`Level::effective_bytes`]). Without
+/// an L3, the gate falls back to the L2 effective bytes. It shares its
+/// cache-derived design with [`gemv_parallel_floor_bytes`], but does not
+/// gate on the `parallel` feature, because the serial gemv path also uses it
 pub(crate) fn gemv_regblock_engage_bytes() -> usize {
     let t = topology();
     match t.l3 {
@@ -282,20 +284,20 @@ pub(crate) fn gemv_regblock_engage_bytes() -> usize {
     }
 }
 
-/// The deep-contraction engage gate in bytes: a narrow-output family (`OUT_IS_ACC = false`)
-/// runs `kc = k` (a single depth panel), so its RHS micropanel is `nr * k * sizeof(N)` bytes;
-/// once that outgrows L2, every microtile call streams it, alongside the even larger `mr * k`
-/// LHS micropanel, from L3/DRAM instead. The `GEMMKIT_DEEP_KC_BYTES` knob overrides it verbatim;
-/// `0` (the default) derives it from half the L2 effective per-worker capacity. Measured on a
-/// Zen5 9950X (AVX-512F, `nr = 12`, `f16`/`bf16`): the throughput cliff hits at `k = 32768` (a
-/// 768 KiB RHS micropanel, about 0.75x the 1 MiB L2), while `k = 16384` (384 KiB) is still near
-/// peak, so a full-L2 gate would engage only past `k ~ 43000` and miss the cliff entirely. The
-/// `L2/2` gate instead switches to the multi-slice twin at `k = 32768`/`65536` (2.8x / 3.6x
-/// faster for `f16`) while leaving `16384` and below on the single panel, where the twin is
-/// within noise, so no regression there. Centralized here, like [`lhs_pack_stride_bytes`] and
-/// [`gemv_parallel_floor_bytes`], as the one home for the `0 => auto` derivation and its direct
-/// test. Consumed only by the `half` dispatch (and the in-module test), so it is gated to match
-/// and stay dead-code-free in half-less builds
+/// The deep-contraction engage gate in bytes. A narrow-output family
+/// (`OUT_IS_ACC = false`) runs `kc = k`, a single depth panel, so its RHS
+/// micropanel is `nr * k * sizeof(N)` bytes. Once that micropanel outgrows
+/// L2, every microtile call streams it, alongside the even larger `mr * k`
+/// LHS micropanel, from L3 or DRAM instead
+///
+/// Past this gate the driver switches to a multi-slice twin that keeps each
+/// slice inside L2. The `GEMMKIT_DEEP_KC_BYTES` knob overrides the gate
+/// verbatim. The default, `0`, derives it from half the L2 effective
+/// per-worker capacity, because the RHS micropanel does not have L2 to
+/// itself
+///
+/// This gate serves only the `half` dispatch and the in-module test, so the
+/// function compiles only under test or the `half` feature
 #[cfg(any(test, feature = "half"))]
 pub(crate) fn deep_k_engage_bytes() -> usize {
     match crate::tuning::deep_kc_bytes() {
@@ -304,20 +306,21 @@ pub(crate) fn deep_k_engage_bytes() -> usize {
     }
 }
 
-/// The C-tile prefetch engage gate in bytes: the driver issues a T0 prefetch of each output
-/// microtile just ahead of its microkernel call only once the call's working set (the A, B and
-/// C bytes together) exceeds this - past it the output streams from beyond the LLC, where the
-/// hardware prefetchers no longer hide the tile's read-modify-write latency; below it the
-/// tiles are cache-resident and the hint is pure overhead. The `GEMMKIT_PREFETCH_MIN_BYTES`
-/// knob overrides it verbatim; `0` (the default) is the per-core-reachable last-level cache
-/// ([`Level::effective_bytes`]): L3 where present, the L2 otherwise. Measured on the Zen5
-/// 9950X (f32, AVX-512F) against its 32 MiB per-CCD slice: +1.4% parallel and about +1% serial
-/// at 2048^3
-/// (48 MiB working set), +2-3% at 3072^3 and deep-k 2048x2048x24576, neutral at 1536^3 (27
-/// MiB, under the gate) and at in-cache sizes. On a target without the x86 prefetch emission
-/// the gate still resolves but the prefetch lowers to nothing, so behavior is unchanged
-/// there. Centralized here, like [`lhs_pack_stride_bytes`], as the one home for the
-/// `0 => auto` derivation and its direct test
+/// The C-tile prefetch engage gate in bytes. The driver issues a T0
+/// prefetch of each output microtile just ahead of its microkernel call. It
+/// fires only once the call's working set, meaning the A, B, and C bytes
+/// together, exceeds this. Past the gate the output streams from beyond the
+/// LLC, where the hardware prefetchers no longer hide the tile's
+/// read-modify-write latency. Below it the tiles stay cache-resident and
+/// the hint is pure overhead
+///
+/// The `GEMMKIT_PREFETCH_MIN_BYTES` knob overrides the gate verbatim. The
+/// default, `0`, is the per-core-reachable last-level cache
+/// ([`Level::effective_bytes`]): L3 where present, L2 otherwise
+///
+/// On a target without the x86 prefetch emission, the gate still resolves,
+/// but the prefetch instruction lowers to nothing, so behavior is unchanged
+/// there
 pub(crate) fn prefetch_ws_bytes() -> usize {
     match crate::tuning::prefetch_min_bytes() {
         0 => {
@@ -331,9 +334,9 @@ pub(crate) fn prefetch_ws_bytes() -> usize {
     }
 }
 
-/// Run the fallback chain once, returning the 1st backend's result that both succeeds
-/// and passes [`plausible`]. Never panics: a backend that fails or returns implausible
-/// values is simply skipped
+/// Run the fallback chain once, returning the 1st backend's result that
+/// both succeeds and passes [`plausible`]. Never panics: a backend that
+/// fails or returns implausible values is simply skipped
 #[cfg(feature = "std")]
 fn detect() -> CacheTopology {
     // Try the CPUID backend
@@ -354,10 +357,11 @@ fn detect() -> CacheTopology {
     ZEN5_FALLBACK
 }
 
-/// Sanity gate on a detected topology, so a half-populated or garbled backend read
-/// (e.g. a masked CPUID leaf) cannot poison the blocking model: every present level
-/// needs a size of at least 4 KiB, a line of at least 16 bytes, and at least 1-way
-/// associativity. A missing L3 passes (`None` is a valid topology)
+/// Sanity gate on a detected topology. A half-populated or garbled backend
+/// read (e.g. a masked CPUID leaf) cannot corrupt the blocking model.
+/// Every present level needs a size of at least 4 KiB, a line of at least
+/// 16 bytes, and at least 1-way associativity. A missing L3 passes
+/// (`None` is a valid topology)
 #[cfg(feature = "std")]
 #[cfg_attr(any(target_family = "wasm", miri), allow(dead_code))]
 fn plausible(t: &CacheTopology) -> bool {
@@ -365,6 +369,7 @@ fn plausible(t: &CacheTopology) -> bool {
     ok(&t.l1d) && ok(&t.l2) && t.l3.as_ref().map(ok).unwrap_or(true)
 }
 
+// Euclidean greatest common divisor, always at least 1
 #[inline]
 fn gcd(mut a: usize, mut b: usize) -> usize {
     while b != 0 {
@@ -375,27 +380,35 @@ fn gcd(mut a: usize, mut b: usize) -> usize {
     a.max(1)
 }
 
+// Round a down to the nearest multiple of b
 #[inline]
 fn round_down(a: usize, b: usize) -> usize {
     (a / b) * b
 }
 
 impl CacheTopology {
-    /// Compute `(MC, KC, NC)` analytically (the BLIS model) for the given microkernel
-    /// tile and problem size
+    /// Compute `(MC, KC, NC)` analytically (the BLIS model) for the given
+    /// microkernel tile and problem size
     ///
     /// # Parameters
-    /// - `mr`/`nr` - microkernel tile shape, in elements
+    ///
+    /// - `mr` - microkernel row tile size, in elements
+    /// - `nr` - microkernel column tile size, in elements
     /// - `sizeof` - size in bytes of one packed input element
-    /// - `m`/`n`/`k` - problem dimensions
+    /// - `m` - row count of A and C
+    /// - `n` - column count of B and C
+    /// - `k` - shared inner dimension of A and B
     ///
     /// # Returns
-    /// - `Blocking` - the computed `mc`/`kc`/`nc` triple
+    ///
+    /// - `Blocking` - the computed `mc`, `kc`, and `nc` triple
     ///
     /// # Notes
-    /// The result depends only on the cache geometry and the problem shape, never on
-    /// the thread count, so serial and parallel runs block identically: the mechanism
-    /// behind reproducible output under a fixed config
+    ///
+    /// The result depends only on the cache geometry and the problem shape,
+    /// never on the thread count. Serial and parallel runs therefore block
+    /// identically, which is the mechanism behind reproducible output under
+    /// a fixed config
     pub fn blocking(
         &self,
         mr: usize,
@@ -487,9 +500,9 @@ impl CacheTopology {
 mod tests {
     use super::*;
 
-    /// `Machine` is the single source of truth: `current()` always hands back the same
-    /// memoized instance, and the `topology()`/`page_size()` accessors read straight
-    /// through it rather than detecting independently
+    /// `Machine` is the single source of truth. `current()` always hands
+    /// back the same memoized instance, and the `topology()`/`page_size()`
+    /// accessors read straight through it instead of detecting independently
     #[test]
     fn machine_aggregates_and_memoizes() {
         let m = Machine::current();
@@ -505,9 +518,9 @@ mod tests {
         );
     }
 
-    /// The detected page size must be a power of 2 in a sane range, whatever host
-    /// runs the test: the LHS-packing stride gate is derived from it, so a garbage
-    /// value there would silently break that gate
+    /// The detected page size must be a power of 2 in a sane range, on
+    /// whatever host runs the test. The LHS-packing stride gate derives
+    /// from it, so a bad value here would silently break that gate
     #[test]
     fn page_size_is_plausible() {
         let p = page_size();
@@ -518,10 +531,11 @@ mod tests {
         );
     }
 
-    /// The LHS-pack stride gate: the default `0` knob must resolve to exactly half the
-    /// page, and any non-zero knob must pass through verbatim as a byte threshold.
-    /// Guards the `0 => page_size() / 2` derivation and the override branch against a
-    /// regression such as an inverted match or a changed divisor
+    /// The LHS-pack stride gate. The default `0` knob must resolve to
+    /// exactly half the page, and any non-zero knob must pass through
+    /// verbatim as a byte threshold. This guards the `0 => page_size() / 2`
+    /// derivation and the override branch against a regression such as an
+    /// inverted match or a changed divisor
     #[test]
     fn lhs_pack_stride_gate_auto_and_override() {
         // Auto: 0 => exactly half the page (and never zero, so the gate can fire)
@@ -536,10 +550,11 @@ mod tests {
         crate::tuning::set_lhs_pack_stride(0);
     }
 
-    /// The deep-contraction engage gate: the default `0` knob must resolve to half the L2
-    /// effective per-worker bytes, and any non-zero knob must pass through verbatim. Guards
-    /// the `0 => l2 / 2` derivation and the override branch; asserts against the host's own
-    /// detected L2, so it holds regardless of which machine runs the test
+    /// The deep-contraction engage gate. The default `0` knob must resolve
+    /// to half the L2 effective per-worker bytes, and any non-zero knob
+    /// must pass through verbatim. This guards the `0 => l2 / 2` derivation
+    /// and the override branch. The assertion reads the host's own detected
+    /// L2, so it holds regardless of which machine runs the test
     #[test]
     fn deep_k_engage_gate_auto_and_override() {
         let restore = crate::tuning::deep_kc_bytes();
@@ -558,11 +573,12 @@ mod tests {
         crate::tuning::set_deep_kc_bytes(restore);
     }
 
-    /// The C-tile prefetch engage gate: the default `0` knob must resolve to the
-    /// per-core-reachable last-level cache (L3 where present, L2 otherwise), and any non-zero
-    /// knob must pass through verbatim. Guards the `0 => LLC` derivation and the override
-    /// branch; asserts against the host's own detected topology, so it holds regardless of
-    /// which machine runs the test
+    /// The C-tile prefetch engage gate. The default `0` knob must resolve
+    /// to the per-core-reachable last-level cache (L3 where present, L2
+    /// otherwise), and any non-zero knob must pass through verbatim. This
+    /// guards the `0 => LLC` derivation and the override branch. The
+    /// assertion reads the host's own detected topology, so it holds
+    /// regardless of which machine runs the test
     #[test]
     fn prefetch_ws_gate_auto_and_override() {
         let restore = crate::tuning::prefetch_min_bytes();
@@ -582,11 +598,13 @@ mod tests {
         crate::tuning::set_prefetch_min_bytes(restore);
     }
 
-    /// A degenerate dimension (`m`, `n`, or `k` == 0) short-circuits `blocking` before the BLIS
-    /// model runs. The gemm driver itself never calls `blocking` with a 0 dimension (it early-
-    /// returns first), so this guard is otherwise unreachable and can only be exercised directly.
-    /// Each blocking dim clamps to its microtile floor (or 1 for `kc`), independent of the
-    /// detected cache: no tuning knobs are read on this path
+    /// A degenerate dimension (`m`, `n`, or `k` equal to `0`) short-circuits
+    /// `blocking` before the BLIS model runs. The gemm driver itself never
+    /// calls `blocking` with a `0` dimension, because it early-returns
+    /// first. This guard is otherwise unreachable, and only a direct call
+    /// can exercise it. Each blocking dimension clamps to its microtile
+    /// floor, or to `1` for `kc`, independent of the detected cache. No
+    /// tuning knobs are read on this path
     #[test]
     fn blocking_zero_dim_early_return() {
         let t = topology();
@@ -602,11 +620,13 @@ mod tests {
         assert_eq!((b.mc, b.kc, b.nc), (16, 1, 8));
     }
 
-    /// The no-L3 `NC` arm (take the full, rounded-up `N` up to the panel-count cap) is dead on
-    /// any machine that reports an L3, so on x86 it only runs here, against a synthetic
-    /// `l3: None` topology. `CacheTopology`/`Level`'s fields are public, so a test can build one
-    /// directly; this makes the branch coverable platform-independently, while an aarch64 run on
-    /// one of Apple's L3-less parts also hits it live through the normal `topology()` path
+    /// The no-L3 `NC` arm (take the full, rounded-up `N` up to the
+    /// panel-count cap) is dead on any machine that reports an L3. On x86 it
+    /// only runs here, against a synthetic `l3: None` topology.
+    /// `CacheTopology` and `Level` expose public fields, so a test can build
+    /// one directly, which makes the branch coverable on any platform. An
+    /// aarch64 machine that reports no L3 also hits this branch live,
+    /// through the normal `topology()` path
     #[test]
     fn blocking_no_l3_nc_arm() {
         let topo = CacheTopology {
@@ -625,7 +645,8 @@ mod tests {
             l3: None,
         };
         let (mr, nr) = (16usize, 4usize);
-        let (m, n, k) = (512usize, 512usize, 512usize); // above tiny_block_dim: takes the full model
+        // Above tiny_block_dim, so this takes the full model
+        let (m, n, k) = (512usize, 512usize, 512usize);
         let b = topo.blocking(mr, nr, 4, m, n, k);
         // No L3: NC is nc_no_l3_panels * nr, capped by the rounded-up N
         let expect_nc = (crate::tuning::nc_no_l3_panels() * nr)

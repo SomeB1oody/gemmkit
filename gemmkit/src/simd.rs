@@ -1,32 +1,40 @@
 //! SIMD abstraction layer (L0): the per-ISA register vocabulary every microkernel builds on
 //!
-//! Self-contained: depends only on [`crate::scalar`] and `core`, never on the kernel,
-//! driver, or cache layers above it, so it could move into its own crate unchanged
+//! Self-contained: it depends only on [`crate::scalar`] and `core`, never on the kernel,
+//! driver, or cache layers above it. It could move into its own crate unchanged
 //!
-//! # The 2 traits
+//! # The 3 traits
 //!
 //! * [`Simd`]: a zero-sized ISA token (e.g. [`Fma`]), not parameterized by element type.
 //!   Its only job is [`Simd::vectorize`], the `#[target_feature]` boundary (see below)
-//! * [`SimdOps<T>`]: the per-element-type vocabulary of a token: register type, lane
-//!   count, and every primitive the microkernel needs (load/store/broadcast/mul/add/
-//!   fma/reduce). Token and element type are decoupled, so `LANES` depends on the
-//!   `(ISA, T)` pair: `f32` is 8 lanes on FMA, 16 on AVX-512F; `f64` is half of `f32`
-//!   on the same token
+//! * [`SimdOps<T>`]: the per-element-type vocabulary of a token. It defines the register
+//!   type, the lane count, and every primitive the microkernel needs: load, store,
+//!   broadcast, multiply, add, fma, and reduce. Token and element type are decoupled, so
+//!   `LANES` depends on the `(ISA, T)` pair. `f32` gets 8 lanes on FMA and 16 on
+//!   AVX-512F. `f64` gets half as many lanes as `f32` on the same token
+//! * [`KernelSimd`]`<L, R, A, O>`: the seam a family with distinct input, accumulator, and
+//!   output types drives on. It widens the LHS and RHS loads into the accumulator type,
+//!   narrows the output store, and carries the optional dot-product and requantize
+//!   fast paths. A homogeneous family (`L = R = A = O`) gets this trait for free
+//!   through the blanket impl below
 //!
-//! Every primitive a microkernel needs lives on these 2 traits, so the microkernel body
-//! is one generic function shared by every ISA. Adding an ISA means adding a token, its
-//! `SimdOps` impls, and one dispatch line, never touching the microkernel itself
+//! The microkernel body binds on [`KernelSimd`], so every primitive it needs lives on
+//! these 3 traits. The body is one generic function shared by every ISA. Adding an ISA
+//! means adding a token and its `SimdOps` impls, plus one dispatch line. A family with
+//! distinct input, accumulator, and output types also needs a `KernelSimd` impl for that
+//! token. That impl can be the free blanket or an explicit widen/narrow impl. The
+//! microkernel itself never changes
 //!
 //! # `#[target_feature]` correctness
 //!
-//! AVX/AVX-512 intrinsics only codegen correctly where the target feature is enabled,
-//! but feature support is a runtime fact resolved by the dispatch layer, so a fixed
-//! `#[target_feature]` attribute cannot sit on the generic microkernel. Instead each
-//! token's [`Simd::vectorize`] runs a closure inside a small `#[target_feature]`-annotated
-//! function; the closure, and the `#[inline]` primitives it calls, inline into that
-//! function, so every intrinsic ends up codegen'd in a feature-enabled context. The same
-//! mechanism works whether the closure runs on the calling thread or inside a rayon
-//! worker closure
+//! AVX and AVX-512 intrinsics compile correctly only where the target feature is
+//! enabled. Feature support is a runtime fact that the dispatch layer resolves, so a
+//! fixed `#[target_feature]` attribute cannot sit on the generic microkernel. Instead,
+//! each token's [`Simd::vectorize`] runs a closure inside a small
+//! `#[target_feature]`-annotated function. The closure, and the `#[inline]` primitives
+//! it calls, inline into that function, so every intrinsic ends up compiled in a
+//! feature-enabled context. The same mechanism works whether the closure runs on the
+//! calling thread or inside a rayon worker closure
 
 use crate::scalar::Scalar;
 
@@ -63,23 +71,25 @@ pub use self::scalar::ScalarTok;
 #[cfg(target_arch = "wasm32")]
 pub use self::wasm::Simd128;
 
-/// The capability an ISA token needs to drive a [`crate::kernel::KernelFamily`] whose
-/// input types `L`/`R`, accumulator `A`, and output `O` are not all the same: accumulate
-/// in `A` (the [`SimdOps<A>`] supertrait), and move family inputs/outputs into and out of
-/// `A`-typed registers, widening on load and narrowing on store wherever the element type
-/// is narrower than `A`
+/// The capability an ISA token needs when a [`crate::kernel::KernelFamily`] has input
+/// types `L`/`R`, an accumulator `A`, and an output `O` that differ
 ///
-/// This is the seam that lets **mixed precision** (`A != L`) work without a per-type
-/// branch in the driver. The homogeneous case (`L = R = A = O`) is covered once by the
-/// blanket impl below, which forwards to plain [`SimdOps`] load/splat/store; a narrow
-/// family (`f16`/`bf16` inputs, `f32` accumulator) instead gets an ISA impl whose
-/// `load_*` widens and `store_out` narrows. The all-equal blanket and any mixed impl
-/// (`L != A`) can never overlap, since a mixed impl's types are concrete and unequal
+/// The token accumulates in `A` (the [`SimdOps<A>`] supertrait) and moves family
+/// inputs and outputs into and out of `A`-typed registers. It widens on load and
+/// narrows on store wherever the element type is narrower than `A`
+///
+/// This is the seam that lets mixed precision (`A != L`) work without a per-type
+/// branch in the driver. The homogeneous case (`L = R = A = O`) is covered once by
+/// the blanket impl below. It forwards to plain [`SimdOps`] load, splat, and store.
+/// A narrow family (`f16` or `bf16` inputs, `f32` accumulator) instead gets an ISA
+/// impl whose `load_*` widens and whose `store_out` narrows. The all-equal blanket
+/// and any mixed impl (`L != A`) can never overlap, because a mixed impl's types are
+/// concrete and unequal
 pub trait KernelSimd<L: Scalar, R: Scalar, A: Scalar, O: Scalar>: SimdOps<A> {
     /// Load `LANES` LHS values, widened to one `A` register (a plain load when `L == A`)
     ///
     /// # Safety
-    /// `p` valid for `LANES` reads; run inside this token's [`Simd::vectorize`]
+    /// `p` must be valid for `LANES` reads. Run this inside this token's [`Simd::vectorize`]
     unsafe fn load_lhs(self, p: *const L) -> <Self as SimdOps<A>>::Reg;
     /// Widen one RHS scalar and broadcast it to all `A` lanes (a plain splat when `R == A`)
     ///
@@ -90,33 +100,34 @@ pub trait KernelSimd<L: Scalar, R: Scalar, A: Scalar, O: Scalar>: SimdOps<A> {
     /// read of `C` (a plain load when `O == A`)
     ///
     /// # Safety
-    /// `p` valid for `LANES` reads; run inside [`Simd::vectorize`]
+    /// `p` must be valid for `LANES` reads. Run this inside [`Simd::vectorize`]
     unsafe fn load_out(self, p: *const O) -> <Self as SimdOps<A>>::Reg;
     /// Narrow one `A` register to `LANES` output values and store them (a plain store
-    /// when `O == A`; rounds to nearest-even when it actually narrows)
+    /// when `O == A`). This rounds to nearest-even when it actually narrows
     ///
     /// # Safety
-    /// `p` valid for `LANES` writes; run inside [`Simd::vectorize`]
+    /// `p` must be valid for `LANES` writes. Run this inside [`Simd::vectorize`]
     unsafe fn store_out(self, p: *mut O, v: <Self as SimdOps<A>>::Reg);
 
     /// Accumulate one full `MR_REG x NR` microtile from dot-product-packed panels into the
     /// register-resident `acc` (pre-zeroed by the caller). This is the seam a dot-kernel
     /// family ([`crate::kernel::KernelFamily::DEPTH_MULTIPLE`] `> 1`) drives on instead of
-    /// [`SimdOps::accumulate_tile`]: it folds `DEPTH_MULTIPLE` consecutive depth steps into
+    /// [`SimdOps::accumulate_tile`]. It folds `DEPTH_MULTIPLE` consecutive depth steps into
     /// one hardware instruction (`vpdpbusd`, `vdpbf16ps`), which reshapes the accumulation
-    /// rounding, something `accumulate_tile`'s contract forbids. `a`/`b` are the family's
+    /// rounding in a way `accumulate_tile`'s contract forbids. `a` and `b` are the family's
     /// interleaved panels, laid out by contract between the family's packers and the
-    /// overriding token. `kc` is the real (unpadded) depth; the token reads
+    /// overriding token. `kc` is the real, unpadded depth. The token reads
     /// `ceil(kc / DEPTH_MULTIPLE)` instruction-groups from the depth-padded panel. Any
-    /// signedness or bias correction (VNNI's `+128`) is applied internally, so `acc` holds
+    /// signedness or bias correction (VNNI's `+128`) applies internally, so `acc` holds
     /// the true `sum_k(A*B)` on return
     ///
-    /// The default is unreachable: only a dot-capable token (e.g. `Avx512Vnni`,
+    /// The default is unreachable. Only a dot-capable token (e.g. `Avx512Vnni`,
     /// `Avx512Bf16`) overrides it, and only a dot family ever calls it
     ///
     /// # Safety
-    /// `a`/`b` valid for the family's packed panel at this `(MR_REG, NR, kc)`; `acc`
-    /// pre-initialized. Run inside this token's [`Simd::vectorize`] context
+    /// `a` and `b` must be valid for the family's packed panel at this
+    /// `(MR_REG, NR, kc)`, and `acc` must be pre-initialized. Run this inside this
+    /// token's [`Simd::vectorize`] context
     #[inline(always)]
     unsafe fn dot_accumulate<const MR_REG: usize, const NR: usize>(
         self,
@@ -128,44 +139,57 @@ pub trait KernelSimd<L: Scalar, R: Scalar, A: Scalar, O: Scalar>: SimdOps<A> {
         unreachable!("dot_accumulate is provided only by dot-capable ISA tokens")
     }
 
-    /// `true` iff [`Self::requant_store`] is a genuine vector implementation, rather than
-    /// the default `unreachable!` stub. The requantizing epilogue's vector store path is
-    /// gated on this: a `false` token routes every element through the scalar map
-    /// (`KRequantize::apply`) instead
+    /// `true` only when [`Self::requant_store`] is a genuine vector implementation,
+    /// rather than the default `unreachable!` stub. The requantizing epilogue's vector
+    /// store path is gated on this. A `false` token routes every element through the
+    /// scalar map (`KRequantize::apply`) instead
     const REQUANT_VECTOR: bool = false;
 
-    /// Vectorized `i32 -> i8` requantize store: clamp each `A`-accumulator lane through the
-    /// exact requant map and write its low byte to `LANES` consecutive slots at `dst`. `dst`
-    /// is a raw byte pointer regardless of `O`: a `u8` output casts its pointer to call this,
-    /// which is bit-identical because the low byte of a value clamped into `[lo, hi]` reads
-    /// the same whether the type is `i8` or `u8`. Only requant-vector-capable tokens
-    /// ([`Self::REQUANT_VECTOR`] `= true`) override this; the default is `unreachable!`, the
-    /// same seam pattern as [`Self::dot_accumulate`]
+    /// Vectorized `i32 -> i8` requantize store
+    ///
+    /// This clamps each `A`-accumulator lane through the exact requant map and writes its
+    /// low byte to `LANES` consecutive slots at `dst`. `dst` is a raw byte pointer
+    /// regardless of `O`. A `u8` output casts its pointer to call this. The result is
+    /// bit-identical, because the low byte of a value clamped into `[lo, hi]` reads the
+    /// same whether the type is `i8` or `u8`. Only requant-vector-capable tokens
+    /// ([`Self::REQUANT_VECTOR`] `= true`) override this. The default is `unreachable!`,
+    /// the same seam pattern as [`Self::dot_accumulate`]
     ///
     /// # Contract: bit-for-bit agreement with the scalar map
-    /// Each lane of an implementation is expected to: widen `i32 -> f64` (exact); multiply by
-    /// `scale` widened `f32 -> f64` (exact widening, one IEEE multiply); round to nearest-even
-    /// in hardware, which agrees with the scalar `round_ne_f64` because that function's `2^52`
-    /// trick *is* roundTiesToEven below `2^52`, and above `2^52` every `f64` is already
-    /// integral so hardware rounding is the identity there too; add `zp as f64`; clamp with
-    /// `max(lo as f64)` then `min(hi as f64)`; convert `f64 -> i32`, exact since the value is
-    /// now integral and inside `[lo, hi]`; store the low byte by truncation, never a saturating
-    /// pack. That sequence equals the scalar `clamp(zp + round_ne(scale*v), lo, hi)` case by
-    /// case:
-    /// * `|t| < 2^52`: `t` is integral and exact, so the scalar `t as i64` is exact, its `zp`
-    ///   add cannot saturate, and the `f64` `t + zp` is exact too since both stay far below
-    ///   `2^53`: the 2 paths feed identical values into an identical clamp
-    /// * `t >= 2^52`: both clamp to `hi` (scalar via a saturating `i64 + zp` then clamp; vector
-    ///   via `f64 + zp` then `min(hi)`). Symmetrically `t <= -2^52` clamps both to `lo`
-    /// * NaN cannot occur: the API validates `scale` finite and positive, and `v` is a finite
-    ///   `i32`
     ///
-    /// The caller supplies `v` already bias-added: SIMD `i32` add (`paddd`) wraps, matching the
-    /// scalar `wrapping_add` it must agree with. `lo`/`hi` are parameters, `-128`/`127` for the
-    /// `i8` output; the `u8` output phase reuses the same machinery with `(0, 255)`
+    /// Each lane of an implementation does the following, in order:
+    ///
+    /// 1. Widen `i32 -> f64` (exact)
+    /// 2. Multiply by `scale` widened `f32 -> f64` (exact widening, one IEEE multiply)
+    /// 3. Round to nearest-even in hardware. This agrees with the scalar `round_ne_f64`.
+    ///    That function's `2^52` trick is roundTiesToEven below `2^52`. Above `2^52`
+    ///    every `f64` is already integral, so hardware rounding is the identity there too
+    /// 4. Add `zp as f64`
+    /// 5. Clamp with `max(lo as f64)` then `min(hi as f64)`
+    /// 6. Convert `f64 -> i32`, exact because the value is now integral and inside
+    ///    `[lo, hi]`
+    /// 7. Store the low byte by truncation, never a saturating pack
+    ///
+    /// That sequence equals the scalar `clamp(zp + round_ne(scale*v), lo, hi)` case by
+    /// case:
+    ///
+    /// * `|t| < 2^52`: `t` is integral and exact. The scalar `t as i64` is exact, and its
+    ///   `zp` add cannot saturate. The `f64` value `t + zp` is exact too, because both
+    ///   stay far below `2^53`. The 2 paths feed identical values into an identical clamp
+    /// * `t >= 2^52`: both clamp to `hi` (scalar through a saturating `i64 + zp` then
+    ///   clamp, vector through `f64 + zp` then `min(hi)`). By symmetry `t <= -2^52`
+    ///   clamps both to `lo`
+    /// * NaN cannot occur: the API validates that `scale` is finite and positive, and
+    ///   that `v` is a finite `i32`
+    ///
+    /// The caller supplies `v` already bias-added. SIMD `i32` add (`paddd`) wraps,
+    /// matching the scalar `wrapping_add` it must agree with. `lo` and `hi` are
+    /// parameters: `-128`/`127` for the `i8` output. The `u8` output phase reuses the
+    /// same machinery with `(0, 255)`
     ///
     /// # Safety
-    /// `dst` valid for `LANES` byte writes; run inside this token's [`Simd::vectorize`]
+    /// `dst` must be valid for `LANES` byte writes. Run this inside this token's
+    /// [`Simd::vectorize`]
     #[inline(always)]
     unsafe fn requant_store(
         self,
@@ -180,21 +204,21 @@ pub trait KernelSimd<L: Scalar, R: Scalar, A: Scalar, O: Scalar>: SimdOps<A> {
     }
 }
 
-/// The `+128` bias the VNNI families add to the LHS: `vpdpbusd` multiplies an unsigned byte
-/// by a signed byte, so packing A as `A + 128` turns the signed x signed GEMM product into
-/// the unsigned x signed form the instruction computes. [`KernelSimd::dot_accumulate`] then
+/// The `+128` bias the VNNI families add to the LHS. `vpdpbusd` multiplies an unsigned byte
+/// by a signed byte. Packing A as `A + 128` turns the signed x signed GEMM product into the
+/// unsigned x signed form the instruction computes. [`KernelSimd::dot_accumulate`] then
 /// subtracts `VNNI_A_BIAS * sum_k(B)` per column to recover the true product. The pack
 /// transform (`vnni_a_xform` in [`crate::kernel::int`]) and that correction must use the
-/// same constant, hence one definition shared by both. It lives here at L0, beside the
-/// `dot_accumulate` contract it corrects, so the kernel-side pack transform imports it
-/// downward and this module keeps its no-upward-references invariant
+/// same constant, so one definition serves both. It lives here at L0, beside the
+/// `dot_accumulate` contract it corrects. The kernel-side pack transform imports it
+/// downward, so this module keeps its no-upward-references invariant
 #[cfg(feature = "int8")]
 pub(crate) const VNNI_A_BIAS: i32 = 128;
 
-/// Homogeneous blanket: when every family type equals the accumulator type there is
-/// nothing to widen or narrow, so `load_lhs`/`splat_rhs`/`load_out`/`store_out` are
-/// plain [`SimdOps`] load/splat/store and any homogeneous family (e.g.
-/// `FloatGemm<f32>`/`FloatGemm<f64>`) needs zero per-ISA code to satisfy [`KernelSimd`]
+/// Homogeneous blanket: when every family type equals the accumulator type, there is
+/// nothing to widen or narrow. So `load_lhs`, `splat_rhs`, `load_out`, and `store_out`
+/// are plain [`SimdOps`] load, splat, and store. Any homogeneous family (e.g.
+/// `FloatGemm<f32>` or `FloatGemm<f64>`) needs zero per-ISA code to satisfy [`KernelSimd`]
 impl<A: Scalar, S: SimdOps<A>> KernelSimd<A, A, A, A> for S {
     #[inline(always)]
     unsafe fn load_lhs(self, p: *const A) -> <S as SimdOps<A>>::Reg {
@@ -214,25 +238,30 @@ impl<A: Scalar, S: SimdOps<A>> KernelSimd<A, A, A, A> for S {
     }
 }
 
-/// Requantizing-integer blanket for a byte-typed output: `i8` inputs, `i32` accumulator, and an
-/// `i8` (`[-128, 127]`) or `u8` (ONNX QLinearMatMul `[0, 255]` activation) output. This is the
-/// seam the requantizing integer families ([`crate::kernel::IntGemmQ`] /
-/// [`crate::kernel::IntGemmVnniQ`]) drive on. [`impl_requant_blanket!`] generates both output
-/// variants as one delegating impl over every token that already provides the widen kernel
-/// (`KernelSimd<i8, i8, i32, i32>`): the hot accumulate-side ops forward verbatim to that impl,
-/// so e.g. `Avx512Vnni`'s `dot_accumulate` override flows through unchanged, and `requant_store`
-/// forwards too, since it already takes a raw `*mut i8` byte pointer and writes each pre-clamped
-/// lane's low byte, the same byte whether read back as `i8` or `u8` (the cast
+/// Requantizing-integer blanket for a byte-typed output: `i8` inputs, `i32` accumulator, and
+/// an `i8` (`[-128, 127]`) or `u8` (ONNX QLinearMatMul `[0, 255]` activation) output. This is
+/// the seam the requantizing integer families ([`crate::kernel::IntGemmQ`] and
+/// [`crate::kernel::IntGemmVnniQ`]) drive on
+///
+/// [`impl_requant_blanket!`] generates both output variants as one delegating impl over every
+/// token that already provides the widen kernel (`KernelSimd<i8, i8, i32, i32>`). The hot
+/// accumulate-side ops forward verbatim to that impl, so `Avx512Vnni`'s `dot_accumulate`
+/// override, for example, flows through unchanged. `requant_store` forwards too, because it
+/// already takes a raw `*mut i8` byte pointer and writes each pre-clamped lane's low byte.
+/// That byte reads the same whether it is read back as `i8` or `u8` (the cast
 /// `KRequantize::apply_store` relies on)
 ///
-/// `load_out`/`store_out` are structurally unreachable here and stubbed with `unreachable!`,
-/// the same satisfy-the-trait-only convention as the `dot_accumulate`/`requant_store` defaults
-/// above: the family's [`crate::kernel::KernelFamily::microkernel`] drains every tile through the
-/// requant epilogue's scratch/scalar path (`Epilogue::VECTOR = false`), and `beta` is always
-/// `Zero` for these families, so C is never read through the `Out`-typed seam; the methods exist
-/// only to satisfy the driver's `KernelSimd<Lhs, Rhs, Acc, Out>` bound. `Out` being a byte type
-/// keeps this coherent with its neighbors: it cannot unify with the homogeneous blanket (which
-/// needs all 4 types equal) or with the sibling byte blanket (whose `Out` is the other byte type)
+/// `load_out` and `store_out` are structurally unreachable here and stubbed with
+/// `unreachable!`, the same satisfy-the-trait-only convention as the
+/// `dot_accumulate`/`requant_store` defaults above. The family's
+/// [`crate::kernel::KernelFamily::microkernel`] drains every tile through the requant
+/// epilogue's scratch or scalar path (`Epilogue::VECTOR = false`). `beta` is always `Zero`
+/// for these families, so C is never read through the `Out`-typed seam. The methods exist
+/// only to satisfy the driver's `KernelSimd<Lhs, Rhs, Acc, Out>` bound
+///
+/// `Out` being a byte type keeps this coherent with its neighbors. It cannot unify with
+/// the homogeneous blanket (all 4 types equal) or with the sibling byte blanket (whose
+/// `Out` is the other byte type)
 #[cfg(feature = "int8")]
 macro_rules! impl_requant_blanket {
     ($out:ty) => {
@@ -259,8 +288,8 @@ macro_rules! impl_requant_blanket {
                     )
                 }
             }
-            // Forwards like `dot_accumulate` above: `dst` is a raw byte pointer either way, so the
-            // vector map is identical whether `Out` is `i32` or a byte
+            // Forwards like `dot_accumulate` above: `dst` is a raw byte pointer either way,
+            // so the vector map is identical whether `Out` is `i32` or a byte
             const REQUANT_VECTOR: bool = <S as KernelSimd<i8, i8, i32, i32>>::REQUANT_VECTOR;
             #[inline(always)]
             unsafe fn requant_store(
@@ -296,19 +325,24 @@ impl_requant_blanket!(i8);
 #[cfg(feature = "int8")]
 impl_requant_blanket!(u8);
 
-/// `f32`-output twin of the narrow mixed seam: `f16`/`bf16` inputs, `f32` accumulator, and an
-/// `f32` output (`Out == Acc`). This is the seam the deep-contraction narrow twins
-/// ([`crate::kernel::MixedGemmF32`] / [`crate::kernel::Bf16DotGemmF32`]) drive on when a large-`k`
-/// narrow GEMM is re-blocked through an `f32` scratch buffer: the accumulate-side ops
-/// (`load_lhs`/`splat_rhs` widen `f16 -> f32`, `dot_accumulate` folds pairs) forward verbatim to
-/// the narrow `KernelSimd<f16, f16, f32, f16>` impl, so a token's override still applies and the
-/// twin's accumulation is bit-identical to the narrow family's, while `load_out`/`store_out` are
-/// a plain `f32` load/store since the C scratch is already `f32` and needs no widen or narrow.
-/// This is written as 2 explicit impls, one per narrow type, rather than one blanket generic over
-/// `N`: a `KernelSimd<N, N, f32, f32>` blanket generic in `N` would collide with the homogeneous
-/// `<A, A, A, A>` blanket under the coherence check, since the compiler cannot rule out `N = f32`;
-/// the concrete `f16`/`bf16` heads cannot unify with `<A, A, A, A>` (`f16 != f32`), so they are
-/// coherent, the same trick as the concrete-type `impl_requant_blanket!` heads above
+/// `f32`-output twin of the narrow mixed seam: `f16` or `bf16` inputs, `f32` accumulator, and
+/// an `f32` output (`Out == Acc`)
+///
+/// This is the seam the deep-contraction narrow twins ([`crate::kernel::MixedGemmF32`] and
+/// [`crate::kernel::Bf16DotGemmF32`]) drive on, when a large-`k` narrow GEMM is re-blocked
+/// through an `f32` scratch buffer. The accumulate-side ops (`load_lhs`/`splat_rhs` widen
+/// `f16 -> f32`, `dot_accumulate` folds pairs) forward verbatim to the narrow
+/// `KernelSimd<f16, f16, f32, f16>` impl. So a token's override still applies, and the twin's
+/// accumulation is bit-identical to the narrow family's. `load_out` and `store_out` are a
+/// plain `f32` load and store instead, because the C scratch is already `f32` and needs no
+/// widen or narrow
+///
+/// This is written as 2 explicit impls, one per narrow type, rather than one blanket generic
+/// over `N`. A `KernelSimd<N, N, f32, f32>` blanket generic in `N` would collide with the
+/// homogeneous `<A, A, A, A>` blanket under the coherence check. The compiler cannot rule out
+/// `N = f32`. The concrete `f16` and `bf16` heads cannot unify with `<A, A, A, A>`
+/// (`f16 != f32`), so they are coherent. This is the same trick as the concrete-type
+/// `impl_requant_blanket!` heads above
 #[cfg(feature = "half")]
 impl<S: KernelSimd<half::f16, half::f16, f32, half::f16>> KernelSimd<half::f16, half::f16, f32, f32>
     for S
@@ -400,9 +434,9 @@ pub trait Simd: Copy + Send + Sync + 'static {
 
 /// The SIMD vocabulary for element type `T` under ISA token `Self`
 ///
-/// Every method is `unsafe`: it assumes the target feature is already enabled in the
-/// current codegen context (guaranteed by running inside [`Simd::vectorize`]) and that
-/// any pointer arguments are valid for the access. Impls mark every method
+/// Every method is `unsafe`. It assumes the target feature is already enabled in the
+/// current codegen context, guaranteed by running inside [`Simd::vectorize`]. It also
+/// assumes any pointer arguments are valid for the access. Impls mark every method
 /// `#[inline(always)]` so the intrinsics fold straight into the caller
 pub trait SimdOps<T: Scalar>: Simd {
     /// The SIMD register type holding [`Self::LANES`] values of `T`
@@ -411,11 +445,11 @@ pub trait SimdOps<T: Scalar>: Simd {
     const LANES: usize;
     /// Whether this ISA has a hardware lane-indexed FMA: broadcasting a multiplier
     /// straight out of a vector lane in one fused instruction (NEON `vfmaq_laneq`).
-    /// When `true` the microkernel takes the lane path via [`Self::fma_bvec`] for a
-    /// packed RHS, loading a block of `LANES` B columns as one vector instead of
-    /// issuing a separate `splat` load per column. The default is `false`: per-column
-    /// `splat` plus FMA, which on x86 the assembler already folds into a
-    /// broadcast-from-memory operand, so the lane path buys nothing there
+    /// When `true`, the microkernel takes the lane path via [`Self::fma_bvec`] for a
+    /// packed RHS. It loads a block of `LANES` B columns as one vector, instead of
+    /// issuing a separate `splat` load per column. The default is `false`, meaning
+    /// per-column `splat` plus FMA. On x86 the assembler already folds that into a
+    /// broadcast-from-memory operand, so the lane path buys nothing
     const LANE_FMA: bool = false;
 
     /// A register of all zeros
@@ -454,10 +488,12 @@ pub trait SimdOps<T: Scalar>: Simd {
     /// See the trait-level note
     unsafe fn mul_add(self, a: Self::Reg, b: Self::Reg, c: Self::Reg) -> Self::Reg;
     /// Lane-wise fused negative-multiply-add `c - a * b` (a true hardware FMA where
-    /// available: x86 `fnmadd`, NEON `vfms`). The subtractive partner of [`Self::mul_add`]
-    /// that the split (SoA) complex kernel needs for its `acc_re -= a_im * b_im` term: it
-    /// rounds `c - a*b` in a single step, so it stays consistent with `mul_add`'s single
-    /// rounding when the 2 accumulation chains interleave
+    /// available: x86 `fnmadd`, NEON `vfms`)
+    ///
+    /// This is the subtractive partner of [`Self::mul_add`], which the split (SoA)
+    /// complex kernel needs for its `acc_re -= a_im * b_im` term. It rounds `c - a*b` in
+    /// a single step, so it stays consistent with `mul_add`'s single rounding when the 2
+    /// accumulation chains interleave
     ///
     /// # Safety
     /// See the trait-level note
@@ -471,11 +507,11 @@ pub trait SimdOps<T: Scalar>: Simd {
 
     /// Lane-wise maximum. Contract: in any lane where `a` is `NaN`, the result is `b`'s
     /// lane. Fused-epilogue call sites always pass a finite splat or zero as `b`
-    /// (`max(v, zero)`), so a `NaN` accumulator lane maps to that finite operand,
-    /// giving `ReLU(NaN) = 0` and matching the scalar edge path's
-    /// `if a > b { a } else { b }` bit-for-bit (a `NaN > b` comparison is always `false`)
+    /// (`max(v, zero)`). So a `NaN` accumulator lane maps to that finite operand,
+    /// giving `ReLU(NaN) = 0`. This matches the scalar edge path's
+    /// `if a > b { a } else { b }`, bit-for-bit. A `NaN > b` comparison is always `false`
     ///
-    /// The default is unreachable: only the real-float (`f32`/`f64`) tokens override it,
+    /// The default is unreachable. Only the real-float (`f32`/`f64`) tokens override it,
     /// and only the fused float epilogue ever calls it, the same seam pattern as
     /// [`KernelSimd::dot_accumulate`]
     ///
@@ -497,22 +533,22 @@ pub trait SimdOps<T: Scalar>: Simd {
 
     /// Accumulate one contiguous block of `B` columns, loaded as the single register
     /// `bvec`, against the `MR_REG` already-loaded `A` registers, broadcasting each `B`
-    /// lane: for `l in 0..LANES` and `i in 0..MR_REG`,
+    /// lane. For `l in 0..LANES` and `i in 0..MR_REG`:
     /// `acc[l][i] = a_regs[i] * bvec[l] + acc[l][i]`. `acc.len()` must be exactly
-    /// `LANES`: the caller only ever hands it whole `B` registers (the kernel path that
-    /// calls this is gated on `NR` being a multiple of `LANES`), so an override is free
-    /// to hard-code its lane count
+    /// `LANES`. The caller only ever hands it whole `B` registers, because the kernel
+    /// path that calls this is gated on `NR` being a multiple of `LANES`. So an override
+    /// is free to hard-code its lane count
     ///
     /// This is the fused inner step of the lane-indexed kernel path, taken only when
     /// [`Self::LANE_FMA`] is set. The default spills `bvec` to the stack and broadcasts
-    /// each lane through [`Self::splat`], which is correct on any ISA but no faster than
-    /// the plain `splat` path; lane-capable ISAs override it with a single hardware
-    /// lane-indexed FMA instead. Either way it performs the same fused `a*b + c` as the
+    /// each lane through [`Self::splat`]. This is correct on any ISA, but no faster than
+    /// the plain `splat` path. Lane-capable ISAs override it instead with a single
+    /// hardware lane-indexed FMA. Either way it performs the same fused `a*b + c` as the
     /// `splat` path, so the 2 paths round consistently within a run
     ///
     /// # Safety
-    /// See the trait-level note; `acc.len()` must be exactly `LANES` and
-    /// `a_regs` valid for `MR_REG` reads
+    /// See the trait-level note. `acc.len()` must be exactly `LANES`, and `a_regs` must
+    /// be valid for `MR_REG` reads
     #[inline(always)]
     unsafe fn fma_bvec<const MR_REG: usize>(
         self,
@@ -536,55 +572,64 @@ pub trait SimdOps<T: Scalar>: Simd {
     }
 
     /// Accumulate one full `MR_REG x NR` microtile over `kc` depth steps into the
-    /// register-resident `acc` (pre-zeroed by the caller):
+    /// register-resident `acc` (pre-zeroed by the caller). Compute
     /// `acc[j][i] += A[p][i] * B[p][j]` for every `p in 0..kc`, in ascending `p` with a
     /// fused multiply-add. This is the GEMM inner loop, and the single hottest piece of
     /// the library
     ///
-    /// `a` points at the LHS micropanel (`a_cs` is the depth stride; rows are unit
-    /// stride, `MR_REG` vectors of `LANES`); `b` points at the RHS panel (`b_rs` is the
-    /// depth stride, `b_cs` the column stride: `(nr, 1)` when packed, `(rsb, csb)` when
-    /// not)
+    /// `a` points at the LHS micropanel. `a_cs` is its depth stride, and rows are unit
+    /// stride: `MR_REG` vectors of `LANES`. `b` points at the RHS panel. `b_rs` is its
+    /// depth stride, and `b_cs` is the column stride: `(nr, 1)` when packed, `(rsb, csb)`
+    /// when not
     ///
     /// The default is the portable per-step schedule: one broadcast (`splat`) per RHS
-    /// column, or the lane-indexed fast path ([`Self::fma_bvec`]) when [`Self::LANE_FMA`]
-    /// is set, the RHS block is contiguous (`b_cs == 1`), and `NR` is a multiple of
-    /// `LANES` so every `LANES`-wide column block is whole; otherwise the broadcast path
-    /// runs
+    /// column. It takes the lane-indexed fast path ([`Self::fma_bvec`]) instead when all
+    /// of these hold:
     ///
-    /// Keep the default on any out-of-order core: on a wide OoO core LLVM already lowers
-    /// it into the canonical register-blocked kernel that saturates the FMA pipes,
-    /// scheduling the next step's loads in among the FMAs and unrolling the `kc` loop on
-    /// its own
+    /// - [`Self::LANE_FMA`] is set
+    /// - the RHS block is contiguous (`b_cs == 1`)
+    /// - `NR` is a multiple of `LANES`, so every `LANES`-wide column block is whole
     ///
-    /// Override only for a target whose generated schedule genuinely stalls in a way
-    /// LLVM will not fix on its own, e.g. an in-order or narrow-OoO core, where explicitly
-    /// hoisting the next step's loads (the textbook software pipeline) pays off because
-    /// the hardware cannot reorder around it, or a scalable-vector ISA (SVE/SME, RVV)
-    /// whose length is not a compile-time `LANES`, so the fixed-width loop needs
-    /// rewriting outright. Both cases still do a per-element fused `a*b + c` in ascending
-    /// `p`, so they round consistently with the edge path. Instructions that reshape the
-    /// accumulation rounding itself (matrix or dot instructions: `bfmmla`, `sdot`, VNNI,
-    /// `vdpbf16ps`) are out of scope for this seam: they arrive as a new
-    /// [`crate::kernel::KernelFamily`] with a dedicated dot seam, which may round
-    /// differently from the widen path within tolerance, rather than as an
-    /// `accumulate_tile` override. Before keeping any override, prove it pays: check the
-    /// disassembly for spills, confirm it stays deterministic and accurate to the same
-    /// tolerance, and benchmark it, since a hand schedule is not guaranteed to help
+    /// Otherwise the broadcast path runs
+    ///
+    /// Keep the default on any out-of-order core. On a wide OoO core, LLVM already
+    /// lowers it into the canonical register-blocked kernel that saturates the FMA
+    /// pipes. It schedules the next step's loads in among the FMAs and unrolls the `kc`
+    /// loop on its own
+    ///
+    /// Override this only for a target whose generated schedule genuinely stalls in a
+    /// way LLVM will not fix on its own. One example is an in-order or narrow-OoO core.
+    /// There, hoisting the next step's loads (the textbook software pipeline) pays off,
+    /// because the hardware cannot reorder around it. Another example is a
+    /// scalable-vector ISA (SVE/SME, RVV) whose length is not a compile-time `LANES`, so
+    /// the fixed-width loop needs rewriting outright. Both cases still do a per-element
+    /// fused `a*b + c` in ascending `p`, so they round consistently with the edge path
+    ///
+    /// Instructions that reshape the accumulation rounding itself (matrix or dot
+    /// instructions: `bfmmla`, `sdot`, VNNI, `vdpbf16ps`) are out of scope for this seam.
+    /// They arrive instead as a new [`crate::kernel::KernelFamily`] with a dedicated dot
+    /// seam, rather than as an `accumulate_tile` override. That seam may round
+    /// differently from the widen path, within tolerance
+    ///
+    /// Before keeping any override, prove that it pays:
+    ///
+    /// 1. Check the disassembly for spills
+    /// 2. Confirm it stays deterministic and accurate to the same tolerance
+    /// 3. Measure it, because a hand schedule is not guaranteed to help
     ///
     /// An override must stay deterministic and accurate to the same tolerance under a
-    /// fixed config, and round consistently with the microkernel's edge path within a run
-    /// (full and edge tiles of the same matrix must agree), but it need not be
+    /// fixed config. It must also round consistently with the microkernel's edge path
+    /// within a run, so full and edge tiles of the same matrix agree. It need not be
     /// bitwise-identical to the default. The portable schedule keeps the ascending-`p`
     /// fused `a*b + c` order, and software pipelining reorders loads, never the
-    /// arithmetic, so it trivially meets that bar. Called only for full tiles
-    /// (`nr_eff == NR`); partial column tiles stay on the microkernel's edge path
+    /// arithmetic, so it trivially meets that bar. This runs only for full tiles
+    /// (`nr_eff == NR`). Partial column tiles stay on the microkernel's edge path
     ///
     /// # Safety
     ///
-    /// `a` valid for `MR_REG*LANES` rows x `kc` depth at stride `a_cs`; `b` valid for
-    /// `NR` cols x `kc` depth at strides `b_rs`/`b_cs`; `acc` pre-initialized. Must run
-    /// inside this token's [`Simd::vectorize`] context
+    /// `a` must be valid for `MR_REG*LANES` rows x `kc` depth at stride `a_cs`. `b` must
+    /// be valid for `NR` cols x `kc` depth at strides `b_rs`/`b_cs`. `acc` must be
+    /// pre-initialized. Run this inside this token's [`Simd::vectorize`] context
     #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
     #[inline(always)]
     unsafe fn accumulate_tile<const MR_REG: usize, const NR: usize>(
@@ -600,9 +645,9 @@ pub trait SimdOps<T: Scalar>: Simd {
         let lanes = Self::LANES;
         unsafe {
             if Self::LANE_FMA && b_cs == 1 && NR.is_multiple_of(lanes) {
-                // Lane-indexed fast path: load each contiguous lanes-wide RHS block as
-                // one vector and fan it out via fused lane-indexed FMA, replacing NR
-                // per-column splat loads with NR/lanes vector loads
+                // Lane-indexed fast path: it loads each contiguous lanes-wide RHS block
+                // as one vector and fans it out through fused lane-indexed FMA. This
+                // replaces NR per-column splat loads with NR/lanes vector loads
                 for p in 0..kc {
                     let pa = a.offset(p as isize * a_cs);
                     let a_regs: [Self::Reg; MR_REG] =
@@ -614,8 +659,8 @@ pub trait SimdOps<T: Scalar>: Simd {
                     }
                 }
             } else {
-                // Splat path: one broadcast per RHS column, correct for any b_cs
-                // (packed or unpacked) and the only full-tile path on ISAs without a
+                // Splat path: one broadcast per RHS column. It works for any b_cs
+                // (packed or unpacked) and is the only full-tile path on ISAs without a
                 // lane FMA. The const-bounded j loop fully unrolls
                 for p in 0..kc {
                     let pa = a.offset(p as isize * a_cs);
@@ -635,23 +680,24 @@ pub trait SimdOps<T: Scalar>: Simd {
 
     /// Compute one `MR x NR` complex tile in the split (structure-of-arrays) layout and
     /// apply the complex `alpha`/`beta` epilogue. This is the complex analogue of
-    /// [`Self::accumulate_tile`]: a per-ISA hot loop that lives on this L0 seam because it
-    /// needs the real-valued intrinsics (`SimdOps<T::Real>`) the generic
+    /// [`Self::accumulate_tile`]. It is a per-ISA hot loop that lives on this L0 seam.
+    /// It needs the real-valued intrinsics (`SimdOps<T::Real>`) that the generic
     /// [`crate::kernel::ComplexGemm`] microkernel cannot name through its
-    /// `KernelSimd<T, T, T, T>` bound. The default is unreachable: only the complex
+    /// `KernelSimd<T, T, T, T>` bound. The default is unreachable. Only the complex
     /// `SimdOps<Complex<_>>` impls override it, and each forwards to the shared,
     /// ISA-generic `complex::soa_microkernel`, which has the real ops available
     /// concretely. Alpha/beta state arrives as plain bools rather than the L4
-    /// `AlphaStatus`/`BetaStatus` enums, since depending on those would be an upward
+    /// `AlphaStatus`/`BetaStatus` enums, because depending on those would be an upward
     /// dependency from this L0 seam
     ///
-    /// * `a`/`b`: planar packed panels (the real plane then the imaginary plane per
-    ///   depth step); `a_cs`/`b_rs` are their depth strides in complex elements (`mr`/`NR`)
-    /// * `c`/`rsc`/`csc`: the interleaved output tile; `scratch` needs at least `2*mr*NR`
-    ///   reals
+    /// * `a` and `b`: planar packed panels, the real plane then the imaginary plane per
+    ///   depth step. `a_cs` and `b_rs` are their depth strides in complex elements
+    ///   (`mr`/`NR`)
+    /// * `c`, `rsc`, `csc`: the interleaved output tile. `scratch` needs at least
+    ///   `2*mr*NR` reals
     ///
     /// # Safety
-    /// As [`crate::kernel::KernelFamily::microkernel`]; run inside [`Simd::vectorize`]
+    /// As [`crate::kernel::KernelFamily::microkernel`]. Run this inside [`Simd::vectorize`]
     #[allow(clippy::too_many_arguments)]
     #[inline(always)]
     unsafe fn cplx_microkernel<const MR_REG: usize, const NR: usize>(
@@ -677,14 +723,18 @@ pub trait SimdOps<T: Scalar>: Simd {
     }
 }
 
-/// Direct unit test of the vectorized `requant_store` seam. For every runtime-available x86
-/// vector-capable token, plus the aarch64 NEON baseline token, sweeps adversarial `i32`
-/// accumulators x scale x zero-point x clamp bounds and asserts each stored byte equals an
-/// independent scalar model of the map (std `round_ties_even`, not the kernel's `2^52` trick). The
-/// `(0, 255)` bounds cover the `u8`-output phase. The oracle is the scalar model, never a captured
-/// machine number, so the test is platform-independent. Gated to the arches that override
-/// `requant_store` (x86 + NEON); on any other arch every token takes the scalar epilogue instead,
-/// so the sweep would be vacuous and its helpers dead code
+/// Direct unit test of the vectorized `requant_store` seam
+///
+/// For every runtime-available x86 vector-capable token, plus the aarch64 NEON baseline
+/// token, this sweeps adversarial `i32` accumulators x scale x zero-point x clamp bounds.
+/// It asserts each stored byte equals an independent scalar model of the map (std
+/// `round_ties_even`, not the kernel's `2^52` trick). The `(0, 255)` bounds cover the
+/// `u8`-output phase. The oracle is the scalar model, never a captured machine number, so
+/// the test is platform-independent
+///
+/// This is gated to the arches that override `requant_store` (x86 and NEON). On any other
+/// arch, every token takes the scalar epilogue instead, so the sweep would be vacuous and
+/// its helpers dead code
 #[cfg(all(
     test,
     feature = "int8",

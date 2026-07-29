@@ -8,6 +8,9 @@
 
 use gemmkit::{MatMut, MatRef, Parallelism};
 
+// An unrecognized GEMMKIT_REQUIRE_ISA value panics with "unknown value" instead of falling
+// back to auto-selection
+
 #[test]
 #[should_panic(expected = "unknown value")]
 fn garbage_pin_is_a_hard_error() {

@@ -60,8 +60,8 @@ impl<'a> Arbitrary<'a> for GemmPlan {
         };
         Ok(GemmPlan {
             ty,
-            // m, n range past the AVX-512F f32 tile edges (mr=32, nr=12 on this dispatch);
-            // k ranges past the bf16/i8-VNNI DEPTH_MULTIPLE padding, into partial-depth panels
+            // m, n range past the AVX-512F f32 tile edges, mr=32 and nr=12 on this dispatch. k
+            // ranges past the bf16/i8-VNNI DEPTH_MULTIPLE padding, into partial-depth panels
             m: u.int_in_range(0usize..=48)?,
             k: u.int_in_range(0usize..=130)?,
             n: u.int_in_range(0usize..=48)?,
@@ -162,8 +162,8 @@ pub fn run_gemm(p: GemmPlan) {
 // fuzz_knobs
 
 /// Every `tuning::set_*` compiled under this crate's features (`std,parallel,complex,
-/// half,int8` on x86_64): the 29 general knobs plus `set_i8_vnni_min_par_mnk` (`int8`).
-/// `set_wasm_threads` is wasm-only and so never compiled here
+/// half,int8` on x86_64): the 30 general knobs plus `set_i8_vnni_min_par_mnk` (`int8`).
+/// `set_wasm_threads` is wasm-only and never compiles here
 pub(crate) const KNOB_SETTERS: &[(&str, fn(usize))] = &[
     ("parallel_threshold", tuning::set_parallel_threshold),
     ("rhs_pack_threshold", tuning::set_rhs_pack_threshold),
@@ -206,9 +206,9 @@ pub(crate) const KNOB_SETTERS: &[(&str, fn(usize))] = &[
 
 pub(crate) const N_KNOBS: usize = KNOB_SETTERS.len();
 
-/// Knob-value classes exercising the setters' boundary behavior. A setter stores its
-/// value unconditionally and clamps `usize::MAX` down to `MAX - 1` (`usize::MAX` is the
-/// internal UNSET sentinel), so drawing `MAX` here exercises that clamp
+/// Picks a knob-value class that exercises the setters' boundary behavior. A setter stores
+/// its value unconditionally and clamps `usize::MAX` down to `MAX - 1`, since `usize::MAX`
+/// is the internal UNSET sentinel. Drawing `MAX` here exercises that clamp
 pub(crate) fn knob_value(u: &mut Unstructured) -> Result<usize> {
     Ok(match u.int_in_range(0u8..=8)? {
         0 => 0, // several knobs treat 0 as "auto"
@@ -281,9 +281,8 @@ impl<'a> Arbitrary<'a> for KnobsPlan {
 }
 
 pub fn run_knobs(p: KnobsPlan) {
-    // Every knob is set on every input, and a setter stores unconditionally, so each
-    // exec fully overwrites the previous exec's knob values: no state leaks across
-    // libFuzzer execs, so a crash artifact reproduces on its own
+    // Every knob is set on every input, and each setter stores unconditionally, so no state
+    // leaks across libFuzzer execs. A crash artifact reproduces on its own
     for (i, (_, setter)) in KNOB_SETTERS.iter().enumerate() {
         setter(p.values[i]);
     }
@@ -347,7 +346,7 @@ pub fn run_knobs(p: KnobsPlan) {
 
 #[derive(Debug)]
 pub struct BatchedPlan {
-    pub ty64: bool, // selects f64 in run_batched; false runs f32
+    pub ty64: bool, // selects f64 in run_batched when true, f32 when false
     pub batch: usize,
     pub m: usize,
     pub k: usize,
@@ -462,7 +461,7 @@ impl<'a> Arbitrary<'a> for PrepackPlan {
         };
         Ok(PrepackPlan {
             ty,
-            // dims 1..=48 cross the AVX-512F tile edges; 0 is excluded since the trivial
+            // dims 1..=48 cross the AVX-512F tile edges. 0 is excluded since the trivial
             // empty-prepack path is already covered by fuzz_api_validation
             m: u.int_in_range(1usize..=48)?,
             k: u.int_in_range(1usize..=48)?,
@@ -501,11 +500,13 @@ pub fn run_prepack(p: PrepackPlan) {
 
 // fuzz_prepack_i8
 
-/// i8 prepack round-trip plan, the integer twin of [`PrepackPlan`]: shapes, strides,
-/// alpha/beta, and parallelism are all arbitrary. There is no i8 LHS prepack (only
-/// `prepack_rhs_i8` + `gemm_i8_packed_b`), so this exercises the RHS path alone: the pack
-/// pins the buffer to whichever family (VNNI k-quad-interleaved, or the widen kernel's
-/// plain panels) built it, and `gemm_i8_packed_b` must read that exact layout back
+/// i8 prepack round-trip plan, the integer twin of [`PrepackPlan`]. Shapes, strides,
+/// alpha, beta, and parallelism are all arbitrary
+///
+/// There is no i8 LHS prepack, only `prepack_rhs_i8` plus `gemm_i8_packed_b`, so this
+/// exercises the RHS path alone. The pack pins the buffer to whichever family built it,
+/// VNNI k-quad-interleaved or the widen kernel's plain panels. `gemm_i8_packed_b` must
+/// read that exact layout back
 #[derive(Debug)]
 pub struct PrepackI8Plan {
     pub m: usize,
@@ -522,10 +523,10 @@ pub struct PrepackI8Plan {
 impl<'a> Arbitrary<'a> for PrepackI8Plan {
     fn arbitrary(u: &mut Unstructured<'a>) -> Result<Self> {
         Ok(PrepackI8Plan {
-            // dims 1..=48 cross the AVX-512F i8 tile edges (mr=32, nr=12); k additionally
-            // crosses the VNNI DEPTH_MULTIPLE (4) pack padding into partial-depth panels
-            // 0 is excluded: an empty prepack is a trivial exact 0-result, and is already
-            // covered by fuzz_api_validation
+            // dims 1..=48 cross the AVX-512F i8 tile edges, mr=32 and nr=12. k crosses the
+            // VNNI DEPTH_MULTIPLE (4) pack padding into partial-depth panels. 0 is excluded:
+            // an empty prepack always returns a 0-length buffer, a degenerate case with
+            // nothing to gate
             m: u.int_in_range(1usize..=48)?,
             k: u.int_in_range(1usize..=48)?,
             n: u.int_in_range(1usize..=48)?,
@@ -565,10 +566,12 @@ mod knob_sync {
 
     /// `KNOB_SETTERS` must exactly cover gemmkit's canonical knob registry
     /// (`tuning::knob_env_names`), so a knob added to gemmkit but not wired into
-    /// `KNOB_SETTERS` fails this test. This crate builds gemmkit for `complex,half,int8`
-    /// on a native target, so the registry is the 29 general knobs plus i8_vnni_min_par_mnk
-    /// (no wasm_threads); an env name maps to its setter name by dropping the `GEMMKIT_`
-    /// prefix and lowercasing
+    /// `KNOB_SETTERS` fails this test
+    ///
+    /// This crate builds gemmkit for `complex,half,int8` on a native target, so the registry
+    /// is the 30 general knobs plus `i8_vnni_min_par_mnk`, and wasm_threads does not appear.
+    /// An env name maps to its setter name by dropping the `GEMMKIT_` prefix, then
+    /// lowercasing what remains
     #[test]
     fn setters_cover_every_knob() {
         let canonical: BTreeSet<String> = gemmkit::tuning::knob_env_names()

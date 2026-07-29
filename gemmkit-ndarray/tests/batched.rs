@@ -1,7 +1,7 @@
 //! Strided-batched ndarray adapter (`gemm_batched` / `dot_batched`, batch on axis 0): the 3-D
-//! `Array3` form must reproduce a per-element loop of `dot` / `gemm`, read general-stride and
-//! permuted-axes 3-D views straight through without copying, and (under `epilogue`) match a loop of
-//! `gemm_fused` for one shared bias/activation bit-for-bit
+//! `Array3` form must reproduce a per-element loop of `dot` / `gemm`, accepting general-stride and
+//! permuted-axes 3-D views directly, and (under `epilogue`) match a loop of `gemm_fused` for one
+//! shared bias/activation bit-for-bit
 
 use approx::assert_relative_eq;
 use ndarray::{Array3, Axis};
@@ -19,6 +19,7 @@ fn rand3(b: usize, r: usize, c: usize, seed: u64) -> Array3<f64> {
     })
 }
 
+// dot_batched matches ae.dot(&be) for each batch element
 #[test]
 fn dot_batched_matches_per_element_dot() {
     let (batch, m, k, n) = (5usize, 7, 9, 6);
@@ -36,6 +37,8 @@ fn dot_batched_matches_per_element_dot() {
     }
 }
 
+// gemm_batched(alpha, ..., beta, ...) matches alpha*ae.dot(&be) + beta*c0 per batch element,
+// under both Serial and Rayon
 #[test]
 fn gemm_batched_matches_per_element_loop() {
     let (batch, m, k, n) = (4usize, 8, 5, 6);
@@ -59,7 +62,8 @@ fn gemm_batched_matches_per_element_loop() {
     }
 }
 
-/// Batched over a permuted-axes (non-contiguous) 3-D view: strides read straight through, no copy
+/// Batched over a permuted-axes (non-contiguous) 3-D view: `dot_batched` takes it directly and
+/// still matches the per-element product
 #[test]
 fn gemm_batched_permuted_axes_view() {
     let (batch, m, k, n) = (3usize, 6, 4, 5);

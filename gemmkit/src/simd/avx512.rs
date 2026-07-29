@@ -1,7 +1,7 @@
 //! AVX-512 ISA token (x86 / x86-64)
 //!
-//! `f32` uses 512-bit registers (16 lanes), `f64` 512-bit (8 lanes). Built on the
-//! AVX-512 intrinsics stabilized in Rust 1.89, this crate's minimum supported version
+//! `f32` uses 512-bit registers with 16 lanes, and `f64` uses 512-bit registers with 8
+//! lanes. These intrinsics work in Rust 1.89, the crate's minimum supported version
 
 #[cfg(target_arch = "x86")]
 use core::arch::x86::*;
@@ -28,8 +28,8 @@ impl Simd for Avx512F {
         unsafe fn inner<R>(f: impl FnOnce() -> R) -> R {
             f()
         }
-        // SAFETY: the dispatcher guarantees avx512f support before calling vectorize;
-        // inner establishes the codegen context and f inlines into it
+        // SAFETY: the dispatcher guarantees avx512f support before calling vectorize
+        // inner establishes the codegen context, and f inlines into it
         unsafe { inner(f) }
     }
 }
@@ -169,12 +169,12 @@ impl KernelSimd<f16, f16, f32, f16> for Avx512F {
     }
 }
 
-/// bf16 via plain integer ops, all AVX-512F: widening is a 16-bit left shift into an f32;
-/// narrowing is the round-to-nearest-even bias trick followed by a truncate. The
+/// bf16 via plain integer ops, all AVX-512F: widening is a 16-bit left shift into an f32.
+/// Narrowing uses the round-to-nearest-even bias trick followed by a truncate. The
 /// narrowing side is bit-identical to `half::bf16::from_f32`, NaN included (forced to
-/// `(bits>>16) | 0x0040`), so this conversion matches the scalar path; that is what keeps
-/// full and edge tiles of the same matrix consistent, even though the `vdpbf16ps` dot
-/// kernel's fused 2-term MAC rounds differently from this widen-and-FMA path
+/// `(bits>>16) | 0x0040`), so this conversion matches the scalar path. That keeps full and
+/// edge tiles of the same matrix consistent. Even so, the `vdpbf16ps` dot kernel's fused
+/// 2-term MAC rounds differently from this widen-and-FMA path
 #[cfg(feature = "half")]
 impl KernelSimd<bf16, bf16, f32, bf16> for Avx512F {
     #[inline(always)]
@@ -250,7 +250,7 @@ impl SimdOps<i32> for Avx512F {
     }
     #[inline(always)]
     unsafe fn fnma(self, a: __m512i, b: __m512i, c: __m512i) -> __m512i {
-        // c - a*b, wrapping i32. Satisfies the trait; the integer kernel never calls it
+        // c - a*b, wrapping i32. Satisfies the trait. The integer kernel never calls it
         unsafe { _mm512_sub_epi32(c, _mm512_mullo_epi32(a, b)) }
     }
     #[inline(always)]
@@ -260,15 +260,15 @@ impl SimdOps<i32> for Avx512F {
 }
 
 /// Requantize one half (8 `i32` lanes, as `__m256i`) of a `__m512i` accumulator to 8
-/// integral `i32` in `[lo, hi]`, following the scalar map exactly: widen `i32 -> f64`,
-/// multiply by `scale` (both exact), round to nearest-even in hardware, add `zp`, clamp to
-/// `[lo, hi]`, convert back to `i32` (exact, since the clamped value is already integral).
-/// `#[inline(always)]` so the intrinsics fold straight into the caller's
-/// `#[target_feature]` context
+/// integral `i32` in `[lo, hi]`. This follows the scalar map exactly: widen `i32` to `f64`,
+/// multiply by `scale` (both exact), and round to nearest-even in hardware. Then it adds
+/// `zp` and clamps to `[lo, hi]`. The final convert back to `i32` is exact, because the
+/// clamped value is already integral. `#[inline(always)]` lets the intrinsics fold
+/// straight into the caller's `#[target_feature]` context
 ///
-/// The `roundscale` imm8 is `0b0000_1000`: bits `[1:0] = 00` selects round-to-nearest-even,
-/// bit `[3] = 1` suppresses the precision exception, bits `[7:4] = 0` select scale `2^0`,
-/// together equal to `_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC`
+/// The `roundscale` imm8 is `0b0000_1000`. Bits `[1:0] = 00` select round-to-nearest-even,
+/// bit `[3] = 1` suppresses the precision exception, and bits `[7:4] = 0` select scale
+/// `2^0`. Together they equal `_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC`
 #[cfg(feature = "int8")]
 #[inline(always)]
 unsafe fn requant_half_avx512f(
@@ -289,18 +289,19 @@ unsafe fn requant_half_avx512f(
     }
 }
 
-/// Vectorized `i32 -> i8` requantize store shared by [`Avx512F`] and [`Avx512Vnni`] (see
-/// [`KernelSimd::requant_store`] for the bit-for-bit-with-scalar contract): split the 16
-/// `i32` lanes into 2 `__m256i` halves, requantize each in `f64` ([`requant_half_avx512f`]),
-/// recombine into one `__m512i` of 16 integral `i32` in `[lo, hi]`, and narrow with the
-/// **truncating** `vpmovdb` (`_mm512_cvtepi32_epi8`, not the saturating
-/// `vpmovsdb`/`vpmovusdb`: the lanes are already clamped, so a saturating pack would
-/// double-clamp and give the wrong answer for the `u8`/`[0, 255]` phase)
+/// Vectorized `i32 -> i8` requantize store shared by [`Avx512F`] and [`Avx512Vnni`]. See
+/// [`KernelSimd::requant_store`] for the bit-for-bit-with-scalar contract. It splits the
+/// 16 `i32` lanes into 2 `__m256i` halves. Each half is requantized in `f64`
+/// ([`requant_half_avx512f`]), and the halves recombine into one `__m512i` of 16 integral
+/// `i32` in `[lo, hi]`. It narrows with the truncating `vpmovdb`
+/// (`_mm512_cvtepi32_epi8`), not the saturating `vpmovsdb`/`vpmovusdb`. The lanes are
+/// already clamped, so a saturating pack would double-clamp and give the wrong answer for
+/// the `u8`/`[0, 255]` phase
 ///
 /// # Safety
-/// `dst` valid for 16 byte writes. Sound under either token's [`Simd::vectorize`]: both
-/// enable `avx512f` ([`Avx512Vnni`]'s `avx512f,avx512bw,avx512vnni` is a superset), all these
-/// intrinsics need
+/// `dst` must be valid for 16 byte writes. This is sound under either token's
+/// [`Simd::vectorize`], because both enable `avx512f` ([`Avx512Vnni`]'s
+/// `avx512f,avx512bw,avx512vnni` set is a superset), which is all these intrinsics need
 #[cfg(feature = "int8")]
 #[inline(always)]
 unsafe fn requant_store_avx512f(dst: *mut i8, v: __m512i, scale: f64, zp: i32, lo: i32, hi: i32) {
@@ -347,14 +348,14 @@ impl KernelSimd<i8, i8, i32, i32> for Avx512F {
     }
 }
 
-/// Emit a `SimdOps<$t>` impl for a **superset AVX-512 token** ([`Avx512Vnni`] /
-/// [`Avx512Bf16`]) that forwards `Reg`/`LANES` and every method to [`Avx512F`]'s impl. Each
-/// token is a distinct type only because `#[target_feature]` is per-token; the numeric
-/// ops themselves are identical. Every method is an `#[inline(always)]` one-line forward
-/// through `<Avx512F as SimdOps<$t>>`, so once inlined inside the token's superset
-/// `vectorize` context, codegen is the same intrinsic as writing it inline directly (the
-/// pattern the `KernelSimd` impls below already use). Delegating keeps one source of
-/// truth: `f32`'s `max`/`min`, for instance, come along for free instead of drifting
+/// Emit a `SimdOps<$t>` impl for a superset AVX-512 token ([`Avx512Vnni`] or
+/// [`Avx512Bf16`]) that forwards `Reg`, `LANES`, and every method to [`Avx512F`]'s impl.
+/// Each token is a distinct type only because `#[target_feature]` is per-token. The
+/// numeric ops themselves are identical. Every method is an `#[inline(always)]` one-line
+/// forward through `<Avx512F as SimdOps<$t>>`. Once it inlines inside the token's
+/// superset `vectorize` context, codegen matches writing the intrinsic inline directly,
+/// the same pattern the `KernelSimd` impls below use. Delegating keeps one source of
+/// truth, so a method such as `f32`'s `max` or `min` needs no separate copy per token
 // Used only by the VNNI (int8) and BF16 (half) tokens below
 #[cfg(any(feature = "int8", feature = "half"))]
 macro_rules! delegate_simdops {
@@ -413,12 +414,12 @@ macro_rules! delegate_simdops {
 
 // AVX-512 VNNI: i8 -> i32 dot kernel via vpdpbusd, 4 depth steps per instruction
 
-/// AVX-512 VNNI ISA token, driving the integer dot kernel. Enables the full
-/// `avx512f,avx512bw,avx512vnni` set (BW rides along for its byte ops). A distinct token from
-/// [`Avx512F`] because `#[target_feature]` is per-token: `_mm512_dpbusd_epi32` needs an
-/// `avx512vnni` codegen context that [`Avx512F::vectorize`] (only `avx512f`) does not
-/// provide. Its `SimdOps<i32>` and `i8 -> i32` seam mirror [`Avx512F`]'s exactly (same
-/// `__m512i`, 16 lanes); the one addition is the [`KernelSimd::dot_accumulate`] override
+/// AVX-512 VNNI ISA token, driving the integer dot kernel. It enables the full
+/// `avx512f,avx512bw,avx512vnni` set (BW rides along for its byte ops). This is a distinct
+/// token from [`Avx512F`] because `#[target_feature]` is per-token: `_mm512_dpbusd_epi32`
+/// needs an `avx512vnni` codegen context that [`Avx512F::vectorize`] (only `avx512f`) does
+/// not provide. Its `SimdOps<i32>` and `i8 -> i32` seam mirror [`Avx512F`]'s exactly (same
+/// `__m512i`, 16 lanes). The one addition is the [`KernelSimd::dot_accumulate`] override
 /// that folds 4 depth steps x 16 lanes into each `vpdpbusd`
 #[cfg(feature = "int8")]
 #[derive(Copy, Clone, Default)]
@@ -428,28 +429,28 @@ pub struct Avx512Vnni;
 impl Simd for Avx512Vnni {
     #[inline(always)]
     unsafe fn vectorize<R>(self, f: impl FnOnce() -> R) -> R {
-        // vpdpbusd needs avx512vnni; avx512bw rides along for its byte ops. The
+        // vpdpbusd needs avx512vnni. avx512bw rides along for its byte ops. The
         // dispatcher verifies all 3 before ever selecting this token
         #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
         unsafe fn inner<R>(f: impl FnOnce() -> R) -> R {
             f()
         }
         // SAFETY: the dispatcher guarantees avx512f+bw+vnni support before calling
-        // vectorize; inner establishes the codegen context and f inlines into it
+        // vectorize. inner establishes the codegen context, and f inlines into it
         unsafe { inner(f) }
     }
 }
 
-// The numeric i32 ops delegate to Avx512F's exactly (this token exists only for
-// vpdpbusd's per-token #[target_feature]); max/min fall to the shared unreachable!
+// The numeric i32 ops delegate to Avx512F's exactly. This token exists only for
+// vpdpbusd's per-token #[target_feature]. max/min fall to the shared unreachable!
 // default, since the integer epilogue never clamps
 #[cfg(feature = "int8")]
 delegate_simdops!(Avx512Vnni => Avx512F, i32);
 
-/// `i8 -> i32` via VNNI. The load/store seam matches [`Avx512F`]'s (a plain `i32`
-/// epilogue); `load_lhs`/`splat_rhs` are required by the trait but unused, since the
-/// hot loop runs through [`Self::dot_accumulate`], which reads the family's
-/// k-quad-interleaved panels directly
+/// `i8 -> i32` via VNNI. The load/store seam matches [`Avx512F`]'s plain `i32` epilogue.
+/// `load_lhs` and `splat_rhs` are required by the trait but unused, because the hot loop
+/// runs through [`Self::dot_accumulate`], which reads the family's k-quad-interleaved
+/// panels directly
 #[cfg(feature = "int8")]
 impl KernelSimd<i8, i8, i32, i32> for Avx512Vnni {
     #[inline(always)]
@@ -490,18 +491,13 @@ impl KernelSimd<i8, i8, i32, i32> for Avx512Vnni {
             let mr = MR_REG * 16;
             let nquads = kc.div_ceil(4);
 
-            // Column sums of the signed B panel, needed for the +128 bias correction below
+            // Column sums of the signed B panel, used for the +128 bias correction below
             // The packed A holds A + 128 (unsigned, as vpdpbusd requires), so per lane
-            // sum_k((A+128)*B) = sum_k(A*B) + 128*sum_k(B). B's depth/column pad is 0, so
-            // summing the padded panel equals summing real B. B is broadcast, so every
-            // output lane shares the same colsum[j]; a scalar sum (wrapping mod 2^32, same
-            // as the i32 accumulation) is enough. (s over one quad is bounded by 4*127, so it
-            // cannot overflow i32; the running colsum wraps, which is fine since only its
-            // final wrapped value is used.) Recomputing this once per A row-panel rather than
-            // once per B panel costs little, since the scalar pass is a small fraction of the
-            // vpdpbusd work and the B strip is already cache-warm; that beats widening the
-            // packed-panel layout and the driver's buffer sizing just to carry a precomputed
-            // column sum
+            // sum_k((A+128)*B) = sum_k(A*B) + 128*sum_k(B). B's pad is 0, so the padded
+            // sum equals the real column sum, and every output lane shares colsum[j]
+            // because B is broadcast. Each quad sum is bounded by 4*127, so it cannot
+            // overflow i32. The wrapped running total stays safe because only its final
+            // value is used
             let mut colsum = [0i32; NR];
             for q in 0..nquads {
                 for j in 0..NR {
@@ -515,7 +511,7 @@ impl KernelSimd<i8, i8, i32, i32> for Avx512Vnni {
             }
 
             // Dot accumulation: each vpdpbusd folds 4 depth steps x 16 lanes. A register
-            // i holds 16 rows x 4 contiguous k-bytes (64 bytes); a B quad broadcasts 4
+            // i holds 16 rows x 4 contiguous k-bytes (64 bytes). A B quad broadcasts 4
             // contiguous k-bytes of one column, read as one i32
             for q in 0..nquads {
                 let a_regs: [__m512i; MR_REG] = core::array::from_fn(|i| {
@@ -532,7 +528,7 @@ impl KernelSimd<i8, i8, i32, i32> for Avx512Vnni {
             }
 
             // Subtract the per-column bias VNNI_A_BIAS*colsum[j] (the same value in every
-            // lane) to recover the true signed sum_k(A*B); this is the same bias constant
+            // lane) to recover the true signed sum_k(A*B). This is the same bias constant
             // the LHS pack added
             for j in 0..NR {
                 let corr = _mm512_set1_epi32(VNNI_A_BIAS.wrapping_mul(colsum[j]));
@@ -546,13 +542,13 @@ impl KernelSimd<i8, i8, i32, i32> for Avx512Vnni {
 
 // AVX-512 BF16: bf16 -> f32 dot kernel via vdpbf16ps, 2 depth steps per instruction
 
-/// AVX-512 BF16 ISA token, driving the bf16 dot kernel. Enables the `avx512f,avx512bf16`
-/// set. A distinct token from [`Avx512F`] because `#[target_feature]` is per-token:
-/// `_mm512_dpbf16_ps` needs an
-/// `avx512bf16` codegen context that [`Avx512F::vectorize`] (only `avx512f`) does not
-/// provide. Its `SimdOps<f32>` and `bf16 -> f32` seam mirror [`Avx512F`]'s exactly (same
-/// `__m512`, 16 lanes, identical round-to-nearest-even/NaN narrowing); the one addition
-/// is the [`KernelSimd::dot_accumulate`] override that folds 2 depth steps per `vdpbf16ps`
+/// AVX-512 BF16 ISA token, driving the bf16 dot kernel. It enables the `avx512f,avx512bf16`
+/// set. This is a distinct token from [`Avx512F`] because `#[target_feature]` is per-token:
+/// `_mm512_dpbf16_ps` needs an `avx512bf16` codegen context that [`Avx512F::vectorize`]
+/// (only `avx512f`) does not provide. Its `SimdOps<f32>` and `bf16 -> f32` seam mirror
+/// [`Avx512F`]'s exactly (same `__m512`, 16 lanes, identical round-to-nearest-even and NaN
+/// narrowing). The one addition is the [`KernelSimd::dot_accumulate`] override that folds
+/// 2 depth steps per `vdpbf16ps`
 #[cfg(feature = "half")]
 #[derive(Copy, Clone, Default)]
 pub struct Avx512Bf16;
@@ -566,24 +562,24 @@ impl Simd for Avx512Bf16 {
             f()
         }
         // SAFETY: the dispatcher guarantees avx512f+bf16 support before calling
-        // vectorize; inner establishes the codegen context
+        // vectorize. inner establishes the codegen context
         unsafe { inner(f) }
     }
 }
 
-// The f32 accumulator ops delegate to Avx512F's exactly (this token exists only for
-// vdpbf16ps's per-token #[target_feature]); delegating also carries max/min along, for a
+// The f32 accumulator ops delegate to Avx512F's exactly. This token exists only for
+// vdpbf16ps's per-token #[target_feature]. Delegating also carries max/min along, for a
 // future fused bf16 epilogue that would need to clamp through them
 #[cfg(feature = "half")]
 delegate_simdops!(Avx512Bf16 => Avx512F, f32);
 
 /// `bf16 -> f32` via `vdpbf16ps`. The widen-load/narrow-store seam delegates to
-/// [`Avx512F`]'s bf16 impl: one source of truth for the round-to-nearest-even-bias plus
-/// `half`-NaN narrowing, which must stay bit-identical to `half::bf16::from_f32` and the
-/// scalar edge path. `vectorize` here enables a superset of `avx512f`, so the delegated
-/// conversions still land in a valid codegen context. `splat_rhs` is trait-required but
-/// unused, since the hot loop runs [`Self::dot_accumulate`]; `load_out` is used, by the
-/// `beta != 0` read of C
+/// [`Avx512F`]'s bf16 impl. That keeps one source of truth for the round-to-nearest-even
+/// bias plus the `half`-NaN narrowing, which must stay bit-identical to
+/// `half::bf16::from_f32` and the scalar edge path. `vectorize` here enables a superset of
+/// `avx512f`, so the delegated conversions still land in a valid codegen context.
+/// `splat_rhs` is trait-required but unused, because the hot loop runs
+/// [`Self::dot_accumulate`]. `load_out` is used by the `beta != 0` read of C
 #[cfg(feature = "half")]
 impl KernelSimd<bf16, bf16, f32, bf16> for Avx512Bf16 {
     #[inline(always)]
@@ -616,12 +612,11 @@ impl KernelSimd<bf16, bf16, f32, bf16> for Avx512Bf16 {
             let mr = MR_REG * 16;
             let npairs = kc.div_ceil(2);
 
-            // Each vdpbf16ps folds 2 depth steps: per f32 lane it computes the 2-term
-            // bf16 dot f32(a0)*f32(b0) + f32(a1)*f32(b1). A register i holds 16 rows x 2
-            // contiguous bf16 (64 bytes as one __m512bh); a B pair broadcasts 2 contiguous
-            // bf16 of one column. An odd-k tail is zero-padded in both panels at pack time
-            // (0*0 = 0), so this loop can always read whole pairs. No bias or signedness
-            // fixup is needed: this is a plain dot product, unlike VNNI's unsigned*signed
+            // Each vdpbf16ps folds 2 depth steps: per f32 lane it computes the 2-term bf16
+            // dot f32(a0)*f32(b0) + f32(a1)*f32(b1). A register i holds 16 rows x 2
+            // contiguous bf16, and a B pair broadcasts 2 contiguous bf16 of one column. An
+            // odd-k tail is zero-padded in both panels at pack time, so this loop always
+            // reads whole pairs. No bias or signedness fixup is needed, unlike in VNNI
             for p2 in 0..npairs {
                 let a_regs: [__m512bh; MR_REG] = core::array::from_fn(|i| {
                     core::mem::transmute::<__m512i, __m512bh>(_mm512_loadu_si512(
@@ -641,8 +636,8 @@ impl KernelSimd<bf16, bf16, f32, bf16> for Avx512Bf16 {
     }
 }
 
-// Complex (AVX-512F): the real Reg is the plain f32/f64 register, LANES the real lane
-// count (16 / 8), and complex GEMM routes through the shared SoA soa_microkernel
+// Complex (AVX-512F): the real Reg is the plain f32/f64 register, and LANES is the real
+// lane count (16 / 8). Complex GEMM routes through the shared SoA soa_microkernel
 #[cfg(feature = "complex")]
 impl_complex_simd!(Avx512F, f32, __m512, 16);
 #[cfg(feature = "complex")]

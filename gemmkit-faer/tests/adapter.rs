@@ -1,9 +1,6 @@
-//! faer adapter correctness: `dot`/`gemm` against a naive reference over faer's native
-//! column-major layout plus transposed, reversed (negative-stride), and offset sub-matrix views;
-//! the prepacked `gemm_packed_b`/`gemm_packed_a` entries against the same reference and their
-//! required C orientation; dimension-mismatch panics; and, gated by feature, the i8, f16, complex,
-//! fused-epilogue, map-epilogue, and i8-requantize entries, each checked bit-exact or bit-identical
-//! against a scalar reference or the plain entry followed by the same epilogue
+//! faer adapter correctness: `dot`/`gemm` and the packed, i8, f16, complex, and epilogue entries
+//! against naive scalar references, across faer's column-major, transposed, reversed-stride, and
+//! offset sub-matrix views
 
 use faer::{Mat, MatMut, MatRef};
 use gemmkit::Parallelism;
@@ -47,6 +44,7 @@ fn assert_close(got: MatRef<'_, f64>, exp: MatRef<'_, f64>, tol: f64) {
     }
 }
 
+// dot() matches a naive triple-loop reference across a spread of m, k, n shapes
 #[test]
 fn dot_matches_naive() {
     for &(m, k, n) in &[
@@ -67,9 +65,10 @@ fn dot_matches_naive() {
     }
 }
 
+// dot() on a fixed 2x2 case matches the hand-worked product exactly, the same inputs as the
+// crate-level doctest
 #[test]
 fn dot_small_exact() {
-    // Same inputs as the crate-level doctest; worked by hand: [[1,2],[3,4]]*[[5,6],[7,8]] = [[19,22],[43,50]]
     let a = Mat::from_fn(2, 2, |i, j| [[1.0_f64, 2.0], [3.0, 4.0]][i][j]);
     let b = Mat::from_fn(2, 2, |i, j| [[5.0_f64, 6.0], [7.0, 8.0]][i][j]);
     let c = dot(a.as_dyn_stride(), b.as_dyn_stride());
@@ -155,6 +154,7 @@ fn submatrix_offset_view() {
     );
 }
 
+// gemm() combines alpha*A*B with beta*C rather than overwriting C
 #[test]
 fn accumulate_with_beta() {
     let a = rand_mat(12, 9, 11);
@@ -178,6 +178,7 @@ fn accumulate_with_beta() {
     }
 }
 
+// gemm() panics when A's column count does not match B's row count
 #[test]
 #[should_panic(expected = "A.cols")]
 fn inner_dim_mismatch_panics() {
@@ -194,6 +195,7 @@ fn inner_dim_mismatch_panics() {
     );
 }
 
+// gemm() panics when C's row count does not match A's row count
 #[test]
 #[should_panic(expected = "C.rows")]
 fn output_rows_mismatch_panics() {
@@ -220,7 +222,8 @@ fn packed_b_matches_dot() {
     let exp = naive_ref(a.as_dyn_stride(), b.as_dyn_stride());
     let packed = prepack_rhs(b.as_dyn_stride());
     for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
-        let mut c = Mat::<f64>::from_fn(m, n, |_, _| 0.0); // column-major, as gemm_packed_b requires
+        // column-major, as gemm_packed_b requires
+        let mut c = Mat::<f64>::from_fn(m, n, |_, _| 0.0);
         gemm_packed_b(
             1.0,
             a.as_dyn_stride(),
@@ -619,7 +622,8 @@ fn map_matches_plain_then_map() {
 }
 
 /// `gemm_fused` accepts a reversed (negative-stride) A view just like plain `gemm`: no special
-/// rejection for it, so the result equals `gemm` on the same view then the same bias/ReLU, bit-for-bit
+/// rejection for it, so the result equals `gemm` on the same view then the same bias/ReLU,
+/// bit-for-bit
 #[cfg(feature = "epilogue")]
 #[test]
 fn fused_reversed_view_matches_plain_then_map() {
@@ -672,7 +676,8 @@ fn fused_reversed_view_matches_plain_then_map() {
 
 /// `gemm_i8_requant`/`gemm_i8_requant_u8` match, bit-exact, an independent scalar model (bias add,
 /// scale, round-half-to-even, clamp to the output range) applied to the exact `i32` accumulator
-/// `dot_i8` produces for the same `A`/`B`; covers per-tensor and per-row scale, with and without bias
+/// `dot_i8` produces for the same `A`/`B`; covers per-tensor and per-row scale, with and without
+/// bias
 #[cfg(all(feature = "int8", feature = "epilogue"))]
 #[test]
 fn requant_matches_scalar_model() {
@@ -861,8 +866,8 @@ fn cplx_fused_matches_gemm_cplx_then_add() {
 }
 
 /// `gemm_packed_b_fused` and `gemm_packed_b_fused_with`, given a `PerRow` bias plus `ReLU`, both
-/// equal plain `gemm_packed_b` off the same prepacked handle followed by the same bias-add-then-clamp,
-/// bit-for-bit, into a column-major C
+/// equal plain `gemm_packed_b` off the same prepacked handle followed by the same
+/// bias-add-then-clamp, bit-for-bit, into a column-major C
 #[cfg(feature = "epilogue")]
 #[test]
 fn packed_b_fused_matches_packed_then_map() {

@@ -1,9 +1,7 @@
-//! The workspace-reusing `_with` entries: `gemm_with`, `gemm_packed_b_with`, `gemm_packed_a_with`,
+//! The workspace-reusing `_with` entries (`gemm_with`, `gemm_packed_b_with`, `gemm_packed_a_with`,
 //! `gemm_i8_with`, `gemm_cplx_with`, `gemm_fused_with`, `gemm_i8_requant_with`/
-//! `gemm_i8_requant_u8_with`, and `gemm_cplx_fused_with` must each match their allocating
-//! counterpart (whose correctness `adapter.rs` already checks) when reusing 1 caller-owned
-//! `Workspace` across several calls; this drives the `Some(ws)` match arm every adapter's
-//! `_common` helper carries
+//! `gemm_i8_requant_u8_with`, `gemm_cplx_fused_with`) must each match their allocating counterpart
+//! while reusing 1 caller-owned `Workspace` across several calls
 
 use faer::{Mat, MatMut, MatRef};
 use gemmkit::{Parallelism, Workspace};
@@ -92,7 +90,7 @@ fn gemm_packed_b_with_matches() {
     let packed = prepack_rhs(b.as_dyn_stride());
     let mut ws = Workspace::new();
     for &par in &[Parallelism::Serial, Parallelism::Rayon(0)] {
-        let mut c_with = Mat::<f64>::from_fn(m, n, |_, _| 0.0); // column-major, as gemm_packed_b requires
+        let mut c_with = Mat::<f64>::from_fn(m, n, |_, _| 0.0); // column-major, as packed_b needs
         gemm_packed_b_with(
             &mut ws,
             1.0,
