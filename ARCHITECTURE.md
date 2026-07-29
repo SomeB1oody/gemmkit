@@ -336,10 +336,12 @@ macro-panel fits L2, with one way reserved for B. `NC` is sized so the B
 macro-panel fits L3, with a panel-count cap on machines that report no L3.
 
 A tiny-matrix shortcut skips the model for small shapes. Sizing uses the
-packed-input element size, so narrower types get deeper blocks. `KC` and
-`NC` are deliberately independent of the thread count. `MC` may shrink with
-the worker count, to keep the parallel job list deep enough. It always
-stays an `MR` multiple, though. So the microtile set, and each tile's
+packed-input element size, so narrower types get deeper blocks. Its depth
+ceiling (`GEMMKIT_KC`) counts 4-byte elements and is divided by that element
+size, which holds the packed panel bytes fixed across the element families.
+`KC` and `NC` are deliberately independent of the thread count. `MC` may
+shrink with the worker count, to keep the parallel job list deep enough. It
+always stays an `MR` multiple, though. So the microtile set, and each tile's
 accumulation order, stay the same at any worker count.
 
 Parallelism otherwise feeds the packing decisions. The LHS pack gate is

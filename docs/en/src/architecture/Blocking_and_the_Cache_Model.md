@@ -42,9 +42,15 @@ The hint walks whole 64-byte cache lines along the tile's unit-stride dimension.
 
 ## The tiny-matrix shortcut
 
-When both `m` and `n` are at or below `GEMMKIT_TINY_BLOCK_DIM` (default 64), the driver skips the full model. It sets `kc` to `k`, clamped to the `GEMMKIT_KC` ceiling (default 512, or 16384 on aarch64). It sets `mc` to whatever row count keeps the panel in L2 at that depth, capped by `m` itself. It sets `nc` to `n` rounded up to `nr`.
+When both `m` and `n` are at or below `GEMMKIT_TINY_BLOCK_DIM` (default 64), the driver skips the full model. It sets `kc` to `k`, clamped to the `GEMMKIT_KC` ceiling (default 2048, or 16384 on aarch64). It sets `mc` to whatever row count keeps the panel in L2 at that depth, capped by `m` itself. It sets `nc` to `n` rounded up to `nr`.
 
 A problem whose whole working set fits in L2 gains nothing from 3 levels of residency analysis. The shortcut spends the saved arithmetic where it matters: on the fixed per-call overhead that dominates small products.
+
+The ceiling counts 4-byte elements, and the shortcut divides it by the packed element size. So `f64` gets half the depth of `f32`, and `int8` gets 4 times as much. What stays fixed is the byte budget, which is what the hardware limit is about. One number then calibrates every element family, and a tuner sweep run on `f32` transfers to the rest.
+
+The ceiling sets the depth-slice count, and the slice count drives 2 costs that pull in opposite directions. Each extra slice re-reads and re-writes `C`, re-enters the driver, and forks the workers once more on the parallel path. That argues for a deep ceiling.
+
+A deeper slice also grows the packed A and B panels. Those panels must stay in a private L2, so that argues for a shallow ceiling. On x86 the panels reach about 1.1 MiB at the default, which is one Zen5 L2. The parallel cost is the larger of the 2, so the default sits at the residency limit rather than below it.
 
 ## Detection: a fallback chain that cannot fail
 

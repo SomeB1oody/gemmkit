@@ -444,7 +444,9 @@ impl CacheTopology {
 
         // Small-matrix shortcut: skip the full model, just size panels to fit L2
         if m <= tiny_dim && n <= tiny_dim {
-            let kc = k.clamp(1, kc_cap);
+            // `kc_cap` counts 4-byte elements, so rescale it by the packed element size
+            let cap = (kc_cap.saturating_mul(4) / sizeof.max(1)).max(1);
+            let kc = k.clamp(1, cap);
             // Cap at the rounded-up row count: with only `m` rows total, a larger
             // `mc` cannot split into fewer blocks, so it buys nothing
             let mc = ((l2 / sizeof / kc) / mr * mr)
@@ -618,6 +620,35 @@ mod tests {
         // k == 0
         let b = t.blocking(mr, nr, 4, 8, 8, 0);
         assert_eq!((b.mc, b.kc, b.nc), (16, 1, 8));
+    }
+
+    /// The small-matrix shortcut spends the same panel bytes on every element family. Its
+    /// depth ceiling counts 4-byte elements, so a wider element gets proportionally fewer
+    /// depth rows. This is what stops 1 calibrated number from over-blocking f64 by 2x, or
+    /// under-blocking i8 by 4x. The check is a ratio across element sizes, so an ambient
+    /// `GEMMKIT_KC` cannot make it vacuous. Integer division can drop up to 1 element of
+    /// depth, so the byte totals match to within 1 element
+    #[test]
+    fn tiny_shortcut_spends_equal_panel_bytes_per_element_size() {
+        let t = topology();
+        let tiny = crate::tuning::tiny_block_dim();
+        // k far past any ceiling, so the ceiling binds instead of k
+        let (m, n, k) = (tiny, tiny, 1usize << 22);
+        let f32_kc = t.blocking(16, 4, 4, m, n, k).kc;
+        let budget = f32_kc * 4;
+        for sizeof in [1usize, 2, 8, 16] {
+            let kc = t.blocking(16, 4, sizeof, m, n, k).kc;
+            let bytes = kc * sizeof;
+            assert!(
+                bytes <= budget && bytes + sizeof > budget,
+                "sizeof {sizeof}: {bytes} panel bytes against a {budget} budget"
+            );
+        }
+        // The f64 regression this fixes: a shared depth would double the f64 panel bytes
+        assert!(
+            t.blocking(16, 4, 8, m, n, k).kc < f32_kc,
+            "a wider element must take a shallower depth block"
+        );
     }
 
     /// The no-L3 `NC` arm (take the full, rounded-up `N` up to the

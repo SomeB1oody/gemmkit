@@ -807,17 +807,22 @@ fn main() {
             false,
         )
     );
+    const KC_SHAPES: &[(usize, usize, usize)] =
+        &[(48, 65536, 48), (64, 131072, 64), (32, 262144, 32)];
     knob!(
         "GEMMKIT_KC",
-        sweep_sgemm(
+        sweep(
             "GEMMKIT_KC",
             tuning::set_kc,
             tuning::KC_DEFAULT,
-            &[128, 256, 1024],
-            &timing,
-            &[(48, 1024, 48), (40, 2048, 40)],
-            ser,
-            false,
+            &[512, 1024, 4096, 8192],
+            "GFLOP/s",
+            KC_SHAPES.len() * 2,
+            || {
+                let mut stats = sgemm_stats(&timing, KC_SHAPES, par, false);
+                stats.extend(sgemm_stats(&timing, KC_SHAPES, ser, false));
+                geomean(&stats)
+            },
         )
     );
     knob!(

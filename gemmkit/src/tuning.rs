@@ -485,18 +485,15 @@ pub const TINY_BLOCK_DIM_DEFAULT: usize = 64;
 static TINY_BLOCK_DIM: Threshold = Threshold::new("GEMMKIT_TINY_BLOCK_DIM", TINY_BLOCK_DIM_DEFAULT);
 
 // Depth-block ceiling used only inside the small-matrix shortcut above. There, kc is k clamped
-// to this value. The ceiling trades depth-slice count against panel residency, so the default
-// is arch-split. Each extra slice re-reads and re-writes the tiny C and re-enters the driver
-//
-// On x86 (Zen5), the ceiling keeps the A/B panels L1/L2-resident. On aarch64 (M4 Max), a deeper
-// ceiling wins instead, since the tiny C makes the per-slice cost dominant. The unified memory
-// there feeds streamed panels well beyond typical cache sizes
+// to this value, after the shortcut rescales it by the packed element size. The count is
+// therefore in 4-byte elements, and `this * 4` is the byte budget every element family gets.
+// One calibrated number then covers f32, f64, f16, i8, and the complex families
 /// Compiled default for [`kc`]: overridden by `GEMMKIT_KC` or [`set_kc`]
 #[cfg(target_arch = "aarch64")]
 pub const KC_DEFAULT: usize = 16384;
 /// The non-aarch64 default. See the aarch64 doc above for what this knob controls
 #[cfg(not(target_arch = "aarch64"))]
-pub const KC_DEFAULT: usize = 512;
+pub const KC_DEFAULT: usize = 2048;
 static KC: Threshold = Threshold::new("GEMMKIT_KC", KC_DEFAULT);
 
 // Depth-block floor used by the main BLIS model, not the small-matrix shortcut. The L1-fit
@@ -884,8 +881,10 @@ pub fn set_tiny_block_dim(v: usize) {
     TINY_BLOCK_DIM.set(v);
 }
 
-/// Get the tiny-branch `kc` ceiling (the small-matrix shortcut's depth block is `k` clamped to
-/// this). Always `>= 1` so the clamp's upper bound never falls below its lower bound
+/// Get the tiny-branch `kc` ceiling, in 4-byte elements. The small-matrix shortcut's depth block
+/// is `k` clamped to this value, after the shortcut divides it by the packed element size. So
+/// the byte budget stays the same for a wider element, and the depth shrinks instead. Always
+/// `>= 1` so the clamp's upper bound never falls below its lower bound
 pub fn kc() -> usize {
     KC.get().max(1)
 }

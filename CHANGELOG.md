@@ -22,6 +22,38 @@ once, with per-crate subsections where a change is crate-specific.
 
 #### Changed
 
+- The tiny-matrix shortcut's depth ceiling (`GEMMKIT_KC`) is deeper on x86, and it now
+  scales with the element size. The x86 default goes from 512 to 2048. The ceiling
+  counts 4-byte elements, and the shortcut divides it by the packed element size. So
+  `f64` takes half the depth of `f32`, and `int8` takes 4 times as much, while the
+  packed panel bytes stay the same. The aarch64 default is unchanged, and so is the
+  `f32` depth it gives.
+
+  A shape with both `m` and `n` at or below `GEMMKIT_TINY_BLOCK_DIM` (default 64) runs
+  `k` in slices of this depth. Each extra slice re-reads and re-writes `C`, re-enters
+  the driver, and forks the workers once more. A long `k` made that per-slice cost
+  dominate. A deeper slice also grows the packed A and B panels, which need to stay in
+  a private L2, so the depth cannot grow without a limit. The new x86 budget puts the
+  widest shortcut shape's panels at about 1.1 MiB, which is one Zen5 L2.
+
+  Measured on the Zen5 reference machine over 8 shapes in the band, against the old
+  512-element budget. The parallel path is 1.06 to 2.3 times faster for `f32`, `f64`,
+  `f16`, and `int8`. The serial path is neutral to 11 percent faster, except at `m` and
+  `n` of 64, where it loses 2 to 4 percent. One step deeper would cost the serial path
+  12 to 20 percent for `f32` and `f64`.
+
+  The 1 element-size rule replaces a single depth shared by every family. That shared
+  depth over-blocked `f64` by 2 times and under-blocked `int8` by 4 times. A tuner
+  sweep run on `f32` now transfers to the other families. gemmkit-tune's own
+  `GEMMKIT_KC` probe changed with it. Its candidates now straddle the default, and its
+  shapes are deep enough to hold 8 or more slices. It also scores the serial and the
+  parallel mode together, because the 2 modes pull the ceiling in opposite directions.
+
+  Blocking still depends only on the cache geometry and the problem shape, never on
+  the worker count. So output remains bit-identical across worker counts. The depth
+  slicing sets the summation order, so an affected shape's result bits change from the
+  previous release
+
 - The small-`m,n` route's pre-pack copy now runs across workers. Before, it ran on
   the calling thread. The copy resolves its own worker count, apart from the tile
   sweep that follows. The 2 axes offer different amounts of parallelism. The
