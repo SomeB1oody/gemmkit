@@ -30,15 +30,15 @@ Beyond plain GEMM, gemmkit offers:
 
 ## Crates
 
-The workspace ships 5 crates. They share version 0.1.1 and release in lockstep.
+The workspace ships 5 crates. They share version 0.1.2 and release in lockstep.
 
-| Crate | Description |
-| --- | --- |
-| [gemmkit](https://crates.io/crates/gemmkit) | Core GEMM engine: strided-view and raw-pointer entry points, runtime ISA dispatch, `no_std` support |
-| [gemmkit-ndarray](https://crates.io/crates/gemmkit-ndarray) | Zero-copy adapter over `ndarray` matrix views |
-| [gemmkit-nalgebra](https://crates.io/crates/gemmkit-nalgebra) | Zero-copy adapter over `nalgebra` matrix views |
-| [gemmkit-faer](https://crates.io/crates/gemmkit-faer) | Zero-copy adapter over `faer` matrix views |
-| [gemmkit-tune](https://crates.io/crates/gemmkit-tune) | Install-time autotuner binary: sweeps the runtime knobs on the target machine and emits a `GEMMKIT_*` environment profile |
+| Crate                                                         | Description                                                                                                               |
+|---------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------|
+| [gemmkit](https://crates.io/crates/gemmkit)                   | Core GEMM engine: strided-view and raw-pointer entry points, runtime ISA dispatch, `no_std` support                       |
+| [gemmkit-ndarray](https://crates.io/crates/gemmkit-ndarray)   | Zero-copy adapter over `ndarray` matrix views                                                                             |
+| [gemmkit-nalgebra](https://crates.io/crates/gemmkit-nalgebra) | Zero-copy adapter over `nalgebra` matrix views                                                                            |
+| [gemmkit-faer](https://crates.io/crates/gemmkit-faer)         | Zero-copy adapter over `faer` matrix views                                                                                |
+| [gemmkit-tune](https://crates.io/crates/gemmkit-tune)         | Install-time autotuner binary: sweeps the runtime knobs on the target machine and emits a `GEMMKIT_*` environment profile |
 
 The adapters wrap `ndarray >= 0.17.1`, `nalgebra 0.35`, and `faer 0.24`. Each
 one forwards its `parallel`, `wasm_threads`, `half`, `complex`, `int8`, and
@@ -79,12 +79,12 @@ Strides express transposition. Use `from_col_major`, or give an explicit
 Every element-type family below has a SIMD implementation on every backend,
 over the scalar fallback that runs anywhere.
 
-| Family | Feature | Accumulator |
-| --- | --- | --- |
-| `f32`, `f64` | (built in) | same type |
-| `f16`, `bf16` | `half` | `f32` |
-| `i8 -> i32` | `int8` | `i32` |
-| `c32`, `c64` | `complex` | same type |
+| Family        | Feature    | Accumulator  |
+|---------------|------------|--------------|
+| `f32`, `f64`  | (built in) | same type    |
+| `f16`, `bf16` | `half`     | `f32`        |
+| `i8 -> i32`   | `int8`     | `i32`        |
+| `c32`, `c64`  | `complex`  | same type    |
 
 Backends, selected at runtime (or pinned with `GEMMKIT_REQUIRE_ISA`):
 

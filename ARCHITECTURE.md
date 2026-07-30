@@ -49,7 +49,7 @@ available instruction set at runtime. The crate uses edition 2024 and
 
 ## Workspace layout
 
-5 crates release in lockstep at version 0.1.1, and all 5 are
+5 crates release in lockstep at version 0.1.2, and all 5 are
 published on crates.io. The fuzz crate is a separate nightly-only root,
 excluded from the workspace.
 

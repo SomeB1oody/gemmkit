@@ -134,7 +134,7 @@ the host:
 
 ```sh
 # gemmkit-tune profile. Source this before you run a gemmkit app: `source <this file>`
-# generated 2026-07-19 14:12:03 UTC by gemmkit-tune 0.1.1
+# generated 2026-07-19 14:12:03 UTC by gemmkit-tune 0.1.2
 # host: 16 logical cores; L1d 32 KiB, L2 1024 KiB, L3 32 MiB; page 4 KiB
 # tuned for 16 worker(s)
 

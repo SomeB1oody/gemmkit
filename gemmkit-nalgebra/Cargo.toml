@@ -25,7 +25,7 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
-gemmkit = { path = "../gemmkit", version = "0.1.1", default-features = false, features = ["std"] }
+gemmkit = { path = "../gemmkit", version = "0.1.2", default-features = false, features = ["std"] }
 # nalgebra 0.35 has rust-version = 1.89.0 (== the workspace MSRV)
 nalgebra = { version = "0.35", default-features = false, features = ["std"] }
 

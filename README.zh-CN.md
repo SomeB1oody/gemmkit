@@ -28,15 +28,15 @@ BF16）、aarch64 NEON 以及 wasm32 `simd128`。可移植的标量回退路径�
 
 ## Crates
 
-本工作空间包含 5 个 crate，共享 0.1.1 版本号，并同步发布。
+本工作空间包含 5 个 crate，共享 0.1.2 版本号，并同步发布。
 
-| Crate | 说明 |
-| --- | --- |
-| [gemmkit](https://crates.io/crates/gemmkit) | 核心 GEMM 引擎：步长视图与裸指针入口、运行时 ISA 分发、`no_std` 支持 |
-| [gemmkit-ndarray](https://crates.io/crates/gemmkit-ndarray) | 面向 `ndarray` 矩阵视图的零拷贝适配器 |
-| [gemmkit-nalgebra](https://crates.io/crates/gemmkit-nalgebra) | 面向 `nalgebra` 矩阵视图的零拷贝适配器 |
-| [gemmkit-faer](https://crates.io/crates/gemmkit-faer) | 面向 `faer` 矩阵视图的零拷贝适配器 |
-| [gemmkit-tune](https://crates.io/crates/gemmkit-tune) | 安装期自动调优器程序：在目标机器上扫描运行时旋钮，并输出一份 `GEMMKIT_*` 环境变量配置 |
+| Crate                                                         | 说明                                                                                  |
+|---------------------------------------------------------------|---------------------------------------------------------------------------------------|
+| [gemmkit](https://crates.io/crates/gemmkit)                   | 核心 GEMM 引擎：步长视图与裸指针入口、运行时 ISA 分发、`no_std` 支持                  |
+| [gemmkit-ndarray](https://crates.io/crates/gemmkit-ndarray)   | 面向 `ndarray` 矩阵视图的零拷贝适配器                                                 |
+| [gemmkit-nalgebra](https://crates.io/crates/gemmkit-nalgebra) | 面向 `nalgebra` 矩阵视图的零拷贝适配器                                                |
+| [gemmkit-faer](https://crates.io/crates/gemmkit-faer)         | 面向 `faer` 矩阵视图的零拷贝适配器                                                    |
+| [gemmkit-tune](https://crates.io/crates/gemmkit-tune)         | 安装期自动调优器程序：在目标机器上扫描运行时旋钮，并输出一份 `GEMMKIT_*` 环境变量配置 |
 
 这些适配器分别封装 `ndarray >= 0.17.1`、`nalgebra 0.35` 和 `faer 0.24`。每个
 适配器都会把自己的 `parallel`、`wasm_threads`、`half`、`complex`、`int8` 和
@@ -76,12 +76,12 @@ fn main() {
 
 下表中的每一类元素类型，在每个后端上都有对应的 SIMD 实现，并以随处可用的标量回退路径兜底。
 
-| 类型族 | Feature | 累加器 |
-| --- | --- | --- |
-| `f32`, `f64` | （内置） | 同类型 |
-| `f16`, `bf16` | `half` | `f32` |
-| `i8 -> i32` | `int8` | `i32` |
-| `c32`, `c64` | `complex` | 同类型 |
+| 类型族        | Feature   | 累加器   |
+|---------------|-----------|----------|
+| `f32`, `f64`  | （内置）  | 同类型   |
+| `f16`, `bf16` | `half`    | `f32`    |
+| `i8 -> i32`   | `int8`    | `i32`    |
+| `c32`, `c64`  | `complex` | 同类型   |
 
 运行时选择的后端（也可用 `GEMMKIT_REQUIRE_ISA` 锁定）：
 

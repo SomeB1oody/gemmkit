@@ -8,7 +8,7 @@ workspace crates (`gemmkit`, `gemmkit-ndarray`, `gemmkit-nalgebra`, `gemmkit-fae
 `gemmkit-tune`) share one version and release in lockstep. So releases are recorded
 once, with per-crate subsections where a change is crate-specific.
 
-## [Unreleased]
+## [0.1.2] - 2026-07-29
 
 ### gemmkit
 
@@ -19,143 +19,75 @@ once, with per-crate subsections where a change is crate-specific.
 - `GEMMKIT_GEMV_AXPY_PAR_MIN_ROWS` (`set_gemv_axpy_par_min_rows`, default 16384 on
   x86, 1024 on aarch64): the output-row floor below which a column-major gemv stays
   serial instead of splitting its rows
+- `Epilogue::apply_tile`, a hook that transforms a whole `MR_REG x NR` register tile
+  in 1 call. It defaults to a loop over `apply_reg`, so an existing impl is
+  unaffected
+- `Debug` on `Bias`, `Activation`, `RequantScale`, and `Requantize`, plus `Copy` and
+  `Clone` on the latter 2, so an epilogue config can be built once and reused by
+  value
 
 #### Changed
 
-- The tiny-matrix shortcut's depth ceiling (`GEMMKIT_KC`) is deeper on x86, and it now
-  resolves against the packed element size. The x86 default goes from 512 to 2048. The
-  ceiling counts 4-byte elements, and a narrow element divides it, so `f16` takes 2
-  times the depth of `f32` and `int8` takes 4 times. The packed panel bytes stay the
-  same. The aarch64 default is unchanged, and so is the `f32` depth it gives.
-
-  A shape with both `m` and `n` at or below `GEMMKIT_TINY_BLOCK_DIM` (default 64) runs
-  `k` in slices of this depth. The depth balances 2 costs that scale differently with
-  the element size. Each extra slice re-reads and re-writes `C`, re-enters the driver,
-  and forks the workers once more. That argues for a deep block at any element size. A
-  deeper slice also grows the packed A and B panels, which need to stay in a private
-  L2, and that limit is in bytes. A byte budget is not a slice budget. At a fixed
-  budget, a 16-byte element takes 4 times the slices of a 4-byte element.
-
-  So a *wide* element divides the ceiling only where panel residency is the binding
-  cost. That is a machine property, and it carries an arch-split cap. On x86 the 1 MiB
-  private L2 binds first, and the divisor applies at every element size. On aarch64 the
-  effective L2 is 4 times larger and unified memory feeds an overflowing panel well, so
-  a wide element keeps the whole ceiling there.
-
-  Measured on the Zen5 reference machine over 8 shapes in the band, against the old
-  512-element budget. The parallel path is 1.06 to 2.3 times faster for `f32`, `f64`,
-  `f16`, and `int8`. The serial path is neutral to 11 percent faster, except at `m` and
-  `n` of 64, where it loses 2 to 4 percent. One step deeper would cost the serial path
-  12 to 20 percent for `f32` and `f64`. `c64` at 1 quarter of the `f32` depth is the
-  best or the tied-best depth on 4 of 5 shapes in parallel, and is flat within 1
-  percent serially.
-
-  Measured on the M4 Max over 5 shapes in the band, against the pre-release behavior of
-  1 depth shared by every family. `int8` gains 22 to 51 percent in parallel on every
-  shape, and `f16` gains 5 to 20 percent. `f64` gains 5 to 15 percent serially. Both
-  narrow families are flat serially, within 1.5 percent. Dividing the depth for `c64`
-  there cost the parallel path 21 to 51 percent, which is what the arch-split cap now
-  prevents.
-
-  The element-size rule replaces a single depth shared by every family, which
-  under-blocked `int8` by 4 times. A tuner sweep run on `f32` now transfers to the
-  other families. gemmkit-tune's own `GEMMKIT_KC` probe changed with it. Its candidates
-  now straddle the default, and its shapes are deep enough to hold 8 or more slices. It
-  also scores the serial and the parallel mode together, because the 2 modes pull the
-  ceiling in opposite directions.
-
-  Blocking still depends only on the cache geometry and the problem shape, never on
-  the worker count. So output remains bit-identical across worker counts. The depth
-  slicing sets the summation order, so an affected shape's result bits change from the
-  previous release
-
-- The small-`m,n` route's pre-pack copy now runs across workers. Before, it ran on
-  the calling thread. The copy resolves its own worker count, apart from the tile
-  sweep that follows. The 2 axes offer different amounts of parallelism. The
-  `MT x NT` output grid caps the sweep, and a small `m, n` makes that grid tiny.
-  The depth caps the copy, and a long `k` makes the depth large. The copy splits
-  the depth, not the few `lead` lines, so each worker reads whole depth lines.
-  Below the cache-derived byte floor that the bandwidth-bound routes share
-  (`GEMMKIT_GEMV_PARALLEL_BYTES`), the copy still runs on the calling thread.
-  Measured on the Zen5 reference machine, f32 at the auto width, with a
-  column-major `A`: `8x8x524288` 3.1x, `16x16x262144` 2.0x, `4x4x1048576` 1.8x,
-  `8x8x2097152` 1.7x, `16x16x1048576` 1.1x. The gain tracks the copy's share of
-  the route's serial time. Footprint is the one trend that holds across these
-  shapes. At a fixed `m,n`, the smaller packed operand gains more. A pack writes
-  each cell once, with the value a serial copy writes. No result bit moves, and
-  the route stays bit-identical across worker counts
-
+- The tiny-matrix shortcut's depth ceiling (`GEMMKIT_KC`) now resolves against the
+  packed element size, and is deeper on x86 (default 512 to 2048). It counts 4-byte
+  elements, so `f16` gets 2 times the `f32` depth, `int8` 4 times, and `c64` 1
+  quarter, at constant packed panel bytes. On aarch64 the divisor stops at 4 bytes, so
+  a wide element keeps the whole ceiling, and the `f32` depth there is unchanged.
+  Output stays bit-identical across worker counts, but an affected shape's result bits
+  change from the previous release
+- The small-`m,n` route's pre-pack copy now runs across workers instead of on the
+  calling thread, splitting the depth rather than the few `lead` lines. It resolves
+  its own worker count, and stays serial below `GEMMKIT_GEMV_PARALLEL_BYTES`. No
+  result bit moves
 - The auto worker count for a bandwidth-bound gemv/gevv is now a ladder over the
-  touched bytes, not a flat fraction of the core count. Its rungs are the
-  exact-fit thread-pool tiers that the compute path already snaps to, so a gemv
-  width always has a pool sized to it. It climbs one tier per
-  `GEMMKIT_GEMV_TIER_STEP` factor of bytes above the serial floor, and stops at the
-  largest tier instead of the full machine width. `GEMMKIT_GEMV_THREAD_CAP` is
-  unchanged. A non-zero value still pins one flat width, now bypassing the ladder.
-  gemv output remains bit-identical across worker counts
+  touched bytes, not a flat fraction of the core count. Its rungs are the exact-fit
+  thread-pool tiers, and it climbs 1 tier per `GEMMKIT_GEMV_TIER_STEP` factor of
+  bytes above the serial floor. A non-zero `GEMMKIT_GEMV_THREAD_CAP` still pins 1
+  flat width, bypassing the ladder. gemv output remains bit-identical across worker
+  counts
 
 #### Fixed
 
-- A column-major gemv no longer splits its output rows across workers below that
-  floor. For a column-major matrix, the output-row axis is the *inner*,
-  fastest-varying memory axis. So any row split gives every worker a strided walk
-  over the whole matrix, while the serial route makes one sequential pass. That
-  made parallelism a net loss over most of the practical range. The floor restores
-  the serial route below the crossover, and leaves everything above it unchanged.
-
-  Row-major gemv is untouched. It splits into `k`-contiguous rows, and stays faster
-  in parallel at every size. So does the `half` mixed twin. No result bit moves
-  either way. The floor decides only whether the rows are split, and gemv output
-  is bit-identical across worker counts, as before. The aarch64 default is 1024,
-  an order of magnitude below the x86 one, because the same regression covers a
-  much narrower band there. On that target the crossover also follows the bytes in
-  one column rather than the row count, so an `f64`-dominated workload there
-  wants 512
-- A gemv sweep with fewer output rows than one SIMD register no longer takes the
-  axpy strategy. That strategy vectorizes over output rows, so below one register
-  its vector loops were unreachable, and the whole reduction ran on the scalar
-  remainder instead.
-
-  This case only ever arose where both classifications fit at once: a single-row
-  matrix, whose row and column strides are both 1. That is the pure dot-product
-  shape `m == n == 1`. It is also how the column-major libraries (nalgebra, faer)
-  naturally describe a row vector, so the adapters hit it by default. Such a sweep
-  now takes the dot strategy instead, which vectorizes over `k`. The dot form's
-  wider accumulator tree is also the more accurate of the 2.
-
-  The affected shapes change bits, since the summation order changes. gemv output
-  remains bit-identical across worker counts, and no other shape changes route.
-  The same fix applies to the `half` mixed-precision twin
+- A column-major gemv no longer splits its output rows across workers below the new
+  floor. The output-row axis is the inner memory axis there, so a row split gave
+  every worker a strided walk over the whole matrix, and lost to the serial pass
+  over most of the practical range. Row-major gemv and the `half` mixed twin are
+  untouched, and no result bit moves
+- A gemv with fewer output rows than 1 SIMD register no longer takes the axpy
+  strategy, whose vector loops were unreachable there, leaving the whole reduction
+  on the scalar remainder. This is the `m == n == 1` unit-stride shape, which is how
+  the column-major adapters describe a row vector. It now takes the dot strategy,
+  which vectorizes over `k`. Those shapes change bits, since the summation order
+  changes
+- A fused GEMM no longer runs at a fraction of the plain rate. `FusedEpi` decodes
+  its bias and activation enums once per output tile, in an `apply_tile` override,
+  instead of once per accumulator register, where the branch web spilled the
+  accumulator tile to the stack from inside the `kc` loop. A perf test now pins the
+  ratio. No result bit moves
+- The wasm32 `simd128` `max` and `min` no longer pass their operands in the order
+  that inverts the trait contract, which returned NaN for a NaN 1st operand and
+  `-0.0` for `max(-0.0, +0.0)`. So a vectorized `ReLU` on wasm maps NaN to 0 and
+  `-0.0` to `+0.0`, as the scalar path and every other backend already did
 
 ### gemmkit-ndarray, gemmkit-nalgebra, gemmkit-faer
 
 #### Added
 
-- Each adapter now re-exports every gemmkit item that its own signatures name, so
-  an adapter user no longer needs a direct `gemmkit` dependency. New in this
-  release:
-  - the `GemmScalar`, `FusedScalar`, `MapScalar`, and `ComplexScalar` element-type
-    bounds, which appear in the adapters' own public signatures. A caller could
-    not name them from outside before this. So a caller could call `gemm`, but
-    could not write a wrapper generic over it
-  - the feature-gated element types `f16`/`bf16` (`half`) and `Complex`/`c32`/`c64`
-    (`complex`), so `half` and `num-complex` also stay out of the caller's
-    manifest
-  - the `tuning` module
-
-  Reaching `tuning` through the adapter is the correct route, not only the
-  convenient one. The knobs are process-global atomics. A `set_*` call made
-  through a separately resolved second `gemmkit` writes a copy that the adapter
-  never reads. That failure is silent: the knob appears set, but has no effect
+- Each adapter now re-exports every gemmkit item its own signatures name, so an
+  adapter user no longer needs a direct `gemmkit` dependency. New in this release:
+  the `GemmScalar`, `FusedScalar`, `MapScalar`, and `ComplexScalar` element-type
+  bounds, the feature-gated element types `f16`/`bf16` and `Complex`/`c32`/`c64`,
+  and the `tuning` module. The last one matters beyond convenience: the knobs are
+  process-global atomics, so a `set_*` call made through a separately resolved 2nd
+  `gemmkit` silently has no effect on the adapter
 
 ### gemmkit-tune
 
 #### Changed
 
 - The `GEMMKIT_GEMV_THREAD_CAP` sweep gained a small cache-resident probe shape.
-  Its 2 previous shapes both touched a working set too large to fit in cache. So
-  the sweep could not observe the size-dependent behavior it is meant to
-  calibrate
+  Both of its previous shapes overflowed cache, so it could not observe the
+  size-dependent behavior it calibrates
 
 ## [0.1.1] - 2026-07-24
 

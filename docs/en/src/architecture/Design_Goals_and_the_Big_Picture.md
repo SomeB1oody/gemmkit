@@ -175,7 +175,7 @@ genuinely needs an OS. The practical how-to lives in
 
 ## The workspace map
 
-5 crates release in lockstep at version 0.1.1, plus a fuzzing crate that
+5 crates release in lockstep at version 0.1.2, plus a fuzzing crate that
 deliberately sits in its own workspace root:
 
 | Path | Crate | Role |

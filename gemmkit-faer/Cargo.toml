@@ -25,6 +25,6 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
-gemmkit = { path = "../gemmkit", version = "0.1.1", default-features = false, features = ["std"] }
+gemmkit = { path = "../gemmkit", version = "0.1.2", default-features = false, features = ["std"] }
 # faer 0.24 (resolves 0.24.4) has rust-version = 1.84.0 (< the workspace MSRV 1.89)
 faer = { version = "0.24", default-features = false }
