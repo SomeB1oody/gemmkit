@@ -96,7 +96,7 @@ with the `GEMMKIT_` prefix.
 | `GEMMKIT_MC_REG_PANELS` | `set_mc_reg_panels` | 8 | The A macro-panel is bounded to this many microtile rows (`this * MR`), following BLIS's rule that MC stays a small multiple of MR. |
 | `GEMMKIT_NC_NO_L3_PANELS` | `set_nc_no_l3_panels` | 512 | The no-L3 column block (Apple Silicon and the like) is `min(this * NR, N)`. Dead where an L3 exists. |
 | `GEMMKIT_TINY_BLOCK_DIM` | `set_tiny_block_dim` | 64 | A shape with both `m` and `n` at or below this skips the full BLIS blocking model and just keeps A/B panels in L2. |
-| `GEMMKIT_KC` | `set_kc` | 2048 (aarch64: 16384) | The depth block in the tiny-matrix shortcut: `k` clamped to this. The count is in 4-byte elements, and the shortcut divides it by the packed element size, so every element family gets the same panel bytes. Deeper slices keep winning further on aarch64 than on x86, so the aarch64 shortcut runs close to a single slice. |
+| `GEMMKIT_KC` | `set_kc` | 2048 (aarch64: 16384) | The depth block in the tiny-matrix shortcut: `k` clamped to this. The count is in 4-byte elements, and a narrower element divides it, so the packed panel bytes hold. On x86 a wider element divides it too. On aarch64 a wider element keeps the whole depth, because dividing it there multiplies the slice count, and each slice costs another worker fork. Deeper slices also keep winning further on aarch64 than on x86, so the aarch64 shortcut runs close to a single slice. |
 | `GEMMKIT_KC_MIN` | `set_kc_min` | 512 | The main-model `kc` floor: the L1-fit depth estimate is raised to at least this, so a small L1 never starves the microkernel's depth walk. |
 
 ### Deep-contraction and wasm

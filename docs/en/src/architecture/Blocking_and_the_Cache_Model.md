@@ -46,11 +46,15 @@ When both `m` and `n` are at or below `GEMMKIT_TINY_BLOCK_DIM` (default 64), the
 
 A problem whose whole working set fits in L2 gains nothing from 3 levels of residency analysis. The shortcut spends the saved arithmetic where it matters: on the fixed per-call overhead that dominates small products.
 
-The ceiling counts 4-byte elements, and the shortcut divides it by the packed element size. So `f64` gets half the depth of `f32`, and `int8` gets 4 times as much. What stays fixed is the byte budget, which is what the hardware limit is about. One number then calibrates every element family, and a tuner sweep run on `f32` transfers to the rest.
+The ceiling counts 4-byte elements, and a narrow element divides it. So `f16` gets 2 times the depth of `f32`, and `int8` gets 4 times. What stays fixed is the byte budget, which is what the hardware limit is about. One number then calibrates every element family, and a tuner sweep run on `f32` transfers to the rest.
 
-The ceiling sets the depth-slice count, and the slice count drives 2 costs that pull in opposite directions. Each extra slice re-reads and re-writes `C`, re-enters the driver, and forks the workers once more on the parallel path. That argues for a deep ceiling.
+The ceiling sets the depth-slice count, and the slice count drives 2 costs that pull in opposite directions. Each extra slice re-reads and re-writes `C`, re-enters the driver, and forks the workers once more. That argues for a deep ceiling.
 
 A deeper slice also grows the packed A and B panels. Those panels must stay in a private L2, so that argues for a shallow ceiling. On x86 the panels reach about 1.1 MiB at the default, which is one Zen5 L2. The parallel cost is the larger of the 2, so the default sits at the residency limit rather than below it.
+
+A *wide* element is the case where those 2 costs disagree about the divisor. A byte budget is not a slice budget. At a fixed budget, a 16-byte element takes 4 times the slices of a 4-byte element, so it pays the per-slice cost 4 times as often. Residency wants the division, and the slice count does not.
+
+Which cost wins is a property of the machine, so the divisor carries an arch-split cap. On x86 the private L2 is 1 MiB, residency binds first, and the divisor applies at every element size. On aarch64 the effective L2 is 4 times larger, and unified memory feeds an overflowing panel well. Residency barely binds there, so a wide element keeps the whole ceiling. Measured on an M4 Max, dividing it cost `c64` 21 to 51 percent on the parallel path.
 
 ## Detection: a fallback chain that cannot fail
 

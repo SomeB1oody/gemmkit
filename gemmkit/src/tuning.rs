@@ -485,9 +485,11 @@ pub const TINY_BLOCK_DIM_DEFAULT: usize = 64;
 static TINY_BLOCK_DIM: Threshold = Threshold::new("GEMMKIT_TINY_BLOCK_DIM", TINY_BLOCK_DIM_DEFAULT);
 
 // Depth-block ceiling used only inside the small-matrix shortcut above. There, kc is k clamped
-// to this value, after the shortcut rescales it by the packed element size. The count is
-// therefore in 4-byte elements, and `this * 4` is the byte budget every element family gets.
-// One calibrated number then covers f32, f64, f16, i8, and the complex families
+// to this value, after [`tiny_kc`] rescales it by the packed element size. The count is
+// therefore in 4-byte elements, and `this * 4` is one element family's byte budget
+//
+// The serial and the parallel path want opposite depths, so each default is a cross-mode
+// compromise. A sweep that times 1 mode alone always wants to move this knob
 /// Compiled default for [`kc`]: overridden by `GEMMKIT_KC` or [`set_kc`]
 #[cfg(target_arch = "aarch64")]
 pub const KC_DEFAULT: usize = 16384;
@@ -495,6 +497,19 @@ pub const KC_DEFAULT: usize = 16384;
 #[cfg(not(target_arch = "aarch64"))]
 pub const KC_DEFAULT: usize = 2048;
 static KC: Threshold = Threshold::new("GEMMKIT_KC", KC_DEFAULT);
+
+// Largest packed element size [`tiny_kc`] divides the ceiling by. A wider element keeps the
+// whole ceiling instead of a proportional share of it
+//
+// Panel residency wants a depth proportional to `1 / sizeof`. The per-slice cost does not
+// shrink with the element size, because a divided depth multiplies the slice count. Which of
+// the 2 binds first is a machine property, so the cap is arch-split. The x86 value is the
+// widest packed element any shipped family uses (c64), so the divisor applies at every size
+// there
+#[cfg(target_arch = "aarch64")]
+pub(crate) const KC_SIZEOF_DIV_CAP: usize = 4;
+#[cfg(not(target_arch = "aarch64"))]
+pub(crate) const KC_SIZEOF_DIV_CAP: usize = 16;
 
 // Depth-block floor used by the main BLIS model, not the small-matrix shortcut. The L1-fit
 // estimate for kc is raised to at least this before the final rebalance pass. A small L1 cache
@@ -881,16 +896,28 @@ pub fn set_tiny_block_dim(v: usize) {
     TINY_BLOCK_DIM.set(v);
 }
 
-/// Get the tiny-branch `kc` ceiling, in 4-byte elements. The small-matrix shortcut's depth block
-/// is `k` clamped to this value, after the shortcut divides it by the packed element size. So
-/// the byte budget stays the same for a wider element, and the depth shrinks instead. Always
-/// `>= 1` so the clamp's upper bound never falls below its lower bound
+/// Get the raw tiny-branch `kc` ceiling, in 4-byte elements. The shortcut divides it into a
+/// depth for the element size it is blocking. Always `>= 1` so the clamp's upper bound never
+/// falls below its lower bound
 pub fn kc() -> usize {
     KC.get().max(1)
 }
 /// Override the tiny-branch `kc` ceiling
 pub fn set_kc(v: usize) {
     KC.set(v);
+}
+
+/// The tiny-branch depth ceiling for a packed element of `sizeof` bytes. The small-matrix
+/// shortcut's depth block is `k` clamped to this
+///
+/// [`kc`] counts 4-byte elements, so `kc() * 4` is a byte budget. A narrow element divides that
+/// budget and takes a deeper block, which keeps the packed panel bytes the same. An element
+/// wider than the arch-split `KC_SIZEOF_DIV_CAP` keeps the whole ceiling instead
+///
+/// Always `>= 1`, so a caller can clamp with it directly
+pub(crate) fn tiny_kc(sizeof: usize) -> usize {
+    let divisor = sizeof.clamp(1, KC_SIZEOF_DIV_CAP);
+    (kc().saturating_mul(4) / divisor).max(1)
 }
 
 /// Get the main-model `kc` floor: the L1-fit depth estimate is raised to at least this before the

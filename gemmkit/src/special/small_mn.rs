@@ -148,7 +148,9 @@ unsafe fn pack_k_contiguous<T: Copy>(
         let tile = crate::tuning::pack_transpose_tile();
         let mut t0 = t_begin;
         while t0 < t_end {
-            let te = core::cmp::min(t0 + tile, t_end);
+            // Saturating: `t0` is an absolute offset, so a parallel range starts it past 0, and
+            // the knob can be set as high as `usize::MAX`
+            let te = core::cmp::min(t0.saturating_add(tile), t_end);
             for t in t0..te {
                 // Depth line `t`. The inner sweep over `lead` then reads it unit-stride
                 let col = src.offset(t as isize * depth_stride);
@@ -1079,6 +1081,39 @@ mod tests {
             )
         };
         (src, stride, whole)
+    }
+
+    /// The strip walk ends each strip at `t0 + tile`. A caller or a tuning profile can set that
+    /// `tile` knob as high as `usize::MAX`. A serial copy starts `t0` at 0, where the sum cannot
+    /// overflow. A parallel copy starts it at its chunk's absolute offset, where it
+    /// can. This packs a shifted range under the largest possible tile, and checks that the range
+    /// still lands exactly its own cells
+    #[test]
+    fn a_huge_transpose_tile_leaves_a_shifted_range_correct() {
+        let (lead, k) = (3usize, 8usize);
+        let (src, stride, whole) = fixture(lead, k);
+        let prev = crate::tuning::pack_transpose_tile();
+        crate::tuning::set_pack_transpose_tile(usize::MAX);
+        let mut got = vec![f32::NAN; lead * stride];
+        // SAFETY: as `fixture`, over the upper half of the same depth
+        unsafe {
+            pack_k_contiguous::<f32>(
+                got.as_mut_ptr(),
+                src.as_ptr(),
+                lead,
+                k / 2,
+                k,
+                stride,
+                1,
+                lead as isize,
+            )
+        };
+        crate::tuning::set_pack_transpose_tile(prev);
+        for l in 0..lead {
+            let (a, b) = (&got[l * stride..][..k], &whole[l * stride..][..k]);
+            assert_eq!(a[k / 2..], b[k / 2..], "line {l}: shifted range");
+            assert!(a[..k / 2].iter().all(|v| v.is_nan()), "line {l}: wrote low");
+        }
     }
 
     /// Any set of disjoint ranges that covers the depth must land exactly the bytes 1 whole-depth

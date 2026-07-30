@@ -338,7 +338,10 @@ macro-panel fits L3, with a panel-count cap on machines that report no L3.
 A tiny-matrix shortcut skips the model for small shapes. Sizing uses the
 packed-input element size, so narrower types get deeper blocks. Its depth
 ceiling (`GEMMKIT_KC`) counts 4-byte elements and is divided by that element
-size, which holds the packed panel bytes fixed across the element families.
+size, which holds the packed panel bytes fixed. A byte budget is not a slice
+budget, though, and each slice costs a worker fork. So the divisor carries an
+arch-split cap that stops a wide element from multiplying the slice count
+where panel residency is not the binding cost.
 `KC` and `NC` are deliberately independent of the thread count. `MC` may
 shrink with the worker count, to keep the parallel job list deep enough. It
 always stays an `MR` multiple, though. So the microtile set, and each tile's

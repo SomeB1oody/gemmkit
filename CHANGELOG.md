@@ -23,31 +23,46 @@ once, with per-crate subsections where a change is crate-specific.
 #### Changed
 
 - The tiny-matrix shortcut's depth ceiling (`GEMMKIT_KC`) is deeper on x86, and it now
-  scales with the element size. The x86 default goes from 512 to 2048. The ceiling
-  counts 4-byte elements, and the shortcut divides it by the packed element size. So
-  `f64` takes half the depth of `f32`, and `int8` takes 4 times as much, while the
-  packed panel bytes stay the same. The aarch64 default is unchanged, and so is the
-  `f32` depth it gives.
+  resolves against the packed element size. The x86 default goes from 512 to 2048. The
+  ceiling counts 4-byte elements, and a narrow element divides it, so `f16` takes 2
+  times the depth of `f32` and `int8` takes 4 times. The packed panel bytes stay the
+  same. The aarch64 default is unchanged, and so is the `f32` depth it gives.
 
   A shape with both `m` and `n` at or below `GEMMKIT_TINY_BLOCK_DIM` (default 64) runs
-  `k` in slices of this depth. Each extra slice re-reads and re-writes `C`, re-enters
-  the driver, and forks the workers once more. A long `k` made that per-slice cost
-  dominate. A deeper slice also grows the packed A and B panels, which need to stay in
-  a private L2, so the depth cannot grow without a limit. The new x86 budget puts the
-  widest shortcut shape's panels at about 1.1 MiB, which is one Zen5 L2.
+  `k` in slices of this depth. The depth balances 2 costs that scale differently with
+  the element size. Each extra slice re-reads and re-writes `C`, re-enters the driver,
+  and forks the workers once more. That argues for a deep block at any element size. A
+  deeper slice also grows the packed A and B panels, which need to stay in a private
+  L2, and that limit is in bytes. A byte budget is not a slice budget. At a fixed
+  budget, a 16-byte element takes 4 times the slices of a 4-byte element.
+
+  So a *wide* element divides the ceiling only where panel residency is the binding
+  cost. That is a machine property, and it carries an arch-split cap. On x86 the 1 MiB
+  private L2 binds first, and the divisor applies at every element size. On aarch64 the
+  effective L2 is 4 times larger and unified memory feeds an overflowing panel well, so
+  a wide element keeps the whole ceiling there.
 
   Measured on the Zen5 reference machine over 8 shapes in the band, against the old
   512-element budget. The parallel path is 1.06 to 2.3 times faster for `f32`, `f64`,
   `f16`, and `int8`. The serial path is neutral to 11 percent faster, except at `m` and
   `n` of 64, where it loses 2 to 4 percent. One step deeper would cost the serial path
-  12 to 20 percent for `f32` and `f64`.
+  12 to 20 percent for `f32` and `f64`. `c64` at 1 quarter of the `f32` depth is the
+  best or the tied-best depth on 4 of 5 shapes in parallel, and is flat within 1
+  percent serially.
 
-  The 1 element-size rule replaces a single depth shared by every family. That shared
-  depth over-blocked `f64` by 2 times and under-blocked `int8` by 4 times. A tuner
-  sweep run on `f32` now transfers to the other families. gemmkit-tune's own
-  `GEMMKIT_KC` probe changed with it. Its candidates now straddle the default, and its
-  shapes are deep enough to hold 8 or more slices. It also scores the serial and the
-  parallel mode together, because the 2 modes pull the ceiling in opposite directions.
+  Measured on the M4 Max over 5 shapes in the band, against the pre-release behavior of
+  1 depth shared by every family. `int8` gains 22 to 51 percent in parallel on every
+  shape, and `f16` gains 5 to 20 percent. `f64` gains 5 to 15 percent serially. Both
+  narrow families are flat serially, within 1.5 percent. Dividing the depth for `c64`
+  there cost the parallel path 21 to 51 percent, which is what the arch-split cap now
+  prevents.
+
+  The element-size rule replaces a single depth shared by every family, which
+  under-blocked `int8` by 4 times. A tuner sweep run on `f32` now transfers to the
+  other families. gemmkit-tune's own `GEMMKIT_KC` probe changed with it. Its candidates
+  now straddle the default, and its shapes are deep enough to hold 8 or more slices. It
+  also scores the serial and the parallel mode together, because the 2 modes pull the
+  ceiling in opposite directions.
 
   Blocking still depends only on the cache geometry and the problem shape, never on
   the worker count. So output remains bit-identical across worker counts. The depth

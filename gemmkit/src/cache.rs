@@ -428,7 +428,9 @@ impl CacheTopology {
 
         // Runtime blocking knobs: read once up front, then used as plain values below
         let tiny_dim = crate::tuning::tiny_block_dim();
-        let kc_cap = crate::tuning::kc();
+        // The tiny-branch ceiling resolves against the packed element size, so ask for the
+        // depth this element gets rather than reading the raw knob
+        let kc_cap = crate::tuning::tiny_kc(sizeof);
         let kc_floor = crate::tuning::kc_min();
         let mc_panels = crate::tuning::mc_reg_panels();
         let nc_panels = crate::tuning::nc_no_l3_panels();
@@ -444,9 +446,7 @@ impl CacheTopology {
 
         // Small-matrix shortcut: skip the full model, just size panels to fit L2
         if m <= tiny_dim && n <= tiny_dim {
-            // `kc_cap` counts 4-byte elements, so rescale it by the packed element size
-            let cap = (kc_cap.saturating_mul(4) / sizeof.max(1)).max(1);
-            let kc = k.clamp(1, cap);
+            let kc = k.clamp(1, kc_cap);
             // Cap at the rounded-up row count: with only `m` rows total, a larger
             // `mc` cannot split into fewer blocks, so it buys nothing
             let mc = ((l2 / sizeof / kc) / mr * mr)
@@ -622,33 +622,63 @@ mod tests {
         assert_eq!((b.mc, b.kc, b.nc), (16, 1, 8));
     }
 
-    /// The small-matrix shortcut spends the same panel bytes on every element family. Its
-    /// depth ceiling counts 4-byte elements, so a wider element gets proportionally fewer
-    /// depth rows. This is what stops 1 calibrated number from over-blocking f64 by 2x, or
-    /// under-blocking i8 by 4x. The check is a ratio across element sizes, so an ambient
-    /// `GEMMKIT_KC` cannot make it vacuous. Integer division can drop up to 1 element of
+    /// The small-matrix shortcut resolves its depth ceiling against the packed element size.
+    /// A narrow element (f16, i8) divides the byte budget and takes a deeper block, which
+    /// holds the packed panel bytes fixed. This is what stops 1 calibrated number from
+    /// under-blocking i8 by 4x. The checks are ratios across element sizes, so an ambient
+    /// `GEMMKIT_KC` cannot make them vacuous. Integer division can drop up to 1 element of
     /// depth, so the byte totals match to within 1 element
     #[test]
-    fn tiny_shortcut_spends_equal_panel_bytes_per_element_size() {
+    fn tiny_shortcut_deepens_the_block_for_a_narrow_element() {
         let t = topology();
         let tiny = crate::tuning::tiny_block_dim();
         // k far past any ceiling, so the ceiling binds instead of k
         let (m, n, k) = (tiny, tiny, 1usize << 22);
         let f32_kc = t.blocking(16, 4, 4, m, n, k).kc;
         let budget = f32_kc * 4;
-        for sizeof in [1usize, 2, 8, 16] {
-            let kc = t.blocking(16, 4, sizeof, m, n, k).kc;
-            let bytes = kc * sizeof;
+        for sizeof in [1usize, 2] {
+            let bytes = t.blocking(16, 4, sizeof, m, n, k).kc * sizeof;
             assert!(
                 bytes <= budget && bytes + sizeof > budget,
                 "sizeof {sizeof}: {bytes} panel bytes against a {budget} budget"
             );
         }
-        // The f64 regression this fixes: a shared depth would double the f64 panel bytes
-        assert!(
-            t.blocking(16, 4, 8, m, n, k).kc < f32_kc,
-            "a wider element must take a shallower depth block"
-        );
+    }
+
+    /// Whether a *wide* element also divides the ceiling is a machine property, so the divisor
+    /// carries an arch-split cap ([`crate::tuning::KC_SIZEOF_DIV_CAP`]). Either way the depth
+    /// stays between the 2 ends of that choice, and never rises as the element widens. The
+    /// branch below then pins whichever policy this target measured. It reads the cap at run
+    /// time rather than through `#[cfg]`, so both arms compile on every target
+    #[test]
+    fn tiny_shortcut_bounds_the_block_for_a_wide_element() {
+        let t = topology();
+        let tiny = crate::tuning::tiny_block_dim();
+        let (m, n, k) = (tiny, tiny, 1usize << 22);
+        let f32_kc = t.blocking(16, 4, 4, m, n, k).kc;
+        let mut prev = f32_kc;
+        for sizeof in [8usize, 16] {
+            let kc = t.blocking(16, 4, sizeof, m, n, k).kc;
+            assert!(
+                kc <= f32_kc && kc >= f32_kc * 4 / sizeof,
+                "sizeof {sizeof}: depth {kc} outside [{}, {f32_kc}]",
+                f32_kc * 4 / sizeof
+            );
+            assert!(kc <= prev, "sizeof {sizeof}: depth rose with the width");
+            prev = kc;
+        }
+        let kc16 = t.blocking(16, 4, 16, m, n, k).kc;
+        if crate::tuning::KC_SIZEOF_DIV_CAP <= 4 {
+            // Hold a wide element at the whole ceiling. Dividing it multiplies the slice
+            // count, which cost the parallel path 21 to 51 percent on c64 on an M4 Max
+            assert_eq!(kc16, f32_kc, "a wide element must keep the whole ceiling");
+        } else {
+            // Divide at every width, where a private L2 makes panel residency bind first
+            assert!(
+                kc16 * 16 <= f32_kc * 4 && kc16 * 16 + 16 > f32_kc * 4,
+                "a wide element must hold the panel bytes"
+            );
+        }
     }
 
     /// The no-L3 `NC` arm (take the full, rounded-up `N` up to the
